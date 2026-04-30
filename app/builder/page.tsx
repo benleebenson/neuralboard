@@ -10,6 +10,8 @@ type Beat = {
   images?: string[];
 };
 
+const RAILWAY_URL = process.env.NEXT_PUBLIC_RAILWAY_URL || "";
+
 export default function BuilderPage() {
   const [authed, setAuthed] = useState(false);
   const [pwInput, setPwInput] = useState("");
@@ -23,11 +25,17 @@ export default function BuilderPage() {
   const [beats, setBeats] = useState<Beat[]>([]);
   const [error, setError] = useState("");
 
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+
+  const [rendering, setRendering] = useState(false);
+  const [renderStatus, setRenderStatus] = useState("");
+  const [mp4Url, setMp4Url] = useState("");
+
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Restore password from sessionStorage so refresh doesn't kick you out
   useEffect(() => {
     const saved = sessionStorage.getItem("nb_pw");
     if (saved) {
@@ -52,6 +60,8 @@ export default function BuilderPage() {
     setTranscript("");
     setBeats([]);
     setDuration(0);
+    setAudioBlob(null);
+    setMp4Url("");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
@@ -73,10 +83,11 @@ export default function BuilderPage() {
 
       recorder.onstop = async () => {
         streamRef.current?.getTracks().forEach((t) => t.stop());
-        const audioBlob = new Blob(chunksRef.current, {
+        const blob = new Blob(chunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
-        await sendToTranscribe(audioBlob);
+        setAudioBlob(blob);
+        await sendToTranscribe(blob);
       };
 
       recorder.start();
@@ -106,7 +117,6 @@ export default function BuilderPage() {
         body: blob,
       });
       if (res.status === 401) {
-        // Wrong password — kick back to login
         sessionStorage.removeItem("nb_pw");
         setAuthed(false);
         setPwError("Password expired or invalid");
@@ -126,16 +136,180 @@ export default function BuilderPage() {
     }
   }
 
-  // ── Password gate ────────────────────────────────────────────
+  async function renderVideo() {
+    if (!audioBlob || beats.length === 0) {
+      setError("Need both audio and beats to render");
+      return;
+    }
+    if (!RAILWAY_URL) {
+      setError("Railway URL not configured");
+      return;
+    }
+    setRendering(true);
+    setError("");
+    setRenderStatus("Loading images...");
+    setMp4Url("");
+
+    try {
+      const images = await Promise.all(
+        beats.map((b) => {
+          if (!b.images || b.images.length === 0) return null;
+          return loadImage(b.images[0]).catch(() => null);
+        })
+      );
+
+      setRenderStatus("Setting up canvas...");
+
+      const W = 1080;
+      const H = 1920;
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error("Canvas not ready");
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas context not available");
+
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, W, H);
+
+      const audioEl = new Audio(URL.createObjectURL(audioBlob));
+      audioEl.preload = "auto";
+      await new Promise<void>((res) => {
+        audioEl.addEventListener("canplaythrough", () => res(), { once: true });
+        audioEl.load();
+      });
+
+      const canvasStream = canvas.captureStream(30);
+      const audioCtx = new AudioContext();
+      const audioSource = audioCtx.createMediaElementSource(audioEl);
+      const audioDest = audioCtx.createMediaStreamDestination();
+      audioSource.connect(audioDest);
+      audioSource.connect(audioCtx.destination);
+
+      const combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioDest.stream.getAudioTracks(),
+      ]);
+
+      const recorderMime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        ? "video/webm;codecs=vp9,opus"
+        : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+        ? "video/webm;codecs=vp8,opus"
+        : "video/webm";
+
+      const renderRecorder = new MediaRecorder(combinedStream, {
+        mimeType: recorderMime,
+        videoBitsPerSecond: 4_000_000,
+      });
+      const renderChunks: Blob[] = [];
+      renderRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) renderChunks.push(e.data);
+      };
+
+      const recordingDone = new Promise<Blob>((resolve) => {
+        renderRecorder.onstop = () => {
+          resolve(new Blob(renderChunks, { type: "video/webm" }));
+        };
+      });
+
+      renderRecorder.start();
+      audioEl.currentTime = 0;
+      await audioEl.play();
+      const startMs = performance.now();
+
+      setRenderStatus("Rendering frames...");
+
+      let prevBeatIdx = -1;
+      let crossfadeStartMs = 0;
+      const CROSSFADE_MS = 400;
+
+      function drawFrame() {
+        const elapsedSec = (performance.now() - startMs) / 1000;
+
+        if (elapsedSec >= duration) {
+          renderRecorder.stop();
+          audioEl.pause();
+          return;
+        }
+
+        const idx = beats.findIndex(
+          (b) => elapsedSec >= b.startTime && elapsedSec < b.endTime
+        );
+        const currentIdx = idx >= 0 ? idx : beats.length - 1;
+        const currentImg = images[currentIdx];
+        const prevImg = prevBeatIdx >= 0 ? images[prevBeatIdx] : null;
+
+        if (currentIdx !== prevBeatIdx) {
+          crossfadeStartMs = performance.now();
+          prevBeatIdx = currentIdx;
+        }
+
+        const fadeElapsed = performance.now() - crossfadeStartMs;
+        const fadeProgress = Math.min(1, fadeElapsed / CROSSFADE_MS);
+
+        ctx!.fillStyle = "#000";
+        ctx!.fillRect(0, 0, W, H);
+
+        if (prevImg && fadeProgress < 1) {
+          ctx!.globalAlpha = 1 - fadeProgress;
+          drawCover(ctx!, prevImg, W, H);
+        }
+        if (currentImg) {
+          ctx!.globalAlpha = fadeProgress;
+          drawCover(ctx!, currentImg, W, H);
+        }
+        ctx!.globalAlpha = 1;
+
+        const progressY = H - 20;
+        ctx!.fillStyle = "#222";
+        ctx!.fillRect(0, progressY, W, 20);
+        ctx!.fillStyle = "#c8f135";
+        ctx!.fillRect(0, progressY, (elapsedSec / duration) * W, 20);
+
+        requestAnimationFrame(drawFrame);
+      }
+
+      requestAnimationFrame(drawFrame);
+
+      const webmBlob = await recordingDone;
+      audioCtx.close();
+
+      setRenderStatus("Converting to MP4 on server...");
+
+      const mp4Res = await fetch(RAILWAY_URL + "/render", {
+        method: "POST",
+        headers: {
+          "Content-Type": "video/webm",
+          "x-neuralboard-password": password,
+        },
+        body: webmBlob,
+      });
+      if (!mp4Res.ok) {
+        const errText = await mp4Res.text().catch(() => "");
+        throw new Error("Server error " + mp4Res.status + ": " + errText);
+      }
+      const mp4Blob = await mp4Res.blob();
+      const url = URL.createObjectURL(mp4Blob);
+      setMp4Url(url);
+      setRenderStatus("Done!");
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "Render failed";
+      setError(message);
+      setRenderStatus("");
+    } finally {
+      setRendering(false);
+    }
+  }
+
   if (!authed) {
     return (
       <main className="min-h-screen bg-black text-white flex items-center justify-center p-8">
         <div className="max-w-sm w-full">
-          <h1 className="text-2xl font-bold mb-2 text-[#c8f135] text-center">
+          <h1 className="text-2xl font-bold mb-2 text-center" style={{ color: "#c8f135" }}>
             Neural Board
           </h1>
           <p className="text-sm text-gray-500 mb-8 text-center">
-            Private beta — enter the password.
+            Private beta - enter the password.
           </p>
           <input
             type="password"
@@ -146,28 +320,35 @@ export default function BuilderPage() {
             }}
             placeholder="Password"
             autoFocus
-            className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg text-white placeholder-gray-600 focus:border-[#c8f135] focus:outline-none mb-3"
+            className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg text-white placeholder-gray-600 mb-3"
           />
           <button
             onClick={handleUnlock}
-            className="w-full px-4 py-3 bg-[#c8f135] text-black font-bold rounded-lg hover:bg-[#b3da2f] transition"
+            className="w-full px-4 py-3 text-black font-bold rounded-lg transition"
+            style={{ backgroundColor: "#c8f135" }}
           >
             Unlock
           </button>
-          {pwError && (
+          {pwError ? (
             <p className="text-red-400 text-xs text-center mt-3">{pwError}</p>
-          )}
+          ) : null}
         </div>
       </main>
     );
   }
 
-  // ── Main page ────────────────────────────────────────────────
+  let recordButtonLabel = "Record";
+  if (processing) recordButtonLabel = "Planning beats and finding images...";
+  else if (recording) recordButtonLabel = "Stop";
+
+  let renderButtonLabel = "Render Video";
+  if (rendering) renderButtonLabel = renderStatus || "Rendering...";
+
   return (
     <main className="min-h-screen bg-black text-white flex flex-col items-center p-8">
       <div className="max-w-3xl w-full">
-        <h1 className="text-3xl font-bold mb-2 text-[#c8f135] text-center mt-12">
-          Neural Board — Builder
+        <h1 className="text-3xl font-bold mb-2 text-center mt-12" style={{ color: "#c8f135" }}>
+          Neural Board - Builder
         </h1>
         <p className="text-sm text-gray-400 mb-12 text-center">
           Record a narration. Watch it become a visual plan.
@@ -176,22 +357,22 @@ export default function BuilderPage() {
         <div className="flex justify-center mb-12">
           <button
             onClick={recording ? stopRecording : startRecording}
-            disabled={processing}
-            className={`px-8 py-4 rounded-full text-lg font-bold transition disabled:opacity-50 ${
-              recording
-                ? "bg-red-500 text-white"
-                : "bg-[#c8f135] text-black hover:bg-[#b3da2f]"
-            }`}
+            disabled={processing || rendering}
+            className="px-8 py-4 rounded-full text-lg font-bold transition disabled:opacity-50"
+            style={{
+              backgroundColor: recording ? "#ef4444" : "#c8f135",
+              color: recording ? "#fff" : "#000",
+            }}
           >
-            {processing ? "Planning beats and finding images..." : recording ? "⬛ Stop" : "🎙 Record"}
+            {recordButtonLabel}
           </button>
         </div>
 
-        {error && (
-          <p className="mb-8 text-red-400 text-sm text-center">❌ {error}</p>
-        )}
+        {error ? (
+          <p className="mb-8 text-red-400 text-sm text-center">{error}</p>
+        ) : null}
 
-        {transcript && (
+        {transcript ? (
           <div className="mb-10">
             <h2 className="text-xs uppercase tracking-widest text-gray-500 mb-3">
               Transcript ({duration.toFixed(1)}s)
@@ -200,31 +381,28 @@ export default function BuilderPage() {
               {transcript}
             </p>
           </div>
-        )}
+        ) : null}
 
-        {beats.length > 0 && (
-          <div>
+        {beats.length > 0 ? (
+          <div className="mb-10">
             <h2 className="text-xs uppercase tracking-widest text-gray-500 mb-3">
               {beats.length} visual beats planned
             </h2>
             <div className="space-y-4">
               {beats.map((b, i) => (
-                <div
-                  key={i}
-                  className="bg-zinc-900 border border-zinc-800 rounded-lg p-5"
-                >
+                <div key={i} className="bg-zinc-900 border border-zinc-800 rounded-lg p-5">
                   <div className="flex items-baseline justify-between mb-2">
-                    <span className="text-[#c8f135] text-xs font-bold uppercase tracking-wider">
+                    <span className="text-xs font-bold uppercase tracking-wider" style={{ color: "#c8f135" }}>
                       Beat {i + 1}
                     </span>
                     <span className="text-gray-500 text-xs font-mono">
-                      {b.startTime.toFixed(1)}s – {b.endTime.toFixed(1)}s
+                      {b.startTime.toFixed(1)}s - {b.endTime.toFixed(1)}s
                     </span>
                   </div>
-                  <p className="text-white text-base mb-1">🔍 {b.searchQuery}</p>
-                  {b.reasoning && (
+                  <p className="text-white text-base mb-1">{b.searchQuery}</p>
+                  {b.reasoning ? (
                     <p className="text-gray-500 text-xs italic mb-3">{b.reasoning}</p>
-                  )}
+                  ) : null}
                   {b.images && b.images.length > 0 ? (
                     <div className="grid grid-cols-3 gap-2 mt-3">
                       {b.images.map((url, j) => (
@@ -232,7 +410,7 @@ export default function BuilderPage() {
                         <img
                           key={j}
                           src={url}
-                          alt={`${b.searchQuery} ${j + 1}`}
+                          alt={b.searchQuery + " " + (j + 1)}
                           className="w-full aspect-video object-cover rounded border border-zinc-700"
                           onError={(e) => {
                             (e.currentTarget as HTMLImageElement).style.display = "none";
@@ -241,16 +419,78 @@ export default function BuilderPage() {
                       ))}
                     </div>
                   ) : (
-                    <p className="text-gray-600 text-xs mt-3 italic">
-                      No images found for this beat.
-                    </p>
+                    <p className="text-gray-600 text-xs mt-3 italic">No images found.</p>
                   )}
                 </div>
               ))}
             </div>
           </div>
-        )}
+        ) : null}
+
+        {beats.length > 0 && audioBlob ? (
+          <div className="mb-10 text-center">
+            <button
+              onClick={renderVideo}
+              disabled={rendering}
+              className="px-8 py-4 rounded-full text-lg font-bold transition disabled:opacity-50"
+              style={{ backgroundColor: "#c8f135", color: "#000" }}
+            >
+              {renderButtonLabel}
+            </button>
+            {rendering && renderStatus ? (
+              <p className="text-gray-500 text-xs mt-3">{renderStatus}</p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {mp4Url ? (
+          <div className="mb-10 text-center">
+            
+            <a
+              href={mp4Url}
+              download="neuralboard.mp4"
+              className="inline-block px-8 py-4 rounded-full text-lg font-bold bg-white text-black hover:bg-gray-200 transition"
+            >
+              Download MP4
+            </a>
+            <p className="text-gray-500 text-xs mt-3">Tap to download to your device.</p>
+          </div>
+        ) : null}
+
+        <canvas ref={canvasRef} style={{ display: "none" }} />
       </div>
     </main>
   );
+}
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load image: " + url));
+    img.src = url;
+  });
+}
+
+function drawCover(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  W: number,
+  H: number
+) {
+  const imgRatio = img.width / img.height;
+  const canvasRatio = W / H;
+  let sx = 0;
+  let sy = 0;
+  let sw = img.width;
+  let sh = img.height;
+  if (imgRatio > canvasRatio) {
+    sw = img.height * canvasRatio;
+    sx = (img.width - sw) / 2;
+  } else {
+    sh = img.width / canvasRatio;
+    sy = (img.height - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
 }
