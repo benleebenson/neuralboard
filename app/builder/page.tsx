@@ -154,7 +154,7 @@ export default function BuilderPage() {
       const images = await Promise.all(
         beats.map((b) => {
           if (!b.images || b.images.length === 0) return null;
-          return loadImage(b.images[0]).catch(() => null);
+          return loadFirstWorking(b.images);
         })
       );
 
@@ -471,6 +471,18 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     img.onerror = () => reject(new Error("Failed to load image: " + url));
     img.src = url;
   });
+}
+
+async function loadFirstWorking(urls: string[]): Promise<HTMLImageElement | null> {
+  for (const url of urls) {
+    try {
+      const img = await loadImage(url);
+      return img;
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 function drawCover(
