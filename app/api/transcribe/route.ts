@@ -19,14 +19,14 @@ async function searchImages(query: string, apiKey: string): Promise<string[]> {
         "Content-Type": "application/json",
         "X-API-KEY": apiKey,
       },
-      body: JSON.stringify({ q: query, num: 3 }),
+      body: JSON.stringify({ q: query, num: 10 }),
     });
     if (!res.ok) return [];
     const data = await res.json();
     return (data.images || [])
       .map((img: { imageUrl?: string; thumbnailUrl?: string }) => img.imageUrl || img.thumbnailUrl || "")
       .filter((url: string) => url && url.startsWith("http"))
-      .slice(0, 3);
+      .slice(0, 8);
   } catch {
     return [];
   }
