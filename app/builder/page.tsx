@@ -228,6 +228,20 @@ export default function BuilderPage() {
       let crossfadeStartMs = 0;
       const CROSSFADE_MS = 400;
 
+      // ── Pre-compute card positions on the virtual corkboard ─────
+      // Cards laid out horizontally with slight vertical jitter
+      const N = beats.length;
+      const cardSpacing = W * 1.1; // slight overlap-free spacing
+      const cardCenters = beats.map((_, i) => {
+        const x = i * cardSpacing + W / 2;
+        // Pseudo-random vertical jitter (deterministic, stable)
+        const jitterY = (((i * 73) % 200) - 100); // -100 to +100 px
+        const y = H / 2 + jitterY;
+        return { x, y };
+      });
+      const boardWidth = N * cardSpacing + W; // total scrollable width
+      const boardHeight = H;
+
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
 
@@ -237,48 +251,88 @@ export default function BuilderPage() {
           return;
         }
 
+        // ── Determine current beat & how far into it we are ─────
         const idx = beats.findIndex(
           (b) => elapsedSec >= b.startTime && elapsedSec < b.endTime
         );
         const currentIdx = idx >= 0 ? idx : beats.length - 1;
-        const currentImg = images[currentIdx];
-        const prevImg = prevBeatIdx >= 0 ? images[prevBeatIdx] : null;
+        const currentBeat = beats[currentIdx];
+        const beatProgress = currentBeat
+          ? Math.min(1, Math.max(0, (elapsedSec - currentBeat.startTime) /
+              (currentBeat.endTime - currentBeat.startTime)))
+          : 0;
 
-        if (currentIdx !== prevBeatIdx) {
-          crossfadeStartMs = performance.now();
-          prevBeatIdx = currentIdx;
-        }
+        // ── Smooth camera position: ease between previous card and current ─
+        // For the first half of each beat, pan from prev card to current card.
+        // For the second half, hold steady on current card.
+        const prevIdx = Math.max(0, currentIdx - 1);
+        const fromCenter = cardCenters[prevIdx];
+        const toCenter = cardCenters[currentIdx];
 
-        const fadeElapsed = performance.now() - crossfadeStartMs;
-        const fadeProgress = Math.min(1, fadeElapsed / CROSSFADE_MS);
+        // Pan completes by the 60% mark of the beat — gives time to settle
+        const panProgress = Math.min(1, beatProgress / 0.6);
+        // Ease in-out cubic for smooth feel
+        const eased = panProgress < 0.5
+          ? 4 * panProgress * panProgress * panProgress
+          : 1 - Math.pow(-2 * panProgress + 2, 3) / 2;
 
-        // Cork background — solid color with darker grain dots for texture
+        const camX = fromCenter.x + (toCenter.x - fromCenter.x) * eased;
+        const camY = fromCenter.y + (toCenter.y - fromCenter.y) * eased;
+
+        // Slight zoom: zoom in slightly during second half (settled)
+        const zoom = 1 + 0.05 * Math.min(1, Math.max(0, (beatProgress - 0.5) * 2));
+
+        // ── Draw cork background, but offset by camera position ─
+        ctx!.save();
         ctx!.fillStyle = CORK_COLOR;
         ctx!.fillRect(0, 0, W, H);
-        // Add cork "grain" dots — pre-computed positions look organic
+
+        // Cork grain dots — fixed pattern, scrolls with camera
         ctx!.fillStyle = CORK_DARK;
-        for (let i = 0; i < 200; i++) {
-          const x = (i * 137.5) % W;
-          const y = (i * 89.3) % H;
+        for (let i = 0; i < 600; i++) {
+          const px = (i * 137.5) % boardWidth;
+          const py = (i * 89.3) % boardHeight;
+          // Translate to screen coords
+          const screenX = px - camX + W / 2;
+          const screenY = py - camY + H / 2;
+          if (screenX < -5 || screenX > W + 5 || screenY < -5 || screenY > H + 5) continue;
           const r = ((i * 7) % 3) + 0.5;
           ctx!.globalAlpha = 0.15;
           ctx!.beginPath();
-          ctx!.arc(x, y, r, 0, Math.PI * 2);
+          ctx!.arc(screenX, screenY, r, 0, Math.PI * 2);
           ctx!.fill();
         }
         ctx!.globalAlpha = 1;
-        
 
-        if (prevImg && fadeProgress < 1) {
-          ctx!.globalAlpha = 1 - fadeProgress;
-          drawCard(ctx!, prevImg, W, H, prevBeatIdx, CARD_BORDER, CARD_SHADOW);
-        }
-        if (currentImg) {
-          ctx!.globalAlpha = fadeProgress;
-          drawCard(ctx!, currentImg, W, H, currentIdx, CARD_BORDER, CARD_SHADOW);
-        }
-        ctx!.globalAlpha = 1;
+        // ── Draw all cards positioned in world-space, transformed to screen ─
+        // Set up camera transform: translate so camX/camY is at center, then zoom
+        ctx!.translate(W / 2, H / 2);
+        ctx!.scale(zoom, zoom);
+        ctx!.translate(-camX, -camY);
 
+        // Draw each card at its world position, but only if visible on screen
+        for (let i = 0; i < beats.length; i++) {
+          const center = cardCenters[i];
+          const cardScreenX = (center.x - camX) * zoom + W / 2;
+          // Cull cards that are way off-screen
+          if (cardScreenX < -W || cardScreenX > W * 2) continue;
+
+          const img = images[i];
+          drawCardAt(
+            ctx!,
+            img,
+            center.x,
+            center.y,
+            i,
+            CARD_BORDER,
+            CARD_SHADOW,
+            beats[i].searchQuery
+          );
+        }
+
+        ctx!.restore();
+
+        // ── Progress bar (drawn after restore, in screen space) ─
         const progressY = H - 20;
         ctx!.fillStyle = "#222";
         ctx!.fillRect(0, progressY, W, 20);
@@ -287,8 +341,6 @@ export default function BuilderPage() {
 
         requestAnimationFrame(drawFrame);
       }
-
-      requestAnimationFrame(drawFrame);
 
       const webmBlob = await recordingDone;
       audioCtx.close();
@@ -526,32 +578,27 @@ function drawCover(
   ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
 }
 
-function drawCard(
+function drawCardAt(
   ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
-  W: number,
-  H: number,
+  img: HTMLImageElement | null,
+  worldX: number,
+  worldY: number,
   beatIdx: number,
   borderColor: string,
-  shadowColor: string
+  shadowColor: string,
+  fallbackText: string
 ) {
-  // Card occupies most of the canvas, leaving cork visible around the edges
-  const margin = 180;
-  const cardW = W - margin * 2;
-  const cardH = H - margin * 2;
-  const cardX = margin;
-  const cardY = margin;
+  // Card dimensions (in world space)
+  const cardW = 720;
+  const cardH = 960;
   const borderW = 18;
 
-  // Deterministic rotation per beat — pseudo-random but stable
+  // Deterministic rotation per beat
   const rotation = (((beatIdx * 137) % 60) - 30) / 100; // ~ -0.3 to +0.3 rad
-  const rotDegrees = rotation * (180 / Math.PI);
 
   ctx.save();
-
-  // Translate to card center, rotate, then draw card centered at origin
-  ctx.translate(cardX + cardW / 2, cardY + cardH / 2);
-  ctx.rotate(rotDegrees * (Math.PI / 180) * 0.3); // soften rotation
+  ctx.translate(worldX, worldY);
+  ctx.rotate(rotation * 0.4); // slight tilt
 
   // Drop shadow
   ctx.shadowColor = shadowColor;
@@ -563,30 +610,57 @@ function drawCard(
   ctx.fillStyle = borderColor;
   ctx.fillRect(-cardW / 2, -cardH / 2, cardW, cardH);
 
-  // Reset shadow before drawing image (so image itself doesn't get shadowed)
+  // Reset shadow before image
   ctx.shadowColor = "transparent";
   ctx.shadowBlur = 0;
   ctx.shadowOffsetX = 0;
   ctx.shadowOffsetY = 0;
 
-  // Image inside the white border
+  // Image area
   const imgW = cardW - borderW * 2;
-  const imgH = cardH - borderW * 2 - 80; // extra space at bottom for "polaroid label" feel
+  const imgH = cardH - borderW * 2 - 80; // bottom strip for "label" feel
   const imgX = -cardW / 2 + borderW;
   const imgY = -cardH / 2 + borderW;
 
-  // Cover-fit the image inside the card
-  const imgRatio = img.width / img.height;
-  const slotRatio = imgW / imgH;
-  let sx = 0, sy = 0, sw = img.width, sh = img.height;
-  if (imgRatio > slotRatio) {
-    sw = img.height * slotRatio;
-    sx = (img.width - sw) / 2;
+  if (img) {
+    // Cover-fit
+    const imgRatio = img.width / img.height;
+    const slotRatio = imgW / imgH;
+    let sx = 0, sy = 0, sw = img.width, sh = img.height;
+    if (imgRatio > slotRatio) {
+      sw = img.height * slotRatio;
+      sx = (img.width - sw) / 2;
+    } else {
+      sh = img.width / slotRatio;
+      sy = (img.height - sh) / 2;
+    }
+    ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
   } else {
-    sh = img.width / slotRatio;
-    sy = (img.height - sh) / 2;
+    // Fallback: dark area with the search query
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(imgX, imgY, imgW, imgH);
+    ctx.fillStyle = "#c8f135";
+    ctx.font = "bold 36px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // Wrap text
+    const words = fallbackText.split(" ");
+    const lines: string[] = [];
+    let line = "";
+    for (const word of words) {
+      if ((line + " " + word).length > 18) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = line ? line + " " + word : word;
+      }
+    }
+    if (line) lines.push(line);
+    lines.forEach((ln, i) => {
+      ctx.fillText(ln, imgX + imgW / 2, imgY + imgH / 2 + (i - lines.length / 2) * 44);
+    });
   }
-  ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
 
   ctx.restore();
 }
