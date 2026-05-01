@@ -160,6 +160,11 @@ export default function BuilderPage() {
 
       setRenderStatus("Setting up canvas...");
 
+    // Detective-board palette
+      const CORK_COLOR = "#b08964";
+      const CORK_DARK = "#8a6740";
+      const CARD_BORDER = "#fafafa";
+      const CARD_SHADOW = "rgba(0, 0, 0, 0.4)";
       const W = 1080;
       const H = 1920;
       const canvas = canvasRef.current;
@@ -247,16 +252,30 @@ export default function BuilderPage() {
         const fadeElapsed = performance.now() - crossfadeStartMs;
         const fadeProgress = Math.min(1, fadeElapsed / CROSSFADE_MS);
 
-        ctx!.fillStyle = "#000";
+        // Cork background — solid color with darker grain dots for texture
+        ctx!.fillStyle = CORK_COLOR;
         ctx!.fillRect(0, 0, W, H);
+        // Add cork "grain" dots — pre-computed positions look organic
+        ctx!.fillStyle = CORK_DARK;
+        for (let i = 0; i < 200; i++) {
+          const x = (i * 137.5) % W;
+          const y = (i * 89.3) % H;
+          const r = ((i * 7) % 3) + 0.5;
+          ctx!.globalAlpha = 0.15;
+          ctx!.beginPath();
+          ctx!.arc(x, y, r, 0, Math.PI * 2);
+          ctx!.fill();
+        }
+        ctx!.globalAlpha = 1;
+        
 
         if (prevImg && fadeProgress < 1) {
           ctx!.globalAlpha = 1 - fadeProgress;
-          drawCover(ctx!, prevImg, W, H);
+          drawCard(ctx!, prevImg, W, H, prevBeatIdx, CARD_BORDER, CARD_SHADOW);
         }
         if (currentImg) {
           ctx!.globalAlpha = fadeProgress;
-          drawCover(ctx!, currentImg, W, H);
+          drawCard(ctx!, currentImg, W, H, currentIdx, CARD_BORDER, CARD_SHADOW);
         }
         ctx!.globalAlpha = 1;
 
@@ -505,4 +524,69 @@ function drawCover(
     sy = (img.height - sh) / 2;
   }
   ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
+}
+
+function drawCard(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  W: number,
+  H: number,
+  beatIdx: number,
+  borderColor: string,
+  shadowColor: string
+) {
+  // Card occupies most of the canvas, leaving cork visible around the edges
+  const margin = 180;
+  const cardW = W - margin * 2;
+  const cardH = H - margin * 2;
+  const cardX = margin;
+  const cardY = margin;
+  const borderW = 18;
+
+  // Deterministic rotation per beat — pseudo-random but stable
+  const rotation = (((beatIdx * 137) % 60) - 30) / 100; // ~ -0.3 to +0.3 rad
+  const rotDegrees = rotation * (180 / Math.PI);
+
+  ctx.save();
+
+  // Translate to card center, rotate, then draw card centered at origin
+  ctx.translate(cardX + cardW / 2, cardY + cardH / 2);
+  ctx.rotate(rotDegrees * (Math.PI / 180) * 0.3); // soften rotation
+
+  // Drop shadow
+  ctx.shadowColor = shadowColor;
+  ctx.shadowBlur = 30;
+  ctx.shadowOffsetX = 8;
+  ctx.shadowOffsetY = 12;
+
+  // White polaroid border
+  ctx.fillStyle = borderColor;
+  ctx.fillRect(-cardW / 2, -cardH / 2, cardW, cardH);
+
+  // Reset shadow before drawing image (so image itself doesn't get shadowed)
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
+
+  // Image inside the white border
+  const imgW = cardW - borderW * 2;
+  const imgH = cardH - borderW * 2 - 80; // extra space at bottom for "polaroid label" feel
+  const imgX = -cardW / 2 + borderW;
+  const imgY = -cardH / 2 + borderW;
+
+  // Cover-fit the image inside the card
+  const imgRatio = img.width / img.height;
+  const slotRatio = imgW / imgH;
+  let sx = 0, sy = 0, sw = img.width, sh = img.height;
+  if (imgRatio > slotRatio) {
+    sw = img.height * slotRatio;
+    sx = (img.width - sw) / 2;
+  } else {
+    sh = img.width / slotRatio;
+    sy = (img.height - sh) / 2;
+  }
+  ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
+
+  ctx.restore();
 }
