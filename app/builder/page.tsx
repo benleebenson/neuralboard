@@ -244,6 +244,7 @@ export default function BuilderPage() {
 
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
+        if (Math.floor(elapsedSec) % 2 === 0 && Math.floor(elapsedSec * 10) % 10 === 0) console.log("RENDER tick: elapsed=" + elapsedSec.toFixed(1) + "s duration=" + duration);
 
         if (elapsedSec >= duration) {
           renderRecorder.stop();
