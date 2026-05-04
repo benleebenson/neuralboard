@@ -343,6 +343,9 @@ export default function BuilderPage() {
         requestAnimationFrame(drawFrame);
       }
 
+
+      requestAnimationFrame(drawFrame);
+
       const webmBlob = await recordingDone;
       audioCtx.close();
 
