@@ -9,11 +9,20 @@ type Beat = {
   reasoning: string;
   images?: string[];
   selectedImageIdx?: number;
+  pos?: { x: number; y: number };
+  size?: number;
+  customImageUrl?: string;
+  customVideoUrl?: string;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
+type CardStyle = "card" | "bare";
+type Stroke = { color: string; size: number; points: Array<{ x: number; y: number }> };
+
 
 const RAILWAY_URL = process.env.NEXT_PUBLIC_RAILWAY_URL || "";
+const CARD_W = 130;
+const CARD_H = 170;
 
 export default function BuilderPage() {
   const [authed, setAuthed] = useState(false);
@@ -33,9 +42,16 @@ export default function BuilderPage() {
   const [mp4Url, setMp4Url] = useState("");
 
   const [activeBeatIdx, setActiveBeatIdx] = useState(0);
+  const [editingBeatIdx, setEditingBeatIdx] = useState<number | null>(null);
+  const [editEndVal, setEditEndVal] = useState('');
   const [background, setBackground] = useState<Background>("cork");
   const [customBgUrl, setCustomBgUrl] = useState<string>("");
   const [draggedBeatIdx, setDraggedBeatIdx] = useState<number | null>(null);
+  const [cardStyle, setCardStyle] = useState<CardStyle>("card");
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawColor, setDrawColor] = useState("#2a2a2a");
+  const [drawSize, setDrawSize] = useState(3);
+  const [strokes, setStrokes] = useState<Stroke[]>([]);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -43,6 +59,14 @@ export default function BuilderPage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
   const bgFileInputRef = useRef<HTMLInputElement | null>(null);
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<{ idx: number; ox: number; oy: number; startBeatX: number; startBeatY: number } | null>(null);
+  const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const strokesRef = useRef<Stroke[]>([]);
+  const currentStrokeRef = useRef<Stroke | null>(null);
+  const beatImageInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadBeatIdxRef = useRef<number>(-1);
+  const resizeRef = useRef<{ idx: number; startX: number; startSize: number } | null>(null);
 
   useEffect(() => {
     const saved = sessionStorage.getItem("nb_pw");
@@ -51,6 +75,34 @@ export default function BuilderPage() {
       setAuthed(true);
     }
   }, []);
+
+  // Keep strokesRef in sync so ResizeObserver can read current strokes
+  useEffect(() => { strokesRef.current = strokes; }, [strokes]);
+
+  // Resize the draw canvas to match board, redraw strokes at new scale.
+  // Depends on `authed` so it re-runs after the board mounts (lock screen hides it).
+  useEffect(() => {
+    if (!authed) return;
+    const board = boardRef.current;
+    const canvas = drawCanvasRef.current;
+    if (!board || !canvas) return;
+    const resize = () => {
+      const r = board.getBoundingClientRect();
+      canvas.width = Math.round(r.width);
+      canvas.height = Math.round(r.height);
+      redrawCanvas(canvas, strokesRef.current);
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(board);
+    resize();
+    return () => observer.disconnect();
+  }, [authed]);
+
+  // Redraw whenever committed strokes change
+  useEffect(() => {
+    const canvas = drawCanvasRef.current;
+    if (canvas) redrawCanvas(canvas, strokes);
+  }, [strokes]);
 
   function handleUnlock() {
     if (!pwInput.trim()) {
@@ -152,9 +204,13 @@ export default function BuilderPage() {
       if (!data.ok) throw new Error(data.error || "Transcription failed");
       setTranscript(data.transcript);
       setDuration(data.duration);
-      const newBeats: Beat[] = (data.beats || []).map((b: Beat) => ({
+      const newBeats: Beat[] = (data.beats || []).map((b: Beat, i: number) => ({
         ...b,
         selectedImageIdx: 0,
+        pos: {
+          x: 40 + (i % 3) * 160 + (i * 17) % 30,
+          y: 40 + Math.floor(i / 3) * 210 + (i * 31) % 40,
+        },
       }));
       setBeats(newBeats);
       setActiveBeatIdx(0);
@@ -199,15 +255,173 @@ export default function BuilderPage() {
     setDraggedBeatIdx(null);
   }
 
+  function handleBoardPointerDown(e: React.PointerEvent, idx: number) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const beat = beats[idx];
+    dragRef.current = {
+      idx,
+      ox: e.clientX,
+      oy: e.clientY,
+      startBeatX: beat.pos?.x ?? 0,
+      startBeatY: beat.pos?.y ?? 0,
+    };
+    setActiveBeatIdx(idx);
+    e.stopPropagation();
+  }
+
+  function handleBoardPointerMove(e: React.PointerEvent) {
+    if (resizeRef.current) {
+      const { idx, startX, startSize } = resizeRef.current;
+      const newSize = Math.max(80, Math.min(400, startSize + (e.clientX - startX)));
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, size: newSize } : b));
+      return;
+    }
+    if (!dragRef.current) return;
+    const { idx, ox, oy, startBeatX, startBeatY } = dragRef.current;
+    const board = boardRef.current;
+    if (!board) return;
+    const boardRect = board.getBoundingClientRect();
+    const cardW = beats[idx]?.size ?? CARD_W;
+    const newX = Math.max(0, Math.min(boardRect.width - cardW, startBeatX + (e.clientX - ox)));
+    const newY = Math.max(0, Math.min(boardRect.height - 60, startBeatY + (e.clientY - oy)));
+    setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, pos: { x: newX, y: newY } } : b));
+  }
+
+  function handleBoardPointerUp() {
+    dragRef.current = null;
+    resizeRef.current = null;
+  }
+
+  function handleBeatMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const idx = uploadBeatIdxRef.current;
+    if (!file || idx < 0) return;
+    const url = URL.createObjectURL(file);
+    if (file.type.startsWith('video/')) {
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined } : b));
+    } else {
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined } : b));
+    }
+    e.target.value = "";
+  }
+
+  function commitBeatEnd(idx: number, rawVal: string) {
+    const newEnd = parseFloat(rawVal);
+    if (isNaN(newEnd)) { setEditingBeatIdx(null); return; }
+    setBeats(prev => {
+      const next = [...prev];
+      const beat = next[idx];
+      const clampedEnd = Math.max(beat.startTime + 0.1, Math.min(duration, newEnd));
+      next[idx] = { ...beat, endTime: clampedEnd };
+      // adjust next beat's startTime (it shrinks/grows to compensate)
+      if (idx + 1 < next.length) {
+        const nb = next[idx + 1];
+        next[idx + 1] = { ...nb, startTime: clampedEnd, endTime: Math.max(clampedEnd + 0.1, nb.endTime) };
+      }
+      return next;
+    });
+    setEditingBeatIdx(null);
+  }
+
+  function addCustomBeat() {
+    setBeats(prev => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      const lastDur = last.endTime - last.startTime;
+      if (lastDur < 0.2) return prev;
+      const split = last.startTime + lastDur / 2;
+      const newBeat: Beat = {
+        startTime: split,
+        endTime: last.endTime,
+        searchQuery: 'custom beat',
+        reasoning: 'user added',
+        images: [],
+        selectedImageIdx: 0,
+        pos: {
+          x: 40 + (prev.length % 3) * 160 + (prev.length * 17) % 30,
+          y: 40 + Math.floor(prev.length / 3) * 210 + (prev.length * 31) % 40,
+        },
+      };
+      return [...prev.slice(0, -1), { ...last, endTime: split }, newBeat];
+    });
+  }
+
+  function selectBeatImage(beatIdx: number, imgIdx: number) {
+    setBeats((prev) => prev.map((b, i) =>
+      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined } : b
+    ));
+  }
+
+  function syncCanvas(): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; w: number; h: number } | null {
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
+    if (w === 0 || h === 0) return null;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      redrawCanvas(canvas, strokesRef.current);
+    }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    return { canvas, ctx, w, h };
+  }
+
+  function boardPx(e: React.PointerEvent<HTMLCanvasElement>) {
+    const rect = drawCanvasRef.current!.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  function handleDrawStart(e: React.PointerEvent<HTMLCanvasElement>) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const s = syncCanvas();
+    if (!s) return;
+    const { x, y } = boardPx(e);
+    currentStrokeRef.current = { color: drawColor, size: drawSize, points: [{ x, y }] };
+  }
+
+  function handleDrawMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    const stroke = currentStrokeRef.current;
+    if (!stroke) return;
+    const s = syncCanvas();
+    if (!s) return;
+    const { x, y } = boardPx(e);
+    const prev = stroke.points[stroke.points.length - 1];
+    stroke.points.push({ x, y });
+    s.ctx.strokeStyle = stroke.color;
+    s.ctx.lineWidth = stroke.size;
+    s.ctx.lineCap = "round";
+    s.ctx.lineJoin = "round";
+    s.ctx.beginPath();
+    s.ctx.moveTo(prev.x, prev.y);
+    s.ctx.lineTo(x, y);
+    s.ctx.stroke();
+  }
+
+  function handleDrawEnd() {
+    const stroke = currentStrokeRef.current;
+    currentStrokeRef.current = null;
+    if (!stroke || stroke.points.length < 2) return;
+    setStrokes((prev) => [...prev, stroke]);
+  }
+
+  function clearDrawing() {
+    setStrokes([]);
+    const canvas = drawCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+
   async function renderVideo() {
     if (!audioBlob || beats.length === 0) {
       setError("Need both audio and beats to render");
       return;
     }
-    if (!RAILWAY_URL) {
-      setError("Railway URL not configured");
-      return;
-    }
+    if (!RAILWAY_URL) return;
     setRendering(true);
     setError("");
     setRenderStatus("Loading images...");
@@ -221,6 +435,23 @@ export default function BuilderPage() {
           const startIdx = b.selectedImageIdx ?? 0;
           const reordered = [...list.slice(startIdx), ...list.slice(0, startIdx)];
           return loadFirstWorking(reordered);
+        })
+      );
+
+      const videoEls: (HTMLVideoElement | null)[] = await Promise.all(
+        beats.map(b => {
+          if (!b.customVideoUrl) return Promise.resolve(null);
+          const vid = document.createElement('video');
+          vid.src = b.customVideoUrl;
+          vid.muted = true;
+          vid.playsInline = true;
+          vid.crossOrigin = 'anonymous';
+          return new Promise<HTMLVideoElement | null>(resolve => {
+            const timer = setTimeout(() => resolve(null), 8000);
+            vid.oncanplay = () => { clearTimeout(timer); resolve(vid); };
+            vid.onerror = () => { clearTimeout(timer); resolve(null); };
+            vid.load();
+          });
         })
       );
 
@@ -301,6 +532,7 @@ export default function BuilderPage() {
       const boardWidth = N * cardSpacing + W;
       const boardHeight = H;
 
+      let prevRenderBeatIdx = -1;
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
         if (elapsedSec >= safeDuration) {
@@ -312,6 +544,17 @@ export default function BuilderPage() {
           (b) => elapsedSec >= b.startTime && elapsedSec < b.endTime
         );
         const currentIdx = idx >= 0 ? idx : beats.length - 1;
+
+        if (currentIdx !== prevRenderBeatIdx) {
+          if (prevRenderBeatIdx >= 0 && videoEls[prevRenderBeatIdx]) {
+            videoEls[prevRenderBeatIdx]!.pause();
+          }
+          if (videoEls[currentIdx]) {
+            videoEls[currentIdx]!.currentTime = 0;
+            videoEls[currentIdx]!.play().catch(() => {});
+          }
+          prevRenderBeatIdx = currentIdx;
+        }
         const currentBeat = beats[currentIdx];
         const beatProgress = currentBeat
           ? Math.min(1, Math.max(0, (elapsedSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
@@ -338,7 +581,8 @@ export default function BuilderPage() {
           const center = cardCenters[i];
           const cardScreenX = (center.x - camX) * zoom + W / 2;
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
-          drawCardAt(ctx!, images[i], center.x, center.y, i, beats[i].searchQuery);
+          const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
+          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery);
         }
         ctx!.restore();
 
@@ -440,10 +684,15 @@ export default function BuilderPage() {
 
           {beats.length > 0 ? (
             <>
-              <SectionLabel n="3" title="Beats" right={beats.length + " found / drag to reorder"} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <span style={{ fontFamily: "'Caveat', cursive", fontSize: 22, color: '#2a2a2a', fontWeight: 700 }}>3. Beats</span>
+                <div style={{ flex: 1, height: 1, background: '#2a2a2a', opacity: 0.2 }} />
+                <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
+                <button onClick={addCustomBeat} style={{ ...miniButton, fontWeight: 700, padding: '2px 8px', fontSize: 12 }} title="Add a custom beat">+</button>
+              </div>
               {beats.map((b, i) => {
                 const isActive = i === activeBeatIdx;
-                const thumbUrl = b.images?.[b.selectedImageIdx ?? 0];
+                const displayImg = b.customImageUrl ?? b.images?.[b.selectedImageIdx ?? 0];
                 return (
                   <div key={i} draggable
                     onDragStart={() => handleDragStart(i)}
@@ -454,9 +703,11 @@ export default function BuilderPage() {
                       boxShadow: isActive ? "0 0 0 2px #c8f135" : "2px 2px 0 #2a2a2a",
                       opacity: draggedBeatIdx === i ? 0.4 : 1 }}>
                     <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                      <div style={{ width: 60, height: 60, border: "1.5px solid #2a2a2a", flexShrink: 0, overflow: "hidden", background: "#d4d4d4" }}>
-                        {thumbUrl ? (
-                          <img src={thumbUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      <div style={{ width: 56, height: 56, border: "1.5px solid #2a2a2a", flexShrink: 0, overflow: "hidden", background: "#d4d4d4" }}>
+                        {b.customVideoUrl ? (
+                          <video src={b.customVideoUrl} muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        ) : displayImg ? (
+                          <img src={displayImg} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                         ) : (
                           <div style={{ width: "100%", height: "100%", background: "#2a2a2a", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 9, padding: 4, textAlign: "center" }}>no image</div>
                         )}
@@ -464,20 +715,59 @@ export default function BuilderPage() {
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
                           <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>
-                            BEAT {i + 1}{isActive ? " <" : ""}
+                            BEAT {i + 1}{isActive ? " ◂" : ""}
                           </span>
-                          <span style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace" }}>
-                            {b.startTime.toFixed(1)}-{b.endTime.toFixed(1)}s
-                          </span>
+                          {editingBeatIdx === i ? (
+                            <input
+                              autoFocus
+                              type="number"
+                              step="0.1"
+                              min={(b.startTime + 0.1).toFixed(1)}
+                              max={duration.toFixed(1)}
+                              defaultValue={b.endTime.toFixed(1)}
+                              onChange={e => setEditEndVal(e.target.value)}
+                              onBlur={() => commitBeatEnd(i, editEndVal || b.endTime.toString())}
+                              onKeyDown={e => { if (e.key === 'Enter') commitBeatEnd(i, editEndVal || b.endTime.toString()); if (e.key === 'Escape') setEditingBeatIdx(null); }}
+                              onClick={e => e.stopPropagation()}
+                              style={{ width: 60, fontSize: 10, fontFamily: 'monospace', border: '1px solid #2a2a2a', padding: '1px 3px', background: '#fffdf5' }}
+                            />
+                          ) : (
+                            <span
+                              onClick={e => { e.stopPropagation(); setEditEndVal(b.endTime.toFixed(1)); setEditingBeatIdx(i); }}
+                              title="Click to edit end time"
+                              style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace", cursor: 'pointer', borderBottom: '1px dashed #6a6a6a' }}>
+                              {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
+                            </span>
+                          )}
                         </div>
-                        <div style={{ fontSize: 12, color: "#2a2a2a", marginBottom: 4, fontFamily: "monospace" }}>
+                        <div style={{ fontSize: 11, color: "#2a2a2a", marginBottom: 6, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {b.searchQuery}
                         </div>
-                        <div style={{ display: "flex", gap: 6 }}>
-                          <button onClick={(e) => { e.stopPropagation(); cycleImage(i); }}
-                            style={miniButton}
-                            disabled={!b.images || b.images.length < 2}>
-                            replace img ({(b.selectedImageIdx ?? 0) + 1}/{b.images?.length || 0})
+                        {/* Thumbnail strip + upload */}
+                        <div style={{ display: "flex", gap: 3, flexWrap: "wrap", alignItems: "center" }}>
+                          {(b.images || []).map((imgUrl, imgI) => {
+                            const selected = !b.customImageUrl && imgI === (b.selectedImageIdx ?? 0);
+                            return (
+                              <div key={imgI}
+                                onClick={(e) => { e.stopPropagation(); selectBeatImage(i, imgI); }}
+                                style={{ width: 22, height: 22, flexShrink: 0, overflow: "hidden", cursor: "pointer",
+                                  border: selected ? "1.5px solid #c8f135" : "1px solid rgba(42,42,42,0.3)",
+                                  outline: selected ? "1px solid #2a2a2a" : "none" }}>
+                                <img src={imgUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                              </div>
+                            );
+                          })}
+                          {b.customImageUrl && (
+                            <div style={{ width: 22, height: 22, flexShrink: 0, overflow: "hidden",
+                              border: "1.5px solid #c8f135", outline: "1px solid #2a2a2a" }}>
+                              <img src={b.customImageUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                            </div>
+                          )}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); uploadBeatIdxRef.current = i; beatImageInputRef.current?.click(); }}
+                            style={{ ...miniButton, width: 22, height: 22, padding: 0, fontSize: 14, fontWeight: 700,
+                              display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                            +
                           </button>
                         </div>
                       </div>
@@ -509,10 +799,30 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 && audioBlob ? (
+          {beats.length > 0 ? (
+            <>
+              <SectionLabel n="5" title="Card Style" />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
+                {(["card", "bare"] as CardStyle[]).map((s) => (
+                  <div key={s} onClick={() => setCardStyle(s)}
+                    style={{ border: "1.5px solid #2a2a2a", padding: "10px 8px", cursor: "pointer", textAlign: "center",
+                      boxShadow: cardStyle === s ? "0 0 0 2px #c8f135" : "2px 2px 0 #2a2a2a",
+                      background: "rgba(255,253,245,0.85)", fontFamily: "monospace", fontSize: 11, fontWeight: 700 }}>
+                    {s === "card" ? "CARD  (framed + tack)" : "BARE  (image only)"}
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
+
+          {beats.length > 0 && audioBlob && RAILWAY_URL ? (
             <button onClick={renderVideo} disabled={rendering} style={renderButtonStyle}>
               {rendering ? (renderStatus || "RENDERING...") : "RENDER VIDEO"}
             </button>
+          ) : beats.length > 0 && audioBlob && !RAILWAY_URL ? (
+            <div style={{ marginTop: 12, padding: "10px 12px", border: "1.5px dashed #2a2a2a", fontSize: 11, fontFamily: "monospace", color: "#6a6a6a" }}>
+              mp4 export needs railway backend (not configured locally)
+            </div>
           ) : null}
 
           {error ? <p style={{ color: "#ff3a3a", fontSize: 12, marginTop: 12, fontFamily: "monospace" }}>{error}</p> : null}
@@ -525,44 +835,147 @@ export default function BuilderPage() {
         </section>
 
         <section style={rightPanelStyle}>
-          <div style={{ fontFamily: "'Caveat', cursive", fontSize: 18, color: "#2a2a2a", fontWeight: 700, marginBottom: 12, alignSelf: "flex-start" }}>
-            preview
-          </div>
-          <div style={previewFrameStyle(background, customBgUrl)}>
-            {activeBeat ? (
-              <div style={polaroidStyle(activeBeatIdx)}>
-                {activeBeatImage ? (
-                  <img src={activeBeatImage} alt="" style={{ width: "100%", aspectRatio: "3/4", objectFit: "cover", display: "block" }} />
-                ) : (
-                  <div style={{ width: "100%", aspectRatio: "3/4", background: "#2a2a2a", display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 14, fontFamily: "monospace", padding: 12, textAlign: "center" }}>
-                    {activeBeat.searchQuery}
-                  </div>
-                )}
-                <div style={{ height: 28, background: "white" }} />
-                <div style={{ position: "absolute", top: -8, left: "50%", transform: "translateX(-50%)", width: 14, height: 14, background: "#ff3a3a", border: "1px solid #2a2a2a", borderRadius: "50%" }} />
-              </div>
-            ) : (
-              <div style={{ color: "#6a6a6a", fontFamily: "monospace", fontSize: 13, textAlign: "center", padding: 20 }}>
-                record or upload audio<br/>to see your video preview
-              </div>
+          {/* Draw toolbar */}
+          <div style={drawToolbarStyle}>
+            <button
+              onClick={() => setDrawMode((d) => !d)}
+              style={{ ...miniButton, background: drawMode ? "#c8f135" : "transparent", fontWeight: 700, padding: "4px 10px" }}>
+              {drawMode ? "✏ DRAWING" : "✏ DRAW"}
+            </button>
+            {drawMode && (
+              <>
+                {["#2a2a2a", "#ff3a3a", "#c8f135", "#3a7fff", "#ffffff"].map((c) => (
+                  <div key={c} onClick={() => setDrawColor(c)}
+                    style={{ width: 18, height: 18, borderRadius: "50%", background: c, cursor: "pointer",
+                      border: drawColor === c ? "2px solid #c8f135" : "1.5px solid #2a2a2a",
+                      boxShadow: drawColor === c ? "0 0 0 1px #2a2a2a" : "none" }} />
+                ))}
+                {[2, 5, 10].map((s) => (
+                  <div key={s} onClick={() => setDrawSize(s)}
+                    style={{ width: s + 10, height: s + 10, borderRadius: "50%", background: drawColor, cursor: "pointer",
+                      border: drawSize === s ? "2px solid #c8f135" : "1px solid #2a2a2a", flexShrink: 0 }} />
+                ))}
+                <button onClick={clearDrawing} style={{ ...miniButton, marginLeft: "auto" }}>clear</button>
+              </>
             )}
-            {beats.length > 0 ? (
-              <div style={{ position: "absolute", bottom: 8, left: 8, right: 8 }}>
-                <div style={{ height: 4, background: "rgba(0,0,0,0.15)", border: "1px solid #2a2a2a" }}>
-                  <div style={{ width: (((activeBeatIdx + 1) / beats.length) * 100) + "%", height: "100%", background: "#c8f135" }} />
+            {!drawMode && beats.length > 0 && (
+              <span style={{ fontSize: 9, color: "rgba(0,0,0,0.3)", fontFamily: "monospace", marginLeft: "auto" }}>
+                drag cards · click to select · + to upload image
+              </span>
+            )}
+          </div>
+
+          {/* Board */}
+          <div
+            ref={boardRef}
+            onPointerMove={handleBoardPointerMove}
+            onPointerUp={handleBoardPointerUp}
+            onPointerLeave={handleBoardPointerUp}
+            style={boardStyle(background, customBgUrl)}
+          >
+            {beats.length === 0 ? (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                <div style={{ color: "#6a6a6a", fontFamily: "monospace", fontSize: 13, textAlign: "center", background: "rgba(255,253,245,0.8)", padding: "16px 20px", border: "1.5px dashed #2a2a2a" }}>
+                  record or upload audio<br/>cards appear here — drag them freely
                 </div>
               </div>
             ) : null}
-          </div>
-          {beats.length > 0 ? (
-            <div style={{ marginTop: 14, fontFamily: "monospace", fontSize: 11, color: "#6a6a6a" }}>
-              beat {activeBeatIdx + 1} of {beats.length}
-            </div>
-          ) : null}
-          <div style={tipBoxStyle}>
-            <span style={{ fontFamily: "'Caveat', cursive", fontSize: 16, fontWeight: 700 }}>tip:</span> click a beat to preview / drag to reorder / replace img cycles candidates
+
+            {beats.map((b, i) => {
+              const isActive = i === activeBeatIdx;
+              const displayImg = b.customImageUrl ?? b.images?.[b.selectedImageIdx ?? 0];
+              const rot = (((i * 137) % 60) - 30) / 10;
+              const x = b.pos?.x ?? 40 + (i % 3) * 160;
+              const y = b.pos?.y ?? 40 + Math.floor(i / 3) * 210;
+              const cardW = b.size ?? CARD_W;
+              const isBare = cardStyle === "bare";
+
+              return (
+                <div
+                  key={i}
+                  onPointerDown={(e) => { if (!drawMode) handleBoardPointerDown(e, i); }}
+                  onClick={() => setActiveBeatIdx(i)}
+                  style={{
+                    position: "absolute",
+                    left: x,
+                    top: y,
+                    width: cardW,
+                    cursor: drawMode ? "crosshair" : "grab",
+                    userSelect: "none",
+                    transform: `rotate(${rot * 0.4}deg)`,
+                    transformOrigin: "center top",
+                    zIndex: isActive ? 10 : i,
+                    filter: isActive
+                      ? "drop-shadow(0 6px 12px rgba(0,0,0,0.4))"
+                      : "drop-shadow(2px 3px 6px rgba(0,0,0,0.25))",
+                  }}
+                >
+                  {isBare ? (
+                    <div style={{ position: "relative", outline: isActive ? "2px solid #c8f135" : "none" }}>
+                      {b.customVideoUrl ? (
+                        <video autoPlay muted loop playsInline style={{ width: '100%', height: 'auto', display: 'block', pointerEvents: 'none' }} src={b.customVideoUrl} />
+                      ) : displayImg ? (
+                        <img src={displayImg} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
+                      ) : (
+                        <div style={{ width: "100%", height: 80, background: "#2a2a2a", display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 9, fontFamily: "monospace", padding: 4, textAlign: "center" }}>
+                          {b.searchQuery}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ background: "white", border: isActive ? "2px solid #c8f135" : "1.5px solid #2a2a2a", padding: 6, paddingBottom: 0, position: "relative" }}>
+                      <div style={{ width: "100%", background: "#2a2a2a", marginBottom: 6 }}>
+                        {b.customVideoUrl ? (
+                          <video autoPlay muted loop playsInline style={{ width: '100%', height: 'auto', display: 'block', pointerEvents: 'none' }} src={b.customVideoUrl} />
+                        ) : displayImg ? (
+                          <img src={displayImg} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
+                        ) : (
+                          <div style={{ width: "100%", height: 80, display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 9, fontFamily: "monospace", padding: 4, textAlign: "center" }}>
+                            {b.searchQuery}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ height: 22, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#2a2a2a", fontWeight: 700, letterSpacing: 0.5 }}>
+                          BEAT {i + 1}
+                        </span>
+                      </div>
+                      <div style={{ position: "absolute", top: -6, left: "50%", transform: "translateX(-50%)", width: 11, height: 11, background: "#ff3a3a", border: "1px solid #2a2a2a", borderRadius: "50%", zIndex: 1 }} />
+                    </div>
+                  )}
+                  {/* Resize handle — bottom-right corner */}
+                  {!drawMode && (
+                    <div
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        resizeRef.current = { idx: i, startX: e.clientX, startSize: cardW };
+                      }}
+                      style={{ position: "absolute", bottom: -6, right: -6, width: 12, height: 12,
+                        background: isActive ? "#c8f135" : "white", border: "1.5px solid #2a2a2a",
+                        cursor: "se-resize", zIndex: 20, borderRadius: 2 }}
+                    />
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Drawing canvas overlay */}
+            <canvas
+              ref={drawCanvasRef}
+              onPointerDown={handleDrawStart}
+              onPointerMove={handleDrawMove}
+              onPointerUp={handleDrawEnd}
+              onPointerLeave={handleDrawEnd}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+                pointerEvents: drawMode ? "auto" : "none",
+                cursor: drawMode ? "crosshair" : "default" }}
+            />
           </div>
         </section>
+
+        {/* Hidden file input for beat media upload */}
+        <input ref={beatImageInputRef} type="file" accept="image/*,video/*" onChange={handleBeatMediaUpload} style={{ display: "none" }} />
       </div>
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
@@ -669,7 +1082,7 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
-function drawCardAt(ctx: CanvasRenderingContext2D, img: HTMLImageElement | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string) {
+function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string) {
   const cardW = 720;
   const cardH = 960;
   const borderW = 18;
@@ -695,11 +1108,13 @@ function drawCardAt(ctx: CanvasRenderingContext2D, img: HTMLImageElement | null,
   const imgY = -cardH / 2 + borderW;
 
   if (img) {
-    const imgRatio = img.width / img.height;
+    const srcW = img instanceof HTMLVideoElement ? img.videoWidth : (img as HTMLImageElement).width;
+    const srcH = img instanceof HTMLVideoElement ? img.videoHeight : (img as HTMLImageElement).height;
+    const imgRatio = srcW / srcH;
     const slotRatio = imgW / imgH;
-    let sx = 0, sy = 0, sw = img.width, sh = img.height;
-    if (imgRatio > slotRatio) { sw = img.height * slotRatio; sx = (img.width - sw) / 2; }
-    else { sh = img.width / slotRatio; sy = (img.height - sh) / 2; }
+    let sx = 0, sy = 0, sw = srcW, sh = srcH;
+    if (imgRatio > slotRatio) { sw = srcH * slotRatio; sx = (srcW - sw) / 2; }
+    else { sh = srcW / slotRatio; sy = (srcH - sh) / 2; }
     ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
   } else {
     ctx.fillStyle = "#1a1a1a";
@@ -754,12 +1169,9 @@ const leftPanelStyle: React.CSSProperties = {
 };
 
 const rightPanelStyle: React.CSSProperties = {
-  padding: 24,
   display: "flex",
   flexDirection: "column",
-  alignItems: "center",
-  justifyContent: "flex-start",
-  paddingTop: 60,
+  minHeight: "calc(100vh - 60px)",
 };
 
 const sketchButton: React.CSSProperties = {
@@ -859,52 +1271,55 @@ const lockScreenStyle: React.CSSProperties = {
   padding: 32,
 };
 
-function previewFrameStyle(background: Background, customBgUrl: string): React.CSSProperties {
-  const bg =
-    background === "cork" ? "linear-gradient(135deg, #b08964 0%, #8a6740 100%)" :
-    background === "beige" ? "#e8d9b8" :
-    background === "custom" && customBgUrl ? "center/cover no-repeat url(" + customBgUrl + ")" :
-    "#f5f1e8";
-  const isGraph = background === "graph";
-  return {
-    position: "relative",
-    width: 320,
-    aspectRatio: "9/16",
-    border: "2px solid #2a2a2a",
-    boxShadow: "4px 4px 0 #2a2a2a",
-    background: bg,
-    backgroundImage: isGraph
-      ? "linear-gradient(rgba(100,130,180,.4) 1px, transparent 1px), linear-gradient(90deg, rgba(100,130,180,.4) 1px, transparent 1px)"
-      : undefined,
-    backgroundSize: isGraph ? "20px 20px" : undefined,
-    overflow: "hidden",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-  };
+function redrawCanvas(canvas: HTMLCanvasElement, strokesToDraw: Stroke[]) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const stroke of strokesToDraw) {
+    if (stroke.points.length < 2) continue;
+    ctx.strokeStyle = stroke.color;
+    ctx.lineWidth = stroke.size;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+    for (const pt of stroke.points.slice(1)) {
+      ctx.lineTo(pt.x, pt.y);
+    }
+    ctx.stroke();
+  }
 }
 
-function polaroidStyle(beatIdx: number): React.CSSProperties {
-  const rot = (((beatIdx * 137) % 60) - 30) / 10;
-  return {
-    position: "relative",
-    width: "75%",
-    background: "white",
-    border: "1px solid #2a2a2a",
-    boxShadow: "3px 3px 0 rgba(0,0,0,0.3)",
-    transform: "rotate(" + (rot * 0.3) + "deg)",
-    overflow: "visible",
-  };
-}
-
-const tipBoxStyle: React.CSSProperties = {
-  marginTop: 20,
-  padding: "10px 14px",
-  background: "rgba(255,253,245,0.85)",
-  border: "1.5px dashed #2a2a2a",
-  maxWidth: 320,
-  fontSize: 11,
-  lineHeight: 1.5,
-  fontFamily: "monospace",
-  color: "#2a2a2a",
+const drawToolbarStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "6px 12px",
+  borderBottom: "1px solid rgba(42,42,42,0.15)",
+  background: "rgba(255,253,245,0.9)",
+  minHeight: 38,
 };
+
+
+function boardStyle(background: Background, customBgUrl: string): React.CSSProperties {
+  const isGraph = background === "graph";
+  const isCustom = background === "custom" && !!customBgUrl;
+  return {
+    position: "relative",
+    flex: 1,
+    overflow: "hidden",
+    backgroundColor:
+      background === "cork" ? "#b08964" :
+      background === "beige" ? "#e8d9b8" :
+      "#f5f1e8",
+    backgroundImage: isCustom
+      ? `url(${customBgUrl})`
+      : isGraph
+        ? "linear-gradient(rgba(100,130,180,.35) 1px, transparent 1px), linear-gradient(90deg, rgba(100,130,180,.35) 1px, transparent 1px)"
+        : "none",
+    backgroundSize: isCustom ? "cover" : isGraph ? "28px 28px" : undefined,
+    backgroundPosition: isCustom ? "center" : undefined,
+    touchAction: "none",
+  };
+}
+
