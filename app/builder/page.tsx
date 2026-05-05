@@ -382,6 +382,9 @@ export default function BuilderPage() {
     try {
       const images: (HTMLImageElement | null)[] = await Promise.all(
         beats.map((b) => {
+          if (b.customImageUrl) {
+            return loadImage(b.customImageUrl).catch(() => null);
+          }
           const list = b.images || [];
           if (list.length === 0) return null;
           const startIdx = b.selectedImageIdx ?? 0;
@@ -515,6 +518,22 @@ export default function BuilderPage() {
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
           drawCardAt(ctx!, images[i], center.x, center.y, i, beats[i].searchQuery);
         }
+
+        // Draw board strokes in world space (same scale as card positions)
+        for (const stroke of strokes) {
+          if (stroke.points.length < 2) continue;
+          ctx!.strokeStyle = stroke.color;
+          ctx!.lineWidth = stroke.size * scale;
+          ctx!.lineCap = "round";
+          ctx!.lineJoin = "round";
+          ctx!.beginPath();
+          ctx!.moveTo(stroke.points[0].x * scale, stroke.points[0].y * scale);
+          for (const pt of stroke.points.slice(1)) {
+            ctx!.lineTo(pt.x * scale, pt.y * scale);
+          }
+          ctx!.stroke();
+        }
+
         ctx!.restore();
 
         const progressY = H - 20;
