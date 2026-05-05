@@ -522,15 +522,18 @@ export default function BuilderPage() {
       setRenderStatus("Rendering frames...");
 
       const N = beats.length;
-      const cardSpacing = W * 1.1;
-      const cardCenters = beats.map((_, i) => {
-        const x = i * cardSpacing + W / 2;
-        const jitterY = ((i * 73) % 200) - 100;
-        const y = H / 2 + jitterY;
-        return { x, y };
-      });
-      const boardWidth = N * cardSpacing + W;
-      const boardHeight = H;
+      // Derive camera positions from board layout — same scale used for strokes
+      const boardEl = boardRef.current;
+      const boardDisplayW = boardEl ? boardEl.getBoundingClientRect().width : 800;
+      const boardDisplayH = boardEl ? boardEl.getBoundingClientRect().height : 600;
+      const VIDEO_CARD_W = 720;
+      const scale = VIDEO_CARD_W / CARD_W;
+      const cardCenters = beats.map((b, i) => ({
+        x: ((b.pos?.x ?? (40 + (i % 3) * 160)) + (b.size ?? CARD_W) / 2) * scale,
+        y: ((b.pos?.y ?? (40 + Math.floor(i / 3) * 210)) + CARD_H / 2) * scale,
+      }));
+      const boardWidth = boardDisplayW * scale + W;
+      const boardHeight = boardDisplayH * scale + H;
 
       let prevRenderBeatIdx = -1;
       function drawFrame() {
@@ -586,11 +589,6 @@ export default function BuilderPage() {
         }
         ctx!.restore();
 
-        const progressY = H - 20;
-        ctx!.fillStyle = "#222";
-        ctx!.fillRect(0, progressY, W, 20);
-        ctx!.fillStyle = "#c8f135";
-        ctx!.fillRect(0, progressY, (elapsedSec / safeDuration) * W, 20);
         requestAnimationFrame(drawFrame);
       }
       requestAnimationFrame(drawFrame);
