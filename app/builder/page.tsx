@@ -210,6 +210,14 @@ export default function BuilderPage() {
     }
     setRendering(true);
     setError("");
+    console.log("=== RENDER START ===");
+    console.log("Audio blob size:", audioBlob.size);
+    console.log("Audio blob type:", audioBlob.type);
+    console.log("Duration state:", duration);
+    console.log("Beats:", beats.length);
+    beats.forEach((b, i) => {
+      console.log("  Beat " + i + ": " + b.startTime.toFixed(2) + "s -> " + b.endTime.toFixed(2) + "s | " + b.searchQuery + " | images: " + (b.images?.length || 0));
+    });
     setRenderStatus("Loading images...");
     setMp4Url("");
 
@@ -591,19 +599,44 @@ function BgTile({ name, current, bgPreview, onClick }: { name: Background; curre
   );
 }
 
-function loadImage(url: string): Promise<HTMLImageElement> {
+function loadImage(url: string, timeoutMs = 5000): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Failed: " + url));
+    let done = false;
+    const finish = (success: boolean, err?: Error) => {
+      if (done) return;
+      done = true;
+      if (success) resolve(img);
+      else reject(err || new Error("Failed: " + url));
+    };
+    const timer = setTimeout(() => finish(false, new Error("Timeout: " + url)), timeoutMs);
+    img.onload = () => {
+      clearTimeout(timer);
+      finish(true);
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      finish(false);
+    };
     img.src = url;
   });
 }
 
 async function loadFirstWorking(urls: string[]): Promise<HTMLImageElement | null> {
+  // First pass: try each URL directly
   for (const url of urls) {
     try { return await loadImage(url); } catch { continue; }
+  }
+  // Second pass: try each URL through the weserv image proxy (handles CORS issues)
+  for (const url of urls) {
+    try {
+      const proxied = "https://images.weserv.nl/?url=" + encodeURIComponent(url.replace(/^https?:\/\//, ""));
+      const img = await loadImage(proxied, 8000);
+      return img;
+    } catch {
+      continue;
+    }
   }
   return null;
 }
