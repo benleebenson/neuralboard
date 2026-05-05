@@ -457,15 +457,24 @@ export default function BuilderPage() {
       setRenderStatus("Rendering frames...");
 
       const N = beats.length;
-      const cardSpacing = W * 1.1;
-      const cardCenters = beats.map((_, i) => {
-        const x = i * cardSpacing + W / 2;
-        const jitterY = ((i * 73) % 200) - 100;
-        const y = H / 2 + jitterY;
-        return { x, y };
+      // Map board positions → video canvas world space.
+      // The video card is 720px wide; the board card is CARD_W px wide.
+      // Everything scales by the same factor so relative positions are preserved.
+      const boardEl = boardRef.current;
+      const boardDisplayW = boardEl ? boardEl.getBoundingClientRect().width : 800;
+      const boardDisplayH = boardEl ? boardEl.getBoundingClientRect().height : 600;
+      const VIDEO_CARD_W = 720;
+      const scale = VIDEO_CARD_W / CARD_W; // board px → canvas px
+      const cardCenters = beats.map((b, i) => {
+        const bx = b.pos?.x ?? (40 + (i % 3) * 160);
+        const by = b.pos?.y ?? (40 + Math.floor(i / 3) * 210);
+        return {
+          x: (bx + (b.size ?? CARD_W) / 2) * scale,
+          y: (by + CARD_H / 2) * scale,
+        };
       });
-      const boardWidth = N * cardSpacing + W;
-      const boardHeight = H;
+      const boardWidth = boardDisplayW * scale + W;
+      const boardHeight = boardDisplayH * scale + H;
 
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
