@@ -12,6 +12,7 @@ type Beat = {
   pos?: { x: number; y: number };
   size?: number;
   customImageUrl?: string;
+  customVideoUrl?: string;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -41,6 +42,8 @@ export default function BuilderPage() {
   const [mp4Url, setMp4Url] = useState("");
 
   const [activeBeatIdx, setActiveBeatIdx] = useState(0);
+  const [editingBeatIdx, setEditingBeatIdx] = useState<number | null>(null);
+  const [editEndVal, setEditEndVal] = useState('');
   const [background, setBackground] = useState<Background>("cork");
   const [customBgUrl, setCustomBgUrl] = useState<string>("");
   const [draggedBeatIdx, setDraggedBeatIdx] = useState<number | null>(null);
@@ -289,18 +292,63 @@ export default function BuilderPage() {
     resizeRef.current = null;
   }
 
-  function handleBeatImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  function handleBeatMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     const idx = uploadBeatIdxRef.current;
     if (!file || idx < 0) return;
     const url = URL.createObjectURL(file);
-    setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url } : b));
+    if (file.type.startsWith('video/')) {
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined } : b));
+    } else {
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined } : b));
+    }
     e.target.value = "";
+  }
+
+  function commitBeatEnd(idx: number, rawVal: string) {
+    const newEnd = parseFloat(rawVal);
+    if (isNaN(newEnd)) { setEditingBeatIdx(null); return; }
+    setBeats(prev => {
+      const next = [...prev];
+      const beat = next[idx];
+      const clampedEnd = Math.max(beat.startTime + 0.1, Math.min(duration, newEnd));
+      next[idx] = { ...beat, endTime: clampedEnd };
+      // adjust next beat's startTime (it shrinks/grows to compensate)
+      if (idx + 1 < next.length) {
+        const nb = next[idx + 1];
+        next[idx + 1] = { ...nb, startTime: clampedEnd, endTime: Math.max(clampedEnd + 0.1, nb.endTime) };
+      }
+      return next;
+    });
+    setEditingBeatIdx(null);
+  }
+
+  function addCustomBeat() {
+    setBeats(prev => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      const lastDur = last.endTime - last.startTime;
+      if (lastDur < 0.2) return prev;
+      const split = last.startTime + lastDur / 2;
+      const newBeat: Beat = {
+        startTime: split,
+        endTime: last.endTime,
+        searchQuery: 'custom beat',
+        reasoning: 'user added',
+        images: [],
+        selectedImageIdx: 0,
+        pos: {
+          x: 40 + (prev.length % 3) * 160 + (prev.length * 17) % 30,
+          y: 40 + Math.floor(prev.length / 3) * 210 + (prev.length * 31) % 40,
+        },
+      };
+      return [...prev.slice(0, -1), { ...last, endTime: split }, newBeat];
+    });
   }
 
   function selectBeatImage(beatIdx: number, imgIdx: number) {
     setBeats((prev) => prev.map((b, i) =>
-      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined } : b
+      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined } : b
     ));
   }
 
@@ -382,14 +430,28 @@ export default function BuilderPage() {
     try {
       const images: (HTMLImageElement | null)[] = await Promise.all(
         beats.map((b) => {
-          if (b.customImageUrl) {
-            return loadImage(b.customImageUrl).catch(() => null);
-          }
           const list = b.images || [];
           if (list.length === 0) return null;
           const startIdx = b.selectedImageIdx ?? 0;
           const reordered = [...list.slice(startIdx), ...list.slice(0, startIdx)];
           return loadFirstWorking(reordered);
+        })
+      );
+
+      const videoEls: (HTMLVideoElement | null)[] = await Promise.all(
+        beats.map(b => {
+          if (!b.customVideoUrl) return Promise.resolve(null);
+          const vid = document.createElement('video');
+          vid.src = b.customVideoUrl;
+          vid.muted = true;
+          vid.playsInline = true;
+          vid.crossOrigin = 'anonymous';
+          return new Promise<HTMLVideoElement | null>(resolve => {
+            const timer = setTimeout(() => resolve(null), 8000);
+            vid.oncanplay = () => { clearTimeout(timer); resolve(vid); };
+            vid.onerror = () => { clearTimeout(timer); resolve(null); };
+            vid.load();
+          });
         })
       );
 
@@ -460,25 +522,17 @@ export default function BuilderPage() {
       setRenderStatus("Rendering frames...");
 
       const N = beats.length;
-      // Map board positions → video canvas world space.
-      // The video card is 720px wide; the board card is CARD_W px wide.
-      // Everything scales by the same factor so relative positions are preserved.
-      const boardEl = boardRef.current;
-      const boardDisplayW = boardEl ? boardEl.getBoundingClientRect().width : 800;
-      const boardDisplayH = boardEl ? boardEl.getBoundingClientRect().height : 600;
-      const VIDEO_CARD_W = 720;
-      const scale = VIDEO_CARD_W / CARD_W; // board px → canvas px
-      const cardCenters = beats.map((b, i) => {
-        const bx = b.pos?.x ?? (40 + (i % 3) * 160);
-        const by = b.pos?.y ?? (40 + Math.floor(i / 3) * 210);
-        return {
-          x: (bx + (b.size ?? CARD_W) / 2) * scale,
-          y: (by + CARD_H / 2) * scale,
-        };
+      const cardSpacing = W * 1.1;
+      const cardCenters = beats.map((_, i) => {
+        const x = i * cardSpacing + W / 2;
+        const jitterY = ((i * 73) % 200) - 100;
+        const y = H / 2 + jitterY;
+        return { x, y };
       });
-      const boardWidth = boardDisplayW * scale + W;
-      const boardHeight = boardDisplayH * scale + H;
+      const boardWidth = N * cardSpacing + W;
+      const boardHeight = H;
 
+      let prevRenderBeatIdx = -1;
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
         if (elapsedSec >= safeDuration) {
@@ -490,6 +544,17 @@ export default function BuilderPage() {
           (b) => elapsedSec >= b.startTime && elapsedSec < b.endTime
         );
         const currentIdx = idx >= 0 ? idx : beats.length - 1;
+
+        if (currentIdx !== prevRenderBeatIdx) {
+          if (prevRenderBeatIdx >= 0 && videoEls[prevRenderBeatIdx]) {
+            videoEls[prevRenderBeatIdx]!.pause();
+          }
+          if (videoEls[currentIdx]) {
+            videoEls[currentIdx]!.currentTime = 0;
+            videoEls[currentIdx]!.play().catch(() => {});
+          }
+          prevRenderBeatIdx = currentIdx;
+        }
         const currentBeat = beats[currentIdx];
         const beatProgress = currentBeat
           ? Math.min(1, Math.max(0, (elapsedSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
@@ -516,24 +581,9 @@ export default function BuilderPage() {
           const center = cardCenters[i];
           const cardScreenX = (center.x - camX) * zoom + W / 2;
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
-          drawCardAt(ctx!, images[i], center.x, center.y, i, beats[i].searchQuery);
+          const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
+          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery);
         }
-
-        // Draw board strokes in world space (same scale as card positions)
-        for (const stroke of strokes) {
-          if (stroke.points.length < 2) continue;
-          ctx!.strokeStyle = stroke.color;
-          ctx!.lineWidth = stroke.size * scale;
-          ctx!.lineCap = "round";
-          ctx!.lineJoin = "round";
-          ctx!.beginPath();
-          ctx!.moveTo(stroke.points[0].x * scale, stroke.points[0].y * scale);
-          for (const pt of stroke.points.slice(1)) {
-            ctx!.lineTo(pt.x * scale, pt.y * scale);
-          }
-          ctx!.stroke();
-        }
-
         ctx!.restore();
 
         const progressY = H - 20;
@@ -634,7 +684,12 @@ export default function BuilderPage() {
 
           {beats.length > 0 ? (
             <>
-              <SectionLabel n="3" title="Beats" right={beats.length + " found / drag to reorder"} />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                <span style={{ fontFamily: "'Caveat', cursive", fontSize: 22, color: '#2a2a2a', fontWeight: 700 }}>3. Beats</span>
+                <div style={{ flex: 1, height: 1, background: '#2a2a2a', opacity: 0.2 }} />
+                <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
+                <button onClick={addCustomBeat} style={{ ...miniButton, fontWeight: 700, padding: '2px 8px', fontSize: 12 }} title="Add a custom beat">+</button>
+              </div>
               {beats.map((b, i) => {
                 const isActive = i === activeBeatIdx;
                 const displayImg = b.customImageUrl ?? b.images?.[b.selectedImageIdx ?? 0];
@@ -649,7 +704,9 @@ export default function BuilderPage() {
                       opacity: draggedBeatIdx === i ? 0.4 : 1 }}>
                     <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
                       <div style={{ width: 56, height: 56, border: "1.5px solid #2a2a2a", flexShrink: 0, overflow: "hidden", background: "#d4d4d4" }}>
-                        {displayImg ? (
+                        {b.customVideoUrl ? (
+                          <video src={b.customVideoUrl} muted playsInline style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        ) : displayImg ? (
                           <img src={displayImg} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                         ) : (
                           <div style={{ width: "100%", height: "100%", background: "#2a2a2a", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 9, padding: 4, textAlign: "center" }}>no image</div>
@@ -660,9 +717,28 @@ export default function BuilderPage() {
                           <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>
                             BEAT {i + 1}{isActive ? " ◂" : ""}
                           </span>
-                          <span style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace" }}>
-                            {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
-                          </span>
+                          {editingBeatIdx === i ? (
+                            <input
+                              autoFocus
+                              type="number"
+                              step="0.1"
+                              min={(b.startTime + 0.1).toFixed(1)}
+                              max={duration.toFixed(1)}
+                              defaultValue={b.endTime.toFixed(1)}
+                              onChange={e => setEditEndVal(e.target.value)}
+                              onBlur={() => commitBeatEnd(i, editEndVal || b.endTime.toString())}
+                              onKeyDown={e => { if (e.key === 'Enter') commitBeatEnd(i, editEndVal || b.endTime.toString()); if (e.key === 'Escape') setEditingBeatIdx(null); }}
+                              onClick={e => e.stopPropagation()}
+                              style={{ width: 60, fontSize: 10, fontFamily: 'monospace', border: '1px solid #2a2a2a', padding: '1px 3px', background: '#fffdf5' }}
+                            />
+                          ) : (
+                            <span
+                              onClick={e => { e.stopPropagation(); setEditEndVal(b.endTime.toFixed(1)); setEditingBeatIdx(i); }}
+                              title="Click to edit end time"
+                              style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace", cursor: 'pointer', borderBottom: '1px dashed #6a6a6a' }}>
+                              {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
+                            </span>
+                          )}
                         </div>
                         <div style={{ fontSize: 11, color: "#2a2a2a", marginBottom: 6, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {b.searchQuery}
@@ -836,7 +912,9 @@ export default function BuilderPage() {
                 >
                   {isBare ? (
                     <div style={{ position: "relative", outline: isActive ? "2px solid #c8f135" : "none" }}>
-                      {displayImg ? (
+                      {b.customVideoUrl ? (
+                        <video autoPlay muted loop playsInline style={{ width: '100%', height: 'auto', display: 'block', pointerEvents: 'none' }} src={b.customVideoUrl} />
+                      ) : displayImg ? (
                         <img src={displayImg} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
                       ) : (
                         <div style={{ width: "100%", height: 80, background: "#2a2a2a", display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 9, fontFamily: "monospace", padding: 4, textAlign: "center" }}>
@@ -847,7 +925,9 @@ export default function BuilderPage() {
                   ) : (
                     <div style={{ background: "white", border: isActive ? "2px solid #c8f135" : "1.5px solid #2a2a2a", padding: 6, paddingBottom: 0, position: "relative" }}>
                       <div style={{ width: "100%", background: "#2a2a2a", marginBottom: 6 }}>
-                        {displayImg ? (
+                        {b.customVideoUrl ? (
+                          <video autoPlay muted loop playsInline style={{ width: '100%', height: 'auto', display: 'block', pointerEvents: 'none' }} src={b.customVideoUrl} />
+                        ) : displayImg ? (
                           <img src={displayImg} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
                         ) : (
                           <div style={{ width: "100%", height: 80, display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 9, fontFamily: "monospace", padding: 4, textAlign: "center" }}>
@@ -894,8 +974,8 @@ export default function BuilderPage() {
           </div>
         </section>
 
-        {/* Hidden file input for beat image upload */}
-        <input ref={beatImageInputRef} type="file" accept="image/*" onChange={handleBeatImageUpload} style={{ display: "none" }} />
+        {/* Hidden file input for beat media upload */}
+        <input ref={beatImageInputRef} type="file" accept="image/*,video/*" onChange={handleBeatMediaUpload} style={{ display: "none" }} />
       </div>
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
@@ -1002,7 +1082,7 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
-function drawCardAt(ctx: CanvasRenderingContext2D, img: HTMLImageElement | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string) {
+function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string) {
   const cardW = 720;
   const cardH = 960;
   const borderW = 18;
@@ -1028,11 +1108,13 @@ function drawCardAt(ctx: CanvasRenderingContext2D, img: HTMLImageElement | null,
   const imgY = -cardH / 2 + borderW;
 
   if (img) {
-    const imgRatio = img.width / img.height;
+    const srcW = img instanceof HTMLVideoElement ? img.videoWidth : (img as HTMLImageElement).width;
+    const srcH = img instanceof HTMLVideoElement ? img.videoHeight : (img as HTMLImageElement).height;
+    const imgRatio = srcW / srcH;
     const slotRatio = imgW / imgH;
-    let sx = 0, sy = 0, sw = img.width, sh = img.height;
-    if (imgRatio > slotRatio) { sw = img.height * slotRatio; sx = (img.width - sw) / 2; }
-    else { sh = img.width / slotRatio; sy = (img.height - sh) / 2; }
+    let sx = 0, sy = 0, sw = srcW, sh = srcH;
+    if (imgRatio > slotRatio) { sw = srcH * slotRatio; sx = (srcW - sw) / 2; }
+    else { sh = srcW / slotRatio; sy = (srcH - sh) / 2; }
     ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
   } else {
     ctx.fillStyle = "#1a1a1a";
