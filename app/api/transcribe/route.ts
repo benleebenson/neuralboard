@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions, isAdmin } from "@/lib/auth";
+import { getRenderCount, upsertUser, logEvent } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -34,6 +37,27 @@ async function searchImages(query: string, apiKey: string): Promise<string[]> {
 
 export async function POST(req: NextRequest) {
   try {
+    // Auth check — must be signed in with Google
+    const session = await getServerSession(authOptions);
+    if (!session?.user?.email) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    const email = session.user.email;
+
+    // Usage check — non-admin users get one free render
+    if (!isAdmin(email)) {
+      const renderCount = await getRenderCount(email).catch(() => 0);
+      if (renderCount > 0) {
+        return NextResponse.json(
+          { error: "Free credit used. Upgrade to generate more videos." },
+          { status: 403 }
+        );
+      }
+    }
+
+    // Ensure user exists in DB
+    await upsertUser(email, session.user.name, session.user.image).catch(() => {});
+
     const audioBlob = await req.blob();
 
     if (audioBlob.size < 500) {
@@ -43,17 +67,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Password check — reject anyone without the right header
-const expectedPassword = process.env.NEURALBOARD_PASSWORD;
-const providedPassword = req.headers.get("x-neuralboard-password");
-if (!expectedPassword) {
-  return NextResponse.json({ error: "Server not configured (no password set)" }, { status: 500 });
-}
-if (providedPassword !== expectedPassword) {
-  return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-}
-
-const openaiKey = process.env.OPENAI_API_KEY;
+    const openaiKey = process.env.OPENAI_API_KEY;
 const serperKey = process.env.SERPER_API_KEY;
 if (!openaiKey) {
   return NextResponse.json({ error: "OPENAI_API_KEY not configured" }, { status: 500 });
@@ -192,6 +206,9 @@ Return ONLY JSON in this exact structure:
     beats.forEach((b, i) => {
       b.images = imageResults[i];
     });
+
+    // Log the transcription usage
+    await logEvent(email, "transcribe", duration).catch(() => {});
 
     return NextResponse.json({
       ok: true,

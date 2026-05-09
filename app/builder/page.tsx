@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { useSession, signIn, signOut } from "next-auth/react";
 
 type Beat = {
   startTime: number;
@@ -20,15 +21,13 @@ type CardStyle = "card" | "bare";
 type Stroke = { color: string; size: number; points: Array<{ x: number; y: number }> };
 
 
-const RAILWAY_URL = process.env.NEXT_PUBLIC_RAILWAY_URL || "";
+// Railway config is loaded server-side via /api/config after login
 const CARD_W = 130;
 const CARD_H = 170;
 
 export default function BuilderPage() {
-  const [authed, setAuthed] = useState(false);
-  const [pwInput, setPwInput] = useState("");
-  const [pwError, setPwError] = useState("");
-  const [password, setPassword] = useState("");
+  const { data: session, status } = useSession();
+  const [config, setConfig] = useState<{ railwayUrl: string; railwayPassword: string } | null>(null);
 
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -69,20 +68,20 @@ export default function BuilderPage() {
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number } | null>(null);
 
   useEffect(() => {
-    const saved = sessionStorage.getItem("nb_pw");
-    if (saved) {
-      setPassword(saved);
-      setAuthed(true);
-    }
-  }, []);
+    if (!session?.user?.email) return;
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((d) => setConfig(d))
+      .catch(() => {});
+  }, [session?.user?.email]);
 
   // Keep strokesRef in sync so ResizeObserver can read current strokes
   useEffect(() => { strokesRef.current = strokes; }, [strokes]);
 
   // Resize the draw canvas to match board, redraw strokes at new scale.
-  // Depends on `authed` so it re-runs after the board mounts (lock screen hides it).
+  // Re-runs after sign-in so the board is mounted before we attach the ResizeObserver.
   useEffect(() => {
-    if (!authed) return;
+    if (status !== "authenticated") return;
     const board = boardRef.current;
     const canvas = drawCanvasRef.current;
     if (!board || !canvas) return;
@@ -96,24 +95,13 @@ export default function BuilderPage() {
     observer.observe(board);
     resize();
     return () => observer.disconnect();
-  }, [authed]);
+  }, [status]);
 
   // Redraw whenever committed strokes change
   useEffect(() => {
     const canvas = drawCanvasRef.current;
     if (canvas) redrawCanvas(canvas, strokes);
   }, [strokes]);
-
-  function handleUnlock() {
-    if (!pwInput.trim()) {
-      setPwError("Enter the password");
-      return;
-    }
-    setPassword(pwInput.trim());
-    sessionStorage.setItem("nb_pw", pwInput.trim());
-    setAuthed(true);
-    setPwError("");
-  }
 
   async function startRecording() {
     setError("");
@@ -189,14 +177,16 @@ export default function BuilderPage() {
         method: "POST",
         headers: {
           "Content-Type": blob.type || "audio/webm",
-          "x-neuralboard-password": password,
         },
         body: blob,
       });
       if (res.status === 401) {
-        sessionStorage.removeItem("nb_pw");
-        setAuthed(false);
-        setPwError("Password expired or invalid");
+        signIn("google");
+        setProcessing(false);
+        return;
+      }
+      if (res.status === 403) {
+        setError("You’ve used your free video. Upgrade to generate more.");
         setProcessing(false);
         return;
       }
@@ -421,7 +411,21 @@ export default function BuilderPage() {
       setError("Need both audio and beats to render");
       return;
     }
-    if (!RAILWAY_URL) return;
+    if (!config?.railwayUrl) return;
+
+    // Usage + duration gate
+    const usageRes = await fetch("/api/usage/check");
+    if (!usageRes.ok) { setError("Please sign in to render."); return; }
+    const usage = await usageRes.json();
+    if (!usage.canGenerate) {
+      setError("You've used your free video. Upgrade to generate more.");
+      return;
+    }
+    if (!usage.isAdmin && duration > 30) {
+      setError(`Free tier is limited to 30 seconds (your audio is ${duration.toFixed(1)}s). Upgrade for longer videos.`);
+      return;
+    }
+
     setRendering(true);
     setError("");
     setRenderStatus("Loading images...");
@@ -597,9 +601,9 @@ export default function BuilderPage() {
       audioCtx.close();
       setRenderStatus("Converting to MP4 on server...");
 
-      const mp4Res = await fetch(RAILWAY_URL + "/render", {
+      const mp4Res = await fetch(config.railwayUrl + "/render", {
         method: "POST",
-        headers: { "Content-Type": "video/webm", "x-neuralboard-password": password },
+        headers: { "Content-Type": "video/webm", "x-neuralboard-password": config.railwayPassword },
         body: webmBlob,
       });
       if (!mp4Res.ok) {
@@ -610,6 +614,12 @@ export default function BuilderPage() {
       const url = URL.createObjectURL(mp4Blob);
       setMp4Url(url);
       setRenderStatus("Done!");
+      // Log the render — this marks the user's free credit as used
+      fetch("/api/render/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ durationSeconds: duration }),
+      }).catch(() => {});
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Render failed";
       setError(message);
@@ -619,7 +629,15 @@ export default function BuilderPage() {
     }
   }
 
-  if (!authed) {
+  if (status === "loading") {
+    return (
+      <main style={lockScreenStyle}>
+        <div style={{ fontFamily: "monospace", color: "#6a6a6a", fontSize: 13 }}>Loading...</div>
+      </main>
+    );
+  }
+
+  if (!session?.user) {
     return (
       <main style={lockScreenStyle}>
         <div style={{ maxWidth: 360, width: "100%" }}>
@@ -627,13 +645,11 @@ export default function BuilderPage() {
             Neural Board
           </h1>
           <p style={{ fontSize: 12, color: "#6a6a6a", textAlign: "center", marginBottom: 24, fontFamily: "'Courier New', monospace" }}>
-            private beta - enter password
+            sign in to continue · 1 free video per account
           </p>
-          <input type="password" value={pwInput} onChange={(e) => setPwInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
-            placeholder="password" autoFocus style={inputStyle} />
-          <button onClick={handleUnlock} style={primaryButtonStyle}>UNLOCK</button>
-          {pwError ? <p style={{ color: "#ff3a3a", fontSize: 11, textAlign: "center", marginTop: 8, fontFamily: "monospace" }}>{pwError}</p> : null}
+          <button onClick={() => signIn("google")} style={primaryButtonStyle}>
+            Sign in with Google
+          </button>
         </div>
       </main>
     );
@@ -649,7 +665,10 @@ export default function BuilderPage() {
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BUILDER</span>
         </div>
-        <span style={{ fontSize: 12, color: "#6a6a6a", fontFamily: "monospace" }}>untitled.notebook</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+          <button onClick={() => signOut()} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign out</button>
+        </div>
       </header>
 
       <div style={splitStyle}>
@@ -813,20 +832,29 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 && audioBlob && RAILWAY_URL ? (
+          {beats.length > 0 && audioBlob && config?.railwayUrl ? (
             <button onClick={renderVideo} disabled={rendering} style={renderButtonStyle}>
               {rendering ? (renderStatus || "RENDERING...") : "RENDER VIDEO"}
             </button>
-          ) : beats.length > 0 && audioBlob && !RAILWAY_URL ? (
+          ) : beats.length > 0 && audioBlob && !config?.railwayUrl ? (
             <div style={{ marginTop: 12, padding: "10px 12px", border: "1.5px dashed #2a2a2a", fontSize: 11, fontFamily: "monospace", color: "#6a6a6a" }}>
-              mp4 export needs railway backend (not configured locally)
+              {config === null ? "loading config..." : "mp4 export needs railway backend (not configured)"}
             </div>
           ) : null}
 
           {error ? <p style={{ color: "#ff3a3a", fontSize: 12, marginTop: 12, fontFamily: "monospace" }}>{error}</p> : null}
 
           {mp4Url ? (
-            <a href={mp4Url} download="neuralboard.mp4" style={{ ...sketchButton, display: "block", marginTop: 12, background: "white", textAlign: "center", textDecoration: "none" }}>
+            <a
+              href={mp4Url}
+              download="neuralboard.mp4"
+              onClick={() => fetch("/api/log", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ event: "download", durationSeconds: duration }),
+              }).catch(() => {})}
+              style={{ ...sketchButton, display: "block", marginTop: 12, background: "white", textAlign: "center", textDecoration: "none" }}
+            >
               DOWNLOAD MP4
             </a>
           ) : null}
