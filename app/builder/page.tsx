@@ -520,8 +520,10 @@ export default function BuilderPage() {
 
       renderRecorder.start();
       audioEl.currentTime = 0;
-      await audioEl.play();
       const startMs = performance.now();
+      const INTRO_SEC = 2.5;
+      // Delay audio so the pan-across intro plays first
+      setTimeout(() => audioEl.play().catch(() => {}), INTRO_SEC * 1000);
 
       setRenderStatus("Rendering frames...");
 
@@ -542,40 +544,72 @@ export default function BuilderPage() {
       let prevRenderBeatIdx = -1;
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
-        if (elapsedSec >= safeDuration) {
+        const audioSec = Math.max(0, elapsedSec - INTRO_SEC);
+
+        if (elapsedSec >= INTRO_SEC + safeDuration) {
           renderRecorder.stop();
           audioEl.pause();
           return;
         }
-        const idx = beats.findIndex(
-          (b) => elapsedSec >= b.startTime && elapsedSec < b.endTime
-        );
-        const currentIdx = idx >= 0 ? idx : beats.length - 1;
 
-        if (currentIdx !== prevRenderBeatIdx) {
-          if (prevRenderBeatIdx >= 0 && videoEls[prevRenderBeatIdx]) {
-            videoEls[prevRenderBeatIdx]!.pause();
+        let camX: number, camY: number, zoom: number;
+
+        if (elapsedSec < INTRO_SEC && cardCenters.length > 0) {
+          // Pan across all cards, then sweep back to card 1
+          const t = elapsedSec / INTRO_SEC;
+          const panEnd = 0.75; // first 75% of intro pans through all cards
+          if (t < panEnd) {
+            const p = t / panEnd;
+            const eased = 0.5 - 0.5 * Math.cos(p * Math.PI);
+            const cardIdx = eased * (cardCenters.length - 1);
+            const lo = Math.floor(cardIdx);
+            const hi = Math.min(lo + 1, cardCenters.length - 1);
+            const frac = cardIdx - lo;
+            camX = cardCenters[lo].x + (cardCenters[hi].x - cardCenters[lo].x) * frac;
+            camY = cardCenters[lo].y + (cardCenters[hi].y - cardCenters[lo].y) * frac;
+            zoom = 0.75 + 0.25 * eased;
+          } else {
+            // Ease back to first card
+            const p = (t - panEnd) / (1 - panEnd);
+            const eased = 0.5 - 0.5 * Math.cos(p * Math.PI);
+            const last = cardCenters[cardCenters.length - 1];
+            const first = cardCenters[0];
+            camX = last.x + (first.x - last.x) * eased;
+            camY = last.y + (first.y - last.y) * eased;
+            zoom = 1;
           }
-          if (videoEls[currentIdx]) {
-            videoEls[currentIdx]!.currentTime = 0;
-            videoEls[currentIdx]!.play().catch(() => {});
+        } else {
+          // Normal beat playback
+          const idx = beats.findIndex(
+            (b) => audioSec >= b.startTime && audioSec < b.endTime
+          );
+          const currentIdx = idx >= 0 ? idx : beats.length - 1;
+
+          if (currentIdx !== prevRenderBeatIdx) {
+            if (prevRenderBeatIdx >= 0 && videoEls[prevRenderBeatIdx]) {
+              videoEls[prevRenderBeatIdx]!.pause();
+            }
+            if (videoEls[currentIdx]) {
+              videoEls[currentIdx]!.currentTime = 0;
+              videoEls[currentIdx]!.play().catch(() => {});
+            }
+            prevRenderBeatIdx = currentIdx;
           }
-          prevRenderBeatIdx = currentIdx;
+          const currentBeat = beats[currentIdx];
+          const beatProgress = currentBeat
+            ? Math.min(1, Math.max(0, (audioSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
+            : 0;
+          const prevIdx = Math.max(0, currentIdx - 1);
+          const fromCenter = cardCenters[prevIdx];
+          const toCenter = cardCenters[currentIdx];
+          const panProgress = Math.min(1, beatProgress / 0.4);
+          const eased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
+          const isFirstBeat = currentIdx === 0;
+          camX = isFirstBeat ? toCenter.x : fromCenter.x + (toCenter.x - fromCenter.x) * eased;
+          camY = isFirstBeat ? toCenter.y : fromCenter.y + (toCenter.y - fromCenter.y) * eased;
+          const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
+          zoom = 1 + 0.04 * Math.sin(settleProgress * Math.PI);
         }
-        const currentBeat = beats[currentIdx];
-        const beatProgress = currentBeat
-          ? Math.min(1, Math.max(0, (elapsedSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
-          : 0;
-        const prevIdx = Math.max(0, currentIdx - 1);
-        const fromCenter = cardCenters[prevIdx];
-        const toCenter = cardCenters[currentIdx];
-        const panProgress = Math.min(1, beatProgress / 0.4);
-        const eased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
-        const isFirstBeat = currentIdx === 0;
-        const camX = isFirstBeat ? toCenter.x : fromCenter.x + (toCenter.x - fromCenter.x) * eased;
-        const camY = isFirstBeat ? toCenter.y : fromCenter.y + (toCenter.y - fromCenter.y) * eased;
-        const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
-        const zoom = 1 + 0.04 * Math.sin(settleProgress * Math.PI);
 
         drawBackground(ctx!, W, H, background, bgImg, camX, camY, boardWidth, boardHeight);
 
