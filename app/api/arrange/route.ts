@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
+import { logApiCost } from "@/lib/supabase";
 import Anthropic from "@anthropic-ai/sdk";
 
 const client = new Anthropic();
@@ -48,6 +49,13 @@ Rules:
     max_tokens: 1024,
     messages: [{ role: "user", content: prompt }],
   });
+
+  // Claude claude-sonnet-4-6: $0.003/1K input, $0.015/1K output
+  const claudeCost = +((message.usage.input_tokens / 1000) * 0.003 + (message.usage.output_tokens / 1000) * 0.015).toFixed(5);
+  logApiCost(session.user.email, "claude-sonnet", claudeCost, {
+    model: "claude-sonnet-4-6",
+    units: message.usage.input_tokens + message.usage.output_tokens,
+  }).catch(() => {});
 
   const text = message.content[0].type === "text" ? message.content[0].text : "";
   const jsonMatch = text.match(/\{[\s\S]*\}/);
