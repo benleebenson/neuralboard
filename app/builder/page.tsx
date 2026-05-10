@@ -20,6 +20,21 @@ type Background = "cork" | "beige" | "graph" | "custom";
 type CardStyle = "card" | "bare";
 type Stroke = { color: string; size: number; points: Array<{ x: number; y: number }> };
 
+type OverlayType = "text" | "arrow" | "circle";
+type Overlay = {
+  id: string;
+  type: OverlayType;
+  x: number;
+  y: number;
+  x2?: number;
+  y2?: number;
+  r?: number;
+  text?: string;
+  color: string;
+  strokeWidth: number;
+  fontSize?: number;
+};
+
 
 // Railway config is loaded server-side via /api/config after login
 const CARD_W = 130;
@@ -51,6 +66,9 @@ export default function BuilderPage() {
   const [drawColor, setDrawColor] = useState("#2a2a2a");
   const [drawSize, setDrawSize] = useState(3);
   const [strokes, setStrokes] = useState<Stroke[]>([]);
+  const [overlays, setOverlays] = useState<Overlay[]>([]);
+  const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
+  const [aiArranging, setAiArranging] = useState(false);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -66,6 +84,14 @@ export default function BuilderPage() {
   const beatImageInputRef = useRef<HTMLInputElement | null>(null);
   const uploadBeatIdxRef = useRef<number>(-1);
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number } | null>(null);
+  const overlaySvgRef = useRef<SVGSVGElement | null>(null);
+  const overlayDragRef = useRef<{
+    id: string;
+    mode: "body" | "arrow-start" | "arrow-end" | "circle-radius";
+    startClientX: number; startClientY: number;
+    origX: number; origY: number;
+    origX2?: number; origY2?: number; origR?: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!session?.user?.email) return;
@@ -280,6 +306,95 @@ export default function BuilderPage() {
   function handleBoardPointerUp() {
     dragRef.current = null;
     resizeRef.current = null;
+  }
+
+  function handleOverlayBodyDown(e: React.PointerEvent, ov: Overlay) {
+    e.stopPropagation();
+    overlaySvgRef.current?.setPointerCapture(e.pointerId);
+    setSelectedOverlayId(ov.id);
+    overlayDragRef.current = {
+      id: ov.id, mode: "body",
+      startClientX: e.clientX, startClientY: e.clientY,
+      origX: ov.x, origY: ov.y,
+      origX2: ov.x2, origY2: ov.y2,
+    };
+  }
+
+  function handleOverlayEndpointDown(e: React.PointerEvent, ov: Overlay, which: "start" | "end") {
+    e.stopPropagation();
+    overlaySvgRef.current?.setPointerCapture(e.pointerId);
+    overlayDragRef.current = {
+      id: ov.id, mode: which === "start" ? "arrow-start" : "arrow-end",
+      startClientX: e.clientX, startClientY: e.clientY,
+      origX: ov.x, origY: ov.y,
+      origX2: ov.x2, origY2: ov.y2,
+    };
+  }
+
+  function handleOverlayRadiusDown(e: React.PointerEvent, ov: Overlay) {
+    e.stopPropagation();
+    overlaySvgRef.current?.setPointerCapture(e.pointerId);
+    overlayDragRef.current = {
+      id: ov.id, mode: "circle-radius",
+      startClientX: e.clientX, startClientY: e.clientY,
+      origX: ov.x, origY: ov.y, origR: ov.r,
+    };
+  }
+
+  function handleOverlayPointerMove(e: React.PointerEvent<SVGSVGElement>) {
+    const drag = overlayDragRef.current;
+    if (!drag) return;
+    const dx = e.clientX - drag.startClientX;
+    const dy = e.clientY - drag.startClientY;
+    setOverlays(prev => prev.map(ov => {
+      if (ov.id !== drag.id) return ov;
+      if (drag.mode === "body") {
+        if (ov.type === "arrow" && drag.origX2 !== undefined && drag.origY2 !== undefined)
+          return { ...ov, x: drag.origX + dx, y: drag.origY + dy, x2: drag.origX2 + dx, y2: drag.origY2 + dy };
+        return { ...ov, x: drag.origX + dx, y: drag.origY + dy };
+      }
+      if (drag.mode === "arrow-start") return { ...ov, x: drag.origX + dx, y: drag.origY + dy };
+      if (drag.mode === "arrow-end") return { ...ov, x2: (drag.origX2 ?? 0) + dx, y2: (drag.origY2 ?? 0) + dy };
+      if (drag.mode === "circle-radius") return { ...ov, r: Math.max(20, (drag.origR ?? 50) + dx) };
+      return ov;
+    }));
+  }
+
+  function handleOverlayPointerUp() {
+    overlayDragRef.current = null;
+  }
+
+  async function aiArrange() {
+    if (beats.length === 0) return;
+    setAiArranging(true);
+    setError("");
+    try {
+      const board = boardRef.current;
+      const boardW = board ? board.getBoundingClientRect().width : 800;
+      const boardH = board ? board.getBoundingClientRect().height : 600;
+      const res = await fetch("/api/arrange", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          beats: beats.map((b, i) => ({
+            i,
+            query: b.searchQuery,
+            x: b.pos?.x ?? (40 + (i % 3) * 160),
+            y: b.pos?.y ?? (40 + Math.floor(i / 3) * 210),
+          })),
+          boardW,
+          boardH,
+        }),
+      });
+      if (!res.ok) throw new Error("Arrange failed");
+      const data = await res.json();
+      if (data.positions) setBeats(prev => prev.map((b, i) => data.positions[i] ? { ...b, pos: data.positions[i] } : b));
+      if (data.overlays) setOverlays(data.overlays);
+    } catch {
+      setError("AI arrange failed — try again");
+    } finally {
+      setAiArranging(false);
+    }
   }
 
   function handleBeatMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -625,6 +740,45 @@ export default function BuilderPage() {
           const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
           drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery);
         }
+
+        // Draw AI overlays
+        for (const ov of overlays) {
+          const sx = ov.x * scale;
+          const sy = ov.y * scale;
+          if (ov.type === "text" && ov.text) {
+            ctx!.save();
+            ctx!.font = `bold ${(ov.fontSize ?? 20) * scale}px Arial`;
+            ctx!.fillStyle = ov.color;
+            ctx!.fillText(ov.text, sx, sy);
+            ctx!.restore();
+          } else if (ov.type === "arrow" && ov.x2 !== undefined && ov.y2 !== undefined) {
+            const ex = ov.x2 * scale;
+            const ey = ov.y2 * scale;
+            const angle = Math.atan2(ey - sy, ex - sx);
+            const aLen = 18 * scale;
+            ctx!.save();
+            ctx!.strokeStyle = ov.color;
+            ctx!.fillStyle = ov.color;
+            ctx!.lineWidth = (ov.strokeWidth ?? 3) * scale;
+            ctx!.lineCap = "round";
+            ctx!.beginPath(); ctx!.moveTo(sx, sy); ctx!.lineTo(ex, ey); ctx!.stroke();
+            ctx!.beginPath();
+            ctx!.moveTo(ex, ey);
+            ctx!.lineTo(ex - aLen * Math.cos(angle - Math.PI / 6), ey - aLen * Math.sin(angle - Math.PI / 6));
+            ctx!.lineTo(ex - aLen * Math.cos(angle + Math.PI / 6), ey - aLen * Math.sin(angle + Math.PI / 6));
+            ctx!.closePath(); ctx!.fill();
+            ctx!.restore();
+          } else if (ov.type === "circle" && ov.r !== undefined) {
+            ctx!.save();
+            ctx!.strokeStyle = ov.color;
+            ctx!.lineWidth = (ov.strokeWidth ?? 3) * scale;
+            ctx!.beginPath();
+            ctx!.arc(sx, sy, ov.r * scale, 0, Math.PI * 2);
+            ctx!.stroke();
+            ctx!.restore();
+          }
+        }
+
         ctx!.restore();
 
         requestAnimationFrame(drawFrame);
@@ -919,9 +1073,21 @@ export default function BuilderPage() {
               </>
             )}
             {!drawMode && beats.length > 0 && (
-              <span style={{ fontSize: 9, color: "rgba(0,0,0,0.3)", fontFamily: "monospace", marginLeft: "auto" }}>
-                drag cards · click to select · + to upload image
-              </span>
+              <>
+                <button onClick={aiArrange} disabled={aiArranging}
+                  style={{ ...miniButton, padding: "4px 10px", fontWeight: 700, opacity: aiArranging ? 0.5 : 1 }}>
+                  {aiArranging ? "arranging..." : "✦ AI ARRANGE"}
+                </button>
+                {overlays.length > 0 && (
+                  <button onClick={() => { setOverlays([]); setSelectedOverlayId(null); }}
+                    style={{ ...miniButton, padding: "4px 8px" }}>
+                    clear overlays
+                  </button>
+                )}
+                <span style={{ fontSize: 9, color: "rgba(0,0,0,0.3)", fontFamily: "monospace", marginLeft: "auto" }}>
+                  drag cards · click overlay to select
+                </span>
+              </>
             )}
           </div>
 
@@ -1019,6 +1185,96 @@ export default function BuilderPage() {
                 </div>
               );
             })}
+
+            {/* AI overlay objects (text, arrows, circles) */}
+            <svg
+              ref={overlaySvgRef}
+              onPointerMove={handleOverlayPointerMove}
+              onPointerUp={handleOverlayPointerUp}
+              onPointerDown={(e) => { if (e.target === e.currentTarget) setSelectedOverlayId(null); }}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+                overflow: "visible", zIndex: 15, pointerEvents: drawMode ? "none" : "auto" }}
+            >
+              {overlays.map((ov) => {
+                const sel = ov.id === selectedOverlayId;
+                if (ov.type === "text") {
+                  const fh = ov.fontSize ?? 20;
+                  const approxW = (ov.text?.length ?? 0) * fh * 0.55 + 8;
+                  return (
+                    <g key={ov.id} onPointerDown={(e) => handleOverlayBodyDown(e, ov)}>
+                      <rect x={ov.x - 4} y={ov.y - fh} width={approxW} height={fh + 4} fill="transparent" style={{ cursor: "move" }} />
+                      <text x={ov.x} y={ov.y} fill={ov.color} fontSize={fh}
+                        fontFamily="'Caveat', cursive" fontWeight="bold"
+                        style={{ cursor: "move", userSelect: "none" }}>
+                        {ov.text}
+                      </text>
+                      {sel && <>
+                        <rect x={ov.x - 4} y={ov.y - fh} width={approxW} height={fh + 4}
+                          fill="none" stroke="#c8f135" strokeWidth={1.5} strokeDasharray="4 2"
+                          style={{ pointerEvents: "none" }} />
+                        <circle cx={ov.x + approxW - 4} cy={ov.y - fh} r={7}
+                          fill="#ff3a3a" stroke="white" strokeWidth={1.5} style={{ cursor: "pointer" }}
+                          onPointerDown={(e) => { e.stopPropagation(); setOverlays(p => p.filter(o => o.id !== ov.id)); setSelectedOverlayId(null); }} />
+                        <text x={ov.x + approxW - 4} y={ov.y - fh + 4} textAnchor="middle"
+                          fill="white" fontSize={10} fontWeight="bold" style={{ pointerEvents: "none" }}>×</text>
+                      </>}
+                    </g>
+                  );
+                }
+                if (ov.type === "arrow" && ov.x2 !== undefined && ov.y2 !== undefined) {
+                  const mid = { x: (ov.x + ov.x2) / 2, y: (ov.y + ov.y2) / 2 };
+                  return (
+                    <g key={ov.id}>
+                      <defs>
+                        <marker id={`ah-${ov.id}`} markerWidth={10} markerHeight={7} refX={9} refY={3.5} orient="auto">
+                          <polygon points="0 0, 10 3.5, 0 7" fill={ov.color} />
+                        </marker>
+                      </defs>
+                      <line x1={ov.x} y1={ov.y} x2={ov.x2} y2={ov.y2}
+                        stroke="transparent" strokeWidth={16} style={{ cursor: "move" }}
+                        onPointerDown={(e) => handleOverlayBodyDown(e, ov)} />
+                      <line x1={ov.x} y1={ov.y} x2={ov.x2} y2={ov.y2}
+                        stroke={ov.color} strokeWidth={ov.strokeWidth ?? 3}
+                        markerEnd={`url(#ah-${ov.id})`} style={{ pointerEvents: "none" }} />
+                      {sel && <>
+                        <circle cx={ov.x} cy={ov.y} r={6} fill="white" stroke="#c8f135" strokeWidth={2}
+                          style={{ cursor: "crosshair" }}
+                          onPointerDown={(e) => handleOverlayEndpointDown(e, ov, "start")} />
+                        <circle cx={ov.x2} cy={ov.y2} r={6} fill="white" stroke="#c8f135" strokeWidth={2}
+                          style={{ cursor: "crosshair" }}
+                          onPointerDown={(e) => handleOverlayEndpointDown(e, ov, "end")} />
+                        <circle cx={mid.x} cy={mid.y - 14} r={7}
+                          fill="#ff3a3a" stroke="white" strokeWidth={1.5} style={{ cursor: "pointer" }}
+                          onPointerDown={(e) => { e.stopPropagation(); setOverlays(p => p.filter(o => o.id !== ov.id)); setSelectedOverlayId(null); }} />
+                        <text x={mid.x} y={mid.y - 10} textAnchor="middle"
+                          fill="white" fontSize={10} fontWeight="bold" style={{ pointerEvents: "none" }}>×</text>
+                      </>}
+                    </g>
+                  );
+                }
+                if (ov.type === "circle" && ov.r !== undefined) {
+                  return (
+                    <g key={ov.id}>
+                      <circle cx={ov.x} cy={ov.y} r={ov.r} fill="none" stroke="transparent" strokeWidth={16}
+                        style={{ cursor: "move" }} onPointerDown={(e) => handleOverlayBodyDown(e, ov)} />
+                      <circle cx={ov.x} cy={ov.y} r={ov.r} fill="none"
+                        stroke={ov.color} strokeWidth={ov.strokeWidth ?? 3} style={{ pointerEvents: "none" }} />
+                      {sel && <>
+                        <circle cx={ov.x + ov.r} cy={ov.y} r={6} fill="white" stroke="#c8f135" strokeWidth={2}
+                          style={{ cursor: "ew-resize" }}
+                          onPointerDown={(e) => handleOverlayRadiusDown(e, ov)} />
+                        <circle cx={ov.x} cy={ov.y - ov.r - 14} r={7}
+                          fill="#ff3a3a" stroke="white" strokeWidth={1.5} style={{ cursor: "pointer" }}
+                          onPointerDown={(e) => { e.stopPropagation(); setOverlays(p => p.filter(o => o.id !== ov.id)); setSelectedOverlayId(null); }} />
+                        <text x={ov.x} y={ov.y - ov.r - 10} textAnchor="middle"
+                          fill="white" fontSize={10} fontWeight="bold" style={{ pointerEvents: "none" }}>×</text>
+                      </>}
+                    </g>
+                  );
+                }
+                return null;
+              })}
+            </svg>
 
             {/* Drawing canvas overlay */}
             <canvas
