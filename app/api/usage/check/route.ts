@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isAdmin } from "@/lib/auth";
-import { getRenderCount } from "@/lib/supabase";
+import { getRenderCount, getSubscriptionStatus } from "@/lib/supabase";
 
 export async function GET() {
   const session = await getServerSession(authOptions);
@@ -12,13 +12,23 @@ export async function GET() {
   const email = session.user.email;
 
   if (isAdmin(email)) {
-    return NextResponse.json({ canGenerate: true, isAdmin: true, renderCount: null });
+    return NextResponse.json({ canGenerate: true, isAdmin: true, isSubscribed: true });
   }
 
-  const renderCount = await getRenderCount(email);
+  const [{ isSubscribed, status }, renderCount] = await Promise.all([
+    getSubscriptionStatus(email),
+    getRenderCount(email),
+  ]);
+
+  if (isSubscribed) {
+    return NextResponse.json({ canGenerate: true, isSubscribed: true, subscriptionStatus: status, renderCount });
+  }
+
   return NextResponse.json({
     canGenerate: renderCount === 0,
     isAdmin: false,
+    isSubscribed: false,
+    subscriptionStatus: status,
     renderCount,
   });
 }
