@@ -533,11 +533,11 @@ export default function BuilderPage() {
     if (!usageRes.ok) { setError("Please sign in to render."); return; }
     const usage = await usageRes.json();
     if (!usage.canGenerate) {
-      setError("You've used your free video. Upgrade to generate more.");
+      setError("UPGRADE_REQUIRED");
       return;
     }
-    if (!usage.isAdmin && duration > 30) {
-      setError(`Free tier is limited to 30 seconds (your audio is ${duration.toFixed(1)}s). Upgrade for longer videos.`);
+    if (!usage.isAdmin && !usage.isSubscribed && duration > 30) {
+      setError("UPGRADE_REQUIRED_LENGTH");
       return;
     }
 
@@ -1030,7 +1030,20 @@ export default function BuilderPage() {
             </div>
           ) : null}
 
-          {error ? <p style={{ color: "#ff3a3a", fontSize: 12, marginTop: 12, fontFamily: "monospace" }}>{error}</p> : null}
+          {error === "UPGRADE_REQUIRED" || error === "UPGRADE_REQUIRED_LENGTH" ? (
+            <div style={{ marginTop: 12, padding: "12px 14px", border: "1.5px solid #ff3a3a", background: "#fff5f5" }}>
+              <p style={{ color: "#cc2200", fontSize: 12, fontFamily: "monospace", margin: "0 0 10px", fontWeight: 700 }}>
+                {error === "UPGRADE_REQUIRED_LENGTH"
+                  ? `Free tier: 30s max (your audio is ${duration.toFixed(1)}s)`
+                  : "You've used your free video."}
+              </p>
+              <a href="/upgrade" style={{ display: "inline-block", padding: "8px 16px", background: "#2a2a2a", color: "white", fontSize: 11, fontFamily: "monospace", fontWeight: 700, textDecoration: "none", letterSpacing: 0.5 }}>
+                Upgrade for $10/mo →
+              </a>
+            </div>
+          ) : error ? (
+            <p style={{ color: "#ff3a3a", fontSize: 12, marginTop: 12, fontFamily: "monospace" }}>{error}</p>
+          ) : null}
 
           {mp4Url ? (
             <a
