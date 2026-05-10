@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isAdmin } from "@/lib/auth";
-import { getRenderCount, upsertUser, logEvent } from "@/lib/supabase";
+import { getRenderCount, getSubscriptionStatus, upsertUser, logEvent, logApiCost } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -44,10 +44,13 @@ export async function POST(req: NextRequest) {
     }
     const email = session.user.email;
 
-    // Usage check — non-admin users get one free render
+    // Usage check — non-admin users get one free render unless subscribed
     if (!isAdmin(email)) {
-      const renderCount = await getRenderCount(email).catch(() => 0);
-      if (renderCount > 0) {
+      const [{ isSubscribed }, renderCount] = await Promise.all([
+        getSubscriptionStatus(email),
+        getRenderCount(email).catch(() => 0),
+      ]);
+      if (!isSubscribed && renderCount > 0) {
         return NextResponse.json(
           { error: "Free credit used. Upgrade to generate more videos." },
           { status: 403 }
@@ -106,6 +109,9 @@ if (!serperKey) {
     const duration: number =
       whisperData.duration ||
       (words.length ? words[words.length - 1].end + 0.3 : 10);
+
+    // Whisper: $0.006/min
+    logApiCost(email, "whisper", +(duration * 0.0001).toFixed(5), { model: "whisper-1", units: duration }).catch(() => {});
 
     if (!transcript.trim()) {
       return NextResponse.json({
@@ -173,6 +179,11 @@ Return ONLY JSON in this exact structure:
     const planData = await planRes.json();
     const planText = planData.choices?.[0]?.message?.content || "{}";
 
+    // GPT-4o-mini: $0.00015/1K input, $0.0006/1K output
+    const gptUsage = planData.usage ?? {};
+    const gptCost = +((gptUsage.prompt_tokens ?? 0) / 1000 * 0.00015 + (gptUsage.completion_tokens ?? 0) / 1000 * 0.0006).toFixed(5);
+    logApiCost(email, "gpt-4o-mini", gptCost, { model: "gpt-4o-mini", units: gptUsage.total_tokens ?? 0 }).catch(() => {});
+
     let beats: Beat[] = [];
     try {
       const parsed = JSON.parse(planText);
@@ -206,6 +217,9 @@ Return ONLY JSON in this exact structure:
     beats.forEach((b, i) => {
       b.images = imageResults[i];
     });
+
+    // Serper: ~$0.001/search
+    logApiCost(email, "serper", +(beats.length * 0.001).toFixed(5), { units: beats.length }).catch(() => {});
 
     // Log the transcription usage
     await logEvent(email, "transcribe", duration).catch(() => {});
