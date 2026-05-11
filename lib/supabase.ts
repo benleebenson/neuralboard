@@ -13,7 +13,12 @@ export async function upsertUser(
 ) {
   const row: Record<string, unknown> = { email, name, image, last_seen: new Date().toISOString() };
   if (isAdmin) row.is_admin = true;
-  await supabase.from("nb_users").upsert(row, { onConflict: "email" });
+  console.log("UPSERT: called with email =", email, "| isAdmin =", isAdmin, "| row =", JSON.stringify(row));
+  console.log("UPSERT: SUPABASE_URL =", process.env.SUPABASE_URL ?? "(undefined)");
+  console.log("UPSERT: SUPABASE_SERVICE_ROLE_KEY set =", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data, error } = await supabase.from("nb_users").upsert(row, { onConflict: "email" }).select();
+  console.log("UPSERT: response data =", JSON.stringify(data), "| error =", JSON.stringify(error));
+  if (error) throw error;
 }
 
 export async function logEvent(

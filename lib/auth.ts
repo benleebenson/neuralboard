@@ -17,8 +17,17 @@ export const authOptions: NextAuthOptions = {
   },
   callbacks: {
     async signIn({ user }) {
+      console.log("SIGNIN: callback fired, user.email =", user.email);
       if (user.email) {
-        await upsertUser(user.email, user.name, user.image, user.email === ADMIN_EMAIL);
+        try {
+          await upsertUser(user.email, user.name, user.image, user.email === ADMIN_EMAIL);
+          console.log("SIGNIN: upsertUser completed successfully for", user.email);
+        } catch (err) {
+          console.log("SIGNIN: upsertUser threw an error for", user.email, err);
+          throw err;
+        }
+      } else {
+        console.log("SIGNIN: user.email is missing, skipping upsert. user =", JSON.stringify(user));
       }
       return true;
     },
