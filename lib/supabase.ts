@@ -8,12 +8,12 @@ export const supabase = createClient(url, key);
 export async function upsertUser(
   email: string,
   name?: string | null,
-  image?: string | null
+  image?: string | null,
+  isAdmin?: boolean
 ) {
-  await supabase.from("nb_users").upsert(
-    { email, name, image, last_seen: new Date().toISOString() },
-    { onConflict: "email" }
-  );
+  const row: Record<string, unknown> = { email, name, image, last_seen: new Date().toISOString() };
+  if (isAdmin) row.is_admin = true;
+  await supabase.from("nb_users").upsert(row, { onConflict: "email" });
 }
 
 export async function logEvent(
