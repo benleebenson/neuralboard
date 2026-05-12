@@ -69,6 +69,8 @@ export default function BuilderPage() {
   const [overlays, setOverlays] = useState<Overlay[]>([]);
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [aiArranging, setAiArranging] = useState(false);
+  const [isSubscribed, setIsSubscribed] = useState(false);
+  const [recSeconds, setRecSeconds] = useState(0);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -100,6 +102,27 @@ export default function BuilderPage() {
       .then((d) => setConfig(d))
       .catch(() => {});
   }, [session?.user?.email]);
+
+  useEffect(() => {
+    if (!session?.user?.email) return;
+    fetch("/api/usage/check")
+      .then((r) => r.json())
+      .then((d) => setIsSubscribed(!!d.isSubscribed))
+      .catch(() => {});
+  }, [session?.user?.email]);
+
+  // Start/stop the recording second-counter
+  useEffect(() => {
+    if (!recording) { setRecSeconds(0); return; }
+    const id = setInterval(() => setRecSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [recording]);
+
+  // Auto-stop free-tier recording at 59 s
+  useEffect(() => {
+    if (recording && !isSubscribed && recSeconds >= 59) stopRecording();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recSeconds]);
 
   // Keep strokesRef in sync so ResizeObserver can read current strokes
   useEffect(() => { strokesRef.current = strokes; }, [strokes]);
@@ -179,14 +202,33 @@ export default function BuilderPage() {
   function handleAudioFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    setError("");
-    setTranscript("");
-    setBeats([]);
-    setDuration(0);
-    setMp4Url("");
-    setAudioBlob(file);
-    setProcessing(true);
-    sendToTranscribe(file);
+
+    function proceed() {
+      setError("");
+      setTranscript("");
+      setBeats([]);
+      setDuration(0);
+      setMp4Url("");
+      setAudioBlob(file!);
+      setProcessing(true);
+      sendToTranscribe(file!);
+    }
+
+    if (isSubscribed) { proceed(); return; }
+
+    // Check duration client-side before spending any API calls
+    const url = URL.createObjectURL(file);
+    const audio = new Audio(url);
+    audio.addEventListener("loadedmetadata", () => {
+      URL.revokeObjectURL(url);
+      if (audio.duration > 59) {
+        setError("Free tier: 59s max. Upgrade for longer recordings.");
+        e.target.value = "";
+        return;
+      }
+      proceed();
+    });
+    audio.addEventListener("error", () => { URL.revokeObjectURL(url); proceed(); });
   }
 
   function handleBgFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -855,6 +897,11 @@ export default function BuilderPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+          {!isSubscribed && (
+            <a href="/upgrade" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>
+              subscribe →
+            </a>
+          )}
           <button onClick={() => signOut()} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign out</button>
         </div>
       </header>
@@ -867,7 +914,9 @@ export default function BuilderPage() {
               style={{ ...sketchButton, flex: 1, background: recording ? "#ff5e3a" : "#fffdf5",
                 color: recording ? "white" : "#2a2a2a",
                 opacity: processing || rendering ? 0.5 : 1 }}>
-              {recording ? "STOP" : "RECORD"}
+              {recording
+                ? `STOP  0:${String(recSeconds).padStart(2, "0")}${!isSubscribed ? " / 0:59" : ""}`
+                : "RECORD"}
             </button>
             <button onClick={() => audioFileInputRef.current?.click()}
               disabled={recording || processing || rendering}
