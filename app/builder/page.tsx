@@ -780,7 +780,8 @@ export default function BuilderPage() {
           const cardScreenX = (center.x - camX) * zoom + W / 2;
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
           const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
-          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery);
+          const beatCardW = (beats[i].size ?? CARD_W) * scale;
+          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery, beatCardW);
         }
 
         // Draw AI overlays
@@ -819,6 +820,21 @@ export default function BuilderPage() {
             ctx!.stroke();
             ctx!.restore();
           }
+        }
+
+        // Strokes rendered on top of cards and overlays
+        for (const stroke of strokes) {
+          if (stroke.points.length < 2) continue;
+          ctx!.strokeStyle = stroke.color;
+          ctx!.lineWidth = stroke.size * scale;
+          ctx!.lineCap = "round";
+          ctx!.lineJoin = "round";
+          ctx!.beginPath();
+          ctx!.moveTo(stroke.points[0].x * scale, stroke.points[0].y * scale);
+          for (const pt of stroke.points.slice(1)) {
+            ctx!.lineTo(pt.x * scale, pt.y * scale);
+          }
+          ctx!.stroke();
         }
 
         ctx!.restore();
@@ -1158,7 +1174,7 @@ export default function BuilderPage() {
             ref={boardRef}
             onPointerMove={handleBoardPointerMove}
             onPointerUp={handleBoardPointerUp}
-            onPointerLeave={handleBoardPointerUp}
+            onPointerCancel={handleBoardPointerUp}
             style={boardStyle(background, customBgUrl)}
           >
             {beats.length === 0 ? (
@@ -1347,7 +1363,8 @@ export default function BuilderPage() {
               onPointerLeave={handleDrawEnd}
               style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
                 pointerEvents: drawMode ? "auto" : "none",
-                cursor: drawMode ? "crosshair" : "default" }}
+                cursor: drawMode ? "crosshair" : "default",
+                zIndex: 30 }}
             />
           </div>
         </section>
@@ -1440,8 +1457,8 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
     ctx.strokeStyle = "rgba(100,130,180,0.3)";
     ctx.lineWidth = 1;
     const grid = 40;
-    const offsetX = -((camX % grid + grid) % grid);
-    const offsetY = -((camY % grid + grid) % grid);
+    const offsetX = 0;
+    const offsetY = 0;
     for (let x = offsetX; x <= W; x += grid) {
       ctx.beginPath();
       ctx.moveTo(x, 0);
@@ -1460,9 +1477,9 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
-function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string) {
-  const cardW = 720;
-  const cardH = 960;
+function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720) {
+  const cardW = cardWidth;
+  const cardH = Math.round(cardW * (960 / 720));
   const borderW = 18;
   const rotation = (((beatIdx * 137) % 60) - 30) / 100;
 
