@@ -470,6 +470,16 @@ export default function BuilderPage() {
     setEditingBeatIdx(null);
   }
 
+  function deleteBeat(idx: number) {
+    setBeats(prev => {
+      const next = prev.filter((_, i) => i !== idx);
+      if (next.length === 0) return next;
+      const segLen = duration / next.length;
+      return next.map((b, i) => ({ ...b, startTime: i * segLen, endTime: (i + 1) * segLen }));
+    });
+    setActiveBeatIdx(prev => Math.max(0, prev >= idx ? prev - 1 : prev));
+  }
+
   function addCustomBeat() {
     setBeats(prev => {
       if (prev.length === 0) return prev;
@@ -983,32 +993,38 @@ export default function BuilderPage() {
                         )}
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
                           <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>
                             BEAT {i + 1}{isActive ? " ◂" : ""}
                           </span>
-                          {editingBeatIdx === i ? (
-                            <input
-                              autoFocus
-                              type="number"
-                              step="0.1"
-                              min={(b.startTime + 0.1).toFixed(1)}
-                              max={duration.toFixed(1)}
-                              defaultValue={b.endTime.toFixed(1)}
-                              onChange={e => setEditEndVal(e.target.value)}
-                              onBlur={() => commitBeatEnd(i, editEndVal || b.endTime.toString())}
-                              onKeyDown={e => { if (e.key === 'Enter') commitBeatEnd(i, editEndVal || b.endTime.toString()); if (e.key === 'Escape') setEditingBeatIdx(null); }}
-                              onClick={e => e.stopPropagation()}
-                              style={{ width: 60, fontSize: 10, fontFamily: 'monospace', border: '1px solid #2a2a2a', padding: '1px 3px', background: '#fffdf5' }}
-                            />
-                          ) : (
-                            <span
-                              onClick={e => { e.stopPropagation(); setEditEndVal(b.endTime.toFixed(1)); setEditingBeatIdx(i); }}
-                              title="Click to edit end time"
-                              style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace", cursor: 'pointer', borderBottom: '1px dashed #6a6a6a' }}>
-                              {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
-                            </span>
-                          )}
+                          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            {editingBeatIdx === i ? (
+                              <input
+                                autoFocus
+                                type="number"
+                                step="0.1"
+                                min={(b.startTime + 0.1).toFixed(1)}
+                                max={duration.toFixed(1)}
+                                defaultValue={b.endTime.toFixed(1)}
+                                onChange={e => setEditEndVal(e.target.value)}
+                                onBlur={() => commitBeatEnd(i, editEndVal || b.endTime.toString())}
+                                onKeyDown={e => { if (e.key === 'Enter') commitBeatEnd(i, editEndVal || b.endTime.toString()); if (e.key === 'Escape') setEditingBeatIdx(null); }}
+                                onClick={e => e.stopPropagation()}
+                                style={{ width: 60, fontSize: 10, fontFamily: 'monospace', border: '1px solid #2a2a2a', padding: '1px 3px', background: '#fffdf5' }}
+                              />
+                            ) : (
+                              <span
+                                onClick={e => { e.stopPropagation(); setEditEndVal(b.endTime.toFixed(1)); setEditingBeatIdx(i); }}
+                                title="Click to edit end time"
+                                style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace", cursor: 'pointer', borderBottom: '1px dashed #6a6a6a' }}>
+                                {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
+                              </span>
+                            )}
+                            <button
+                              onClick={e => { e.stopPropagation(); deleteBeat(i); }}
+                              style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}
+                              title="Delete beat">×</button>
+                          </div>
                         </div>
                         <div style={{ fontSize: 11, color: "#2a2a2a", marginBottom: 6, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {b.searchQuery}
@@ -1200,6 +1216,7 @@ export default function BuilderPage() {
                   key={i}
                   onPointerDown={(e) => { if (!drawMode) handleBoardPointerDown(e, i); }}
                   onClick={() => setActiveBeatIdx(i)}
+                  onDragStart={(e) => e.preventDefault()}
                   style={{
                     position: "absolute",
                     left: x,
@@ -1260,6 +1277,15 @@ export default function BuilderPage() {
                         background: isActive ? "#c8f135" : "white", border: "1.5px solid #2a2a2a",
                         cursor: "se-resize", zIndex: 20, borderRadius: 2 }}
                     />
+                  )}
+                  {isActive && !drawMode && (
+                    <div
+                      onPointerDown={(e) => { e.stopPropagation(); deleteBeat(i); }}
+                      style={{ position: "absolute", top: -8, right: -8, width: 18, height: 18,
+                        background: "#ff3a3a", border: "1.5px solid #2a2a2a", borderRadius: "50%",
+                        cursor: "pointer", zIndex: 21, display: "flex", alignItems: "center",
+                        justifyContent: "center", color: "white", fontSize: 12, fontWeight: 700,
+                        userSelect: "none" }}>×</div>
                   )}
                 </div>
               );
