@@ -674,10 +674,18 @@ export default function BuilderPage() {
 
       const canvasStream = canvas.captureStream(30);
       const audioCtx = new AudioContext();
+      if (audioCtx.state === "suspended") await audioCtx.resume();
       const audioSource = audioCtx.createMediaElementSource(audioEl);
       const audioDest = audioCtx.createMediaStreamDestination();
       audioSource.connect(audioDest);
       audioSource.connect(audioCtx.destination);
+
+      // Connect custom video audio tracks to the recording stream
+      for (const vid of videoEls) {
+        if (vid) {
+          try { audioCtx.createMediaElementSource(vid).connect(audioDest); } catch {}
+        }
+      }
 
       const combinedStream = new MediaStream([
         ...canvasStream.getVideoTracks(),
@@ -709,7 +717,7 @@ export default function BuilderPage() {
       audioEl.currentTime = 0;
       const startMs = performance.now();
       const INTRO_SEC = 0;
-      audioEl.play().catch(() => {});
+      try { await audioEl.play(); } catch {}
 
       setRenderStatus("Rendering frames...");
 
@@ -726,6 +734,28 @@ export default function BuilderPage() {
       }));
       const boardWidth = boardDisplayW * scale + W;
       const boardHeight = boardDisplayH * scale + H;
+
+      // Where the camera arrives at the start of the settle phase for a given beat
+      function beatPanTarget(bidx: number): { x: number; y: number; zoom: number } {
+        if (bidx < 0 || bidx >= beats.length) return { x: cardCenters[0]?.x ?? 0, y: cardCenters[0]?.y ?? 0, zoom: 1 };
+        const b = beats[bidx]; const c = cardCenters[bidx];
+        const bw = (b.size ?? CARD_W) * scale;
+        const m = b.cameraMode ?? "default";
+        if (m === "pan-right") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
+        if (m === "pan-left") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
+        return { x: c.x, y: c.y, zoom: 1 };
+      }
+      // Where the camera ends up at the end of the settle phase for a given beat
+      function beatEndCam(bidx: number): { x: number; y: number; zoom: number } {
+        if (bidx < 0 || bidx >= beats.length) return { x: cardCenters[0]?.x ?? 0, y: cardCenters[0]?.y ?? 0, zoom: 1 };
+        const b = beats[bidx]; const c = cardCenters[bidx];
+        const bw = (b.size ?? CARD_W) * scale;
+        const m = b.cameraMode ?? "default";
+        if (m === "pan-right") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
+        if (m === "pan-left") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
+        if (m === "closeup") return { x: c.x, y: c.y, zoom: 1.9 };
+        return { x: c.x, y: c.y, zoom: 1 };
+      }
 
       let prevRenderBeatIdx = -1;
       function drawFrame() {
@@ -785,29 +815,22 @@ export default function BuilderPage() {
           const beatProgress = currentBeat
             ? Math.min(1, Math.max(0, (audioSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
             : 0;
-          const prevIdx = Math.max(0, currentIdx - 1);
-          const fromCenter = cardCenters[prevIdx];
-          const toCenter = cardCenters[currentIdx];
           const panProgress = Math.min(1, beatProgress / 0.4);
-          const eased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
-          const isFirstBeat = currentIdx === 0;
-          camX = isFirstBeat ? toCenter.x : fromCenter.x + (toCenter.x - fromCenter.x) * eased;
-          camY = isFirstBeat ? toCenter.y : fromCenter.y + (toCenter.y - fromCenter.y) * eased;
+          const panEased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
           const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
           const settleEased = 0.5 - 0.5 * Math.cos(settleProgress * Math.PI);
-          const mode = currentBeat.cameraMode ?? "default";
-          const beatCardW = (currentBeat.size ?? CARD_W) * scale;
-          if (mode === "closeup") {
-            zoom = 1 + settleEased * 0.9; // 1.0 → 1.9, card fills screen
-          } else if (mode === "pan-right") {
-            zoom = 1.3;
-            camX = toCenter.x - beatCardW * 0.3 + beatCardW * 0.6 * settleEased;
-          } else if (mode === "pan-left") {
-            zoom = 1.3;
-            camX = toCenter.x + beatCardW * 0.3 - beatCardW * 0.6 * settleEased;
-          } else {
-            zoom = 1 + 0.04 * Math.sin(settleProgress * Math.PI);
-          }
+
+          const panTarget = beatPanTarget(currentIdx);
+          const endCam = beatEndCam(currentIdx);
+          // For first beat, skip pan travel and start directly at pan target
+          const fromCam = currentIdx > 0 ? beatEndCam(currentIdx - 1) : panTarget;
+          const mode = currentBeat?.cameraMode ?? "default";
+          // Subtle breathe for default mode
+          const breathe = mode === "default" ? 0.04 * Math.sin(settleProgress * Math.PI) : 0;
+
+          camX = fromCam.x + (panTarget.x - fromCam.x) * panEased + (endCam.x - panTarget.x) * settleEased;
+          camY = fromCam.y + (panTarget.y - fromCam.y) * panEased + (endCam.y - panTarget.y) * settleEased;
+          zoom = fromCam.zoom + (panTarget.zoom - fromCam.zoom) * panEased + (endCam.zoom - panTarget.zoom) * settleEased + breathe;
         }
 
         drawBackground(ctx!, W, H, background, bgImg, camX, camY, boardWidth, boardHeight);
