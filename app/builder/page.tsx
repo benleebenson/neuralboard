@@ -3,6 +3,8 @@
 import { useState, useRef, useEffect } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 
+type CameraMode = "default" | "closeup" | "pan-left" | "pan-right";
+
 type Beat = {
   startTime: number;
   endTime: number;
@@ -14,6 +16,7 @@ type Beat = {
   size?: number;
   customImageUrl?: string;
   customVideoUrl?: string;
+  cameraMode?: CameraMode;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -71,6 +74,7 @@ export default function BuilderPage() {
   const [aiArranging, setAiArranging] = useState(false);
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [recSeconds, setRecSeconds] = useState(0);
+  const [expandedBeatIdx, setExpandedBeatIdx] = useState<number | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -704,9 +708,8 @@ export default function BuilderPage() {
       renderRecorder.start();
       audioEl.currentTime = 0;
       const startMs = performance.now();
-      const INTRO_SEC = 2.5;
-      // Delay audio so the pan-across intro plays first
-      setTimeout(() => audioEl.play().catch(() => {}), INTRO_SEC * 1000);
+      const INTRO_SEC = 0;
+      audioEl.play().catch(() => {});
 
       setRenderStatus("Rendering frames...");
 
@@ -791,7 +794,20 @@ export default function BuilderPage() {
           camX = isFirstBeat ? toCenter.x : fromCenter.x + (toCenter.x - fromCenter.x) * eased;
           camY = isFirstBeat ? toCenter.y : fromCenter.y + (toCenter.y - fromCenter.y) * eased;
           const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
-          zoom = 1 + 0.04 * Math.sin(settleProgress * Math.PI);
+          const settleEased = 0.5 - 0.5 * Math.cos(settleProgress * Math.PI);
+          const mode = currentBeat.cameraMode ?? "default";
+          const beatCardW = (currentBeat.size ?? CARD_W) * scale;
+          if (mode === "closeup") {
+            zoom = 1 + settleEased * 0.9; // 1.0 → 1.9, card fills screen
+          } else if (mode === "pan-right") {
+            zoom = 1.3;
+            camX = toCenter.x - beatCardW * 0.3 + beatCardW * 0.6 * settleEased;
+          } else if (mode === "pan-left") {
+            zoom = 1.3;
+            camX = toCenter.x + beatCardW * 0.3 - beatCardW * 0.6 * settleEased;
+          } else {
+            zoom = 1 + 0.04 * Math.sin(settleProgress * Math.PI);
+          }
         }
 
         drawBackground(ctx!, W, H, background, bgImg, camX, camY, boardWidth, boardHeight);
@@ -1075,6 +1091,32 @@ export default function BuilderPage() {
                             +
                           </button>
                         </div>
+                        {/* Camera options */}
+                        <div style={{ marginTop: 6, borderTop: "1px dashed rgba(42,42,42,0.15)", paddingTop: 5 }}>
+                          <button
+                            onClick={e => { e.stopPropagation(); setExpandedBeatIdx(expandedBeatIdx === i ? null : i); }}
+                            style={{ ...miniButton, fontSize: 9, padding: "2px 6px" }}>
+                            {expandedBeatIdx === i ? "▴ cam" : "▾ cam"}{b.cameraMode && b.cameraMode !== "default" ? ` · ${b.cameraMode}` : ""}
+                          </button>
+                          {expandedBeatIdx === i && (
+                            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 5 }}>
+                              {(["default", "closeup", "pan-left", "pan-right"] as CameraMode[]).map(mode => {
+                                const active = (b.cameraMode ?? "default") === mode;
+                                const labels: Record<CameraMode, string> = { default: "default", closeup: "close-up", "pan-left": "pan ←", "pan-right": "pan →" };
+                                return (
+                                  <button key={mode}
+                                    onClick={e => { e.stopPropagation(); setBeats(prev => prev.map((b2, j) => j === i ? { ...b2, cameraMode: mode } : b2)); }}
+                                    style={{ ...miniButton, fontSize: 9, padding: "2px 7px",
+                                      background: active ? "#2a2a2a" : "transparent",
+                                      color: active ? "white" : "#2a2a2a",
+                                      fontWeight: active ? 700 : 400 }}>
+                                    {labels[mode]}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1246,7 +1288,7 @@ export default function BuilderPage() {
                     userSelect: "none",
                     transform: `rotate(${rot * 0.4}deg)`,
                     transformOrigin: "center top",
-                    zIndex: isActive ? 10 : i,
+                    zIndex: isActive ? 9999 : 1,
                     filter: isActive
                       ? "drop-shadow(0 6px 12px rgba(0,0,0,0.4))"
                       : "drop-shadow(2px 3px 6px rgba(0,0,0,0.25))",
