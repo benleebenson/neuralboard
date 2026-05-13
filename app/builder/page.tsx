@@ -79,13 +79,14 @@ export default function BuilderPage() {
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
   const bgFileInputRef = useRef<HTMLInputElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{ idx: number; ox: number; oy: number; startBeatX: number; startBeatY: number } | null>(null);
+  const dragRef = useRef<{ idx: number; ox: number; oy: number; startBeatX: number; startBeatY: number; currentX: number; currentY: number } | null>(null);
+  const cardElemsRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
   const beatImageInputRef = useRef<HTMLInputElement | null>(null);
   const uploadBeatIdxRef = useRef<number>(-1);
-  const resizeRef = useRef<{ idx: number; startX: number; startSize: number } | null>(null);
+  const resizeRef = useRef<{ idx: number; startX: number; startSize: number; currentSize: number } | null>(null);
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
     id: string;
@@ -322,6 +323,8 @@ export default function BuilderPage() {
       oy: e.clientY,
       startBeatX: beat.pos?.x ?? 0,
       startBeatY: beat.pos?.y ?? 0,
+      currentX: beat.pos?.x ?? 0,
+      currentY: beat.pos?.y ?? 0,
     };
     setActiveBeatIdx(idx);
     e.stopPropagation();
@@ -331,7 +334,9 @@ export default function BuilderPage() {
     if (resizeRef.current) {
       const { idx, startX, startSize } = resizeRef.current;
       const newSize = Math.max(80, Math.min(400, startSize + (e.clientX - startX)));
-      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, size: newSize } : b));
+      resizeRef.current.currentSize = newSize;
+      const el = cardElemsRef.current.get(idx);
+      if (el) el.style.width = newSize + "px";
       return;
     }
     if (!dragRef.current) return;
@@ -342,10 +347,21 @@ export default function BuilderPage() {
     const cardW = beats[idx]?.size ?? CARD_W;
     const newX = Math.max(0, Math.min(boardRect.width - cardW, startBeatX + (e.clientX - ox)));
     const newY = Math.max(0, Math.min(boardRect.height - 60, startBeatY + (e.clientY - oy)));
-    setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, pos: { x: newX, y: newY } } : b));
+    dragRef.current.currentX = newX;
+    dragRef.current.currentY = newY;
+    const el = cardElemsRef.current.get(idx);
+    if (el) { el.style.left = newX + "px"; el.style.top = newY + "px"; }
   }
 
   function handleBoardPointerUp() {
+    if (dragRef.current) {
+      const { idx, currentX, currentY } = dragRef.current;
+      setBeats(prev => prev.map((b, i) => i === idx ? { ...b, pos: { x: currentX, y: currentY } } : b));
+    }
+    if (resizeRef.current) {
+      const { idx, currentSize } = resizeRef.current;
+      setBeats(prev => prev.map((b, i) => i === idx ? { ...b, size: currentSize } : b));
+    }
     dragRef.current = null;
     resizeRef.current = null;
   }
@@ -855,6 +871,9 @@ export default function BuilderPage() {
 
       const webmBlob = await recordingDone;
       audioCtx.close();
+      if (webmBlob.size < 1000) {
+        throw new Error("Recording produced no data — try a different browser (Chrome works best)");
+      }
       setRenderStatus("Converting to MP4 on server...");
 
       const mp4Res = await fetch(config.railwayUrl + "/render", {
@@ -1142,7 +1161,7 @@ export default function BuilderPage() {
           ) : null}
         </section>
 
-        <section style={rightPanelStyle}>
+        <section style={{ ...rightPanelStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
           {/* Draw toolbar */}
           <div style={drawToolbarStyle}>
             <button
@@ -1214,6 +1233,7 @@ export default function BuilderPage() {
               return (
                 <div
                   key={i}
+                  ref={(el) => { if (el) cardElemsRef.current.set(i, el as HTMLDivElement); else cardElemsRef.current.delete(i); }}
                   onPointerDown={(e) => { if (!drawMode) handleBoardPointerDown(e, i); }}
                   onClick={() => setActiveBeatIdx(i)}
                   onDragStart={(e) => e.preventDefault()}
@@ -1271,7 +1291,7 @@ export default function BuilderPage() {
                       onPointerDown={(e) => {
                         e.stopPropagation();
                         e.currentTarget.setPointerCapture(e.pointerId);
-                        resizeRef.current = { idx: i, startX: e.clientX, startSize: cardW };
+                        resizeRef.current = { idx: i, startX: e.clientX, startSize: cardW, currentSize: cardW };
                       }}
                       style={{ position: "absolute", bottom: -6, right: -6, width: 12, height: 12,
                         background: isActive ? "#c8f135" : "white", border: "1.5px solid #2a2a2a",
