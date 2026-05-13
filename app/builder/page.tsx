@@ -75,6 +75,7 @@ export default function BuilderPage() {
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [recSeconds, setRecSeconds] = useState(0);
   const [expandedBeatIdx, setExpandedBeatIdx] = useState<number | null>(null);
+  const [introPanDuration, setIntroPanDuration] = useState<number | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -716,7 +717,7 @@ export default function BuilderPage() {
       renderRecorder.start();
       audioEl.currentTime = 0;
       const startMs = performance.now();
-      const INTRO_SEC = 0;
+      const INTRO_SEC = introPanDuration ?? 0;
       try { await audioEl.play(); } catch {}
 
       setRenderStatus("Rendering frames...");
@@ -1026,8 +1027,43 @@ export default function BuilderPage() {
                 <span style={{ fontFamily: "'Caveat', cursive", fontSize: 22, color: '#2a2a2a', fontWeight: 700 }}>3. Beats</span>
                 <div style={{ flex: 1, height: 1, background: '#2a2a2a', opacity: 0.2 }} />
                 <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
+                {introPanDuration === null && (
+                  <button onClick={() => setIntroPanDuration(3)} style={{ ...miniButton, padding: '2px 8px', fontSize: 12 }} title="Add intro pan across all cards">↔ pan</button>
+                )}
                 <button onClick={addCustomBeat} style={{ ...miniButton, fontWeight: 700, padding: '2px 8px', fontSize: 12 }} title="Add a custom beat">+</button>
               </div>
+              {introPanDuration !== null && (
+                <div style={{ ...beatCardStyle, background: "rgba(200,241,53,0.08)", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #b0d020", marginBottom: 8 }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                    <div style={{ width: 56, height: 56, border: "1.5px solid #2a2a2a", flexShrink: 0, background: "#2a2a2a",
+                      display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontSize: 22, fontWeight: 700 }}>
+                      ↔
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                        <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>INTRO PAN</span>
+                        <button
+                          onClick={() => setIntroPanDuration(null)}
+                          style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}>×</button>
+                      </div>
+                      <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", marginBottom: 6 }}>
+                        pans across all cards before beats
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>duration</span>
+                        <input
+                          type="number" step="0.5" min="0.5" max="20"
+                          value={introPanDuration}
+                          onChange={e => setIntroPanDuration(Math.max(0.5, parseFloat(e.target.value) || 3))}
+                          onClick={e => e.stopPropagation()}
+                          style={{ width: 52, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
+                        />
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>s</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
               {beats.map((b, i) => {
                 const isActive = i === activeBeatIdx;
                 const displayImg = b.customImageUrl ?? b.images?.[b.selectedImageIdx ?? 0];
