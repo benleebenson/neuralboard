@@ -1172,6 +1172,7 @@ export default function BuilderPage() {
           {/* Board */}
           <div
             ref={boardRef}
+            onPointerDown={(e) => { if (e.target === e.currentTarget) setSelectedOverlayId(null); }}
             onPointerMove={handleBoardPointerMove}
             onPointerUp={handleBoardPointerUp}
             onPointerCancel={handleBoardPointerUp}
@@ -1269,9 +1270,8 @@ export default function BuilderPage() {
               ref={overlaySvgRef}
               onPointerMove={handleOverlayPointerMove}
               onPointerUp={handleOverlayPointerUp}
-              onPointerDown={(e) => { if (e.target === e.currentTarget) setSelectedOverlayId(null); }}
               style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
-                overflow: "visible", zIndex: 15, pointerEvents: drawMode ? "none" : "auto" }}
+                overflow: "visible", zIndex: 15, pointerEvents: "none" }}
             >
               {overlays.map((ov) => {
                 const sel = ov.id === selectedOverlayId;
@@ -1279,7 +1279,7 @@ export default function BuilderPage() {
                   const fh = ov.fontSize ?? 20;
                   const approxW = (ov.text?.length ?? 0) * fh * 0.55 + 8;
                   return (
-                    <g key={ov.id} onPointerDown={(e) => handleOverlayBodyDown(e, ov)}>
+                    <g key={ov.id} style={{ pointerEvents: drawMode ? "none" : "auto" }} onPointerDown={(e) => handleOverlayBodyDown(e, ov)}>
                       <rect x={ov.x - 4} y={ov.y - fh} width={approxW} height={fh + 4} fill="transparent" style={{ cursor: "move" }} />
                       <text x={ov.x} y={ov.y} fill={ov.color} fontSize={fh}
                         fontFamily="'Caveat', cursive" fontWeight="bold"
@@ -1302,7 +1302,7 @@ export default function BuilderPage() {
                 if (ov.type === "arrow" && ov.x2 !== undefined && ov.y2 !== undefined) {
                   const mid = { x: (ov.x + ov.x2) / 2, y: (ov.y + ov.y2) / 2 };
                   return (
-                    <g key={ov.id}>
+                    <g key={ov.id} style={{ pointerEvents: drawMode ? "none" : "auto" }}>
                       <defs>
                         <marker id={`ah-${ov.id}`} markerWidth={10} markerHeight={7} refX={9} refY={3.5} orient="auto">
                           <polygon points="0 0, 10 3.5, 0 7" fill={ov.color} />
@@ -1332,7 +1332,7 @@ export default function BuilderPage() {
                 }
                 if (ov.type === "circle" && ov.r !== undefined) {
                   return (
-                    <g key={ov.id}>
+                    <g key={ov.id} style={{ pointerEvents: drawMode ? "none" : "auto" }}>
                       <circle cx={ov.x} cy={ov.y} r={ov.r} fill="none" stroke="transparent" strokeWidth={16}
                         style={{ cursor: "move" }} onPointerDown={(e) => handleOverlayBodyDown(e, ov)} />
                       <circle cx={ov.x} cy={ov.y} r={ov.r} fill="none"
