@@ -45,6 +45,9 @@ type Overlay = {
 };
 
 
+type YtSearchResult = { id: string; title: string; channel: string; duration: string; thumbnail: string };
+type YtModalView = 'search' | 'trim';
+
 // Railway config is loaded server-side via /api/config after login
 const CARD_W = 130;
 const CARD_H = 170;
@@ -83,6 +86,17 @@ export default function BuilderPage() {
   const [recSeconds, setRecSeconds] = useState(0);
   const [expandedBeatIdx, setExpandedBeatIdx] = useState<number | null>(null);
   const [introPanDuration, setIntroPanDuration] = useState<number | null>(null);
+
+  const [ytModalOpen, setYtModalOpen] = useState(false);
+  const [ytModalBeatIdx, setYtModalBeatIdx] = useState<number | null>(null);
+  const [ytQuery, setYtQuery] = useState('');
+  const [ytResults, setYtResults] = useState<YtSearchResult[]>([]);
+  const [ytView, setYtView] = useState<YtModalView>('search');
+  const [ytSelected, setYtSelected] = useState<YtSearchResult | null>(null);
+  const [ytStart, setYtStart] = useState(0);
+  const [ytEnd, setYtEnd] = useState(30);
+  const [ytError, setYtError] = useState('');
+  const [ytLoading, setYtLoading] = useState(false);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -550,6 +564,61 @@ export default function BuilderPage() {
     setBeats(prev => prev.map((b, i) =>
       i === beatIdx && b.transition ? { ...b, transition: { ...b.transition, ...updates } } : b
     ));
+  }
+
+  async function handleYtSearch() {
+    if (!config?.railwayUrl || !ytQuery.trim()) return;
+    setYtLoading(true);
+    setYtError('');
+    setYtResults([]);
+    try {
+      const res = await fetch(`${config.railwayUrl}/ytsearch?q=${encodeURIComponent(ytQuery)}`, {
+        headers: { 'x-neuralboard-password': config.railwayPassword },
+      });
+      if (!res.ok) throw new Error(`Search failed (${res.status})`);
+      const data = await res.json();
+      setYtResults(data.results || []);
+    } catch (e) {
+      setYtError(e instanceof Error ? e.message : 'Search failed');
+    } finally {
+      setYtLoading(false);
+    }
+  }
+
+  async function handleYtConfirm() {
+    if (!config?.railwayUrl || !ytSelected || ytModalBeatIdx === null) return;
+    setYtLoading(true);
+    setYtError('');
+    try {
+      const url = `https://www.youtube.com/watch?v=${ytSelected.id}`;
+      const dlRes = await fetch(`${config.railwayUrl}/ytdl`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-neuralboard-password': config.railwayPassword },
+        body: JSON.stringify({ url, start: ytStart, end: ytEnd }),
+      });
+      if (!dlRes.ok) {
+        const err = await dlRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Download failed (${dlRes.status})`);
+      }
+      const { id } = await dlRes.json() as { id: string };
+      const fileRes = await fetch(`${config.railwayUrl}/ytdl-file/${id}`, {
+        headers: { 'x-neuralboard-password': config.railwayPassword },
+      });
+      if (!fileRes.ok) throw new Error(`File fetch failed (${fileRes.status})`);
+      const blob = await fileRes.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const idx = ytModalBeatIdx;
+      setBeats(prev => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: blobUrl, customImageUrl: undefined } : b));
+      setYtModalOpen(false);
+      setYtView('search');
+      setYtSelected(null);
+      setYtResults([]);
+      setYtQuery('');
+    } catch (e) {
+      setYtError(e instanceof Error ? e.message : 'Download failed');
+    } finally {
+      setYtLoading(false);
+    }
   }
 
   function selectBeatImage(beatIdx: number, imgIdx: number) {
@@ -1224,6 +1293,14 @@ export default function BuilderPage() {
                               display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                             +
                           </button>
+                          {config?.railwayUrl && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setYtModalBeatIdx(i); setYtView('search'); setYtQuery(''); setYtResults([]); setYtError(''); setYtModalOpen(true); }}
+                              style={{ ...miniButton, height: 22, padding: '0 5px', fontSize: 9, fontWeight: 700, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 2 }}
+                              title="Search YouTube">
+                              ▶ yt
+                            </button>
+                          )}
                         </div>
                         {/* Camera options */}
                         <div style={{ marginTop: 6, borderTop: "1px dashed rgba(42,42,42,0.15)", paddingTop: 5 }}>
@@ -1631,6 +1708,128 @@ export default function BuilderPage() {
       </div>
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
+
+      {ytModalOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setYtModalOpen(false); }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
+            display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fffdf5', border: '2px solid #2a2a2a', boxShadow: '4px 4px 0 #2a2a2a',
+            width: 640, maxWidth: '95vw', maxHeight: '90vh', display: 'flex', flexDirection: 'column',
+            fontFamily: 'monospace', overflow: 'hidden' }}>
+
+            {/* Header */}
+            <div style={{ padding: '10px 16px', borderBottom: '1.5px solid #2a2a2a', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>
+                {ytView === 'search' ? '▶ YOUTUBE SEARCH' : `▶ TRIM  —  ${(ytSelected?.title ?? '').slice(0, 45)}${(ytSelected?.title?.length ?? 0) > 45 ? '…' : ''}`}
+              </span>
+              <button onClick={() => setYtModalOpen(false)} style={{ ...miniButton, marginLeft: 'auto', padding: '1px 7px', fontSize: 15 }}>×</button>
+            </div>
+
+            {/* Body */}
+            <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+              {ytView === 'search' ? (
+                <>
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                    <input
+                      autoFocus
+                      type="text"
+                      value={ytQuery}
+                      onChange={e => setYtQuery(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') handleYtSearch(); }}
+                      placeholder="search youtube..."
+                      style={{ flex: 1, fontFamily: 'monospace', fontSize: 13, padding: '8px 10px',
+                        border: '1.5px solid #2a2a2a', background: '#fffdf5', outline: 'none', boxShadow: '2px 2px 0 #2a2a2a' }}
+                    />
+                    <button onClick={handleYtSearch} disabled={ytLoading}
+                      style={{ ...miniButton, padding: '8px 16px', fontSize: 12, fontWeight: 700, opacity: ytLoading ? 0.5 : 1 }}>
+                      {ytLoading ? '...' : 'search'}
+                    </button>
+                  </div>
+                  {ytError && <p style={{ color: '#ff3a3a', fontSize: 11, marginBottom: 8, fontFamily: 'monospace' }}>{ytError}</p>}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                    {ytResults.map(r => (
+                      <div key={r.id}
+                        onClick={() => {
+                          setYtSelected(r);
+                          const maxSec = parseDurationSec(r.duration);
+                          setYtStart(0);
+                          setYtEnd(Math.min(30, maxSec));
+                          setYtView('trim');
+                        }}
+                        style={{ border: '1.5px solid #2a2a2a', cursor: 'pointer', background: 'rgba(255,253,245,0.9)',
+                          boxShadow: '2px 2px 0 #2a2a2a', overflow: 'hidden' }}>
+                        <img src={r.thumbnail} alt="" style={{ width: '100%', display: 'block', aspectRatio: '16/9', objectFit: 'cover' }} />
+                        <div style={{ padding: '5px 7px' }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, lineHeight: 1.3, marginBottom: 2,
+                            display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } as React.CSSProperties}>
+                            {r.title}
+                          </div>
+                          <div style={{ fontSize: 9, color: '#6a6a6a' }}>{r.channel} · {r.duration}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <>
+                  {ytSelected && (
+                    <div style={{ marginBottom: 14, background: '#000', lineHeight: 0 }}>
+                      <iframe
+                        src={`https://www.youtube.com/embed/${ytSelected.id}?start=${Math.floor(ytStart)}&end=${Math.ceil(ytEnd)}&autoplay=0`}
+                        style={{ width: '100%', aspectRatio: '16/9', border: 'none' }}
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                        allowFullScreen
+                      />
+                    </div>
+                  )}
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontSize: 11, width: 36 }}>start</span>
+                      <input type="range" min={0} max={Math.max(0, ytEnd - 1)} step={1} value={ytStart}
+                        onChange={e => setYtStart(Math.min(Number(e.target.value), ytEnd - 1))}
+                        style={{ flex: 1 }} />
+                      <input type="number" min={0} max={ytEnd - 1} step={1} value={ytStart}
+                        onChange={e => setYtStart(Math.max(0, Math.min(Number(e.target.value), ytEnd - 1)))}
+                        style={{ width: 50, fontFamily: 'monospace', fontSize: 11, border: '1px solid #2a2a2a', padding: '2px 4px', background: '#fffdf5' }} />
+                      <span style={{ fontSize: 10, color: '#6a6a6a' }}>s</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 11, width: 36 }}>end</span>
+                      <input type="range" min={ytStart + 1} max={30} step={1} value={ytEnd}
+                        onChange={e => setYtEnd(Math.max(ytStart + 1, Math.min(30, Number(e.target.value))))}
+                        style={{ flex: 1 }} />
+                      <input type="number" min={ytStart + 1} max={30} step={1} value={ytEnd}
+                        onChange={e => setYtEnd(Math.max(ytStart + 1, Math.min(30, Number(e.target.value))))}
+                        style={{ width: 50, fontFamily: 'monospace', fontSize: 11, border: '1px solid #2a2a2a', padding: '2px 4px', background: '#fffdf5' }} />
+                      <span style={{ fontSize: 10, color: '#6a6a6a' }}>s (max 30)</span>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 10, color: '#6a6a6a', marginBottom: 10 }}>
+                    clip: {ytEnd - ytStart}s · hard cap 30s enforced
+                  </div>
+                  {ytError && <p style={{ color: '#ff3a3a', fontSize: 11, fontFamily: 'monospace' }}>{ytError}</p>}
+                </>
+              )}
+            </div>
+
+            {/* Footer (trim view only) */}
+            {ytView === 'trim' && (
+              <div style={{ padding: '10px 16px', borderTop: '1.5px solid #2a2a2a', display: 'flex', gap: 8, alignItems: 'center' }}>
+                <button onClick={() => { setYtView('search'); setYtSelected(null); setYtError(''); }}
+                  style={{ ...miniButton, padding: '6px 12px', fontSize: 11 }}>
+                  ← back
+                </button>
+                <button onClick={handleYtConfirm} disabled={ytLoading}
+                  style={{ ...miniButton, marginLeft: 'auto', padding: '6px 18px', fontSize: 12, fontWeight: 700,
+                    background: '#c8f135', borderColor: '#2a2a2a', opacity: ytLoading ? 0.5 : 1 }}>
+                  {ytLoading ? 'downloading…' : 'confirm'}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -1922,6 +2121,13 @@ const lockScreenStyle: React.CSSProperties = {
   justifyContent: "center",
   padding: 32,
 };
+
+function parseDurationSec(dur: string): number {
+  const parts = dur.split(':').map(Number);
+  if (parts.length === 2) return (parts[0] ?? 0) * 60 + (parts[1] ?? 0);
+  if (parts.length === 3) return (parts[0] ?? 0) * 3600 + (parts[1] ?? 0) * 60 + (parts[2] ?? 0);
+  return 30;
+}
 
 function redrawCanvas(canvas: HTMLCanvasElement, strokesToDraw: Stroke[]) {
   const ctx = canvas.getContext("2d");
