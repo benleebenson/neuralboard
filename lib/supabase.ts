@@ -44,6 +44,15 @@ export async function getRenderCount(email: string): Promise<number> {
   return count ?? 0;
 }
 
+export async function getDownloadCount(email: string): Promise<number> {
+  const { count } = await supabase
+    .from("nb_events")
+    .select("*", { count: "exact", head: true })
+    .eq("email", email)
+    .eq("event", "download");
+  return count ?? 0;
+}
+
 export async function getAllUsers() {
   const { data } = await supabase
     .from("nb_users")

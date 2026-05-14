@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isAdmin } from "@/lib/auth";
-import { getRenderCount, getSubscriptionStatus, upsertUser, logEvent, logApiCost } from "@/lib/supabase";
+import { getDownloadCount, getSubscriptionStatus, upsertUser, logEvent, logApiCost } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -44,13 +44,13 @@ export async function POST(req: NextRequest) {
     }
     const email = session.user.email;
 
-    // Usage check — non-admin users get one free render unless subscribed
+    // Usage check — non-admin users get one free video (gated after first download)
     if (!isAdmin(email)) {
-      const [{ isSubscribed }, renderCount] = await Promise.all([
+      const [{ isSubscribed }, downloadCount] = await Promise.all([
         getSubscriptionStatus(email),
-        getRenderCount(email).catch(() => 0),
+        getDownloadCount(email).catch(() => 0),
       ]);
-      if (!isSubscribed && renderCount > 0) {
+      if (!isSubscribed && downloadCount > 0) {
         return NextResponse.json(
           { error: "Free credit used. Upgrade to generate more videos." },
           { status: 403 }

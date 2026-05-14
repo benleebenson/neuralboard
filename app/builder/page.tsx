@@ -73,6 +73,7 @@ export default function BuilderPage() {
   const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
   const [aiArranging, setAiArranging] = useState(false);
   const [isSubscribed, setIsSubscribed] = useState(false);
+  const [canGenerate, setCanGenerate] = useState(true);
   const [recSeconds, setRecSeconds] = useState(0);
   const [expandedBeatIdx, setExpandedBeatIdx] = useState<number | null>(null);
   const [introPanDuration, setIntroPanDuration] = useState<number | null>(null);
@@ -113,7 +114,10 @@ export default function BuilderPage() {
     if (!session?.user?.email) return;
     fetch("/api/usage/check")
       .then((r) => r.json())
-      .then((d) => setIsSubscribed(!!d.isSubscribed))
+      .then((d) => {
+        setIsSubscribed(!!d.isSubscribed);
+        setCanGenerate(!!d.canGenerate);
+      })
       .catch(() => {});
   }, [session?.user?.email]);
 
@@ -995,7 +999,12 @@ export default function BuilderPage() {
         <section style={leftPanelStyle}>
           <SectionLabel n="1" title="Audio" />
           <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-            <button onClick={recording ? stopRecording : startRecording} disabled={processing || rendering}
+            <button
+              onClick={() => {
+                if (!canGenerate) { window.location.href = "/upgrade"; return; }
+                if (recording) stopRecording(); else startRecording();
+              }}
+              disabled={processing || rendering}
               style={{ ...sketchButton, flex: 1, background: recording ? "#ff5e3a" : "#fffdf5",
                 color: recording ? "white" : "#2a2a2a",
                 opacity: processing || rendering ? 0.5 : 1 }}>
@@ -1003,7 +1012,11 @@ export default function BuilderPage() {
                 ? `STOP  0:${String(recSeconds).padStart(2, "0")}${!isSubscribed ? " / 0:59" : ""}`
                 : "RECORD"}
             </button>
-            <button onClick={() => audioFileInputRef.current?.click()}
+            <button
+              onClick={() => {
+                if (!canGenerate) { window.location.href = "/upgrade"; return; }
+                audioFileInputRef.current?.click();
+              }}
               disabled={recording || processing || rendering}
               style={{ ...sketchButton, flex: 1, opacity: recording || processing || rendering ? 0.5 : 1 }}>
               UPLOAD
@@ -1250,11 +1263,14 @@ export default function BuilderPage() {
             <a
               href={mp4Url}
               download="neuralboard.mp4"
-              onClick={() => fetch("/api/log", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ event: "download", durationSeconds: duration }),
-              }).catch(() => {})}
+              onClick={() => {
+                if (!isSubscribed) setCanGenerate(false);
+                fetch("/api/log", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ event: "download", durationSeconds: duration }),
+                }).catch(() => {});
+              }}
               style={{ ...sketchButton, display: "block", marginTop: 12, background: "white", textAlign: "center", textDecoration: "none" }}
             >
               DOWNLOAD MP4
