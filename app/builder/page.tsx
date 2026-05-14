@@ -1,9 +1,14 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, Fragment } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 
 type CameraMode = "default" | "closeup" | "pan-left" | "pan-right";
+
+type Transition = {
+  zoomOut: number;  // 0–1: how far to zoom out (1 = show whole board, 0.5 = halfway)
+  duration: number; // seconds
+};
 
 type Beat = {
   startTime: number;
@@ -17,6 +22,7 @@ type Beat = {
   customImageUrl?: string;
   customVideoUrl?: string;
   cameraMode?: CameraMode;
+  transition?: Transition;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -528,6 +534,24 @@ export default function BuilderPage() {
     });
   }
 
+  function addTransition(afterBeatIdx: number) {
+    setBeats(prev => prev.map((b, i) =>
+      i === afterBeatIdx + 1 ? { ...b, transition: { zoomOut: 1, duration: 1 } } : b
+    ));
+  }
+
+  function removeTransition(beatIdx: number) {
+    setBeats(prev => prev.map((b, i) =>
+      i === beatIdx ? { ...b, transition: undefined } : b
+    ));
+  }
+
+  function updateTransition(beatIdx: number, updates: Partial<Transition>) {
+    setBeats(prev => prev.map((b, i) =>
+      i === beatIdx && b.transition ? { ...b, transition: { ...b.transition, ...updates } } : b
+    ));
+  }
+
   function selectBeatImage(beatIdx: number, imgIdx: number) {
     setBeats((prev) => prev.map((b, i) =>
       i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined } : b
@@ -739,6 +763,8 @@ export default function BuilderPage() {
       }));
       const boardWidth = boardDisplayW * scale + W;
       const boardHeight = boardDisplayH * scale + H;
+      const boardCenterX = cardCenters.reduce((s, c) => s + c.x, 0) / (cardCenters.length || 1);
+      const boardCenterY = cardCenters.reduce((s, c) => s + c.y, 0) / (cardCenters.length || 1);
 
       // Where the camera arrives at the start of the settle phase for a given beat
       function beatPanTarget(bidx: number): { x: number; y: number; zoom: number } {
@@ -817,25 +843,59 @@ export default function BuilderPage() {
             prevRenderBeatIdx = currentIdx;
           }
           const currentBeat = beats[currentIdx];
-          const beatProgress = currentBeat
-            ? Math.min(1, Math.max(0, (audioSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
-            : 0;
-          const panProgress = Math.min(1, beatProgress / 0.4);
-          const panEased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
-          const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
-          const settleEased = 0.5 - 0.5 * Math.cos(settleProgress * Math.PI);
+          const transition = currentIdx > 0 ? currentBeat?.transition : undefined;
 
-          const panTarget = beatPanTarget(currentIdx);
-          const endCam = beatEndCam(currentIdx);
-          // For first beat, skip pan travel and start directly at pan target
-          const fromCam = currentIdx > 0 ? beatEndCam(currentIdx - 1) : panTarget;
-          const mode = currentBeat?.cameraMode ?? "default";
-          // Subtle breathe for default mode
-          const breathe = mode === "default" ? 0.04 * Math.sin(settleProgress * Math.PI) : 0;
+          if (transition) {
+            const beatDur = currentBeat.endTime - currentBeat.startTime;
+            const transSec = Math.min(transition.duration, beatDur * 0.9);
+            const transEnd = currentBeat.startTime + transSec;
+            const prevEnd = beatEndCam(currentIdx - 1);
+            const currTarget = beatPanTarget(currentIdx);
+            const peakZoom = 1.0 - transition.zoomOut * 0.7;
 
-          camX = fromCam.x + (panTarget.x - fromCam.x) * panEased + (endCam.x - panTarget.x) * settleEased;
-          camY = fromCam.y + (panTarget.y - fromCam.y) * panEased + (endCam.y - panTarget.y) * settleEased;
-          zoom = fromCam.zoom + (panTarget.zoom - fromCam.zoom) * panEased + (endCam.zoom - panTarget.zoom) * settleEased + breathe;
+            if (audioSec < transEnd) {
+              const t = Math.min(1, (audioSec - currentBeat.startTime) / transSec);
+              if (t < 0.5) {
+                const eased = 0.5 - 0.5 * Math.cos(t * 2 * Math.PI);
+                camX = prevEnd.x + (boardCenterX - prevEnd.x) * eased;
+                camY = prevEnd.y + (boardCenterY - prevEnd.y) * eased;
+                zoom = prevEnd.zoom + (peakZoom - prevEnd.zoom) * eased;
+              } else {
+                const eased = 0.5 - 0.5 * Math.cos((t - 0.5) * 2 * Math.PI);
+                camX = boardCenterX + (currTarget.x - boardCenterX) * eased;
+                camY = boardCenterY + (currTarget.y - boardCenterY) * eased;
+                zoom = peakZoom + (currTarget.zoom - peakZoom) * eased;
+              }
+            } else {
+              const remaining = currentBeat.endTime - transEnd;
+              const settleP = remaining > 0 ? Math.min(1, (audioSec - transEnd) / remaining) : 1;
+              const settleEased = 0.5 - 0.5 * Math.cos(settleP * Math.PI);
+              const endCam = beatEndCam(currentIdx);
+              camX = currTarget.x + (endCam.x - currTarget.x) * settleEased;
+              camY = currTarget.y + (endCam.y - currTarget.y) * settleEased;
+              zoom = currTarget.zoom + (endCam.zoom - currTarget.zoom) * settleEased;
+            }
+          } else {
+            const beatProgress = currentBeat
+              ? Math.min(1, Math.max(0, (audioSec - currentBeat.startTime) / (currentBeat.endTime - currentBeat.startTime)))
+              : 0;
+            const panProgress = Math.min(1, beatProgress / 0.4);
+            const panEased = 0.5 - 0.5 * Math.cos(panProgress * Math.PI);
+            const settleProgress = Math.min(1, Math.max(0, (beatProgress - 0.4) / 0.6));
+            const settleEased = 0.5 - 0.5 * Math.cos(settleProgress * Math.PI);
+
+            const panTarget = beatPanTarget(currentIdx);
+            const endCam = beatEndCam(currentIdx);
+            // For first beat, skip pan travel and start directly at pan target
+            const fromCam = currentIdx > 0 ? beatEndCam(currentIdx - 1) : panTarget;
+            const mode = currentBeat?.cameraMode ?? "default";
+            // Subtle breathe for default mode
+            const breathe = mode === "default" ? 0.04 * Math.sin(settleProgress * Math.PI) : 0;
+
+            camX = fromCam.x + (panTarget.x - fromCam.x) * panEased + (endCam.x - panTarget.x) * settleEased;
+            camY = fromCam.y + (panTarget.y - fromCam.y) * panEased + (endCam.y - panTarget.y) * settleEased;
+            zoom = fromCam.zoom + (panTarget.zoom - fromCam.zoom) * panEased + (endCam.zoom - panTarget.zoom) * settleEased + breathe;
+          }
         }
 
         drawBackground(ctx!, W, H, background, bgImg, camX, camY, boardWidth, boardHeight);
@@ -1080,8 +1140,10 @@ export default function BuilderPage() {
               {beats.map((b, i) => {
                 const isActive = i === activeBeatIdx;
                 const displayImg = b.customImageUrl ?? b.images?.[b.selectedImageIdx ?? 0];
+                const nextTransition = i < beats.length - 1 ? beats[i + 1]?.transition : undefined;
                 return (
-                  <div key={i} draggable
+                  <Fragment key={i}>
+                  <div draggable
                     onDragStart={() => handleDragStart(i)}
                     onDragOver={handleDragOver}
                     onDrop={() => handleDrop(i)}
@@ -1192,6 +1254,38 @@ export default function BuilderPage() {
                       </div>
                     </div>
                   </div>
+                  {i < beats.length - 1 && (
+                    nextTransition ? (
+                      <div style={{ marginLeft: 20, marginBottom: 6, padding: "7px 10px", border: "1px dashed #2a2a2a",
+                        background: "rgba(200,241,53,0.06)", display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 13, color: "#2a2a2a" }}>↕</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a", letterSpacing: 0.5 }}>ZOOM</span>
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>out</span>
+                        <input type="number" step="0.1" min="0.1" max="1"
+                          value={beats[i + 1].transition!.zoomOut}
+                          onChange={e => updateTransition(i + 1, { zoomOut: Math.max(0.1, Math.min(1, parseFloat(e.target.value) || 1)) })}
+                          onClick={e => e.stopPropagation()}
+                          style={{ width: 44, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }} />
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>dur</span>
+                        <input type="number" step="0.5" min="0.2" max="10"
+                          value={beats[i + 1].transition!.duration}
+                          onChange={e => updateTransition(i + 1, { duration: Math.max(0.2, parseFloat(e.target.value) || 1) })}
+                          onClick={e => e.stopPropagation()}
+                          style={{ width: 44, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }} />
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>s</span>
+                        <button onClick={e => { e.stopPropagation(); removeTransition(i + 1); }}
+                          style={{ ...miniButton, marginLeft: "auto", padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}>×</button>
+                      </div>
+                    ) : (
+                      <div style={{ marginLeft: 20, marginBottom: 6 }}>
+                        <button onClick={e => { e.stopPropagation(); addTransition(i); }}
+                          style={{ ...miniButton, fontSize: 9, padding: "2px 8px", opacity: 0.6 }}>
+                          ↕ zoom transition
+                        </button>
+                      </div>
+                    )
+                  )}
+                  </Fragment>
                 );
               })}
             </>
