@@ -45,7 +45,7 @@ type Overlay = {
 };
 
 
-type YtSearchResult = { id: string; title: string; channel: string; duration: string; thumbnail: string };
+type YtSearchResult = { id: string; title: string; channel: string; duration: string | number; thumbnail: string };
 type YtModalView = 'search' | 'trim';
 
 // Railway config is loaded server-side via /api/config after login
@@ -1764,13 +1764,13 @@ export default function BuilderPage() {
                         }}
                         style={{ border: '1.5px solid #2a2a2a', cursor: 'pointer', background: 'rgba(255,253,245,0.9)',
                           boxShadow: '2px 2px 0 #2a2a2a', overflow: 'hidden' }}>
-                        <img src={r.thumbnail} alt="" style={{ width: '100%', display: 'block', aspectRatio: '16/9', objectFit: 'cover' }} />
+                        {r.thumbnail && <img src={r.thumbnail} alt="" style={{ width: '100%', display: 'block', aspectRatio: '16/9', objectFit: 'cover' }} />}
                         <div style={{ padding: '5px 7px' }}>
                           <div style={{ fontSize: 10, fontWeight: 700, lineHeight: 1.3, marginBottom: 2,
                             display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } as React.CSSProperties}>
-                            {r.title}
+                            {r.title ?? '(no title)'}
                           </div>
-                          <div style={{ fontSize: 9, color: '#6a6a6a' }}>{r.channel} · {r.duration}</div>
+                          <div style={{ fontSize: 9, color: '#6a6a6a' }}>{r.channel ?? ''}{r.channel && r.duration != null ? ' · ' : ''}{r.duration != null ? (typeof r.duration === 'number' ? `${Math.floor(r.duration / 60)}:${String(r.duration % 60).padStart(2, '0')}` : r.duration) : ''}</div>
                         </div>
                       </div>
                     ))}
@@ -2127,11 +2127,14 @@ const lockScreenStyle: React.CSSProperties = {
   padding: 32,
 };
 
-function parseDurationSec(dur: string): number {
+function parseDurationSec(dur: string | number | undefined): number {
+  if (typeof dur === 'number') return dur > 0 ? dur : 30;
+  if (!dur) return 30;
   const parts = dur.split(':').map(Number);
   if (parts.length === 2) return (parts[0] ?? 0) * 60 + (parts[1] ?? 0);
   if (parts.length === 3) return (parts[0] ?? 0) * 3600 + (parts[1] ?? 0) * 60 + (parts[2] ?? 0);
-  return 30;
+  const asNum = Number(dur);
+  return Number.isFinite(asNum) && asNum > 0 ? asNum : 30;
 }
 
 function redrawCanvas(canvas: HTMLCanvasElement, strokesToDraw: Stroke[]) {
