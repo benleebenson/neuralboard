@@ -572,12 +572,17 @@ export default function BuilderPage() {
     setYtError('');
     setYtResults([]);
     try {
-      const res = await fetch(`${config.railwayUrl}/ytsearch?q=${encodeURIComponent(ytQuery)}`, {
-        headers: { 'x-neuralboard-password': config.railwayPassword },
+      const res = await fetch(`${config.railwayUrl}/video-search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-neuralboard-password': config.railwayPassword,
+        },
+        body: JSON.stringify({ query: ytQuery, limit: 12 }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
       const data = await res.json();
-      setYtResults(data.results || []);
+      setYtResults(Array.isArray(data) ? data : []);
     } catch (e) {
       setYtError(e instanceof Error ? e.message : 'Search failed');
     } finally {
