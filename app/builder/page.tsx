@@ -1072,7 +1072,7 @@ export default function BuilderPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ durationSeconds: duration }),
-      }).catch(() => {});
+      }).catch(err => console.error("RENDER_COMPLETE_CLIENT_FAIL:", err));
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "Render failed";
       setError(message);

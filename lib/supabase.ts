@@ -23,16 +23,17 @@ export async function upsertUser(
 
 export async function logEvent(
   email: string,
-  event: "login" | "transcribe" | "render" | "download",
+  eventType: "login" | "transcribe" | "render" | "download",
   durationSeconds?: number | null,
   meta: Record<string, unknown> = {}
 ) {
-  await supabase.from("nb_events").insert({
+  const { error } = await supabase.from("nb_events").insert({
     email,
-    event,
+    event: eventType,
     duration_seconds: durationSeconds ?? null,
     meta,
   });
+  if (error) console.error("LOGEVENT_FAIL:", error.message, "for", email, "event", eventType);
 }
 
 export async function getRenderCount(email: string): Promise<number> {
@@ -41,6 +42,7 @@ export async function getRenderCount(email: string): Promise<number> {
     .select("*", { count: "exact", head: true })
     .eq("email", email)
     .eq("event", "render");
+  console.log("RENDER_COUNT:", email, "→", count);
   return count ?? 0;
 }
 
