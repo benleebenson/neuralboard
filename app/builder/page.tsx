@@ -1441,6 +1441,8 @@ export default function BuilderPage() {
               download="neuralboard.mp4"
               onClick={() => {
                 if (!isSubscribed) setCanGenerate(false);
+                // Non-blocking analytics only — do NOT rely on this for paywall enforcement.
+                // The gate uses renderCount from /api/render/complete (server-side, source of truth).
                 fetch("/api/log", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
