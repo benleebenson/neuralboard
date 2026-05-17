@@ -1298,7 +1298,7 @@ export default function BuilderPage() {
                               display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                             +
                           </button>
-                          {config?.railwayUrl && (
+                          {config?.railwayUrl && isSubscribed && (
                             <button
                               onClick={(e) => { e.stopPropagation(); setYtModalBeatIdx(i); setYtView('search'); setYtQuery(''); setYtResults([]); setYtError(''); setYtModalOpen(true); }}
                               style={{ ...miniButton, height: 22, padding: '0 5px', fontSize: 9, fontWeight: 700, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 2 }}
