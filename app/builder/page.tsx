@@ -810,7 +810,10 @@ export default function BuilderPage() {
 
     try {
       const images: (HTMLImageElement | null)[] = await Promise.all(
-        beats.map((b) => {
+        beats.map(async (b) => {
+          if (b.customImageUrl) {
+            try { return await loadImage(b.customImageUrl); } catch { /* fall through */ }
+          }
           const list = b.images || [];
           if (list.length === 0) return null;
           const startIdx = b.selectedImageIdx ?? 0;
