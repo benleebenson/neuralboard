@@ -1075,7 +1075,7 @@ export default function BuilderPage() {
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
           const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
           const beatCardW = (beats[i].size ?? CARD_W) * scale;
-          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery, beatCardW);
+          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery, beatCardW, cardStyle);
         }
 
         // Draw AI overlays
@@ -2054,11 +2054,38 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
-function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720) {
+function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720, style: "card" | "bare" = "card") {
   const cardW = cardWidth;
+  const rotation = (((beatIdx * 137) % 60) - 30) / 100;
+
+  if (style === "bare") {
+    ctx.save();
+    ctx.translate(worldX, worldY);
+    ctx.rotate(rotation * 0.4);
+    ctx.shadowColor = "rgba(0,0,0,0.4)";
+    ctx.shadowBlur = 20;
+    ctx.shadowOffsetX = 6;
+    ctx.shadowOffsetY = 10;
+    if (img) {
+      const srcW = img instanceof HTMLVideoElement ? img.videoWidth : (img as HTMLImageElement).naturalWidth;
+      const srcH = img instanceof HTMLVideoElement ? img.videoHeight : (img as HTMLImageElement).naturalHeight;
+      const maxW = cardW;
+      const maxH = cardW * (960 / 720);
+      const aspect = srcW / srcH;
+      const drawW = aspect >= maxW / maxH ? maxW : maxH * aspect;
+      const drawH = aspect >= maxW / maxH ? maxW / aspect : maxH;
+      ctx.drawImage(img, 0, 0, srcW, srcH, -drawW / 2, -drawH / 2, drawW, drawH);
+    } else {
+      const fbH = cardW * (960 / 720);
+      ctx.fillStyle = "#1a1a1a";
+      ctx.fillRect(-cardW / 2, -fbH / 2, cardW, fbH);
+    }
+    ctx.restore();
+    return;
+  }
+
   const cardH = Math.round(cardW * (960 / 720));
   const borderW = 18;
-  const rotation = (((beatIdx * 137) % 60) - 30) / 100;
 
   ctx.save();
   ctx.translate(worldX, worldY);
