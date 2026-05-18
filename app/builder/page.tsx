@@ -97,6 +97,7 @@ export default function BuilderPage() {
   const [ytEnd, setYtEnd] = useState(30);
   const [ytError, setYtError] = useState('');
   const [ytLoading, setYtLoading] = useState(false);
+  const [ytShortsOnly, setYtShortsOnly] = useState(true);
 
   const [playingBeatIdx, setPlayingBeatIdx] = useState<number | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -664,7 +665,7 @@ export default function BuilderPage() {
           'Content-Type': 'application/json',
           'x-neuralboard-password': config.railwayPassword,
         },
-        body: JSON.stringify({ query: ytQuery, limit: 12 }),
+        body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: ytShortsOnly }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
       const data = await res.json();
@@ -1832,6 +1833,22 @@ export default function BuilderPage() {
               {ytView === 'search' ? (
                 <>
                   <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+                    <div style={{ display: 'flex', flexShrink: 0 }}>
+                      {(['Shorts', 'Normal'] as const).map(label => {
+                        const active = label === 'Shorts' ? ytShortsOnly : !ytShortsOnly;
+                        return (
+                          <button key={label}
+                            onClick={() => setYtShortsOnly(label === 'Shorts')}
+                            style={{ ...miniButton, fontSize: 11, padding: '4px 8px',
+                              background: active ? '#2a2a2a' : 'transparent',
+                              color: active ? '#fffdf5' : '#2a2a2a',
+                              marginRight: label === 'Shorts' ? -1 : 0,
+                              position: 'relative', zIndex: active ? 1 : 0 }}>
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
                     <input
                       autoFocus
                       type="text"
