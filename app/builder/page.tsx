@@ -98,6 +98,12 @@ export default function BuilderPage() {
   const [ytError, setYtError] = useState('');
   const [ytLoading, setYtLoading] = useState(false);
 
+  const [playingBeatIdx, setPlayingBeatIdx] = useState<number | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewAudioUrlRef = useRef<string | null>(null);
+  const previewRafRef = useRef<number | null>(null);
+  const previewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
@@ -181,6 +187,31 @@ export default function BuilderPage() {
     const canvas = drawCanvasRef.current;
     if (canvas) redrawCanvas(canvas, strokes);
   }, [strokes]);
+
+  // Revoke cached preview URL when audioBlob changes so next play gets a fresh URL
+  useEffect(() => {
+    stopPreview();
+    if (previewAudioUrlRef.current) {
+      URL.revokeObjectURL(previewAudioUrlRef.current);
+      previewAudioUrlRef.current = null;
+    }
+    if (previewAudioRef.current) {
+      previewAudioRef.current.src = "";
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioBlob]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopPreview();
+      if (previewAudioUrlRef.current) {
+        URL.revokeObjectURL(previewAudioUrlRef.current);
+        previewAudioUrlRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function startRecording() {
     setError("");
@@ -523,6 +554,61 @@ export default function BuilderPage() {
       return next.map((b, i) => ({ ...b, startTime: i * segLen, endTime: (i + 1) * segLen }));
     });
     setActiveBeatIdx(prev => Math.max(0, prev >= idx ? prev - 1 : prev));
+  }
+
+  function stopPreview() {
+    const audio = previewAudioRef.current;
+    if (audio) audio.pause();
+    if (previewRafRef.current !== null) { cancelAnimationFrame(previewRafRef.current); previewRafRef.current = null; }
+    if (previewTimeoutRef.current !== null) { clearTimeout(previewTimeoutRef.current); previewTimeoutRef.current = null; }
+    setPlayingBeatIdx(null);
+  }
+
+  function playBeatPreview(beatIdx: number, b: Beat) {
+    stopPreview();
+    if (!audioBlob) return;
+
+    if (!previewAudioUrlRef.current) {
+      previewAudioUrlRef.current = URL.createObjectURL(audioBlob);
+    }
+    if (!previewAudioRef.current) {
+      previewAudioRef.current = new Audio();
+      previewAudioRef.current.addEventListener("ended", stopPreview);
+      previewAudioRef.current.addEventListener("error", stopPreview);
+    }
+    const audio = previewAudioRef.current;
+    if (audio.src !== previewAudioUrlRef.current) {
+      audio.src = previewAudioUrlRef.current;
+    }
+
+    const startTime = b.startTime;
+    const endTime = b.endTime;
+
+    function beginPlayback() {
+      audio.currentTime = startTime;
+      // Wait for seek to land before playing — avoids blip from wrong position
+      audio.addEventListener("seeked", function onSeeked() {
+        audio.removeEventListener("seeked", onSeeked);
+        // Arm rAF endTime guard
+        function rafCheck() {
+          if (audio.currentTime >= endTime) { stopPreview(); return; }
+          previewRafRef.current = requestAnimationFrame(rafCheck);
+        }
+        previewRafRef.current = requestAnimationFrame(rafCheck);
+        // Backstop timeout: slice duration + 150ms buffer for busy main thread
+        previewTimeoutRef.current = setTimeout(stopPreview, (endTime - startTime) * 1000 + 150);
+        setPlayingBeatIdx(beatIdx);
+        audio.play().catch(stopPreview);
+      }, { once: true });
+    }
+
+    // If audio isn't ready to seek, wait for loadeddata first
+    if (audio.readyState >= 1) {
+      beginPlayback();
+    } else {
+      audio.addEventListener("loadeddata", beginPlayback, { once: true });
+      audio.load();
+    }
   }
 
   function addCustomBeat() {
@@ -1262,6 +1348,14 @@ export default function BuilderPage() {
                                 style={{ fontSize: 10, color: "#6a6a6a", fontFamily: "monospace", cursor: 'pointer', borderBottom: '1px dashed #6a6a6a' }}>
                                 {b.startTime.toFixed(1)}–{b.endTime.toFixed(1)}s
                               </span>
+                            )}
+                            {audioBlob && (
+                              <button
+                                onClick={e => { e.stopPropagation(); playingBeatIdx === i ? stopPreview() : playBeatPreview(i, b); }}
+                                style={{ ...miniButton, padding: "0 4px", fontSize: 11, lineHeight: "14px" }}
+                                title={playingBeatIdx === i ? "Stop preview" : "Preview narration"}>
+                                {playingBeatIdx === i ? "⏸" : "▶"}
+                              </button>
                             )}
                             <button
                               onClick={e => { e.stopPropagation(); deleteBeat(i); }}
