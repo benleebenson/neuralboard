@@ -80,8 +80,23 @@ if (!serperKey) {
 }
 
     // ── Step 1: Whisper transcription with word timings ─────────────
+    const contentType = req.headers.get("content-type") || "audio/webm";
+    const ext =
+      contentType.includes("mp4") || contentType.includes("m4a")
+        ? ".m4a"
+        : contentType.includes("aac")
+        ? ".m4a"
+        : contentType.includes("mp3") || contentType.includes("mpeg")
+        ? ".mp3"
+        : contentType.includes("wav")
+        ? ".wav"
+        : contentType.includes("ogg")
+        ? ".ogg"
+        : ".webm";
+    console.log("[transcribe] incoming Content-Type:", contentType, "→ extension:", ext);
+
     const formData = new FormData();
-    formData.append("file", audioBlob, "audio.webm");
+    formData.append("file", audioBlob, `audio${ext}`);
     formData.append("model", "whisper-1");
     formData.append("response_format", "verbose_json");
     formData.append("timestamp_granularities[]", "word");
