@@ -10,6 +10,14 @@ type Transition = {
   duration: number; // seconds
 };
 
+type SubBeat = {
+  id: string;
+  imageUrl: string;
+  appearTime: number;
+  pos?: { x: number; y: number };
+  size?: number;
+};
+
 type Beat = {
   startTime: number;
   endTime: number;
@@ -23,6 +31,7 @@ type Beat = {
   customVideoUrl?: string;
   cameraMode?: CameraMode;
   transition?: Transition;
+  subBeats?: SubBeat[];
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -122,6 +131,9 @@ export default function BuilderPage() {
   const currentStrokeRef = useRef<Stroke | null>(null);
   const beatImageInputRef = useRef<HTMLInputElement | null>(null);
   const uploadBeatIdxRef = useRef<number>(-1);
+  const subBeatImageInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadSubBeatBeatIdxRef = useRef<number>(-1);
+  const subBeatDragRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number; currentSize: number } | null>(null);
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
@@ -368,7 +380,7 @@ export default function BuilderPage() {
       const [moved] = copy.splice(draggedBeatIdx, 1);
       copy.splice(targetIdx, 0, moved);
       const segLen = duration / copy.length;
-      return copy.map((b, i) => ({
+      return copy.map((b, i) => clampSubBeats({
         ...b,
         startTime: i * segLen,
         endTime: (i + 1) * segLen,
@@ -532,6 +544,109 @@ export default function BuilderPage() {
     e.target.value = "";
   }
 
+  async function handleSubBeatUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const beatIdx = uploadSubBeatBeatIdxRef.current;
+    if (!file || beatIdx < 0) return;
+    e.target.value = "";
+
+    const url = URL.createObjectURL(file);
+    let imgW = 80, imgH = 80;
+    try {
+      const img = await loadImage(url);
+      imgW = img.naturalWidth;
+      imgH = img.naturalHeight;
+    } catch { /* use square fallback */ }
+
+    const sbW = 80;
+    const sbH = imgH > 0 ? Math.round(sbW * imgH / imgW) : sbW;
+
+    setBeats(prev => {
+      const beat = prev[beatIdx];
+      if (!beat) return prev;
+
+      // Compute parent card height from DOM element (exact same source of truth as Issue 4 fix)
+      const parentEl = cardElemsRef.current.get(beatIdx);
+      const parentW = beat.size ?? CARD_W;
+      const parentH = parentEl?.offsetHeight ?? 100;
+      const px = beat.pos?.x ?? (40 + (beatIdx % 3) * 160);
+      const py = beat.pos?.y ?? (40 + Math.floor(beatIdx / 3) * 210);
+
+      // Candidate slots around parent card, tried in priority order
+      const slots: Array<{ x: number; y: number }> = [
+        { x: px + parentW + 14, y: py + parentH / 2 - sbH / 2 },       // right
+        { x: px + parentW / 2 - sbW / 2, y: py + parentH + 14 },        // below
+        { x: px - sbW - 14, y: py + parentH / 2 - sbH / 2 },            // left
+        { x: px + parentW / 2 - sbW / 2, y: py - sbH - 14 },            // above
+        { x: px + parentW + 14, y: py + parentH + 14 },                  // below-right
+        { x: px - sbW - 14, y: py + parentH + 14 },                     // below-left
+      ];
+
+      // Collect existing sub-beat rects to avoid overlap
+      const occupied = (beat.subBeats ?? []).map(sb => ({
+        x: sb.pos?.x ?? px + parentW + 14,
+        y: sb.pos?.y ?? py,
+        w: sb.size ?? 80,
+        h: 80,
+      }));
+      // Also treat parent card as occupied
+      occupied.push({ x: px, y: py, w: parentW, h: parentH });
+
+      function overlaps(ax: number, ay: number, aw: number, ah: number) {
+        return occupied.some(o =>
+          ax < o.x + o.w + 8 && ax + aw + 8 > o.x &&
+          ay < o.y + o.h + 8 && ay + ah + 8 > o.y
+        );
+      }
+
+      const chosenSlot = slots.find(s => !overlaps(s.x, s.y, sbW, sbH)) ?? slots[0]!;
+
+      // Re-space all sub-beat appear times evenly across the parent beat window
+      const existing = beat.subBeats ?? [];
+      const allSubBeats = [...existing, { id: crypto.randomUUID(), imageUrl: url, pos: chosenSlot, size: sbW, appearTime: 0 }];
+      const N = allSubBeats.length;
+      const dur = beat.endTime - beat.startTime;
+      const respaced = allSubBeats.map((sb, k) => ({
+        ...sb,
+        appearTime: beat.startTime + dur * (k + 1) / (N + 1),
+      }));
+
+      return prev.map((b, i) => i === beatIdx ? { ...b, subBeats: respaced } : b);
+    });
+  }
+
+  function clampSubBeats(b: Beat): Beat {
+    if (!b.subBeats?.length) return b;
+    return {
+      ...b,
+      subBeats: b.subBeats.map(sb => ({
+        ...sb,
+        appearTime: Math.max(b.startTime, Math.min(b.endTime, sb.appearTime)),
+      })),
+    };
+  }
+
+  function deleteSubBeat(beatIdx: number, subBeatId: string) {
+    setBeats(prev => prev.map((b, i) => {
+      if (i !== beatIdx) return b;
+      const remaining = (b.subBeats ?? []).filter(sb => sb.id !== subBeatId);
+      return clampSubBeats({ ...b, subBeats: remaining });
+    }));
+  }
+
+  function updateSubBeatAppearTime(beatIdx: number, subBeatId: string, rawVal: string) {
+    const t = parseFloat(rawVal);
+    if (isNaN(t)) return;
+    setBeats(prev => prev.map((b, i) => {
+      if (i !== beatIdx) return b;
+      const clamped = Math.max(b.startTime, Math.min(b.endTime, t));
+      return {
+        ...b,
+        subBeats: (b.subBeats ?? []).map(sb => sb.id === subBeatId ? { ...sb, appearTime: clamped } : sb),
+      };
+    }));
+  }
+
   function commitBeatEnd(idx: number, rawVal: string) {
     const newEnd = parseFloat(rawVal);
     if (isNaN(newEnd)) { setEditingBeatIdx(null); return; }
@@ -539,11 +654,11 @@ export default function BuilderPage() {
       const next = [...prev];
       const beat = next[idx];
       const clampedEnd = Math.max(beat.startTime + 0.1, Math.min(duration, newEnd));
-      next[idx] = { ...beat, endTime: clampedEnd };
+      next[idx] = clampSubBeats({ ...beat, endTime: clampedEnd });
       // adjust next beat's startTime (it shrinks/grows to compensate)
       if (idx + 1 < next.length) {
         const nb = next[idx + 1];
-        next[idx + 1] = { ...nb, startTime: clampedEnd, endTime: Math.max(clampedEnd + 0.1, nb.endTime) };
+        next[idx + 1] = clampSubBeats({ ...nb, startTime: clampedEnd, endTime: Math.max(clampedEnd + 0.1, nb.endTime) });
       }
       return next;
     });
@@ -555,7 +670,7 @@ export default function BuilderPage() {
       const next = prev.filter((_, i) => i !== idx);
       if (next.length === 0) return next;
       const segLen = duration / next.length;
-      return next.map((b, i) => ({ ...b, startTime: i * segLen, endTime: (i + 1) * segLen }));
+      return next.map((b, i) => clampSubBeats({ ...b, startTime: i * segLen, endTime: (i + 1) * segLen }));
     });
     setActiveBeatIdx(prev => Math.max(0, prev >= idx ? prev - 1 : prev));
   }
@@ -634,7 +749,7 @@ export default function BuilderPage() {
           y: 40 + Math.floor(prev.length / 3) * 210 + (prev.length * 31) % 40,
         },
       };
-      return [...prev.slice(0, -1), { ...last, endTime: split }, newBeat];
+      return [...prev.slice(0, -1), clampSubBeats({ ...last, endTime: split }), newBeat];
     });
   }
 
@@ -839,6 +954,18 @@ export default function BuilderPage() {
             vid.onerror = () => { clearTimeout(timer); resolve(null); };
             vid.load();
           });
+        })
+      );
+
+      // Sub-beat images: Map<subBeatId, HTMLImageElement | null> per beat
+      const subBeatImages: Map<string, HTMLImageElement | null>[] = await Promise.all(
+        beats.map(async (b) => {
+          const map = new Map<string, HTMLImageElement | null>();
+          for (const sb of b.subBeats ?? []) {
+            try { map.set(sb.id, await loadImage(sb.imageUrl)); }
+            catch { map.set(sb.id, null); }
+          }
+          return map;
         })
       );
 
@@ -1093,6 +1220,37 @@ export default function BuilderPage() {
           const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
           const beatCardW = (beats[i].size ?? CARD_W) * scale;
           drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery, beatCardW, cardStyle);
+
+          // Draw sub-beats that have already appeared during this beat's window
+          for (const sb of beats[i].subBeats ?? []) {
+            if (audioSec < sb.appearTime) continue;
+            const elapsed = audioSec - sb.appearTime;
+            const progress = Math.min(1, elapsed / 0.3); // 300ms pop-in
+            const alpha = progress;
+            const scaleAnim = 0.5 + 0.5 * progress;
+            const sbImg = subBeatImages[i]?.get(sb.id) ?? null;
+            const sbW = (sb.size ?? 80) * scale;
+            const sbNatH = sbImg ? sbImg.naturalHeight : sbImg === null ? 0 : 0;
+            const sbNatW = sbImg ? sbImg.naturalWidth : 0;
+            const sbH = sbNatW > 0 ? sbW * sbNatH / sbNatW : sbW;
+            const sbPosX = sb.pos ? sb.pos.x * scale : center.x + beatCardW / 2 + 14 * scale;
+            const sbPosY = sb.pos ? sb.pos.y * scale : center.y;
+            const sbCx = sbPosX + sbW / 2;
+            const sbCy = sbPosY + sbH / 2;
+            ctx!.save();
+            ctx!.globalAlpha = alpha;
+            ctx!.translate(sbCx, sbCy);
+            ctx!.scale(scaleAnim, scaleAnim);
+            ctx!.translate(-sbCx, -sbCy);
+            if (sbImg) {
+              ctx!.shadowColor = "rgba(0,0,0,0.35)";
+              ctx!.shadowBlur = 10 * scale;
+              ctx!.shadowOffsetX = 3 * scale;
+              ctx!.shadowOffsetY = 5 * scale;
+              ctx!.drawImage(sbImg, sbPosX, sbPosY, sbW, sbH);
+            }
+            ctx!.restore();
+          }
         }
 
         // Draw AI overlays
@@ -1448,9 +1606,50 @@ export default function BuilderPage() {
                             </div>
                           )}
                         </div>
+                        {/* Sub-beat add button */}
+                        <div style={{ marginTop: 5 }}>
+                          <button
+                            onClick={e => { e.stopPropagation(); uploadSubBeatBeatIdxRef.current = i; subBeatImageInputRef.current?.click(); }}
+                            style={{ ...miniButton, fontSize: 9, padding: "2px 8px", opacity: 0.75 }}>
+                            + sub-beat
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
+                  {/* Sub-beat rows — indented under parent beat */}
+                  {(b.subBeats ?? []).map((sb, sbi) => (
+                    <div key={sb.id} onClick={e => e.stopPropagation()}
+                      style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 24, marginBottom: 4,
+                        paddingLeft: 10, borderLeft: "2px solid rgba(42,42,42,0.2)",
+                        background: "rgba(255,253,245,0.6)", padding: "5px 8px 5px 10px" }}>
+                      <div style={{ width: 34, height: 34, flexShrink: 0, overflow: "hidden", border: "1px solid #2a2a2a" }}>
+                        <img src={sb.imageUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 0 }}>
+                        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", fontWeight: 700 }}>
+                          SUB {sbi + 1}
+                        </span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>at</span>
+                          <input
+                            type="number" step="0.1"
+                            min={b.startTime.toFixed(1)} max={b.endTime.toFixed(1)}
+                            value={sb.appearTime.toFixed(1)}
+                            onChange={e => updateSubBeatAppearTime(i, sb.id, e.target.value)}
+                            onClick={e => e.stopPropagation()}
+                            style={{ width: 52, fontSize: 9, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
+                          />
+                          <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>s</span>
+                        </div>
+                      </div>
+                      <button
+                        onClick={e => { e.stopPropagation(); deleteSubBeat(i, sb.id); }}
+                        style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 12, flexShrink: 0 }}>
+                        ×
+                      </button>
+                    </div>
+                  ))}
                   {i < beats.length - 1 && (
                     nextTransition ? (
                       <div style={{ marginLeft: 20, marginBottom: 6, padding: "7px 10px", border: "1px dashed #2a2a2a",
@@ -1721,6 +1920,74 @@ export default function BuilderPage() {
               );
             })}
 
+            {/* Sub-beat images on the board — always visible so user can nudge positions */}
+            {beats.flatMap((b, i) =>
+              (b.subBeats ?? []).map((sb, sbIdx) => {
+                const sbW = sb.size ?? 80;
+                const sbX = sb.pos?.x ?? ((b.pos?.x ?? 40) + (b.size ?? CARD_W) + 14);
+                const sbY = sb.pos?.y ?? (b.pos?.y ?? 40);
+                return (
+                  <div
+                    key={sb.id}
+                    onPointerDown={(e) => {
+                      if (drawMode) return;
+                      e.stopPropagation();
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      subBeatDragRef.current = {
+                        id: sb.id, beatIdx: i, sbIdx,
+                        ox: e.clientX, oy: e.clientY,
+                        startX: sbX, startY: sbY,
+                        currentX: sbX, currentY: sbY,
+                      };
+                    }}
+                    onPointerMove={(e) => {
+                      const d = subBeatDragRef.current;
+                      if (!d || d.id !== sb.id) return;
+                      d.currentX = d.startX + (e.clientX - d.ox);
+                      d.currentY = d.startY + (e.clientY - d.oy);
+                      const el = e.currentTarget as HTMLDivElement;
+                      el.style.left = d.currentX + "px";
+                      el.style.top = d.currentY + "px";
+                    }}
+                    onPointerUp={() => {
+                      const d = subBeatDragRef.current;
+                      if (!d || d.id !== sb.id) return;
+                      setBeats(prev => prev.map((beat, bi) => {
+                        if (bi !== d.beatIdx) return beat;
+                        return {
+                          ...beat, subBeats: (beat.subBeats ?? []).map((s, si) =>
+                            si === d.sbIdx ? { ...s, pos: { x: d.currentX, y: d.currentY } } : s
+                          ),
+                        };
+                      }));
+                      subBeatDragRef.current = null;
+                    }}
+                    onPointerCancel={() => { subBeatDragRef.current = null; }}
+                    onDragStart={(e) => e.preventDefault()}
+                    style={{
+                      position: "absolute",
+                      left: sbX,
+                      top: sbY,
+                      width: sbW,
+                      cursor: drawMode ? "crosshair" : "grab",
+                      userSelect: "none",
+                      zIndex: 5,
+                      filter: "drop-shadow(2px 3px 5px rgba(0,0,0,0.3))",
+                      outline: "1.5px solid rgba(42,42,42,0.4)",
+                    }}
+                  >
+                    <img src={sb.imageUrl} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
+                    <div style={{ position: "absolute", top: -6, left: -6, width: 12, height: 12,
+                      background: "#2a2a2a", border: "1px solid #c8f135", borderRadius: "50%",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      color: "#c8f135", fontSize: 7, fontFamily: "monospace", fontWeight: 700, lineHeight: 1 }}>
+                      s
+                    </div>
+                  </div>
+                );
+              })
+            )}
+
             {/* AI overlay objects (text, arrows, circles) */}
             <svg
               ref={overlaySvgRef}
@@ -1827,6 +2094,8 @@ export default function BuilderPage() {
 
         {/* Hidden file input for beat media upload */}
         <input ref={beatImageInputRef} type="file" accept="image/*,video/*" onChange={handleBeatMediaUpload} style={{ display: "none" }} />
+        {/* Hidden file input for sub-beat image upload */}
+        <input ref={subBeatImageInputRef} type="file" accept="image/*" onChange={handleSubBeatUpload} style={{ display: "none" }} />
       </div>
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
