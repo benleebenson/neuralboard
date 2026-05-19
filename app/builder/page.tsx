@@ -356,6 +356,8 @@ export default function BuilderPage() {
       if (!data.ok) throw new Error(data.error || "Transcription failed");
       setTranscript(data.transcript);
       setDuration(data.duration);
+      setIntroPanDuration(null);
+      setIntroPanStart(0);
       const newBeats: Beat[] = (data.beats || []).map((b: Beat, i: number) => ({
         ...b,
         selectedImageIdx: 0,
@@ -396,11 +398,12 @@ export default function BuilderPage() {
       const copy = [...prev];
       const [moved] = copy.splice(draggedBeatIdx, 1);
       copy.splice(targetIdx, 0, moved);
-      const segLen = duration / copy.length;
+      const panEnd = introPanDuration ?? 0;
+      const segLen = (duration - panEnd) / copy.length;
       return copy.map((b, i) => clampSubBeats({
         ...b,
-        startTime: i * segLen,
-        endTime: (i + 1) * segLen,
+        startTime: panEnd + i * segLen,
+        endTime: panEnd + (i + 1) * segLen,
       }));
     });
     setActiveBeatIdx(targetIdx);
@@ -664,6 +667,39 @@ export default function BuilderPage() {
     }));
   }
 
+  function retimeBeatsAfterPan(prev: Beat[], panDuration: number): Beat[] {
+    if (prev.length === 0) return prev;
+    const panEnd = Math.max(0, Math.min(duration, panDuration));
+    const remaining = Math.max(0.1 * prev.length, duration - panEnd);
+    const sourceStart = Math.min(...prev.map(b => b.startTime));
+    const sourceEnd = Math.max(...prev.map(b => b.endTime));
+    const sourceDur = Math.max(0.1, sourceEnd - sourceStart);
+    let cursor = panEnd;
+    return prev.map((b, i) => {
+      const rawDur = Math.max(0.1, b.endTime - b.startTime);
+      const scaledDur = rawDur / sourceDur * remaining;
+      const isLast = i === prev.length - 1;
+      const startTime = cursor;
+      const endTime = isLast ? duration : Math.min(duration, cursor + scaledDur);
+      cursor = endTime;
+      return clampSubBeats({ ...b, startTime, endTime: Math.max(startTime + 0.1, endTime) });
+    });
+  }
+
+  function setCameraPanDuration(nextDuration: number) {
+    const panDuration = Math.max(0.5, Math.min(duration > 0 ? duration - 0.1 : 20, nextDuration));
+    setIntroPanStart(0);
+    setIntroPanDuration(panDuration);
+    setBeats(prev => retimeBeatsAfterPan(prev, panDuration));
+    setActiveBeatIdx(0);
+  }
+
+  function removeCameraPan() {
+    setIntroPanDuration(null);
+    setIntroPanStart(0);
+    setBeats(prev => retimeBeatsAfterPan(prev, 0));
+  }
+
   function commitBeatEnd(idx: number, rawVal: string) {
     const newEnd = parseFloat(rawVal);
     if (isNaN(newEnd)) { setEditingBeatIdx(null); return; }
@@ -686,8 +722,7 @@ export default function BuilderPage() {
     setBeats(prev => {
       const next = prev.filter((_, i) => i !== idx);
       if (next.length === 0) return next;
-      const segLen = duration / next.length;
-      return next.map((b, i) => clampSubBeats({ ...b, startTime: i * segLen, endTime: (i + 1) * segLen }));
+      return retimeBeatsAfterPan(next, introPanDuration ?? 0);
     });
     setActiveBeatIdx(prev => Math.max(0, prev >= idx ? prev - 1 : prev));
   }
@@ -1209,7 +1244,22 @@ export default function BuilderPage() {
           const currentBeat = beats[currentIdx];
           const transition = currentIdx > 0 ? currentBeat?.transition : undefined;
 
-          if (transition) {
+          const panHandoffSec = introPanDuration !== null && currentIdx === 0
+            ? Math.min(0.8, Math.max(0.2, (currentBeat.endTime - currentBeat.startTime) * 0.35))
+            : 0;
+          const inPanHandoff = panHandoffSec > 0 &&
+            audioSec >= currentBeat.startTime &&
+            audioSec < currentBeat.startTime + panHandoffSec &&
+            Math.abs(currentBeat.startTime - cameraPanEnd) < 0.05;
+
+          if (inPanHandoff) {
+            const t = Math.min(1, (audioSec - currentBeat.startTime) / panHandoffSec);
+            const eased = 0.5 - 0.5 * Math.cos(t * Math.PI);
+            const target = beatPanTarget(currentIdx);
+            camX = cameraPanEndX + (target.x - cameraPanEndX) * eased;
+            camY = cameraPanY + (target.y - cameraPanY) * eased;
+            zoom = cameraPanZoom + (target.zoom - cameraPanZoom) * eased;
+          } else if (transition) {
             const beatDur = currentBeat.endTime - currentBeat.startTime;
             const transSec = Math.min(transition.duration, beatDur * 0.9);
             const transEnd = currentBeat.startTime + transSec;
@@ -1497,7 +1547,7 @@ export default function BuilderPage() {
                 <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
                 {introPanDuration === null && (
                   <button
-                    onClick={() => { setIntroPanStart(0); setIntroPanDuration(3); }}
+                    onClick={() => setCameraPanDuration(Math.min(3, Math.max(0.5, duration - 0.1)))}
                     style={{ ...miniButton, padding: '2px 8px', fontSize: 12 }}
                     title="Add a timed camera pan across the board">↔ pan</button>
                 )}
@@ -1529,27 +1579,19 @@ export default function BuilderPage() {
                             </button>
                           )}
                           <button
-                            onClick={() => setIntroPanDuration(null)}
+                            onClick={removeCameraPan}
                             style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}>×</button>
                         </div>
                       </div>
                       <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", marginBottom: 6 }}>
-                        constant-zoom board pan from {introPanStart.toFixed(1)}–{Math.min(introPanStart + introPanDuration, duration || introPanStart + introPanDuration).toFixed(1)}s
+                        constant-zoom board pan from 0.0–{Math.min(introPanDuration, duration || introPanDuration).toFixed(1)}s
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>start</span>
-                        <input
-                          type="number" step="0.1" min="0" max={duration.toFixed(1)}
-                          value={introPanStart}
-                          onChange={e => setIntroPanStart(Math.max(0, Math.min(duration, parseFloat(e.target.value) || 0)))}
-                          onClick={e => e.stopPropagation()}
-                          style={{ width: 52, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
-                        />
                         <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>duration</span>
                         <input
                           type="number" step="0.5" min="0.5" max="20"
                           value={introPanDuration}
-                          onChange={e => setIntroPanDuration(Math.max(0.5, Math.min(Math.max(0.5, duration - introPanStart), parseFloat(e.target.value) || 3)))}
+                          onChange={e => setCameraPanDuration(parseFloat(e.target.value) || 3)}
                           onClick={e => e.stopPropagation()}
                           style={{ width: 52, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
                         />
