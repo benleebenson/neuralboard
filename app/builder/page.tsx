@@ -1206,6 +1206,7 @@ export default function BuilderPage() {
       }
 
       let prevRenderBeatIdx = -1;
+      let wasInCameraPan = false;
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
         const audioSec = Math.max(0, elapsedSec);
@@ -1217,8 +1218,26 @@ export default function BuilderPage() {
         }
 
         let camX: number, camY: number, zoom: number;
+        const inCameraPan = introPanDuration !== null && audioSec >= cameraPanStart && audioSec < cameraPanEnd && cardCenters.length > 0;
 
-        if (introPanDuration !== null && audioSec >= cameraPanStart && audioSec < cameraPanEnd && cardCenters.length > 0) {
+        if (inCameraPan && !wasInCameraPan) {
+          for (const vid of videoEls) {
+            if (!vid) continue;
+            vid.currentTime = 0;
+            vid.play().catch(() => {});
+          }
+          wasInCameraPan = true;
+        } else if (!inCameraPan && wasInCameraPan) {
+          for (const vid of videoEls) {
+            if (!vid) continue;
+            vid.pause();
+            vid.currentTime = 0;
+          }
+          prevRenderBeatIdx = -1;
+          wasInCameraPan = false;
+        }
+
+        if (inCameraPan) {
           const t = (audioSec - cameraPanStart) / Math.max(0.001, cameraPanEnd - cameraPanStart);
           const eased = 0.5 - 0.5 * Math.cos(t * Math.PI);
           camX = cameraPanStartX + (cameraPanEndX - cameraPanStartX) * eased;
