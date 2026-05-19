@@ -50,7 +50,10 @@ type YtModalView = 'search' | 'trim';
 
 // Railway config is loaded server-side via /api/config after login
 const CARD_W = 130;
-const CARD_H = 170;
+// Height the "card" (Polaroid) wrapper adds around the media, in CSS px.
+// border-top 1.5 + padding-top 6 + img-wrapper margin-bottom 6 + label 22 + border-bottom 1.5
+// If you change the Polaroid card layout (~line 1661), update this constant too.
+const CARD_STYLE_CHROME_H = 37;
 
 export default function BuilderPage() {
   const { data: session, status } = useSession();
@@ -921,10 +924,24 @@ export default function BuilderPage() {
       const boardDisplayH = boardEl ? boardEl.getBoundingClientRect().height : 600;
       const VIDEO_CARD_W = 720;
       const scale = VIDEO_CARD_W / CARD_W;
-      const cardCenters = beats.map((b, i) => ({
-        x: ((b.pos?.x ?? (40 + (i % 3) * 160)) + (b.size ?? CARD_W) / 2) * scale,
-        y: ((b.pos?.y ?? (40 + Math.floor(i / 3) * 210)) + CARD_H / 2) * scale,
-      }));
+      const cardCenters = beats.map((b, i) => {
+        const cardW = b.size ?? CARD_W;
+        const vid = videoEls[i];
+        const img = images[i];
+        let mediaH: number;
+        if (vid && vid.videoWidth) {
+          mediaH = cardW * vid.videoHeight / vid.videoWidth;
+        } else if (img) {
+          mediaH = cardW * img.naturalHeight / img.naturalWidth;
+        } else {
+          mediaH = 80;
+        }
+        const actualH = cardStyle === "bare" ? mediaH : mediaH + CARD_STYLE_CHROME_H;
+        return {
+          x: ((b.pos?.x ?? (40 + (i % 3) * 160)) + cardW / 2) * scale,
+          y: ((b.pos?.y ?? (40 + Math.floor(i / 3) * 210)) + actualH / 2) * scale,
+        };
+      });
       const boardWidth = boardDisplayW * scale + W;
       const boardHeight = boardDisplayH * scale + H;
       const boardCenterX = cardCenters.reduce((s, c) => s + c.x, 0) / (cardCenters.length || 1);
