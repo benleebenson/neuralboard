@@ -15,7 +15,9 @@ type SubBeat = {
   imageUrl: string;
   appearTime: number;
   pos?: { x: number; y: number };
+  compPos?: { x: number; y: number };
   size?: number;
+  compSize?: number;
 };
 
 type Beat = {
@@ -36,6 +38,7 @@ type Beat = {
 
 type Background = "cork" | "beige" | "graph" | "custom";
 type CardStyle = "card" | "bare";
+type AppMode = "board" | "compilation";
 type Stroke = { color: string; size: number; points: Array<{ x: number; y: number }> };
 
 type OverlayType = "text" | "arrow" | "circle";
@@ -94,6 +97,7 @@ export default function BuilderPage() {
   const [rendering, setRendering] = useState(false);
   const [renderStatus, setRenderStatus] = useState("");
   const [mp4Url, setMp4Url] = useState("");
+  const [appMode, setAppMode] = useState<AppMode>("board");
 
   const [activeBeatIdx, setActiveBeatIdx] = useState(0);
   const [editingBeatIdx, setEditingBeatIdx] = useState<number | null>(null);
@@ -152,6 +156,8 @@ export default function BuilderPage() {
   const subBeatImageInputRef = useRef<HTMLInputElement | null>(null);
   const uploadSubBeatBeatIdxRef = useRef<number>(-1);
   const subBeatDragRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  const compPreviewRef = useRef<HTMLDivElement | null>(null);
+  const compSubBeatDragRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number; currentSize: number } | null>(null);
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
@@ -1098,6 +1104,66 @@ export default function BuilderPage() {
 
       setRenderStatus("Rendering frames...");
 
+      if (appMode === "compilation") {
+        let prevRenderBeatIdx = -1;
+        function drawCompilationFrame() {
+          const elapsedSec = (performance.now() - startMs) / 1000;
+          const audioSec = Math.max(0, elapsedSec);
+
+          if (elapsedSec >= safeDuration) {
+            renderRecorder.stop();
+            audioEl.pause();
+            for (const vid of videoEls) vid?.pause();
+            return;
+          }
+
+          const idx = beats.findIndex((b) => audioSec >= b.startTime && audioSec < b.endTime);
+          const currentIdx = idx >= 0 ? idx : beats.length - 1;
+
+          if (currentIdx !== prevRenderBeatIdx) {
+            if (prevRenderBeatIdx >= 0 && videoEls[prevRenderBeatIdx]) {
+              videoEls[prevRenderBeatIdx]!.pause();
+            }
+            if (videoEls[currentIdx]) {
+              videoEls[currentIdx]!.currentTime = 0;
+              videoEls[currentIdx]!.play().catch(() => {});
+            }
+            prevRenderBeatIdx = currentIdx;
+          }
+
+          ctx!.fillStyle = "#000";
+          ctx!.fillRect(0, 0, W, H);
+          const mediaEl: CanvasImageSource | null = videoEls[currentIdx] ?? images[currentIdx];
+          drawMediaContain(ctx!, mediaEl, 0, 0, W, H, "#111");
+
+          for (const sb of beats[currentIdx]?.subBeats ?? []) {
+            if (audioSec < sb.appearTime) continue;
+            const sbImg = subBeatImages[currentIdx]?.get(sb.id) ?? null;
+            if (!sbImg) continue;
+            const elapsed = audioSec - sb.appearTime;
+            const progress = Math.min(1, elapsed / 0.3);
+            const size = sb.compSize ?? 260;
+            const pos = sb.compPos ?? { x: W / 2 - size / 2, y: H * 0.16 };
+            const h = sbImg.naturalWidth > 0 ? size * sbImg.naturalHeight / sbImg.naturalWidth : size;
+            const cx = pos.x + size / 2;
+            const cy = pos.y + h / 2;
+            ctx!.save();
+            ctx!.globalAlpha = progress;
+            ctx!.translate(cx, cy);
+            ctx!.scale(0.5 + 0.5 * progress, 0.5 + 0.5 * progress);
+            ctx!.translate(-cx, -cy);
+            ctx!.shadowColor = "rgba(0,0,0,0.45)";
+            ctx!.shadowBlur = 18;
+            ctx!.shadowOffsetX = 6;
+            ctx!.shadowOffsetY = 8;
+            ctx!.drawImage(sbImg, pos.x, pos.y, size, h);
+            ctx!.restore();
+          }
+
+          requestAnimationFrame(drawCompilationFrame);
+        }
+        requestAnimationFrame(drawCompilationFrame);
+      } else {
       // Derive camera positions from the live board layout. This keeps export camera
       // targets aligned with the board the user actually arranged.
       const boardEl = boardRef.current;
@@ -1436,6 +1502,7 @@ export default function BuilderPage() {
         requestAnimationFrame(drawFrame);
       }
       requestAnimationFrame(drawFrame);
+      }
 
       const webmBlob = await recordingDone;
       audioCtx.close();
@@ -1519,6 +1586,21 @@ export default function BuilderPage() {
         </div>
       </header>
 
+      <div style={{ display: "flex", gap: 8, padding: "10px 22px", borderBottom: "1px solid rgba(42,42,42,0.15)", background: "rgba(255,253,245,0.6)" }}>
+        {(["board", "compilation"] as AppMode[]).map(mode => {
+          const active = appMode === mode;
+          return (
+            <button key={mode}
+              onClick={() => { setAppMode(mode); setDrawMode(false); }}
+              style={{ ...miniButton, padding: "5px 12px", fontWeight: 700,
+                background: active ? "#2a2a2a" : "transparent",
+                color: active ? "#fffdf5" : "#2a2a2a" }}>
+              {mode === "board" ? "board" : "compilation"}
+            </button>
+          );
+        })}
+      </div>
+
       <div style={splitStyle}>
         <section style={leftPanelStyle}>
           <SectionLabel n="1" title="Audio" />
@@ -1558,13 +1640,13 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 ? (
+          {appMode === "board" && beats.length > 0 ? (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
                 <span style={{ fontFamily: "'Caveat', cursive", fontSize: 22, color: '#2a2a2a', fontWeight: 700 }}>3. Beats</span>
                 <div style={{ flex: 1, height: 1, background: '#2a2a2a', opacity: 0.2 }} />
                 <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
-                {introPanDuration === null && (
+                {appMode === "board" && introPanDuration === null && (
                   <button
                     onClick={() => setCameraPanDuration(Math.min(3, Math.max(0.5, duration - 0.1)))}
                     style={{ ...miniButton, padding: '2px 8px', fontSize: 12 }}
@@ -1572,7 +1654,7 @@ export default function BuilderPage() {
                 )}
                 <button onClick={addCustomBeat} style={{ ...miniButton, fontWeight: 700, padding: '2px 8px', fontSize: 12 }} title="Add a custom beat">+</button>
               </div>
-              {introPanDuration !== null && (
+              {appMode === "board" && introPanDuration !== null && (
                 <div style={{ ...beatCardStyle, background: "rgba(200,241,53,0.08)", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #b0d020", marginBottom: 8 }}>
                   <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                     <div style={{ width: 56, height: 56, border: "1.5px solid #2a2a2a", flexShrink: 0, background: "#2a2a2a",
@@ -1725,7 +1807,7 @@ export default function BuilderPage() {
                           )}
                         </div>
                         {/* Camera options */}
-                        <div style={{ marginTop: 6, borderTop: "1px dashed rgba(42,42,42,0.15)", paddingTop: 5 }}>
+                        {appMode === "board" && <div style={{ marginTop: 6, borderTop: "1px dashed rgba(42,42,42,0.15)", paddingTop: 5 }}>
                           <button
                             onClick={e => { e.stopPropagation(); setExpandedBeatIdx(expandedBeatIdx === i ? null : i); }}
                             style={{ ...miniButton, fontSize: 9, padding: "2px 6px" }}>
@@ -1749,7 +1831,7 @@ export default function BuilderPage() {
                               })}
                             </div>
                           )}
-                        </div>
+                        </div>}
                         {/* Sub-beat add button */}
                         <div style={{ marginTop: 5 }}>
                           <button
@@ -1794,7 +1876,7 @@ export default function BuilderPage() {
                       </button>
                     </div>
                   ))}
-                  {i < beats.length - 1 && (
+                  {appMode === "board" && i < beats.length - 1 && (
                     nextTransition ? (
                       <div style={{ marginLeft: 20, marginBottom: 6, padding: "7px 10px", border: "1px dashed #2a2a2a",
                         background: "rgba(200,241,53,0.06)", display: "flex", alignItems: "center", gap: 8 }}>
@@ -1831,7 +1913,7 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 ? (
+          {appMode === "board" && beats.length > 0 ? (
             <>
               <SectionLabel n="4" title="Background" />
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 24 }}>
@@ -1870,7 +1952,7 @@ export default function BuilderPage() {
 
           {beats.length > 0 && audioBlob && config?.railwayUrl ? (
             <button onClick={renderVideo} disabled={rendering} style={renderButtonStyle}>
-              {rendering ? (renderStatus || "RENDERING...") : "RENDER VIDEO"}
+              {rendering ? (renderStatus || "RENDERING...") : appMode === "compilation" ? "RENDER COMPILATION" : "RENDER VIDEO"}
             </button>
           ) : beats.length > 0 && audioBlob && !config?.railwayUrl ? (
             <div style={{ marginTop: 12, padding: "10px 12px", border: "1.5px dashed #2a2a2a", fontSize: 11, fontFamily: "monospace", color: "#6a6a6a" }}>
@@ -1915,8 +1997,79 @@ export default function BuilderPage() {
         </section>
 
         <section style={{ ...rightPanelStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
+          {appMode === "compilation" && (
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#101010", padding: 18 }}>
+              <div
+                ref={compPreviewRef}
+                style={{ position: "relative", aspectRatio: "9 / 16", height: "min(calc(100vh - 130px), 860px)", maxWidth: "100%", background: "#000", overflow: "hidden", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)" }}
+              >
+                {activeBeat ? (() => {
+                  const displayImg = activeBeat.customImageUrl ?? activeBeat.images?.[activeBeat.selectedImageIdx ?? 0];
+                  return activeBeat.customVideoUrl ? (
+                    <video src={activeBeat.customVideoUrl} muted playsInline autoPlay loop style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }} />
+                  ) : displayImg ? (
+                    <img src={displayImg} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }} />
+                  ) : (
+                    <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontFamily: "monospace", fontSize: 14, padding: 20, textAlign: "center" }}>
+                      {activeBeat.searchQuery}
+                    </div>
+                  );
+                })() : (
+                  <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#777", fontFamily: "monospace", fontSize: 13 }}>
+                    record or upload audio
+                  </div>
+                )}
+                {(activeBeat?.subBeats ?? []).map((sb, sbIdx) => {
+                  const preview = compPreviewRef.current;
+                  const rect = preview?.getBoundingClientRect();
+                  const sx = rect ? rect.width / 1080 : 1;
+                  const sy = rect ? rect.height / 1920 : 1;
+                  const size = sb.compSize ?? 260;
+                  const pos = sb.compPos ?? { x: 1080 / 2 - size / 2, y: 1920 * 0.16 };
+                  return (
+                    <div key={sb.id}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        compSubBeatDragRef.current = {
+                          id: sb.id, beatIdx: activeBeatIdx, sbIdx,
+                          ox: e.clientX, oy: e.clientY,
+                          startX: pos.x, startY: pos.y,
+                          currentX: pos.x, currentY: pos.y,
+                        };
+                      }}
+                      onPointerMove={(e) => {
+                        const d = compSubBeatDragRef.current;
+                        if (!d || d.id !== sb.id) return;
+                        const r = compPreviewRef.current?.getBoundingClientRect();
+                        if (!r) return;
+                        d.currentX = Math.max(0, Math.min(1080 - size, d.startX + (e.clientX - d.ox) / (r.width / 1080)));
+                        d.currentY = Math.max(0, Math.min(1920 - size, d.startY + (e.clientY - d.oy) / (r.height / 1920)));
+                        const el = e.currentTarget as HTMLDivElement;
+                        el.style.left = d.currentX * (r.width / 1080) + "px";
+                        el.style.top = d.currentY * (r.height / 1920) + "px";
+                      }}
+                      onPointerUp={() => {
+                        const d = compSubBeatDragRef.current;
+                        if (!d || d.id !== sb.id) return;
+                        setBeats(prev => prev.map((beat, bi) => bi !== d.beatIdx ? beat : {
+                          ...beat,
+                          subBeats: (beat.subBeats ?? []).map((s, si) => si === d.sbIdx ? { ...s, compPos: { x: d.currentX, y: d.currentY } } : s),
+                        }));
+                        compSubBeatDragRef.current = null;
+                      }}
+                      onPointerCancel={() => { compSubBeatDragRef.current = null; }}
+                      style={{ position: "absolute", left: pos.x * sx, top: pos.y * sy, width: size * sx, cursor: "grab", filter: "drop-shadow(0 6px 12px rgba(0,0,0,0.45))", outline: "1px solid rgba(200,241,53,0.7)" }}
+                    >
+                      <img src={sb.imageUrl} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {/* Draw toolbar */}
-          <div style={drawToolbarStyle}>
+          <div style={{ ...drawToolbarStyle, display: appMode === "board" ? "flex" : "none" }}>
             <button
               onClick={() => setDrawMode((d) => !d)}
               style={{ ...miniButton, background: drawMode ? "#c8f135" : "transparent", fontWeight: 700, padding: "4px 10px" }}>
@@ -1964,7 +2117,7 @@ export default function BuilderPage() {
             onPointerMove={handleBoardPointerMove}
             onPointerUp={handleBoardPointerUp}
             onPointerCancel={handleBoardPointerUp}
-            style={boardStyle(background, customBgUrl)}
+            style={{ ...boardStyle(background, customBgUrl), display: appMode === "board" ? undefined : "none" }}
           >
             {beats.length === 0 ? (
               <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
@@ -2507,6 +2660,25 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   }
   ctx.fillStyle = "#f5f1e8";
   ctx.fillRect(0, 0, W, H);
+}
+
+function drawMediaContain(ctx: CanvasRenderingContext2D, media: CanvasImageSource | null, x: number, y: number, w: number, h: number, fallbackColor = "#111") {
+  if (!media) {
+    ctx.fillStyle = fallbackColor;
+    ctx.fillRect(x, y, w, h);
+    return;
+  }
+  const srcW = media instanceof HTMLVideoElement ? media.videoWidth : (media as HTMLImageElement).naturalWidth || (media as HTMLImageElement).width;
+  const srcH = media instanceof HTMLVideoElement ? media.videoHeight : (media as HTMLImageElement).naturalHeight || (media as HTMLImageElement).height;
+  if (!srcW || !srcH) {
+    ctx.fillStyle = fallbackColor;
+    ctx.fillRect(x, y, w, h);
+    return;
+  }
+  const scale = Math.min(w / srcW, h / srcH);
+  const drawW = srcW * scale;
+  const drawH = srcH * scale;
+  ctx.drawImage(media, x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH);
 }
 
 function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720, cardHeight = 960, style: "card" | "bare" = "card") {
