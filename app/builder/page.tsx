@@ -53,6 +53,15 @@ type Overlay = {
   fontSize?: number;
 };
 
+type RenderCardLayout = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  cx: number;
+  cy: number;
+};
+
 
 type YtSearchResult = { id: string; title: string; channel: string; duration: string | number; thumbnail: string };
 type YtModalView = 'search' | 'trim';
@@ -1039,46 +1048,78 @@ export default function BuilderPage() {
       renderRecorder.start();
       audioEl.currentTime = 0;
       const startMs = performance.now();
-      const INTRO_SEC = introPanDuration ?? 0;
+      const INTRO_SEC = Math.min(introPanDuration ?? 0, safeDuration);
       try { await audioEl.play(); } catch {}
 
       setRenderStatus("Rendering frames...");
 
-      const N = beats.length;
-      // Derive camera positions from board layout — same scale used for strokes
+      // Derive camera positions from the live board layout. This keeps export camera
+      // targets aligned with the board the user actually arranged.
       const boardEl = boardRef.current;
       const boardDisplayW = boardEl ? boardEl.getBoundingClientRect().width : 800;
       const boardDisplayH = boardEl ? boardEl.getBoundingClientRect().height : 600;
       const VIDEO_CARD_W = 720;
       const scale = VIDEO_CARD_W / CARD_W;
-      const cardCenters = beats.map((b, i) => {
-        const cardW = b.size ?? CARD_W;
-        const vid = videoEls[i];
-        const img = images[i];
-        let mediaH: number;
-        if (vid && vid.videoWidth) {
-          mediaH = cardW * vid.videoHeight / vid.videoWidth;
-        } else if (img) {
-          mediaH = cardW * img.naturalHeight / img.naturalWidth;
-        } else {
-          mediaH = 80;
-        }
-        const actualH = cardStyle === "bare" ? mediaH : mediaH + CARD_STYLE_CHROME_H;
+      const cardLayouts: RenderCardLayout[] = beats.map((b, i) => {
+        const fallbackX = b.pos?.x ?? (40 + (i % 3) * 160);
+        const fallbackY = b.pos?.y ?? (40 + Math.floor(i / 3) * 210);
+        const fallbackW = b.size ?? CARD_W;
+        const fallbackMedia = videoEls[i] ?? images[i];
+        const fallbackMediaW = fallbackMedia instanceof HTMLVideoElement
+          ? fallbackMedia.videoWidth
+          : fallbackMedia instanceof HTMLImageElement
+          ? fallbackMedia.naturalWidth
+          : 0;
+        const fallbackMediaH = fallbackMedia instanceof HTMLVideoElement
+          ? fallbackMedia.videoHeight
+          : fallbackMedia instanceof HTMLImageElement
+          ? fallbackMedia.naturalHeight
+          : 0;
+        const fallbackH = fallbackMediaW > 0
+          ? fallbackW * fallbackMediaH / fallbackMediaW + (cardStyle === "card" ? CARD_STYLE_CHROME_H : 0)
+          : fallbackW;
+        const el = cardElemsRef.current.get(i);
+        const w = el?.offsetWidth || fallbackW;
+        const h = el?.offsetHeight || fallbackH;
+        const x = fallbackX * scale;
+        const y = fallbackY * scale;
+        const sw = w * scale;
+        const sh = h * scale;
         return {
-          x: ((b.pos?.x ?? (40 + (i % 3) * 160)) + cardW / 2) * scale,
-          y: ((b.pos?.y ?? (40 + Math.floor(i / 3) * 210)) + actualH / 2) * scale,
+          x,
+          y,
+          w: sw,
+          h: sh,
+          cx: x + sw / 2,
+          cy: y + sh / 2,
         };
       });
+      const cardCenters = cardLayouts.map(({ cx, cy }) => ({ x: cx, y: cy }));
+      const boardBounds = cardLayouts.length
+        ? cardLayouts.reduce((acc, r) => ({
+            minX: Math.min(acc.minX, r.x),
+            minY: Math.min(acc.minY, r.y),
+            maxX: Math.max(acc.maxX, r.x + r.w),
+            maxY: Math.max(acc.maxY, r.y + r.h),
+          }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity })
+        : { minX: 0, minY: 0, maxX: boardDisplayW * scale, maxY: boardDisplayH * scale };
       const boardWidth = boardDisplayW * scale + W;
       const boardHeight = boardDisplayH * scale + H;
-      const boardCenterX = cardCenters.reduce((s, c) => s + c.x, 0) / (cardCenters.length || 1);
-      const boardCenterY = cardCenters.reduce((s, c) => s + c.y, 0) / (cardCenters.length || 1);
+      const boardCenterX = (boardBounds.minX + boardBounds.maxX) / 2;
+      const boardCenterY = (boardBounds.minY + boardBounds.maxY) / 2;
+      const introFitZoom = Math.max(0.35, Math.min(1, (W * 0.82) / Math.max(1, boardBounds.maxX - boardBounds.minX), (H * 0.82) / Math.max(1, boardBounds.maxY - boardBounds.minY)));
+      const introViewW = W / introFitZoom;
+      const introViewH = H / introFitZoom;
+      const introStartX = boardBounds.maxX - boardBounds.minX > introViewW ? boardBounds.minX + introViewW / 2 : boardCenterX;
+      const introEndX = boardBounds.maxX - boardBounds.minX > introViewW ? boardBounds.maxX - introViewW / 2 : boardCenterX;
+      const introStartY = boardBounds.maxY - boardBounds.minY > introViewH ? boardBounds.minY + introViewH / 2 : boardCenterY;
+      const introEndY = boardBounds.maxY - boardBounds.minY > introViewH ? boardBounds.maxY - introViewH / 2 : boardCenterY;
 
       // Where the camera arrives at the start of the settle phase for a given beat
       function beatPanTarget(bidx: number): { x: number; y: number; zoom: number } {
         if (bidx < 0 || bidx >= beats.length) return { x: cardCenters[0]?.x ?? 0, y: cardCenters[0]?.y ?? 0, zoom: 1 };
-        const b = beats[bidx]; const c = cardCenters[bidx];
-        const bw = (b.size ?? CARD_W) * scale;
+        const b = beats[bidx]; const c = cardCenters[bidx]; const layout = cardLayouts[bidx];
+        const bw = layout?.w ?? ((b.size ?? CARD_W) * scale);
         const m = b.cameraMode ?? "default";
         if (m === "pan-right") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
         if (m === "pan-left") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
@@ -1087,8 +1128,8 @@ export default function BuilderPage() {
       // Where the camera ends up at the end of the settle phase for a given beat
       function beatEndCam(bidx: number): { x: number; y: number; zoom: number } {
         if (bidx < 0 || bidx >= beats.length) return { x: cardCenters[0]?.x ?? 0, y: cardCenters[0]?.y ?? 0, zoom: 1 };
-        const b = beats[bidx]; const c = cardCenters[bidx];
-        const bw = (b.size ?? CARD_W) * scale;
+        const b = beats[bidx]; const c = cardCenters[bidx]; const layout = cardLayouts[bidx];
+        const bw = layout?.w ?? ((b.size ?? CARD_W) * scale);
         const m = b.cameraMode ?? "default";
         if (m === "pan-right") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
         if (m === "pan-left") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
@@ -1099,9 +1140,9 @@ export default function BuilderPage() {
       let prevRenderBeatIdx = -1;
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
-        const audioSec = Math.max(0, elapsedSec - INTRO_SEC);
+        const audioSec = Math.max(0, elapsedSec);
 
-        if (elapsedSec >= INTRO_SEC + safeDuration) {
+        if (elapsedSec >= safeDuration) {
           renderRecorder.stop();
           audioEl.pause();
           return;
@@ -1109,29 +1150,23 @@ export default function BuilderPage() {
 
         let camX: number, camY: number, zoom: number;
 
-        if (elapsedSec < INTRO_SEC && cardCenters.length > 0) {
-          // Pan across all cards, then sweep back to card 1
-          const t = elapsedSec / INTRO_SEC;
-          const panEnd = 0.75; // first 75% of intro pans through all cards
-          if (t < panEnd) {
-            const p = t / panEnd;
-            const eased = 0.5 - 0.5 * Math.cos(p * Math.PI);
-            const cardIdx = eased * (cardCenters.length - 1);
-            const lo = Math.floor(cardIdx);
-            const hi = Math.min(lo + 1, cardCenters.length - 1);
-            const frac = cardIdx - lo;
-            camX = cardCenters[lo].x + (cardCenters[hi].x - cardCenters[lo].x) * frac;
-            camY = cardCenters[lo].y + (cardCenters[hi].y - cardCenters[lo].y) * frac;
-            zoom = 0.75 + 0.25 * eased;
+        if (audioSec < INTRO_SEC && cardCenters.length > 0) {
+          const t = audioSec / INTRO_SEC;
+          const eased = 0.5 - 0.5 * Math.cos(t * Math.PI);
+          const first = beatPanTarget(0);
+          const scanX = introStartX + (introEndX - introStartX) * eased;
+          const scanY = introStartY + (introEndY - introStartY) * eased;
+          const settleStart = 0.82;
+          if (t < settleStart) {
+            camX = scanX;
+            camY = scanY;
+            zoom = introFitZoom;
           } else {
-            // Ease back to first card
-            const p = (t - panEnd) / (1 - panEnd);
-            const eased = 0.5 - 0.5 * Math.cos(p * Math.PI);
-            const last = cardCenters[cardCenters.length - 1];
-            const first = cardCenters[0];
-            camX = last.x + (first.x - last.x) * eased;
-            camY = last.y + (first.y - last.y) * eased;
-            zoom = 1;
+            const p = (t - settleStart) / (1 - settleStart);
+            const settle = 0.5 - 0.5 * Math.cos(p * Math.PI);
+            camX = scanX + (first.x - scanX) * settle;
+            camY = scanY + (first.y - scanY) * settle;
+            zoom = introFitZoom + (first.zoom - introFitZoom) * settle;
           }
         } else {
           // Normal beat playback
@@ -1214,12 +1249,12 @@ export default function BuilderPage() {
         ctx!.translate(-camX, -camY);
 
         for (let i = 0; i < beats.length; i++) {
+          const layout = cardLayouts[i];
           const center = cardCenters[i];
           const cardScreenX = (center.x - camX) * zoom + W / 2;
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
           const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
-          const beatCardW = (beats[i].size ?? CARD_W) * scale;
-          drawCardAt(ctx!, mediaEl, center.x, center.y, i, beats[i].searchQuery, beatCardW, cardStyle);
+          drawCardAt(ctx!, mediaEl, layout.x, layout.y, i, beats[i].searchQuery, layout.w, layout.h, cardStyle);
 
           // Draw sub-beats that have already appeared during this beat's window
           for (const sb of beats[i].subBeats ?? []) {
@@ -1233,7 +1268,7 @@ export default function BuilderPage() {
             const sbNatH = sbImg ? sbImg.naturalHeight : sbImg === null ? 0 : 0;
             const sbNatW = sbImg ? sbImg.naturalWidth : 0;
             const sbH = sbNatW > 0 ? sbW * sbNatH / sbNatW : sbW;
-            const sbPosX = sb.pos ? sb.pos.x * scale : center.x + beatCardW / 2 + 14 * scale;
+            const sbPosX = sb.pos ? sb.pos.x * scale : layout.x + layout.w + 14 * scale;
             const sbPosY = sb.pos ? sb.pos.y * scale : center.y;
             const sbCx = sbPosX + sbW / 2;
             const sbCy = sbPosY + sbH / 2;
@@ -1454,12 +1489,28 @@ export default function BuilderPage() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                         <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>INTRO PAN</span>
-                        <button
-                          onClick={() => setIntroPanDuration(null)}
-                          style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}>×</button>
+                        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                          {audioBlob && (
+                            <button
+                              onClick={e => {
+                                e.stopPropagation();
+                                const introEnd = Math.min(introPanDuration ?? 0, duration);
+                                playingBeatIdx === -1
+                                  ? stopPreview()
+                                  : playBeatPreview(-1, { startTime: 0, endTime: introEnd, searchQuery: "intro pan", reasoning: "" });
+                              }}
+                              style={{ ...miniButton, padding: "0 4px", fontSize: 11, lineHeight: "14px" }}
+                              title={playingBeatIdx === -1 ? "Stop preview" : "Preview intro pan audio"}>
+                              {playingBeatIdx === -1 ? "⏸" : "▶"}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => setIntroPanDuration(null)}
+                            style={{ ...miniButton, padding: "0 4px", color: "#ff3a3a", borderColor: "#ff3a3a", lineHeight: "14px", fontSize: 13 }}>×</button>
+                        </div>
                       </div>
                       <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", marginBottom: 6 }}>
-                        pans across all cards before beats
+                        pans across all cards from 0.0–{Math.min(introPanDuration, duration || introPanDuration).toFixed(1)}s
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                         <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>duration</span>
@@ -2340,14 +2391,17 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
-function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720, style: "card" | "bare" = "card") {
+function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null, worldX: number, worldY: number, beatIdx: number, fallbackText: string, cardWidth = 720, cardHeight = 960, style: "card" | "bare" = "card") {
   const cardW = cardWidth;
-  const rotation = (((beatIdx * 137) % 60) - 30) / 100;
+  const cardH = cardHeight;
+  const rotationDeg = ((((beatIdx * 137) % 60) - 30) / 10) * 0.4;
+  const rotation = rotationDeg * Math.PI / 180;
 
   if (style === "bare") {
     ctx.save();
-    ctx.translate(worldX, worldY);
-    ctx.rotate(rotation * 0.4);
+    ctx.translate(worldX + cardW / 2, worldY);
+    ctx.rotate(rotation);
+    ctx.translate(-cardW / 2, 0);
     ctx.shadowColor = "rgba(0,0,0,0.4)";
     ctx.shadowBlur = 20;
     ctx.shadowOffsetX = 6;
@@ -2355,52 +2409,43 @@ function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null
     if (img) {
       const srcW = img instanceof HTMLVideoElement ? img.videoWidth : (img as HTMLImageElement).naturalWidth;
       const srcH = img instanceof HTMLVideoElement ? img.videoHeight : (img as HTMLImageElement).naturalHeight;
-      const maxW = cardW;
-      const maxH = cardW * (960 / 720);
-      const aspect = srcW / srcH;
-      const drawW = aspect >= maxW / maxH ? maxW : maxH * aspect;
-      const drawH = aspect >= maxW / maxH ? maxW / aspect : maxH;
-      ctx.drawImage(img, 0, 0, srcW, srcH, -drawW / 2, -drawH / 2, drawW, drawH);
+      ctx.drawImage(img, 0, 0, srcW, srcH, 0, 0, cardW, cardH);
     } else {
-      const fbH = cardW * (960 / 720);
       ctx.fillStyle = "#1a1a1a";
-      ctx.fillRect(-cardW / 2, -fbH / 2, cardW, fbH);
+      ctx.fillRect(0, 0, cardW, cardH);
     }
     ctx.restore();
     return;
   }
 
-  const cardH = Math.round(cardW * (960 / 720));
-  const borderW = 18;
+  const borderW = 8 * (cardW / 130);
+  const labelH = 22 * (cardW / 130);
+  const marginBottom = 6 * (cardW / 130);
 
   ctx.save();
-  ctx.translate(worldX, worldY);
-  ctx.rotate(rotation * 0.4);
+  ctx.translate(worldX + cardW / 2, worldY);
+  ctx.rotate(rotation);
+  ctx.translate(-cardW / 2, 0);
   ctx.shadowColor = "rgba(0,0,0,0.4)";
   ctx.shadowBlur = 30;
   ctx.shadowOffsetX = 8;
   ctx.shadowOffsetY = 12;
   ctx.fillStyle = "#fafafa";
-  ctx.fillRect(-cardW / 2, -cardH / 2, cardW, cardH);
+  ctx.fillRect(0, 0, cardW, cardH);
   ctx.shadowColor = "transparent";
   ctx.shadowBlur = 0;
   ctx.shadowOffsetX = 0;
   ctx.shadowOffsetY = 0;
 
   const imgW = cardW - borderW * 2;
-  const imgH = cardH - borderW * 2 - 80;
-  const imgX = -cardW / 2 + borderW;
-  const imgY = -cardH / 2 + borderW;
+  const imgH = Math.max(1, cardH - borderW * 2 - labelH - marginBottom);
+  const imgX = borderW;
+  const imgY = borderW;
 
   if (img) {
     const srcW = img instanceof HTMLVideoElement ? img.videoWidth : (img as HTMLImageElement).width;
     const srcH = img instanceof HTMLVideoElement ? img.videoHeight : (img as HTMLImageElement).height;
-    const imgRatio = srcW / srcH;
-    const slotRatio = imgW / imgH;
-    let sx = 0, sy = 0, sw = srcW, sh = srcH;
-    if (imgRatio > slotRatio) { sw = srcH * slotRatio; sx = (srcW - sw) / 2; }
-    else { sh = srcW / slotRatio; sy = (srcH - sh) / 2; }
-    ctx.drawImage(img, sx, sy, sw, sh, imgX, imgY, imgW, imgH);
+    ctx.drawImage(img, 0, 0, srcW, srcH, imgX, imgY, imgW, imgH);
   } else {
     ctx.fillStyle = "#1a1a1a";
     ctx.fillRect(imgX, imgY, imgW, imgH);
@@ -2420,6 +2465,18 @@ function drawCardAt(ctx: CanvasRenderingContext2D, img: CanvasImageSource | null
       ctx.fillText(ln, imgX + imgW / 2, imgY + imgH / 2 + (i - lines.length / 2) * 44);
     });
   }
+  ctx.fillStyle = "#2a2a2a";
+  ctx.font = `bold ${Math.max(20, 9 * (cardW / 130))}px monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(`BEAT ${beatIdx + 1}`, cardW / 2, cardH - labelH / 2);
+  ctx.fillStyle = "#ff3a3a";
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = Math.max(1, 1 * (cardW / 130));
+  ctx.beginPath();
+  ctx.arc(cardW / 2, -6 * (cardW / 130), 5.5 * (cardW / 130), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -2617,4 +2674,3 @@ function boardStyle(background: Background, customBgUrl: string): React.CSSPrope
     touchAction: "none",
   };
 }
-
