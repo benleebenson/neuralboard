@@ -62,6 +62,13 @@ type RenderCardLayout = {
   cy: number;
 };
 
+type RenderBounds = {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+};
+
 
 type YtSearchResult = { id: string; title: string; channel: string; duration: string | number; thumbnail: string };
 type YtModalView = 'search' | 'trim';
@@ -107,6 +114,7 @@ export default function BuilderPage() {
   const [recSeconds, setRecSeconds] = useState(0);
   const [expandedBeatIdx, setExpandedBeatIdx] = useState<number | null>(null);
   const [introPanDuration, setIntroPanDuration] = useState<number | null>(null);
+  const [introPanStart, setIntroPanStart] = useState(0);
 
   const [ytModalOpen, setYtModalOpen] = useState(false);
   const [ytModalBeatIdx, setYtModalBeatIdx] = useState<number | null>(null);
@@ -1048,7 +1056,8 @@ export default function BuilderPage() {
       renderRecorder.start();
       audioEl.currentTime = 0;
       const startMs = performance.now();
-      const INTRO_SEC = Math.min(introPanDuration ?? 0, safeDuration);
+      const cameraPanStart = Math.max(0, Math.min(safeDuration, introPanStart));
+      const cameraPanEnd = Math.max(cameraPanStart, Math.min(safeDuration, cameraPanStart + (introPanDuration ?? 0)));
       try { await audioEl.play(); } catch {}
 
       setRenderStatus("Rendering frames...");
@@ -1095,25 +1104,49 @@ export default function BuilderPage() {
         };
       });
       const cardCenters = cardLayouts.map(({ cx, cy }) => ({ x: cx, y: cy }));
-      const boardBounds = cardLayouts.length
-        ? cardLayouts.reduce((acc, r) => ({
+      const subBeatLayouts = beats.flatMap((b, i) =>
+        (b.subBeats ?? []).map(sb => {
+          const img = subBeatImages[i]?.get(sb.id) ?? null;
+          const w = (sb.size ?? 80) * scale;
+          const h = img && img.naturalWidth > 0 ? w * img.naturalHeight / img.naturalWidth : w;
+          return {
+            x: (sb.pos?.x ?? ((b.pos?.x ?? 40) + (b.size ?? CARD_W) + 14)) * scale,
+            y: (sb.pos?.y ?? (b.pos?.y ?? 40)) * scale,
+            w,
+            h,
+          };
+        })
+      );
+      const visibleLayouts = [
+        ...cardLayouts,
+        ...subBeatLayouts,
+      ];
+      const boardBounds: RenderBounds = visibleLayouts.length
+        ? visibleLayouts.reduce((acc, r) => ({
             minX: Math.min(acc.minX, r.x),
             minY: Math.min(acc.minY, r.y),
             maxX: Math.max(acc.maxX, r.x + r.w),
             maxY: Math.max(acc.maxY, r.y + r.h),
           }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity })
         : { minX: 0, minY: 0, maxX: boardDisplayW * scale, maxY: boardDisplayH * scale };
+      const paddedBounds: RenderBounds = {
+        minX: boardBounds.minX - 80 * scale,
+        minY: boardBounds.minY - 80 * scale,
+        maxX: boardBounds.maxX + 80 * scale,
+        maxY: boardBounds.maxY + 80 * scale,
+      };
       const boardWidth = boardDisplayW * scale + W;
       const boardHeight = boardDisplayH * scale + H;
-      const boardCenterX = (boardBounds.minX + boardBounds.maxX) / 2;
-      const boardCenterY = (boardBounds.minY + boardBounds.maxY) / 2;
-      const introFitZoom = Math.max(0.35, Math.min(1, (W * 0.82) / Math.max(1, boardBounds.maxX - boardBounds.minX), (H * 0.82) / Math.max(1, boardBounds.maxY - boardBounds.minY)));
-      const introViewW = W / introFitZoom;
-      const introViewH = H / introFitZoom;
-      const introStartX = boardBounds.maxX - boardBounds.minX > introViewW ? boardBounds.minX + introViewW / 2 : boardCenterX;
-      const introEndX = boardBounds.maxX - boardBounds.minX > introViewW ? boardBounds.maxX - introViewW / 2 : boardCenterX;
-      const introStartY = boardBounds.maxY - boardBounds.minY > introViewH ? boardBounds.minY + introViewH / 2 : boardCenterY;
-      const introEndY = boardBounds.maxY - boardBounds.minY > introViewH ? boardBounds.maxY - introViewH / 2 : boardCenterY;
+      const boardCenterX = (paddedBounds.minX + paddedBounds.maxX) / 2;
+      const boardCenterY = (paddedBounds.minY + paddedBounds.maxY) / 2;
+      const sceneW = Math.max(1, paddedBounds.maxX - paddedBounds.minX);
+      const sceneH = Math.max(1, paddedBounds.maxY - paddedBounds.minY);
+      const cameraPanZoom = Math.max(0.22, Math.min(1, (H * 0.74) / sceneH));
+      const cameraPanViewW = W / cameraPanZoom;
+      const cameraPanViewH = H / cameraPanZoom;
+      const cameraPanStartX = sceneW > cameraPanViewW ? paddedBounds.minX + cameraPanViewW / 2 : boardCenterX;
+      const cameraPanEndX = sceneW > cameraPanViewW ? paddedBounds.maxX - cameraPanViewW / 2 : boardCenterX;
+      const cameraPanY = sceneH > cameraPanViewH ? paddedBounds.minY + cameraPanViewH / 2 : boardCenterY;
 
       // Where the camera arrives at the start of the settle phase for a given beat
       function beatPanTarget(bidx: number): { x: number; y: number; zoom: number } {
@@ -1121,8 +1154,8 @@ export default function BuilderPage() {
         const b = beats[bidx]; const c = cardCenters[bidx]; const layout = cardLayouts[bidx];
         const bw = layout?.w ?? ((b.size ?? CARD_W) * scale);
         const m = b.cameraMode ?? "default";
-        if (m === "pan-right") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
-        if (m === "pan-left") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
+        if (m === "pan-right") return { x: c.x - bw * 0.35, y: c.y, zoom: 1 };
+        if (m === "pan-left") return { x: c.x + bw * 0.35, y: c.y, zoom: 1 };
         return { x: c.x, y: c.y, zoom: 1 };
       }
       // Where the camera ends up at the end of the settle phase for a given beat
@@ -1131,8 +1164,8 @@ export default function BuilderPage() {
         const b = beats[bidx]; const c = cardCenters[bidx]; const layout = cardLayouts[bidx];
         const bw = layout?.w ?? ((b.size ?? CARD_W) * scale);
         const m = b.cameraMode ?? "default";
-        if (m === "pan-right") return { x: c.x + bw * 0.3, y: c.y, zoom: 1.3 };
-        if (m === "pan-left") return { x: c.x - bw * 0.3, y: c.y, zoom: 1.3 };
+        if (m === "pan-right") return { x: c.x + bw * 0.35, y: c.y, zoom: 1 };
+        if (m === "pan-left") return { x: c.x - bw * 0.35, y: c.y, zoom: 1 };
         if (m === "closeup") return { x: c.x, y: c.y, zoom: 1.9 };
         return { x: c.x, y: c.y, zoom: 1 };
       }
@@ -1150,24 +1183,12 @@ export default function BuilderPage() {
 
         let camX: number, camY: number, zoom: number;
 
-        if (audioSec < INTRO_SEC && cardCenters.length > 0) {
-          const t = audioSec / INTRO_SEC;
+        if (introPanDuration !== null && audioSec >= cameraPanStart && audioSec < cameraPanEnd && cardCenters.length > 0) {
+          const t = (audioSec - cameraPanStart) / Math.max(0.001, cameraPanEnd - cameraPanStart);
           const eased = 0.5 - 0.5 * Math.cos(t * Math.PI);
-          const first = beatPanTarget(0);
-          const scanX = introStartX + (introEndX - introStartX) * eased;
-          const scanY = introStartY + (introEndY - introStartY) * eased;
-          const settleStart = 0.82;
-          if (t < settleStart) {
-            camX = scanX;
-            camY = scanY;
-            zoom = introFitZoom;
-          } else {
-            const p = (t - settleStart) / (1 - settleStart);
-            const settle = 0.5 - 0.5 * Math.cos(p * Math.PI);
-            camX = scanX + (first.x - scanX) * settle;
-            camY = scanY + (first.y - scanY) * settle;
-            zoom = introFitZoom + (first.zoom - introFitZoom) * settle;
-          }
+          camX = cameraPanStartX + (cameraPanEndX - cameraPanStartX) * eased;
+          camY = cameraPanY;
+          zoom = cameraPanZoom;
         } else {
           // Normal beat playback
           const idx = beats.findIndex(
@@ -1475,7 +1496,10 @@ export default function BuilderPage() {
                 <div style={{ flex: 1, height: 1, background: '#2a2a2a', opacity: 0.2 }} />
                 <span style={{ fontSize: 11, color: '#6a6a6a', fontFamily: 'monospace' }}>{beats.length} found / drag to reorder</span>
                 {introPanDuration === null && (
-                  <button onClick={() => setIntroPanDuration(3)} style={{ ...miniButton, padding: '2px 8px', fontSize: 12 }} title="Add intro pan across all cards">↔ pan</button>
+                  <button
+                    onClick={() => { setIntroPanStart(0); setIntroPanDuration(3); }}
+                    style={{ ...miniButton, padding: '2px 8px', fontSize: 12 }}
+                    title="Add a timed camera pan across the board">↔ pan</button>
                 )}
                 <button onClick={addCustomBeat} style={{ ...miniButton, fontWeight: 700, padding: '2px 8px', fontSize: 12 }} title="Add a custom beat">+</button>
               </div>
@@ -1488,16 +1512,16 @@ export default function BuilderPage() {
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                        <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>INTRO PAN</span>
+                        <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: "#2a2a2a" }}>CAMERA PAN</span>
                         <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                           {audioBlob && (
                             <button
                               onClick={e => {
                                 e.stopPropagation();
-                                const introEnd = Math.min(introPanDuration ?? 0, duration);
+                                const introEnd = Math.min(introPanStart + (introPanDuration ?? 0), duration);
                                 playingBeatIdx === -1
                                   ? stopPreview()
-                                  : playBeatPreview(-1, { startTime: 0, endTime: introEnd, searchQuery: "intro pan", reasoning: "" });
+                                  : playBeatPreview(-1, { startTime: introPanStart, endTime: introEnd, searchQuery: "camera pan", reasoning: "" });
                               }}
                               style={{ ...miniButton, padding: "0 4px", fontSize: 11, lineHeight: "14px" }}
                               title={playingBeatIdx === -1 ? "Stop preview" : "Preview intro pan audio"}>
@@ -1510,14 +1534,22 @@ export default function BuilderPage() {
                         </div>
                       </div>
                       <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", marginBottom: 6 }}>
-                        pans across all cards from 0.0–{Math.min(introPanDuration, duration || introPanDuration).toFixed(1)}s
+                        constant-zoom board pan from {introPanStart.toFixed(1)}–{Math.min(introPanStart + introPanDuration, duration || introPanStart + introPanDuration).toFixed(1)}s
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>start</span>
+                        <input
+                          type="number" step="0.1" min="0" max={duration.toFixed(1)}
+                          value={introPanStart}
+                          onChange={e => setIntroPanStart(Math.max(0, Math.min(duration, parseFloat(e.target.value) || 0)))}
+                          onClick={e => e.stopPropagation()}
+                          style={{ width: 52, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
+                        />
                         <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>duration</span>
                         <input
                           type="number" step="0.5" min="0.5" max="20"
                           value={introPanDuration}
-                          onChange={e => setIntroPanDuration(Math.max(0.5, parseFloat(e.target.value) || 3))}
+                          onChange={e => setIntroPanDuration(Math.max(0.5, Math.min(Math.max(0.5, duration - introPanStart), parseFloat(e.target.value) || 3)))}
                           onClick={e => e.stopPropagation()}
                           style={{ width: 52, fontSize: 10, fontFamily: "monospace", border: "1px solid #2a2a2a", padding: "1px 3px", background: "#fffdf5" }}
                         />
