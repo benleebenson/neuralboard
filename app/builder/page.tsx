@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, Fragment } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 
-type CameraMode = "default" | "closeup" | "pan-left" | "pan-right";
+type CameraMode = "default" | "closeup" | "pan-left" | "pan-right" | "pulse";
 
 type Transition = {
   zoomOut: number;  // 0–1: how far to zoom out (1 = show whole board, 0.5 = halfway)
@@ -123,6 +123,7 @@ export default function BuilderPage() {
   const [ytView, setYtView] = useState<YtModalView>('search');
   const [ytSelected, setYtSelected] = useState<YtSearchResult | null>(null);
   const [ytStart, setYtStart] = useState(0);
+  const [ytStartInput, setYtStartInput] = useState("0:00");
   const [ytEnd, setYtEnd] = useState(30);
   const [ytError, setYtError] = useState('');
   const [ytLoading, setYtLoading] = useState(false);
@@ -1322,8 +1323,7 @@ export default function BuilderPage() {
             // For first beat, skip pan travel and start directly at pan target
             const fromCam = currentIdx > 0 ? beatEndCam(currentIdx - 1) : panTarget;
             const mode = currentBeat?.cameraMode ?? "default";
-            // Subtle breathe for default mode
-            const breathe = mode === "default" ? 0.04 * Math.sin(settleProgress * Math.PI) : 0;
+            const breathe = mode === "pulse" ? 0.04 * Math.sin(settleProgress * Math.PI) : 0;
 
             camX = fromCam.x + (panTarget.x - fromCam.x) * panEased + (endCam.x - panTarget.x) * settleEased;
             camY = fromCam.y + (panTarget.y - fromCam.y) * panEased + (endCam.y - panTarget.y) * settleEased;
@@ -1733,9 +1733,9 @@ export default function BuilderPage() {
                           </button>
                           {expandedBeatIdx === i && (
                             <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 5 }}>
-                              {(["default", "closeup", "pan-left", "pan-right"] as CameraMode[]).map(mode => {
+                              {(["default", "closeup", "pan-left", "pan-right", "pulse"] as CameraMode[]).map(mode => {
                                 const active = (b.cameraMode ?? "default") === mode;
-                                const labels: Record<CameraMode, string> = { default: "default", closeup: "close-up", "pan-left": "pan ←", "pan-right": "pan →" };
+                                const labels: Record<CameraMode, string> = { default: "default", closeup: "close-up", "pan-left": "pan ←", "pan-right": "pan →", pulse: "pulse" };
                                 return (
                                   <button key={mode}
                                     onClick={e => { e.stopPropagation(); setBeats(prev => prev.map((b2, j) => j === i ? { ...b2, cameraMode: mode } : b2)); }}
@@ -2305,6 +2305,7 @@ export default function BuilderPage() {
                           setYtSelected(r);
                           const maxSec = parseDurationSec(r.duration);
                           setYtStart(0);
+                          setYtStartInput("0:00");
                           setYtEnd(Math.min(30, maxSec));
                           setYtView('trim');
                         }}
@@ -2334,31 +2335,55 @@ export default function BuilderPage() {
                       />
                     </div>
                   )}
+                  {(() => {
+                    const maxSec = parseDurationSec(ytSelected?.duration);
+                    const clipLen = Math.max(1, Math.round(ytEnd - ytStart));
+                    const maxClipLen = Math.max(1, Math.min(30, Math.floor(maxSec - ytStart)));
+                    const setStartAndKeepLength = (nextStart: number) => {
+                      const clampedStart = Math.max(0, Math.min(Math.max(0, maxSec - 1), nextStart));
+                      const nextLen = Math.min(clipLen, Math.max(1, Math.min(30, Math.floor(maxSec - clampedStart))));
+                      setYtStart(clampedStart);
+                      setYtEnd(clampedStart + nextLen);
+                    };
+                    const setClipLen = (nextLen: number) => {
+                      const clampedLen = Math.max(1, Math.min(maxClipLen, nextLen));
+                      setYtEnd(ytStart + clampedLen);
+                    };
+                    return (
                   <div style={{ marginBottom: 12 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                      <span style={{ fontSize: 11, width: 36 }}>start</span>
-                      <input type="range" min={0} max={Math.max(0, ytEnd - 1)} step={1} value={ytStart}
-                        onChange={e => setYtStart(Math.min(Number(e.target.value), ytEnd - 1))}
+                      <span style={{ fontSize: 11, width: 76 }}>source time</span>
+                      <input
+                        type="text"
+                        value={ytStartInput}
+                        placeholder="1:23"
+                        onChange={e => {
+                          const next = e.target.value;
+                          setYtStartInput(next);
+                          const parsed = parseTimestampSec(next);
+                          if (parsed !== null) setStartAndKeepLength(parsed);
+                        }}
+                        onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
+                        style={{ width: 90, fontFamily: 'monospace', fontSize: 12, border: '1px solid #2a2a2a', padding: '4px 6px', background: '#fffdf5' }}
+                      />
+                      <span style={{ fontSize: 10, color: '#6a6a6a' }}>of {formatTimestamp(maxSec)}</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 11, width: 76 }}>clip length</span>
+                      <input type="range" min={1} max={maxClipLen} step={1} value={Math.min(clipLen, maxClipLen)}
+                        onChange={e => setClipLen(Number(e.target.value))}
                         style={{ flex: 1 }} />
-                      <input type="number" min={0} max={ytEnd - 1} step={1} value={ytStart}
-                        onChange={e => setYtStart(Math.max(0, Math.min(Number(e.target.value), ytEnd - 1)))}
+                      <input type="number" min={1} max={maxClipLen} step={1} value={Math.min(clipLen, maxClipLen)}
+                        onChange={e => setClipLen(Number(e.target.value))}
                         style={{ width: 50, fontFamily: 'monospace', fontSize: 11, border: '1px solid #2a2a2a', padding: '2px 4px', background: '#fffdf5' }} />
                       <span style={{ fontSize: 10, color: '#6a6a6a' }}>s</span>
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 11, width: 36 }}>end</span>
-                      <input type="range" min={ytStart + 1} max={30} step={1} value={ytEnd}
-                        onChange={e => setYtEnd(Math.max(ytStart + 1, Math.min(30, Number(e.target.value))))}
-                        style={{ flex: 1 }} />
-                      <input type="number" min={ytStart + 1} max={30} step={1} value={ytEnd}
-                        onChange={e => setYtEnd(Math.max(ytStart + 1, Math.min(30, Number(e.target.value))))}
-                        style={{ width: 50, fontFamily: 'monospace', fontSize: 11, border: '1px solid #2a2a2a', padding: '2px 4px', background: '#fffdf5' }} />
-                      <span style={{ fontSize: 10, color: '#6a6a6a' }}>s (max 30)</span>
+                    <div style={{ fontSize: 10, color: '#6a6a6a', marginTop: 8 }}>
+                      pulls {formatTimestamp(ytStart)}–{formatTimestamp(ytEnd)} · max 30s
                     </div>
                   </div>
-                  <div style={{ fontSize: 10, color: '#6a6a6a', marginBottom: 10 }}>
-                    clip: {ytEnd - ytStart}s · hard cap 30s enforced
-                  </div>
+                    );
+                  })()}
                   {ytError && <p style={{ color: '#ff3a3a', fontSize: 11, fontFamily: 'monospace' }}>{ytError}</p>}
                 </>
               )}
@@ -2714,6 +2739,28 @@ function parseDurationSec(dur: string | number | undefined): number {
   if (parts.length === 3) return (parts[0] ?? 0) * 3600 + (parts[1] ?? 0) * 60 + (parts[2] ?? 0);
   const asNum = Number(dur);
   return Number.isFinite(asNum) && asNum > 0 ? asNum : 30;
+}
+
+function parseTimestampSec(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(':').map(part => part.trim());
+  if (parts.some(part => part === '' || !/^\d+(\.\d+)?$/.test(part))) return null;
+  const nums = parts.map(Number);
+  if (nums.some(n => !Number.isFinite(n) || n < 0)) return null;
+  if (nums.length === 1) return nums[0];
+  if (nums.length === 2) return nums[0] * 60 + nums[1];
+  if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
+  return null;
+}
+
+function formatTimestamp(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds || 0));
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 function redrawCanvas(canvas: HTMLCanvasElement, strokesToDraw: Stroke[]) {
