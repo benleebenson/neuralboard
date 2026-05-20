@@ -1,6 +1,7 @@
 "use client";
 
 import { useSession, signIn } from "next-auth/react";
+import LegalFooter from "../components/LegalFooter";
 import { useState, useEffect } from "react";
 
 export default function UpgradePage() {
@@ -36,7 +37,8 @@ export default function UpgradePage() {
   }
 
   return (
-    <main style={{ minHeight: "100vh", background: "#f5f1e8", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Courier New', monospace" }}>
+    <div style={{ minHeight: "100vh", background: "#f5f1e8", display: "flex", flexDirection: "column", fontFamily: "'Courier New', monospace" }}>
+    <main style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
       <div style={{ maxWidth: 480, width: "100%", padding: 32 }}>
         <h1 style={{ fontFamily: "'Caveat', cursive", fontSize: 42, color: "#2a2a2a", marginBottom: 4, textAlign: "center" }}>
           Neural Board
@@ -98,6 +100,8 @@ export default function UpgradePage() {
         </div>
       </div>
     </main>
+    <LegalFooter />
+    </div>
   );
 }
 
