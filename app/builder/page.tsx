@@ -2184,8 +2184,8 @@ export default function BuilderPage() {
                             media.style.height = d.currentRect.h * (r.height / COMP_H) + "px";
                           }
                           const handle = e.currentTarget as HTMLDivElement;
-                          handle.style.left = (d.currentRect.x + d.currentRect.w) * (r.width / COMP_W) - 7 + "px";
-                          handle.style.top = (d.currentRect.y + d.currentRect.h) * (r.height / COMP_H) - 7 + "px";
+                          handle.style.left = Math.min(COMP_W, d.currentRect.x + d.currentRect.w) * (r.width / COMP_W) - 7 + "px";
+                          handle.style.top = Math.min(COMP_H, d.currentRect.y + d.currentRect.h) * (r.height / COMP_H) - 7 + "px";
                         }}
                         onPointerUp={() => {
                           const d = compMediaResizeRef.current;
@@ -2193,7 +2193,7 @@ export default function BuilderPage() {
                           compMediaResizeRef.current = null;
                         }}
                         onPointerCancel={() => { compMediaResizeRef.current = null; }}
-                        style={{ position: "absolute", left: cornerX * sx - 7, top: cornerY * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
+                        style={{ position: "absolute", left: Math.min(COMP_W, cornerX) * sx - 7, top: Math.min(COMP_H, cornerY) * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
                         title="Resize beat media"
                       />
                     </>
