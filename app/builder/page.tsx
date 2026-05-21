@@ -910,9 +910,15 @@ export default function BuilderPage() {
 
   function initializeCompMediaRect(beatIdx: number, srcW: number, srcH: number) {
     if (!srcW || !srcH) return;
-    setBeats(prev => prev.map((b, i) =>
-      i === beatIdx && !b.compMediaRect ? { ...b, compMediaRect: getContainRect(srcW, srcH, COMP_W, COMP_H) } : b
-    ));
+    const naturalAspect = srcW / srcH;
+    setBeats(prev => prev.map((b, i) => {
+      if (i !== beatIdx) return b;
+      const rectAspect = b.compMediaRect ? b.compMediaRect.w / Math.max(1, b.compMediaRect.h) : 0;
+      const hasStretchedRect = b.compMediaRect && Math.abs(rectAspect - naturalAspect) > 0.03;
+      return !b.compMediaRect || hasStretchedRect
+        ? { ...b, compMediaRect: getContainRect(srcW, srcH, COMP_W, COMP_H) }
+        : b;
+    }));
   }
 
   function updateCompMediaRect(beatIdx: number, rect: CompRect) {
@@ -2079,14 +2085,12 @@ export default function BuilderPage() {
                     e.stopPropagation();
                     e.currentTarget.setPointerCapture(e.pointerId);
                     const r = compPreviewRef.current?.getBoundingClientRect();
-                    const layerRect = e.currentTarget.getBoundingClientRect();
                     if (!r) return;
-                    const startRect = activeBeat.compMediaRect ?? {
-                      x: (layerRect.left - r.left) / (r.width / COMP_W),
-                      y: (layerRect.top - r.top) / (r.height / COMP_H),
-                      w: layerRect.width / (r.width / COMP_W),
-                      h: layerRect.height / (r.height / COMP_H),
-                    };
+                    const target = e.currentTarget;
+                    const mediaSize = target instanceof HTMLVideoElement
+                      ? { w: target.videoWidth, h: target.videoHeight }
+                      : { w: (target as HTMLImageElement).naturalWidth, h: (target as HTMLImageElement).naturalHeight };
+                    const startRect = activeBeat.compMediaRect ?? getContainRect(mediaSize.w, mediaSize.h, COMP_W, COMP_H);
                     if (!activeBeat.compMediaRect) updateCompMediaRect(activeBeatIdx, startRect);
                     compMediaDragRef.current = {
                       beatIdx: activeBeatIdx,
@@ -2166,6 +2170,11 @@ export default function BuilderPage() {
                             media.style.width = d.currentRect.w * (r.width / COMP_W) + "px";
                             media.style.height = d.currentRect.h * (r.height / COMP_H) + "px";
                           }
+                          const handle = e.currentTarget as HTMLDivElement;
+                          const visibleHandleX = Math.max(0, Math.min(COMP_W, d.currentRect.x + d.currentRect.w));
+                          const visibleHandleY = Math.max(0, Math.min(COMP_H, d.currentRect.y + d.currentRect.h));
+                          handle.style.left = visibleHandleX * (r.width / COMP_W) - 7 + "px";
+                          handle.style.top = visibleHandleY * (r.height / COMP_H) - 7 + "px";
                         }}
                         onPointerUp={() => {
                           const d = compMediaResizeRef.current;
@@ -2173,7 +2182,7 @@ export default function BuilderPage() {
                           compMediaResizeRef.current = null;
                         }}
                         onPointerCancel={() => { compMediaResizeRef.current = null; }}
-                        style={{ position: "absolute", left: (mediaRect.x + mediaRect.w) * sx - 7, top: (mediaRect.y + mediaRect.h) * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
+                        style={{ position: "absolute", left: Math.max(0, Math.min(COMP_W, mediaRect.x + mediaRect.w)) * sx - 7, top: Math.max(0, Math.min(COMP_H, mediaRect.y + mediaRect.h)) * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
                         title="Resize beat media"
                       />
                     </>
