@@ -2061,9 +2061,10 @@ export default function BuilderPage() {
                   })}
                 </div>
               )}
+              <div style={{ position: "relative", width: "min(100%, 920px)", height: "min(calc(100vh - 220px), 820px)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
               <div
                 ref={compPreviewRef}
-                style={{ position: "relative", aspectRatio: "9 / 16", height: "min(calc(100vh - 130px), 860px)", maxWidth: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)" }}
+                style={{ position: "relative", aspectRatio: "9 / 16", height: "100%", maxHeight: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)", flex: "0 0 auto" }}
               >
                 {activeBeat ? (() => {
                   const displayImg = activeBeat.customImageUrl ?? activeBeat.images?.[activeBeat.selectedImageIdx ?? 0];
@@ -2276,6 +2277,7 @@ export default function BuilderPage() {
                     </div>
                   );
                 })}
+              </div>
               </div>
             </div>
           )}
@@ -2794,11 +2796,11 @@ function CompilationCropMask() {
   };
   return (
     <>
-      <div style={{ ...common, left: "-120vw", top: "-120vh", width: "240vw", height: "120vh" }} />
-      <div style={{ ...common, left: "-120vw", top: "100%", width: "240vw", height: "120vh" }} />
-      <div style={{ ...common, right: "100%", top: 0, width: "120vw", height: "100%" }} />
-      <div style={{ ...common, left: "100%", top: 0, width: "120vw", height: "100%" }} />
-      <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5, boxShadow: "0 0 0 1.5px rgba(200,241,53,0.9), 0 0 0 9999px rgba(0,0,0,0)", outline: "1px solid rgba(255,255,255,0.28)" }} />
+      <div style={{ ...common, left: "-400%", top: "-400%", width: "900%", height: "400%" }} />
+      <div style={{ ...common, left: "-400%", top: "100%", width: "900%", height: "400%" }} />
+      <div style={{ ...common, right: "100%", top: 0, width: "400%", height: "100%" }} />
+      <div style={{ ...common, left: "100%", top: 0, width: "400%", height: "100%" }} />
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5, boxShadow: "0 0 0 1.5px rgba(200,241,53,0.9)", outline: "1px solid rgba(255,255,255,0.28)" }} />
     </>
   );
 }
