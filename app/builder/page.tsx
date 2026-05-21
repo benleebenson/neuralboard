@@ -37,6 +37,7 @@ type Beat = {
   transition?: Transition;
   subBeats?: SubBeat[];
   compMediaRect?: CompRect;
+  compMediaAspect?: number;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -574,9 +575,9 @@ export default function BuilderPage() {
     if (!file || idx < 0) return;
     const url = URL.createObjectURL(file);
     if (file.type.startsWith('video/')) {
-      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined, compMediaRect: undefined } : b));
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined, compMediaRect: undefined, compMediaAspect: undefined } : b));
     } else {
-      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined, compMediaRect: undefined } : b));
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined, compMediaRect: undefined, compMediaAspect: undefined } : b));
     }
     e.target.value = "";
   }
@@ -904,7 +905,7 @@ export default function BuilderPage() {
 
   function selectBeatImage(beatIdx: number, imgIdx: number) {
     setBeats((prev) => prev.map((b, i) =>
-      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined, compMediaRect: undefined } : b
+      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined, compMediaRect: undefined, compMediaAspect: undefined } : b
     ));
   }
 
@@ -913,16 +914,15 @@ export default function BuilderPage() {
     const naturalAspect = srcW / srcH;
     setBeats(prev => prev.map((b, i) => {
       if (i !== beatIdx) return b;
-      const rectAspect = b.compMediaRect ? b.compMediaRect.w / Math.max(1, b.compMediaRect.h) : 0;
-      const hasStretchedRect = b.compMediaRect && Math.abs(rectAspect - naturalAspect) > 0.03;
-      return !b.compMediaRect || hasStretchedRect
-        ? { ...b, compMediaRect: getContainRect(srcW, srcH, COMP_W, COMP_H) }
-        : b;
+      if (!b.compMediaRect) {
+        return { ...b, compMediaAspect: naturalAspect, compMediaRect: getContainRect(srcW, srcH, COMP_W, COMP_H) };
+      }
+      return { ...b, compMediaAspect: naturalAspect, compMediaRect: lockRectAspect(b.compMediaRect, naturalAspect) };
     }));
   }
 
   function updateCompMediaRect(beatIdx: number, rect: CompRect) {
-    setBeats(prev => prev.map((b, i) => i === beatIdx ? { ...b, compMediaRect: rect } : b));
+    setBeats(prev => prev.map((b, i) => i === beatIdx ? { ...b, compMediaRect: lockRectAspect(rect, b.compMediaAspect) } : b));
   }
 
   function syncCanvas(): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; w: number; h: number } | null {
@@ -2077,7 +2077,7 @@ export default function BuilderPage() {
                   const rect = compPreviewRef.current?.getBoundingClientRect();
                   const sx = rect ? rect.width / COMP_W : 1;
                   const sy = rect ? rect.height / COMP_H : 1;
-                  const mediaRect = activeBeat.compMediaRect ?? { x: 0, y: 0, w: COMP_W, h: COMP_H };
+                  const mediaRect = getCompMediaRect(activeBeat, null, COMP_W, COMP_H);
                   const mediaStyle: React.CSSProperties = activeBeat.compMediaRect
                     ? { position: "absolute", left: mediaRect.x * sx, top: mediaRect.y * sy, width: mediaRect.w * sx, height: mediaRect.h * sy, objectFit: "fill", display: "block", cursor: "grab", userSelect: "none" }
                     : { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", display: "block", cursor: "grab", userSelect: "none" };
@@ -2090,7 +2090,8 @@ export default function BuilderPage() {
                     const mediaSize = target instanceof HTMLVideoElement
                       ? { w: target.videoWidth, h: target.videoHeight }
                       : { w: (target as HTMLImageElement).naturalWidth, h: (target as HTMLImageElement).naturalHeight };
-                    const startRect = activeBeat.compMediaRect ?? getContainRect(mediaSize.w, mediaSize.h, COMP_W, COMP_H);
+                    const aspect = getMediaAspectFromSize(mediaSize.w, mediaSize.h) ?? activeBeat.compMediaAspect;
+                    const startRect = lockRectAspect(activeBeat.compMediaRect ?? getContainRect(mediaSize.w, mediaSize.h, COMP_W, COMP_H), aspect);
                     if (!activeBeat.compMediaRect) updateCompMediaRect(activeBeatIdx, startRect);
                     compMediaDragRef.current = {
                       beatIdx: activeBeatIdx,
@@ -2118,7 +2119,8 @@ export default function BuilderPage() {
                   const mediaPointerUp = () => {
                     const d = compMediaDragRef.current;
                     if (!d || d.beatIdx !== activeBeatIdx) return;
-                    const currentRect = beats[d.beatIdx]?.compMediaRect ?? mediaRect;
+                    const beat = beats[d.beatIdx];
+                    const currentRect = getCompMediaRect(beat, null, COMP_W, COMP_H);
                     updateCompMediaRect(d.beatIdx, { ...currentRect, x: d.currentX, y: d.currentY });
                     compMediaDragRef.current = null;
                   };
@@ -2154,8 +2156,15 @@ export default function BuilderPage() {
                         onPointerDown={(e) => {
                           e.stopPropagation();
                           e.currentTarget.setPointerCapture(e.pointerId);
-                          const r = activeBeat.compMediaRect ?? mediaRect;
-                          compMediaResizeRef.current = { beatIdx: activeBeatIdx, ox: e.clientX, startRect: r, aspect: r.h / Math.max(1, r.w), currentRect: r };
+                          const target = e.currentTarget.parentElement?.querySelector("img,video");
+                          const mediaSize = target instanceof HTMLVideoElement
+                            ? { w: target.videoWidth, h: target.videoHeight }
+                            : target instanceof HTMLImageElement
+                            ? { w: target.naturalWidth, h: target.naturalHeight }
+                            : { w: 0, h: 0 };
+                          const aspect = getMediaAspectFromSize(mediaSize.w, mediaSize.h) ?? activeBeat.compMediaAspect ?? (mediaRect.w / Math.max(1, mediaRect.h));
+                          const r = lockRectAspect(activeBeat.compMediaRect ?? mediaRect, aspect);
+                          compMediaResizeRef.current = { beatIdx: activeBeatIdx, ox: e.clientX, startRect: r, aspect: 1 / aspect, currentRect: r };
                         }}
                         onPointerMove={(e) => {
                           const d = compMediaResizeRef.current;
@@ -2870,6 +2879,17 @@ function getMediaSourceSize(media: CanvasImageSource | null): { w: number; h: nu
   return { w: img.naturalWidth || img.width || 0, h: img.naturalHeight || img.height || 0 };
 }
 
+function getMediaAspectFromSize(w: number, h: number): number | undefined {
+  return w > 0 && h > 0 ? w / h : undefined;
+}
+
+function lockRectAspect(rect: CompRect, aspect?: number): CompRect {
+  if (!aspect || aspect <= 0) return rect;
+  const centerY = rect.y + rect.h / 2;
+  const h = rect.w / aspect;
+  return { ...rect, h, y: centerY - h / 2 };
+}
+
 function getContainRect(srcW: number, srcH: number, w: number, h: number): CompRect {
   if (!srcW || !srcH) return { x: 0, y: 0, w, h };
   const scale = Math.min(w / srcW, h / srcH);
@@ -2879,8 +2899,9 @@ function getContainRect(srcW: number, srcH: number, w: number, h: number): CompR
 }
 
 function getCompMediaRect(beat: Beat | undefined, media: CanvasImageSource | null, w: number, h: number): CompRect {
-  if (beat?.compMediaRect) return beat.compMediaRect;
   const size = getMediaSourceSize(media);
+  const aspect = beat?.compMediaAspect ?? getMediaAspectFromSize(size.w, size.h);
+  if (beat?.compMediaRect) return lockRectAspect(beat.compMediaRect, aspect);
   return getContainRect(size.w, size.h, w, h);
 }
 
