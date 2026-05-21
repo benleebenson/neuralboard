@@ -2061,10 +2061,10 @@ export default function BuilderPage() {
                   })}
                 </div>
               )}
-              <div style={{ position: "relative", width: "min(100%, 920px)", height: "min(calc(100vh - 220px), 820px)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+              <div style={{ position: "relative", width: "min(100%, 980px)", height: "min(calc(100vh - 190px), 860px)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", background: "#050505" }}>
               <div
                 ref={compPreviewRef}
-                style={{ position: "relative", aspectRatio: "9 / 16", height: "100%", maxHeight: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)", flex: "0 0 auto" }}
+                style={{ position: "relative", aspectRatio: "9 / 16", height: "82%", maxHeight: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1.5px rgba(200,241,53,0.95), 0 0 0 2.5px rgba(255,255,255,0.2)", flex: "0 0 auto" }}
               >
                 {activeBeat ? (() => {
                   const displayImg = activeBeat.customImageUrl ?? activeBeat.images?.[activeBeat.selectedImageIdx ?? 0];
@@ -2195,7 +2195,6 @@ export default function BuilderPage() {
                         style={{ position: "absolute", left: cornerX * sx - 7, top: cornerY * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
                         title="Resize beat media"
                       />
-                      <CompilationCropMask />
                     </>
                   );
                 })() : (
@@ -2277,6 +2276,7 @@ export default function BuilderPage() {
                     </div>
                   );
                 })}
+                <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 7, border: "1.5px solid rgba(200,241,53,0.95)" }} />
               </div>
               </div>
             </div>
@@ -2783,25 +2783,6 @@ function SectionLabel({ n, title, right }: { n: string; title: string; right?: s
       <div style={{ flex: 1, height: 1, background: "#2a2a2a", opacity: 0.2 }} />
       {right ? <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{right}</span> : null}
     </div>
-  );
-}
-
-function CompilationCropMask() {
-  const shade = "rgba(0,0,0,0.48)";
-  const common: React.CSSProperties = {
-    position: "absolute",
-    background: shade,
-    pointerEvents: "none",
-    zIndex: 4,
-  };
-  return (
-    <>
-      <div style={{ ...common, left: "-400%", top: "-400%", width: "900%", height: "400%" }} />
-      <div style={{ ...common, left: "-400%", top: "100%", width: "900%", height: "400%" }} />
-      <div style={{ ...common, right: "100%", top: 0, width: "400%", height: "100%" }} />
-      <div style={{ ...common, left: "100%", top: 0, width: "400%", height: "100%" }} />
-      <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5, boxShadow: "0 0 0 1.5px rgba(200,241,53,0.9)", outline: "1px solid rgba(255,255,255,0.28)" }} />
-    </>
   );
 }
 
