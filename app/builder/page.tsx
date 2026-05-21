@@ -359,6 +359,7 @@ export default function BuilderPage() {
         },
         body: blob,
       });
+      const data = await readJsonResponse<{ ok?: boolean; error?: string; transcript: string; duration: number; beats?: Beat[] }>(res);
       if (res.status === 401) {
         signIn("google");
         setProcessing(false);
@@ -369,7 +370,7 @@ export default function BuilderPage() {
         setProcessing(false);
         return;
       }
-      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Transcription failed (${res.status})`);
       if (!data.ok) throw new Error(data.error || "Transcription failed");
       setTranscript(data.transcript);
       setDuration(data.duration);
@@ -2812,6 +2813,16 @@ async function loadFirstWorking(urls: string[]): Promise<HTMLImageElement | null
     try { return await loadImage(url); } catch { continue; }
   }
   return null;
+}
+
+async function readJsonResponse<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    const fallback = text.trim() || `Request failed with status ${res.status}`;
+    throw new Error(fallback.slice(0, 240));
+  }
 }
 
 function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, background: Background,

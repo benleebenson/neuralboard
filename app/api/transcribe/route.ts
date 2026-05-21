@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isAdmin } from "@/lib/auth";
-import { getRenderCount, getSubscriptionStatus, upsertUser, logEvent, logApiCost } from "@/lib/supabase";
+import { getRenderCount, getSubscriptionStatus, upsertUser, logApiCost } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -237,9 +237,6 @@ Return ONLY JSON in this exact structure:
 
     // Serper: ~$0.001/search
     logApiCost(email, "serper", +(beats.length * 0.001).toFixed(5), { units: beats.length }).catch(() => {});
-
-    // Log the transcription usage
-    await logEvent(email, "transcribe", duration).catch(() => {});
 
     return NextResponse.json({
       ok: true,
