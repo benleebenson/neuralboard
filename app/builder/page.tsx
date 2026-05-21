@@ -2063,7 +2063,7 @@ export default function BuilderPage() {
               )}
               <div
                 ref={compPreviewRef}
-                style={{ position: "relative", aspectRatio: "9 / 16", height: "min(calc(100vh - 130px), 860px)", maxWidth: "100%", background: "#000", overflow: "hidden", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)" }}
+                style={{ position: "relative", aspectRatio: "9 / 16", height: "min(calc(100vh - 130px), 860px)", maxWidth: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)" }}
               >
                 {activeBeat ? (() => {
                   const displayImg = activeBeat.customImageUrl ?? activeBeat.images?.[activeBeat.selectedImageIdx ?? 0];
@@ -2078,9 +2078,11 @@ export default function BuilderPage() {
                   const sx = rect ? rect.width / COMP_W : 1;
                   const sy = rect ? rect.height / COMP_H : 1;
                   const mediaRect = getCompMediaRect(activeBeat, null, COMP_W, COMP_H);
+                  const cornerX = mediaRect.x + mediaRect.w;
+                  const cornerY = mediaRect.y + mediaRect.h;
                   const mediaStyle: React.CSSProperties = activeBeat.compMediaRect
-                    ? { position: "absolute", left: mediaRect.x * sx, top: mediaRect.y * sy, width: mediaRect.w * sx, height: mediaRect.h * sy, objectFit: "fill", display: "block", cursor: "grab", userSelect: "none" }
-                    : { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", display: "block", cursor: "grab", userSelect: "none" };
+                    ? { position: "absolute", left: mediaRect.x * sx, top: mediaRect.y * sy, width: mediaRect.w * sx, height: mediaRect.h * sy, objectFit: "fill", display: "block", cursor: "grab", userSelect: "none", zIndex: 1 }
+                    : { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", display: "block", cursor: "grab", userSelect: "none", zIndex: 1 };
                   const mediaPointerDown = (e: React.PointerEvent<HTMLElement>) => {
                     e.stopPropagation();
                     e.currentTarget.setPointerCapture(e.pointerId);
@@ -2180,10 +2182,8 @@ export default function BuilderPage() {
                             media.style.height = d.currentRect.h * (r.height / COMP_H) + "px";
                           }
                           const handle = e.currentTarget as HTMLDivElement;
-                          const visibleHandleX = Math.max(0, Math.min(COMP_W, d.currentRect.x + d.currentRect.w));
-                          const visibleHandleY = Math.max(0, Math.min(COMP_H, d.currentRect.y + d.currentRect.h));
-                          handle.style.left = visibleHandleX * (r.width / COMP_W) - 7 + "px";
-                          handle.style.top = visibleHandleY * (r.height / COMP_H) - 7 + "px";
+                          handle.style.left = (d.currentRect.x + d.currentRect.w) * (r.width / COMP_W) - 7 + "px";
+                          handle.style.top = (d.currentRect.y + d.currentRect.h) * (r.height / COMP_H) - 7 + "px";
                         }}
                         onPointerUp={() => {
                           const d = compMediaResizeRef.current;
@@ -2191,9 +2191,10 @@ export default function BuilderPage() {
                           compMediaResizeRef.current = null;
                         }}
                         onPointerCancel={() => { compMediaResizeRef.current = null; }}
-                        style={{ position: "absolute", left: Math.max(0, Math.min(COMP_W, mediaRect.x + mediaRect.w)) * sx - 7, top: Math.max(0, Math.min(COMP_H, mediaRect.y + mediaRect.h)) * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
+                        style={{ position: "absolute", left: cornerX * sx - 7, top: cornerY * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
                         title="Resize beat media"
                       />
+                      <CompilationCropMask />
                     </>
                   );
                 })() : (
@@ -2780,6 +2781,25 @@ function SectionLabel({ n, title, right }: { n: string; title: string; right?: s
       <div style={{ flex: 1, height: 1, background: "#2a2a2a", opacity: 0.2 }} />
       {right ? <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{right}</span> : null}
     </div>
+  );
+}
+
+function CompilationCropMask() {
+  const shade = "rgba(0,0,0,0.48)";
+  const common: React.CSSProperties = {
+    position: "absolute",
+    background: shade,
+    pointerEvents: "none",
+    zIndex: 4,
+  };
+  return (
+    <>
+      <div style={{ ...common, left: "-120vw", top: "-120vh", width: "240vw", height: "120vh" }} />
+      <div style={{ ...common, left: "-120vw", top: "100%", width: "240vw", height: "120vh" }} />
+      <div style={{ ...common, right: "100%", top: 0, width: "120vw", height: "100%" }} />
+      <div style={{ ...common, left: "100%", top: 0, width: "120vw", height: "100%" }} />
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5, boxShadow: "0 0 0 1.5px rgba(200,241,53,0.9), 0 0 0 9999px rgba(0,0,0,0)", outline: "1px solid rgba(255,255,255,0.28)" }} />
+    </>
   );
 }
 
