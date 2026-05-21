@@ -37,6 +37,7 @@ async function searchImages(query: string, apiKey: string): Promise<string[]> {
 
 export async function POST(req: NextRequest) {
   try {
+    const isCompilationMode = req.headers.get("x-neuralboard-mode") === "compilation";
     // Auth check — must be signed in with Google
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
@@ -139,7 +140,7 @@ if (!serperKey) {
     }
 
     // ── Step 2: GPT-4o-mini plans the beats ─────────────────────────
-    const targetBeats = Math.max(2, Math.round(duration / 2));
+    const targetBeats = isCompilationMode ? Math.min(5, Math.max(2, Math.round(duration / 6))) : Math.max(2, Math.round(duration / 2));
 
     const timedTranscript = words.length
       ? words
@@ -150,7 +151,7 @@ if (!serperKey) {
     const systemPrompt = `You are a video director AI. Given a narration transcript with word-level timestamps, plan a sequence of visual beats — moments where a new image should appear.
 
 RULES:
-- Aim for one beat every ~2 seconds. A ${duration.toFixed(1)}s narration should have ~${targetBeats} beats.
+- ${isCompilationMode ? `Return no more than 5 beats. A ${duration.toFixed(1)}s narration should have about ${targetBeats} beats, with longer holds when needed.` : `Aim for one beat every ~2 seconds. A ${duration.toFixed(1)}s narration should have ~${targetBeats} beats.`}
 - Important moments (specific names, key claims, big topics) get longer holds: 2.5–4s.
 - Quick mentions get shorter holds: 1–1.5s.
 - Each beat's startTime must align with when its topic is FIRST mentioned.
@@ -177,7 +178,7 @@ Return ONLY JSON in this exact structure:
           { role: "system", content: systemPrompt },
           {
             role: "user",
-            content: `NARRATION (${duration.toFixed(1)}s total):\n\n${timedTranscript}\n\nPlain transcript: "${transcript}"\n\nReturn approximately ${targetBeats} beats.`,
+            content: `NARRATION (${duration.toFixed(1)}s total):\n\n${timedTranscript}\n\nPlain transcript: "${transcript}"\n\nReturn ${isCompilationMode ? `no more than ${targetBeats} beats` : `approximately ${targetBeats} beats`}.`,
           },
         ],
       }),
@@ -206,6 +207,7 @@ Return ONLY JSON in this exact structure:
     } catch {
       beats = [];
     }
+    if (isCompilationMode && beats.length > 5) beats = beats.slice(0, 5);
 
     // Normalize and clamp
     beats = beats

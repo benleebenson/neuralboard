@@ -20,6 +20,8 @@ type SubBeat = {
   compSize?: number;
 };
 
+type CompRect = { x: number; y: number; w: number; h: number };
+
 type Beat = {
   startTime: number;
   endTime: number;
@@ -34,6 +36,7 @@ type Beat = {
   cameraMode?: CameraMode;
   transition?: Transition;
   subBeats?: SubBeat[];
+  compMediaRect?: CompRect;
 };
 
 type Background = "cork" | "beige" | "graph" | "custom";
@@ -78,6 +81,8 @@ type YtModalView = 'search' | 'trim';
 
 // Railway config is loaded server-side via /api/config after login
 const CARD_W = 130;
+const COMP_W = 1080;
+const COMP_H = 1920;
 // Height the "card" (Polaroid) wrapper adds around the media, in CSS px.
 // border-top 1.5 + padding-top 6 + img-wrapper margin-bottom 6 + label 22 + border-bottom 1.5
 // If you change the Polaroid card layout (~line 1661), update this constant too.
@@ -158,6 +163,9 @@ export default function BuilderPage() {
   const subBeatDragRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   const compPreviewRef = useRef<HTMLDivElement | null>(null);
   const compSubBeatDragRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  const compSubBeatResizeRef = useRef<{ id: string; beatIdx: number; sbIdx: number; ox: number; startSize: number; currentSize: number } | null>(null);
+  const compMediaDragRef = useRef<{ beatIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  const compMediaResizeRef = useRef<{ beatIdx: number; ox: number; startRect: CompRect; aspect: number; currentRect: CompRect } | null>(null);
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number; currentSize: number } | null>(null);
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
@@ -346,6 +354,7 @@ export default function BuilderPage() {
         method: "POST",
         headers: {
           "Content-Type": blob.type || "audio/webm",
+          "x-neuralboard-mode": appMode,
         },
         body: blob,
       });
@@ -365,7 +374,8 @@ export default function BuilderPage() {
       setDuration(data.duration);
       setIntroPanDuration(null);
       setIntroPanStart(0);
-      const newBeats: Beat[] = (data.beats || []).map((b: Beat, i: number) => ({
+      const sourceBeats = appMode === "compilation" ? (data.beats || []).slice(0, 5) : (data.beats || []);
+      const newBeats: Beat[] = sourceBeats.map((b: Beat, i: number) => ({
         ...b,
         selectedImageIdx: 0,
         pos: {
@@ -564,9 +574,9 @@ export default function BuilderPage() {
     if (!file || idx < 0) return;
     const url = URL.createObjectURL(file);
     if (file.type.startsWith('video/')) {
-      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined } : b));
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: url, customImageUrl: undefined, compMediaRect: undefined } : b));
     } else {
-      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined } : b));
+      setBeats((prev) => prev.map((b, i) => i === idx ? { ...b, customImageUrl: url, customVideoUrl: undefined, compMediaRect: undefined } : b));
     }
     e.target.value = "";
   }
@@ -635,6 +645,8 @@ export default function BuilderPage() {
       const dur = beat.endTime - beat.startTime;
       const respaced = allSubBeats.map((sb, k) => ({
         ...sb,
+        compPos: sb.compPos ?? { x: COMP_W / 2 - 130, y: COMP_H * 0.16 },
+        compSize: sb.compSize ?? 260,
         appearTime: beat.startTime + dur * (k + 1) / (N + 1),
       }));
 
@@ -892,8 +904,19 @@ export default function BuilderPage() {
 
   function selectBeatImage(beatIdx: number, imgIdx: number) {
     setBeats((prev) => prev.map((b, i) =>
-      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined } : b
+      i === beatIdx ? { ...b, selectedImageIdx: imgIdx, customImageUrl: undefined, customVideoUrl: undefined, compMediaRect: undefined } : b
     ));
+  }
+
+  function initializeCompMediaRect(beatIdx: number, srcW: number, srcH: number) {
+    if (!srcW || !srcH) return;
+    setBeats(prev => prev.map((b, i) =>
+      i === beatIdx && !b.compMediaRect ? { ...b, compMediaRect: getContainRect(srcW, srcH, COMP_W, COMP_H) } : b
+    ));
+  }
+
+  function updateCompMediaRect(beatIdx: number, rect: CompRect) {
+    setBeats(prev => prev.map((b, i) => i === beatIdx ? { ...b, compMediaRect: rect } : b));
   }
 
   function syncCanvas(): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; w: number; h: number } | null {
@@ -1134,7 +1157,13 @@ export default function BuilderPage() {
           ctx!.fillStyle = "#000";
           ctx!.fillRect(0, 0, W, H);
           const mediaEl: CanvasImageSource | null = videoEls[currentIdx] ?? images[currentIdx];
-          drawMediaContain(ctx!, mediaEl, 0, 0, W, H, "#111");
+          const mediaRect = getCompMediaRect(beats[currentIdx], mediaEl, W, H);
+          if (mediaEl) {
+            ctx!.drawImage(mediaEl, mediaRect.x, mediaRect.y, mediaRect.w, mediaRect.h);
+          } else {
+            ctx!.fillStyle = "#111";
+            ctx!.fillRect(0, 0, W, H);
+          }
 
           for (const sb of beats[currentIdx]?.subBeats ?? []) {
             if (audioSec < sb.appearTime) continue;
@@ -1640,7 +1669,7 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {appMode === "board" && beats.length > 0 ? (
+          {beats.length > 0 ? (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
                 <span style={{ fontFamily: "'Caveat', cursive", fontSize: 22, color: '#2a2a2a', fontWeight: 700 }}>3. Beats</span>
@@ -1934,7 +1963,7 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 ? (
+          {appMode === "board" && beats.length > 0 ? (
             <>
               <SectionLabel n="5" title="Card Style" />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
@@ -1998,21 +2027,156 @@ export default function BuilderPage() {
 
         <section style={{ ...rightPanelStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
           {appMode === "compilation" && (
-            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#101010", padding: 18 }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, background: "#101010", padding: 18 }}>
+              {beats.length > 0 && (
+                <div style={{ width: "min(100%, 560px)", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(54px, 1fr))", gap: 6 }}>
+                  {beats.map((beat, i) => {
+                    const thumb = beat.customImageUrl ?? beat.images?.[beat.selectedImageIdx ?? 0];
+                    const isActive = i === activeBeatIdx;
+                    return (
+                      <button
+                        key={i}
+                        onClick={() => setActiveBeatIdx(i)}
+                        style={{ border: isActive ? "2px solid #c8f135" : "1px solid rgba(255,255,255,0.35)", background: "#181818", padding: 3, cursor: "pointer", height: 54, position: "relative" }}
+                        title={`Beat ${i + 1}`}
+                      >
+                        {beat.customVideoUrl ? (
+                          <video src={beat.customVideoUrl} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                        ) : thumb ? (
+                          <img src={thumb} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                        ) : (
+                          <span style={{ color: "#c8f135", fontSize: 9, fontFamily: "monospace" }}>{i + 1}</span>
+                        )}
+                        <span style={{ position: "absolute", left: 3, bottom: 2, color: "#fff", background: "rgba(0,0,0,0.65)", fontSize: 9, fontFamily: "monospace", padding: "0 3px" }}>
+                          {i + 1}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <div
                 ref={compPreviewRef}
                 style={{ position: "relative", aspectRatio: "9 / 16", height: "min(calc(100vh - 130px), 860px)", maxWidth: "100%", background: "#000", overflow: "hidden", boxShadow: "0 0 0 1px rgba(255,255,255,0.18)" }}
               >
                 {activeBeat ? (() => {
                   const displayImg = activeBeat.customImageUrl ?? activeBeat.images?.[activeBeat.selectedImageIdx ?? 0];
-                  return activeBeat.customVideoUrl ? (
-                    <video src={activeBeat.customVideoUrl} muted playsInline autoPlay loop style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }} />
-                  ) : displayImg ? (
-                    <img src={displayImg} alt="" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }} />
-                  ) : (
+                  if (!activeBeat.customVideoUrl && !displayImg) {
+                    return (
                     <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#c8f135", fontFamily: "monospace", fontSize: 14, padding: 20, textAlign: "center" }}>
                       {activeBeat.searchQuery}
                     </div>
+                    );
+                  }
+                  const rect = compPreviewRef.current?.getBoundingClientRect();
+                  const sx = rect ? rect.width / COMP_W : 1;
+                  const sy = rect ? rect.height / COMP_H : 1;
+                  const mediaRect = activeBeat.compMediaRect ?? { x: 0, y: 0, w: COMP_W, h: COMP_H };
+                  const mediaStyle: React.CSSProperties = activeBeat.compMediaRect
+                    ? { position: "absolute", left: mediaRect.x * sx, top: mediaRect.y * sy, width: mediaRect.w * sx, height: mediaRect.h * sy, objectFit: "fill", display: "block", cursor: "grab", userSelect: "none" }
+                    : { position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain", display: "block", cursor: "grab", userSelect: "none" };
+                  const mediaPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+                    e.stopPropagation();
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                    const r = compPreviewRef.current?.getBoundingClientRect();
+                    const layerRect = e.currentTarget.getBoundingClientRect();
+                    if (!r) return;
+                    const startRect = activeBeat.compMediaRect ?? {
+                      x: (layerRect.left - r.left) / (r.width / COMP_W),
+                      y: (layerRect.top - r.top) / (r.height / COMP_H),
+                      w: layerRect.width / (r.width / COMP_W),
+                      h: layerRect.height / (r.height / COMP_H),
+                    };
+                    if (!activeBeat.compMediaRect) updateCompMediaRect(activeBeatIdx, startRect);
+                    compMediaDragRef.current = {
+                      beatIdx: activeBeatIdx,
+                      ox: e.clientX,
+                      oy: e.clientY,
+                      startX: startRect.x,
+                      startY: startRect.y,
+                      currentX: startRect.x,
+                      currentY: startRect.y,
+                    };
+                  };
+                  const mediaPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+                    const d = compMediaDragRef.current;
+                    if (!d || d.beatIdx !== activeBeatIdx) return;
+                    const r = compPreviewRef.current?.getBoundingClientRect();
+                    if (!r) return;
+                    d.currentX = d.startX + (e.clientX - d.ox) / (r.width / COMP_W);
+                    d.currentY = d.startY + (e.clientY - d.oy) / (r.height / COMP_H);
+                    const el = e.currentTarget as HTMLElement;
+                    el.style.left = d.currentX * (r.width / COMP_W) + "px";
+                    el.style.top = d.currentY * (r.height / COMP_H) + "px";
+                    el.style.right = "auto";
+                    el.style.bottom = "auto";
+                  };
+                  const mediaPointerUp = () => {
+                    const d = compMediaDragRef.current;
+                    if (!d || d.beatIdx !== activeBeatIdx) return;
+                    const currentRect = beats[d.beatIdx]?.compMediaRect ?? mediaRect;
+                    updateCompMediaRect(d.beatIdx, { ...currentRect, x: d.currentX, y: d.currentY });
+                    compMediaDragRef.current = null;
+                  };
+                  return (
+                    <>
+                      {activeBeat.customVideoUrl ? (
+                        <video
+                          src={activeBeat.customVideoUrl}
+                          muted
+                          playsInline
+                          autoPlay
+                          loop
+                          onLoadedMetadata={(e) => initializeCompMediaRect(activeBeatIdx, e.currentTarget.videoWidth, e.currentTarget.videoHeight)}
+                          onPointerDown={mediaPointerDown}
+                          onPointerMove={mediaPointerMove}
+                          onPointerUp={mediaPointerUp}
+                          onPointerCancel={() => { compMediaDragRef.current = null; }}
+                          style={mediaStyle}
+                        />
+                      ) : (
+                        <img
+                          src={displayImg}
+                          alt=""
+                          onLoad={(e) => initializeCompMediaRect(activeBeatIdx, e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)}
+                          onPointerDown={mediaPointerDown}
+                          onPointerMove={mediaPointerMove}
+                          onPointerUp={mediaPointerUp}
+                          onPointerCancel={() => { compMediaDragRef.current = null; }}
+                          style={mediaStyle}
+                        />
+                      )}
+                      <div
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          const r = activeBeat.compMediaRect ?? mediaRect;
+                          compMediaResizeRef.current = { beatIdx: activeBeatIdx, ox: e.clientX, startRect: r, aspect: r.h / Math.max(1, r.w), currentRect: r };
+                        }}
+                        onPointerMove={(e) => {
+                          const d = compMediaResizeRef.current;
+                          if (!d || d.beatIdx !== activeBeatIdx) return;
+                          const r = compPreviewRef.current?.getBoundingClientRect();
+                          if (!r) return;
+                          const nextW = Math.max(80, d.startRect.w + (e.clientX - d.ox) / (r.width / COMP_W));
+                          d.currentRect = { ...d.startRect, w: nextW, h: nextW * d.aspect };
+                          const el = e.currentTarget.parentElement as HTMLElement | null;
+                          const media = el?.querySelector("img,video") as HTMLElement | null;
+                          if (media) {
+                            media.style.width = d.currentRect.w * (r.width / COMP_W) + "px";
+                            media.style.height = d.currentRect.h * (r.height / COMP_H) + "px";
+                          }
+                        }}
+                        onPointerUp={() => {
+                          const d = compMediaResizeRef.current;
+                          if (d) updateCompMediaRect(d.beatIdx, d.currentRect);
+                          compMediaResizeRef.current = null;
+                        }}
+                        onPointerCancel={() => { compMediaResizeRef.current = null; }}
+                        style={{ position: "absolute", left: (mediaRect.x + mediaRect.w) * sx - 7, top: (mediaRect.y + mediaRect.h) * sy - 7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize", zIndex: 8 }}
+                        title="Resize beat media"
+                      />
+                    </>
                   );
                 })() : (
                   <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#777", fontFamily: "monospace", fontSize: 13 }}>
@@ -2043,8 +2207,8 @@ export default function BuilderPage() {
                         if (!d || d.id !== sb.id) return;
                         const r = compPreviewRef.current?.getBoundingClientRect();
                         if (!r) return;
-                        d.currentX = Math.max(0, Math.min(1080 - size, d.startX + (e.clientX - d.ox) / (r.width / 1080)));
-                        d.currentY = Math.max(0, Math.min(1920 - size, d.startY + (e.clientY - d.oy) / (r.height / 1920)));
+                        d.currentX = d.startX + (e.clientX - d.ox) / (r.width / 1080);
+                        d.currentY = d.startY + (e.clientY - d.oy) / (r.height / 1920);
                         const el = e.currentTarget as HTMLDivElement;
                         el.style.left = d.currentX * (r.width / 1080) + "px";
                         el.style.top = d.currentY * (r.height / 1920) + "px";
@@ -2062,6 +2226,34 @@ export default function BuilderPage() {
                       style={{ position: "absolute", left: pos.x * sx, top: pos.y * sy, width: size * sx, cursor: "grab", filter: "drop-shadow(0 6px 12px rgba(0,0,0,0.45))", outline: "1px solid rgba(200,241,53,0.7)" }}
                     >
                       <img src={sb.imageUrl} alt="" style={{ width: "100%", height: "auto", display: "block", pointerEvents: "none" }} />
+                      <div
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          compSubBeatResizeRef.current = { id: sb.id, beatIdx: activeBeatIdx, sbIdx, ox: e.clientX, startSize: size, currentSize: size };
+                        }}
+                        onPointerMove={(e) => {
+                          const d = compSubBeatResizeRef.current;
+                          if (!d || d.id !== sb.id) return;
+                          const r = compPreviewRef.current?.getBoundingClientRect();
+                          if (!r) return;
+                          d.currentSize = Math.max(40, d.startSize + (e.clientX - d.ox) / (r.width / 1080));
+                          const el = e.currentTarget.parentElement as HTMLDivElement | null;
+                          if (el) el.style.width = d.currentSize * (r.width / 1080) + "px";
+                        }}
+                        onPointerUp={() => {
+                          const d = compSubBeatResizeRef.current;
+                          if (!d || d.id !== sb.id) return;
+                          setBeats(prev => prev.map((beat, bi) => bi !== d.beatIdx ? beat : {
+                            ...beat,
+                            subBeats: (beat.subBeats ?? []).map((s, si) => si === d.sbIdx ? { ...s, compSize: d.currentSize } : s),
+                          }));
+                          compSubBeatResizeRef.current = null;
+                        }}
+                        onPointerCancel={() => { compSubBeatResizeRef.current = null; }}
+                        style={{ position: "absolute", right: -7, bottom: -7, width: 14, height: 14, background: "#c8f135", border: "1.5px solid #111", cursor: "se-resize" }}
+                        title="Resize sub-beat"
+                      />
                     </div>
                   );
                 })}
@@ -2662,14 +2854,34 @@ function drawBackground(ctx: CanvasRenderingContext2D, W: number, H: number, bac
   ctx.fillRect(0, 0, W, H);
 }
 
+function getMediaSourceSize(media: CanvasImageSource | null): { w: number; h: number } {
+  if (!media) return { w: 0, h: 0 };
+  if (media instanceof HTMLVideoElement) return { w: media.videoWidth, h: media.videoHeight };
+  const img = media as HTMLImageElement;
+  return { w: img.naturalWidth || img.width || 0, h: img.naturalHeight || img.height || 0 };
+}
+
+function getContainRect(srcW: number, srcH: number, w: number, h: number): CompRect {
+  if (!srcW || !srcH) return { x: 0, y: 0, w, h };
+  const scale = Math.min(w / srcW, h / srcH);
+  const drawW = srcW * scale;
+  const drawH = srcH * scale;
+  return { x: (w - drawW) / 2, y: (h - drawH) / 2, w: drawW, h: drawH };
+}
+
+function getCompMediaRect(beat: Beat | undefined, media: CanvasImageSource | null, w: number, h: number): CompRect {
+  if (beat?.compMediaRect) return beat.compMediaRect;
+  const size = getMediaSourceSize(media);
+  return getContainRect(size.w, size.h, w, h);
+}
+
 function drawMediaContain(ctx: CanvasRenderingContext2D, media: CanvasImageSource | null, x: number, y: number, w: number, h: number, fallbackColor = "#111") {
   if (!media) {
     ctx.fillStyle = fallbackColor;
     ctx.fillRect(x, y, w, h);
     return;
   }
-  const srcW = media instanceof HTMLVideoElement ? media.videoWidth : (media as HTMLImageElement).naturalWidth || (media as HTMLImageElement).width;
-  const srcH = media instanceof HTMLVideoElement ? media.videoHeight : (media as HTMLImageElement).naturalHeight || (media as HTMLImageElement).height;
+  const { w: srcW, h: srcH } = getMediaSourceSize(media);
   if (!srcW || !srcH) {
     ctx.fillStyle = fallbackColor;
     ctx.fillRect(x, y, w, h);
