@@ -174,7 +174,6 @@ export default function BuilderPage() {
   const boardRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ idx: number; pointerId: number; ox: number; oy: number; startBeatX: number; startBeatY: number; currentX: number; currentY: number; pointerX: number; pointerY: number } | null>(null);
   const pendingDragRef = useRef<{ idx: number; pointerId: number; startClientX: number; startClientY: number; lastClientX: number; lastClientY: number; startBeatX: number; startBeatY: number } | null>(null);
-  const pinchRef = useRef<{ idx: number; p1id: number; p1x: number; p2id: number; p2x: number; initSpread: number; initSize: number; currentSize: number } | null>(null);
   const cardElemsRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const strokesRef = useRef<Stroke[]>([]);
@@ -516,24 +515,7 @@ export default function BuilderPage() {
     const beat = beats[idx];
 
     if (isMobile) {
-      // Second finger on the same card while first is already tracked → switch to pinch
-      const firstPtrX =
-        dragRef.current?.idx === idx ? dragRef.current.pointerX :
-        pendingDragRef.current?.idx === idx ? pendingDragRef.current.lastClientX :
-        null;
-      if (firstPtrX !== null) {
-        const firstId =
-          dragRef.current?.idx === idx
-            ? dragRef.current.pointerId
-            : pendingDragRef.current!.pointerId;
-        const initSpread = Math.max(1, Math.abs(e.clientX - firstPtrX));
-        const initSize = beat.size ?? CARD_W;
-        pinchRef.current = { idx, p1id: firstId, p1x: firstPtrX, p2id: e.pointerId, p2x: e.clientX, initSpread, initSize, currentSize: initSize };
-        dragRef.current = null;
-        pendingDragRef.current = null;
-        return;
-      }
-      // First touch: park in pending until 8 px threshold is crossed
+      // Park in pending until the 8 px drag threshold is crossed
       pendingDragRef.current = {
         idx,
         pointerId: e.pointerId,
@@ -562,24 +544,11 @@ export default function BuilderPage() {
   }
 
   function handleBoardPointerMove(e: React.PointerEvent) {
-    // ── Pinch-to-resize (two fingers on same card) ──────────────────
-    if (pinchRef.current) {
-      const { idx, p1id, p2id, initSpread, initSize } = pinchRef.current;
-      if (e.pointerId === p1id) pinchRef.current.p1x = e.clientX;
-      else if (e.pointerId === p2id) pinchRef.current.p2x = e.clientX;
-      else return;
-      const newSpread = Math.max(1, Math.abs(pinchRef.current.p1x - pinchRef.current.p2x));
-      const newSize = Math.max(80, Math.min(400, initSize * (newSpread / initSpread)));
-      pinchRef.current.currentSize = newSize;
-      const el = cardElemsRef.current.get(idx);
-      if (el) el.style.width = newSize + "px";
-      return;
-    }
-
     // ── Pending tap-to-select: promote to drag once 8 px moved ──────
-    if (pendingDragRef.current) {
+    // Only handle if this is the same pointer that started the pending tap.
+    // If it's a different pointer (e.g. the resize handle), fall through.
+    if (pendingDragRef.current && e.pointerId === pendingDragRef.current.pointerId) {
       const { idx, pointerId, startClientX, startClientY, startBeatX, startBeatY } = pendingDragRef.current;
-      if (e.pointerId !== pointerId) return;
       pendingDragRef.current.lastClientX = e.clientX;
       pendingDragRef.current.lastClientY = e.clientY;
       const dx = e.clientX - startClientX;
@@ -627,12 +596,6 @@ export default function BuilderPage() {
   }
 
   function handleBoardPointerUp() {
-    // Commit pinch resize (first finger to lift ends the gesture)
-    if (pinchRef.current) {
-      const { idx, currentSize } = pinchRef.current;
-      setBeats(prev => prev.map((b, i) => i === idx ? { ...b, size: currentSize } : b));
-      pinchRef.current = null;
-    }
     // Pending tap never moved far enough — selection already set in pointerDown, just clear
     pendingDragRef.current = null;
     // Commit card drag position
@@ -1862,6 +1825,8 @@ export default function BuilderPage() {
         overflowY: "auto",
         // extra bottom padding so content clears the floating preview button
         paddingBottom: "calc(80px + env(safe-area-inset-bottom, 0px))",
+        // block pointer events when the preview overlay is covering it
+        pointerEvents: previewOpen ? "none" : "auto",
       }
     : leftPanelStyle;
 
@@ -1873,6 +1838,7 @@ export default function BuilderPage() {
         zIndex: 200,
         display: previewOpen ? "flex" : "none",
         flexDirection: "column",
+        userSelect: "none",
       }
     : rightPanelStyle;
 
@@ -2728,6 +2694,7 @@ export default function BuilderPage() {
                       onPointerDown={(e) => {
                         e.stopPropagation();
                         e.currentTarget.setPointerCapture(e.pointerId);
+                        pendingDragRef.current = null;
                         resizeRef.current = { idx: i, startX: e.clientX, startSize: cardW, currentSize: cardW };
                       }}
                       style={{
