@@ -1171,6 +1171,7 @@ export default function BuilderPage() {
         })
       );
 
+      setRenderStatus("Loading custom videos...");
       const videoEls: (HTMLVideoElement | null)[] = await Promise.all(
         beats.map(b => {
           if (!b.customVideoUrl) return Promise.resolve(null);
@@ -1218,6 +1219,7 @@ export default function BuilderPage() {
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, W, H);
 
+      setRenderStatus("Setting up audio...");
       const audioEl = new Audio(URL.createObjectURL(audioBlob));
       audioEl.preload = "auto";
       await new Promise<void>((res) => {
@@ -1226,6 +1228,9 @@ export default function BuilderPage() {
       });
       const safeDuration = duration && duration > 0.5 ? duration : audioEl.duration;
 
+      if (typeof (canvas as HTMLCanvasElement & { captureStream?: (fps: number) => MediaStream }).captureStream !== "function") {
+        throw new Error("Video export requires canvas.captureStream, which is not available on this browser. Use desktop Chrome or Safari 17.2+.");
+      }
       const canvasStream = canvas.captureStream(30);
       const audioCtx = new AudioContext();
       if (audioCtx.state === "suspended") await audioCtx.resume();
@@ -1275,6 +1280,7 @@ export default function BuilderPage() {
         };
       });
 
+      setRenderStatus(`Starting recorder [${actualMimeType || "browser default"}]...`);
       renderRecorder.start();
       audioEl.currentTime = 0;
       const startMs = performance.now();
@@ -1282,13 +1288,20 @@ export default function BuilderPage() {
       const cameraPanEnd = Math.max(cameraPanStart, Math.min(safeDuration, cameraPanStart + (introPanDuration ?? 0)));
       try { await audioEl.play(); } catch {}
 
-      setRenderStatus("Rendering frames...");
+      setRenderStatus(`Recording 0s / ${safeDuration.toFixed(0)}s...`);
+      let lastStatusSec = -1;
 
       if (appMode === "compilation") {
         let prevRenderBeatIdx = -1;
         function drawCompilationFrame() {
           const elapsedSec = (performance.now() - startMs) / 1000;
           const audioSec = Math.max(0, elapsedSec);
+
+          const flooredSec = Math.floor(elapsedSec);
+          if (flooredSec !== lastStatusSec) {
+            lastStatusSec = flooredSec;
+            setRenderStatus(`Recording ${flooredSec}s / ${safeDuration.toFixed(0)}s...`);
+          }
 
           if (elapsedSec >= safeDuration) {
             renderRecorder.stop();
@@ -1463,6 +1476,12 @@ export default function BuilderPage() {
       function drawFrame() {
         const elapsedSec = (performance.now() - startMs) / 1000;
         const audioSec = Math.max(0, elapsedSec);
+
+        const flooredSec = Math.floor(elapsedSec);
+        if (flooredSec !== lastStatusSec) {
+          lastStatusSec = flooredSec;
+          setRenderStatus(`Recording ${flooredSec}s / ${safeDuration.toFixed(0)}s...`);
+        }
 
         if (elapsedSec >= safeDuration) {
           renderRecorder.stop();
@@ -1693,9 +1712,10 @@ export default function BuilderPage() {
       const webmBlob = await recordingDone;
       audioCtx.close();
       if (webmBlob.size < 1000) {
-        throw new Error("Recording produced no data — try a different browser (Chrome works best)");
+        throw new Error(`Recording produced no data (${webmBlob.size}b, codec: ${actualMimeType || "unknown"}). Try desktop Chrome or Safari 17.2+.`);
       }
-      setRenderStatus("Converting to MP4 on server...");
+      const blobKb = Math.round(webmBlob.size / 1024);
+      setRenderStatus(`Uploading to server (${blobKb}kb, ${actualMimeType.split(";")[0]})...`);
 
       const mp4Res = await fetch(config.railwayUrl + "/render", {
         method: "POST",
@@ -1706,10 +1726,11 @@ export default function BuilderPage() {
         const errText = await mp4Res.text().catch(() => "");
         throw new Error("Server error " + mp4Res.status + ": " + errText);
       }
+      setRenderStatus("Downloading result...");
       const mp4Blob = await mp4Res.blob();
       const url = URL.createObjectURL(mp4Blob);
       setMp4Url(url);
-      setRenderStatus("Done!");
+      setRenderStatus(`Done! (${Math.round(mp4Blob.size / 1024)}kb)`);
       // Log the render — this marks the user's free credit as used
       fetch("/api/render/complete", {
         method: "POST",
