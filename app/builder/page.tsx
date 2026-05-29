@@ -198,6 +198,7 @@ export default function BuilderPage() {
   const { isMobile } = useWindowSize();
   const [previewOpen, setPreviewOpen] = useState(false);
   const mobileDefaultApplied = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
@@ -299,6 +300,45 @@ export default function BuilderPage() {
       mobileDefaultApplied.current = true;
     }
   }, [isMobile]);
+
+  // Restore persisted builder state on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("neuralboard_builder_state");
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (s.transcript) setTranscript(s.transcript);
+      if (typeof s.duration === "number") setDuration(s.duration);
+      if (Array.isArray(s.beats) && s.beats.length > 0) setBeats(s.beats);
+      if (s.background) setBackground(s.background as Background);
+      if (s.cardStyle) setCardStyle(s.cardStyle as CardStyle);
+      if (Array.isArray(s.strokes)) setStrokes(s.strokes as Stroke[]);
+      if (Array.isArray(s.overlays)) setOverlays(s.overlays as Overlay[]);
+    } catch { /* corrupt/missing — start fresh */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Debounced save — fires 500 ms after the last change to any watched state
+  useEffect(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      try {
+        // Strip blob: URLs — they don't survive page reloads
+        const beatsToSave = beats.map((b) => ({
+          ...b,
+          customVideoUrl: b.customVideoUrl?.startsWith("blob:") ? undefined : b.customVideoUrl,
+          customImageUrl: b.customImageUrl?.startsWith("blob:") ? undefined : b.customImageUrl,
+        }));
+        localStorage.setItem(
+          "neuralboard_builder_state",
+          JSON.stringify({ transcript, duration, beats: beatsToSave, background, cardStyle, strokes, overlays })
+        );
+      } catch { /* quota exceeded or private-browsing restriction — silently skip */ }
+    }, 500);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [beats, transcript, duration, background, cardStyle, strokes, overlays]);
 
   async function startRecording() {
     setError("");
