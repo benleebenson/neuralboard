@@ -1246,16 +1246,24 @@ export default function BuilderPage() {
         ...audioDest.stream.getAudioTracks(),
       ]);
 
-      const recorderMime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-        ? "video/webm;codecs=vp9,opus"
-        : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
-        ? "video/webm;codecs=vp8,opus"
-        : "video/webm";
+      const recorderMime = (() => {
+        const candidates = [
+          "video/webm;codecs=vp9,opus",
+          "video/webm;codecs=vp8,opus",
+          "video/webm",
+          "video/mp4;codecs=avc1,mp4a.40.2", // iOS Safari
+          "video/mp4",                         // iOS Safari fallback
+        ];
+        return candidates.find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
+      })();
 
-      const renderRecorder = new MediaRecorder(combinedStream, {
-        mimeType: recorderMime,
-        videoBitsPerSecond: 4_000_000,
-      });
+      const renderRecorder = new MediaRecorder(
+        combinedStream,
+        recorderMime
+          ? { mimeType: recorderMime, videoBitsPerSecond: 4_000_000 }
+          : { videoBitsPerSecond: 4_000_000 }
+      );
+      const actualMimeType = renderRecorder.mimeType || recorderMime || "video/webm";
       const renderChunks: Blob[] = [];
       renderRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) renderChunks.push(e.data);
@@ -1263,7 +1271,7 @@ export default function BuilderPage() {
 
       const recordingDone = new Promise<Blob>((resolve) => {
         renderRecorder.onstop = () => {
-          resolve(new Blob(renderChunks, { type: "video/webm" }));
+          resolve(new Blob(renderChunks, { type: actualMimeType }));
         };
       });
 
@@ -1691,7 +1699,7 @@ export default function BuilderPage() {
 
       const mp4Res = await fetch(config.railwayUrl + "/render", {
         method: "POST",
-        headers: { "Content-Type": "video/webm", "x-neuralboard-password": config.railwayPassword },
+        headers: { "Content-Type": actualMimeType, "x-neuralboard-password": config.railwayPassword },
         body: webmBlob,
       });
       if (!mp4Res.ok) {
@@ -2299,11 +2307,12 @@ export default function BuilderPage() {
             isMobile ? (
               <div style={{ marginTop: 12 }}>
                 <video
-                  src={mp4Url}
                   controls
                   playsInline
                   style={{ width: "100%", display: "block", background: "#000", maxHeight: 320 }}
-                />
+                >
+                  <source src={mp4Url} type="video/mp4" />
+                </video>
                 <div style={{ marginTop: 6, padding: "9px 12px", background: "rgba(200,241,53,0.12)", border: "1px solid #c8f135", fontSize: 11, fontFamily: "monospace", color: "#2a2a2a", lineHeight: 1.55 }}>
                   <strong>iOS Safari:</strong> tap play, then long-press the video → &quot;Save to Photos&quot;<br />
                   <strong>Android:</strong> use the download button below
