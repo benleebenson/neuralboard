@@ -172,7 +172,9 @@ export default function BuilderPage() {
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
   const bgFileInputRef = useRef<HTMLInputElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{ idx: number; ox: number; oy: number; startBeatX: number; startBeatY: number; currentX: number; currentY: number } | null>(null);
+  const dragRef = useRef<{ idx: number; pointerId: number; ox: number; oy: number; startBeatX: number; startBeatY: number; currentX: number; currentY: number; pointerX: number; pointerY: number } | null>(null);
+  const pendingDragRef = useRef<{ idx: number; pointerId: number; startClientX: number; startClientY: number; lastClientX: number; lastClientY: number; startBeatX: number; startBeatY: number } | null>(null);
+  const pinchRef = useRef<{ idx: number; p1id: number; p1x: number; p2id: number; p2x: number; initSpread: number; initSize: number; currentSize: number } | null>(null);
   const cardElemsRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const strokesRef = useRef<Stroke[]>([]);
@@ -509,21 +511,95 @@ export default function BuilderPage() {
 
   function handleBoardPointerDown(e: React.PointerEvent, idx: number) {
     e.currentTarget.setPointerCapture(e.pointerId);
-    const beat = beats[idx];
-    dragRef.current = {
-      idx,
-      ox: e.clientX,
-      oy: e.clientY,
-      startBeatX: beat.pos?.x ?? 0,
-      startBeatY: beat.pos?.y ?? 0,
-      currentX: beat.pos?.x ?? 0,
-      currentY: beat.pos?.y ?? 0,
-    };
-    setActiveBeatIdx(idx);
     e.stopPropagation();
+    setActiveBeatIdx(idx);
+    const beat = beats[idx];
+
+    if (isMobile) {
+      // Second finger on the same card while first is already tracked → switch to pinch
+      const firstPtrX =
+        dragRef.current?.idx === idx ? dragRef.current.pointerX :
+        pendingDragRef.current?.idx === idx ? pendingDragRef.current.lastClientX :
+        null;
+      if (firstPtrX !== null) {
+        const firstId =
+          dragRef.current?.idx === idx
+            ? dragRef.current.pointerId
+            : pendingDragRef.current!.pointerId;
+        const initSpread = Math.max(1, Math.abs(e.clientX - firstPtrX));
+        const initSize = beat.size ?? CARD_W;
+        pinchRef.current = { idx, p1id: firstId, p1x: firstPtrX, p2id: e.pointerId, p2x: e.clientX, initSpread, initSize, currentSize: initSize };
+        dragRef.current = null;
+        pendingDragRef.current = null;
+        return;
+      }
+      // First touch: park in pending until 8 px threshold is crossed
+      pendingDragRef.current = {
+        idx,
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        lastClientX: e.clientX,
+        lastClientY: e.clientY,
+        startBeatX: beat.pos?.x ?? 0,
+        startBeatY: beat.pos?.y ?? 0,
+      };
+    } else {
+      // Desktop: start drag immediately (unchanged behaviour)
+      dragRef.current = {
+        idx,
+        pointerId: e.pointerId,
+        ox: e.clientX,
+        oy: e.clientY,
+        startBeatX: beat.pos?.x ?? 0,
+        startBeatY: beat.pos?.y ?? 0,
+        currentX: beat.pos?.x ?? 0,
+        currentY: beat.pos?.y ?? 0,
+        pointerX: e.clientX,
+        pointerY: e.clientY,
+      };
+    }
   }
 
   function handleBoardPointerMove(e: React.PointerEvent) {
+    // ── Pinch-to-resize (two fingers on same card) ──────────────────
+    if (pinchRef.current) {
+      const { idx, p1id, p2id, initSpread, initSize } = pinchRef.current;
+      if (e.pointerId === p1id) pinchRef.current.p1x = e.clientX;
+      else if (e.pointerId === p2id) pinchRef.current.p2x = e.clientX;
+      else return;
+      const newSpread = Math.max(1, Math.abs(pinchRef.current.p1x - pinchRef.current.p2x));
+      const newSize = Math.max(80, Math.min(400, initSize * (newSpread / initSpread)));
+      pinchRef.current.currentSize = newSize;
+      const el = cardElemsRef.current.get(idx);
+      if (el) el.style.width = newSize + "px";
+      return;
+    }
+
+    // ── Pending tap-to-select: promote to drag once 8 px moved ──────
+    if (pendingDragRef.current) {
+      const { idx, pointerId, startClientX, startClientY, startBeatX, startBeatY } = pendingDragRef.current;
+      if (e.pointerId !== pointerId) return;
+      pendingDragRef.current.lastClientX = e.clientX;
+      pendingDragRef.current.lastClientY = e.clientY;
+      const dx = e.clientX - startClientX;
+      const dy = e.clientY - startClientY;
+      if (dx * dx + dy * dy > 64) {
+        // Crossed threshold — activate drag from the original touch-down point
+        const board = boardRef.current;
+        const cardW = beats[idx]?.size ?? CARD_W;
+        const boardRect = board?.getBoundingClientRect();
+        const clampedX = boardRect ? Math.max(0, Math.min(boardRect.width - cardW, startBeatX + dx)) : startBeatX + dx;
+        const clampedY = boardRect ? Math.max(0, Math.min(boardRect.height - 60, startBeatY + dy)) : startBeatY + dy;
+        dragRef.current = { idx, pointerId, ox: startClientX, oy: startClientY, startBeatX, startBeatY, currentX: clampedX, currentY: clampedY, pointerX: e.clientX, pointerY: e.clientY };
+        pendingDragRef.current = null;
+        const el = cardElemsRef.current.get(idx);
+        if (el) { el.style.left = clampedX + "px"; el.style.top = clampedY + "px"; }
+      }
+      return;
+    }
+
+    // ── Resize handle drag ───────────────────────────────────────────
     if (resizeRef.current) {
       const { idx, startX, startSize } = resizeRef.current;
       const newSize = Math.max(80, Math.min(400, startSize + (e.clientX - startX)));
@@ -532,8 +608,12 @@ export default function BuilderPage() {
       if (el) el.style.width = newSize + "px";
       return;
     }
+
+    // ── Active card drag ─────────────────────────────────────────────
     if (!dragRef.current) return;
     const { idx, ox, oy, startBeatX, startBeatY } = dragRef.current;
+    dragRef.current.pointerX = e.clientX;
+    dragRef.current.pointerY = e.clientY;
     const board = boardRef.current;
     if (!board) return;
     const boardRect = board.getBoundingClientRect();
@@ -547,10 +627,20 @@ export default function BuilderPage() {
   }
 
   function handleBoardPointerUp() {
+    // Commit pinch resize (first finger to lift ends the gesture)
+    if (pinchRef.current) {
+      const { idx, currentSize } = pinchRef.current;
+      setBeats(prev => prev.map((b, i) => i === idx ? { ...b, size: currentSize } : b));
+      pinchRef.current = null;
+    }
+    // Pending tap never moved far enough — selection already set in pointerDown, just clear
+    pendingDragRef.current = null;
+    // Commit card drag position
     if (dragRef.current) {
       const { idx, currentX, currentY } = dragRef.current;
       setBeats(prev => prev.map((b, i) => i === idx ? { ...b, pos: { x: currentX, y: currentY } } : b));
     }
+    // Commit resize
     if (resizeRef.current) {
       const { idx, currentSize } = resizeRef.current;
       setBeats(prev => prev.map((b, i) => i === idx ? { ...b, size: currentSize } : b));
@@ -2640,19 +2730,51 @@ export default function BuilderPage() {
                         e.currentTarget.setPointerCapture(e.pointerId);
                         resizeRef.current = { idx: i, startX: e.clientX, startSize: cardW, currentSize: cardW };
                       }}
-                      style={{ position: "absolute", bottom: -6, right: -6, width: 12, height: 12,
-                        background: isActive ? "#c8f135" : "white", border: "1.5px solid #2a2a2a",
-                        cursor: "se-resize", zIndex: 20, borderRadius: 2 }}
-                    />
+                      style={{
+                        position: "absolute",
+                        bottom: isMobile ? -14 : -6,
+                        right: isMobile ? -14 : -6,
+                        width: isMobile ? 28 : 12,
+                        height: isMobile ? 28 : 12,
+                        background: isMobile ? "rgba(255,255,255,0.88)" : (isActive ? "#c8f135" : "white"),
+                        border: isMobile ? "1.5px solid rgba(42,42,42,0.35)" : "1.5px solid #2a2a2a",
+                        cursor: "se-resize",
+                        zIndex: 20,
+                        borderRadius: isMobile ? "50%" : 2,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: 13,
+                        color: "#2a2a2a",
+                        userSelect: "none",
+                      }}
+                    >
+                      {isMobile ? "⤡" : ""}
+                    </div>
                   )}
                   {isActive && !drawMode && (
                     <div
                       onPointerDown={(e) => { e.stopPropagation(); deleteBeat(i); }}
-                      style={{ position: "absolute", top: -8, right: -8, width: 18, height: 18,
-                        background: "#ff3a3a", border: "1.5px solid #2a2a2a", borderRadius: "50%",
-                        cursor: "pointer", zIndex: 21, display: "flex", alignItems: "center",
-                        justifyContent: "center", color: "white", fontSize: 12, fontWeight: 700,
-                        userSelect: "none" }}>×</div>
+                      style={{
+                        position: "absolute",
+                        top: isMobile ? -16 : -8,
+                        right: isMobile ? -16 : -8,
+                        width: isMobile ? 36 : 18,
+                        height: isMobile ? 36 : 18,
+                        background: "#ff3a3a",
+                        border: "1.5px solid #2a2a2a",
+                        borderRadius: "50%",
+                        cursor: "pointer",
+                        zIndex: 21,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "white",
+                        fontSize: isMobile ? 20 : 12,
+                        fontWeight: 700,
+                        userSelect: "none",
+                      }}
+                    >×</div>
                   )}
                 </div>
               );
