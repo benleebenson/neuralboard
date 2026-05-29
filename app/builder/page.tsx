@@ -196,7 +196,7 @@ export default function BuilderPage() {
   const [confirmingDirector, setConfirmingDirector] = useState(false);
 
   const { isMobile } = useWindowSize();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   const mobileDefaultApplied = useRef(false);
 
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
@@ -1719,32 +1719,31 @@ export default function BuilderPage() {
   const activeBeat = beats[activeBeatIdx];
   const activeBeatImage = activeBeat?.images?.[activeBeat.selectedImageIdx ?? 0];
 
-  // Mobile-responsive layout styles (computed here so they can reference isMobile/sidebarOpen)
+  // Mobile-responsive layout styles (computed here so they can reference isMobile/previewOpen)
   const mobileSplitStyle: React.CSSProperties = isMobile
     ? { display: "block" }
     : splitStyle;
 
+  // On mobile the sidebar is a full-width block in normal document flow — no drawer
   const mobileSidebarStyle: React.CSSProperties = isMobile
     ? {
-        position: "fixed",
-        bottom: 0,
-        left: 0,
-        right: 0,
-        height: "72vh",
-        zIndex: 200,
-        background: "#fffdf5",
+        padding: "20px 20px",
+        minHeight: "calc(100vh - 104px)",
         overflowY: "auto",
-        padding: "16px 20px",
-        paddingBottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
-        borderTop: "2px solid #2a2a2a",
-        boxShadow: "0 -4px 24px rgba(0,0,0,0.18)",
-        transform: sidebarOpen ? "translateY(0)" : "translateY(100%)",
-        transition: "transform 0.3s cubic-bezier(0.32, 0.72, 0, 1)",
+        // extra bottom padding so content clears the floating preview button
+        paddingBottom: "calc(80px + env(safe-area-inset-bottom, 0px))",
       }
     : leftPanelStyle;
 
+  // On mobile the right panel is a full-screen fixed overlay, visible only when previewOpen
   const mobileRightStyle: React.CSSProperties = isMobile
-    ? { display: "flex", flexDirection: "column", minHeight: "calc(100vh - 104px)" }
+    ? {
+        position: "fixed",
+        inset: 0,
+        zIndex: 200,
+        display: previewOpen ? "flex" : "none",
+        flexDirection: "column",
+      }
     : rightPanelStyle;
 
   return (
@@ -1782,12 +1781,6 @@ export default function BuilderPage() {
 
       <div style={mobileSplitStyle}>
         <section style={mobileSidebarStyle}>
-          {isMobile && (
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 12, borderBottom: "1px dashed rgba(42,42,42,0.25)" }}>
-              <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>CONTROLS</span>
-              <button onClick={() => setSidebarOpen(false)} style={{ ...miniButton, padding: "6px 10px", fontSize: 16, lineHeight: 1 }}>✕</button>
-            </div>
-          )}
           <SectionLabel n="1" title="Audio" />
           <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
             <button
@@ -2217,6 +2210,16 @@ export default function BuilderPage() {
         </section>
 
         <section style={{ ...mobileRightStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
+          {isMobile && previewOpen && (
+            <div style={{ background: "#0a0a0a", padding: "10px 16px", display: "flex", justifyContent: "flex-end", flexShrink: 0 }}>
+              <button
+                onClick={() => setPreviewOpen(false)}
+                style={{ ...miniButton, color: "#c8f135", borderColor: "rgba(200,241,53,0.5)", padding: "6px 14px", fontSize: 13, fontWeight: 700, minHeight: 36 }}
+              >
+                ✕ close
+              </button>
+            </div>
+          )}
           {appMode === "compilation" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, background: "#101010", padding: 18 }}>
               {beats.length > 0 && (
@@ -2246,7 +2249,7 @@ export default function BuilderPage() {
                   })}
                 </div>
               )}
-              <div style={{ position: "relative", width: "min(100%, 980px)", height: isMobile ? "calc(100dvh - 190px)" : "min(calc(100vh - 190px), 860px)", flex: isMobile ? 1 : undefined, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", background: "#050505" }}>
+              <div style={{ position: "relative", width: "min(100%, 980px)", height: isMobile ? "auto" : "min(calc(100vh - 190px), 860px)", flex: isMobile ? 1 : undefined, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", background: "#050505" }}>
               <div
                 ref={compPreviewRef}
                 style={{ position: "relative", aspectRatio: "9 / 16", height: "82%", maxHeight: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1.5px rgba(200,241,53,0.95), 0 0 0 2.5px rgba(255,255,255,0.2)", flex: "0 0 auto" }}
@@ -3041,18 +3044,10 @@ export default function BuilderPage() {
         </div>
       )}
 
-      {/* Mobile sidebar backdrop */}
-      {isMobile && sidebarOpen && (
-        <div
-          onClick={() => setSidebarOpen(false)}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 150 }}
-        />
-      )}
-
-      {/* Mobile floating sidebar toggle button */}
-      {isMobile && (
+      {/* Mobile floating preview button — only shown when the overlay is closed */}
+      {isMobile && !previewOpen && (
         <button
-          onClick={() => setSidebarOpen((o) => !o)}
+          onClick={() => setPreviewOpen(true)}
           style={{
             position: "fixed",
             bottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
@@ -3071,7 +3066,7 @@ export default function BuilderPage() {
             letterSpacing: 0.5,
           }}
         >
-          {sidebarOpen ? "✕ close" : "☰ controls"}
+          ▶ Preview
         </button>
       )}
     </main>
