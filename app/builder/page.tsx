@@ -1179,10 +1179,12 @@ export default function BuilderPage() {
           vid.src = b.customVideoUrl;
           vid.muted = true;
           vid.playsInline = true;
-          vid.crossOrigin = 'anonymous';
           return new Promise<HTMLVideoElement | null>(resolve => {
             const timer = setTimeout(() => resolve(null), 8000);
-            vid.oncanplay = () => { clearTimeout(timer); resolve(vid); };
+            vid.addEventListener('loadeddata', () => {
+              vid.currentTime = 0;
+              vid.addEventListener('seeked', () => { clearTimeout(timer); resolve(vid); }, { once: true });
+            }, { once: true });
             vid.onerror = () => { clearTimeout(timer); resolve(null); };
             vid.load();
           });
@@ -1326,12 +1328,15 @@ export default function BuilderPage() {
 
           ctx!.fillStyle = "#000";
           ctx!.fillRect(0, 0, W, H);
-          const mediaEl: CanvasImageSource | null = videoEls[currentIdx] ?? images[currentIdx];
+          const rawVideoEl = videoEls[currentIdx];
+          const mediaEl: CanvasImageSource | null = rawVideoEl
+            ? (rawVideoEl.readyState >= 2 ? rawVideoEl : null)
+            : images[currentIdx];
           const mediaRect = getCompMediaRect(beats[currentIdx], mediaEl, W, H);
           if (mediaEl) {
             ctx!.drawImage(mediaEl, mediaRect.x, mediaRect.y, mediaRect.w, mediaRect.h);
           } else {
-            ctx!.fillStyle = "#111";
+            ctx!.fillStyle = "#000";
             ctx!.fillRect(0, 0, W, H);
           }
 
@@ -1614,7 +1619,10 @@ export default function BuilderPage() {
           const center = cardCenters[i];
           const cardScreenX = (center.x - camX) * zoom + W / 2;
           if (cardScreenX < -W * 1.5 || cardScreenX > W * 2.5) continue;
-          const mediaEl: CanvasImageSource | null = videoEls[i] ?? images[i];
+          const rawVideoEl = videoEls[i];
+          const mediaEl: CanvasImageSource | null = rawVideoEl
+            ? (rawVideoEl.readyState >= 2 ? rawVideoEl : null)
+            : images[i];
           drawCardAt(ctx!, mediaEl, layout.x, layout.y, i, beats[i].searchQuery, layout.w, layout.h, cardStyle);
 
           // Draw sub-beats that have already appeared during this beat's window
