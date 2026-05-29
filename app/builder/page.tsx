@@ -1129,8 +1129,12 @@ export default function BuilderPage() {
   }
 
   async function renderVideo() {
-    if (!audioBlob || beats.length === 0) {
-      setError("Need both audio and beats to render");
+    if (beats.length === 0) {
+      setError("Record or upload audio first to generate beats");
+      return;
+    }
+    if (!audioBlob) {
+      setError("Audio not loaded — please re-upload your audio file to render");
       return;
     }
     if (!config?.railwayUrl) return;
@@ -2266,11 +2270,11 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 && audioBlob && config?.railwayUrl ? (
+          {beats.length > 0 && config?.railwayUrl ? (
             <button onClick={renderVideo} disabled={rendering} style={{ ...renderButtonStyle, minHeight: isMobile ? 44 : undefined }}>
               {rendering ? (renderStatus || "RENDERING...") : appMode === "compilation" ? "RENDER COMPILATION" : "RENDER VIDEO"}
             </button>
-          ) : beats.length > 0 && audioBlob && !config?.railwayUrl ? (
+          ) : beats.length > 0 && !config?.railwayUrl ? (
             <div style={{ marginTop: 12, padding: "10px 12px", border: "1.5px dashed #2a2a2a", fontSize: 11, fontFamily: "monospace", color: "#6a6a6a" }}>
               {config === null ? "loading config..." : "mp4 export needs railway backend (not configured)"}
             </div>
@@ -2292,23 +2296,49 @@ export default function BuilderPage() {
           ) : null}
 
           {mp4Url ? (
-            <a
-              href={mp4Url}
-              download="neuralboard.mp4"
-              onClick={() => {
-                if (!isSubscribed) setCanGenerate(false);
-                // Non-blocking analytics only — do NOT rely on this for paywall enforcement.
-                // The gate uses renderCount from /api/render/complete (server-side, source of truth).
-                fetch("/api/log", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ event: "download", durationSeconds: duration }),
-                }).catch(() => {});
-              }}
-              style={{ ...sketchButton, display: "block", marginTop: 12, background: "white", textAlign: "center", textDecoration: "none" }}
-            >
-              DOWNLOAD MP4
-            </a>
+            isMobile ? (
+              <div style={{ marginTop: 12 }}>
+                <video
+                  src={mp4Url}
+                  controls
+                  playsInline
+                  style={{ width: "100%", display: "block", background: "#000", maxHeight: 320 }}
+                />
+                <div style={{ marginTop: 6, padding: "9px 12px", background: "rgba(200,241,53,0.12)", border: "1px solid #c8f135", fontSize: 11, fontFamily: "monospace", color: "#2a2a2a", lineHeight: 1.55 }}>
+                  <strong>iOS Safari:</strong> tap play, then long-press the video → &quot;Save to Photos&quot;<br />
+                  <strong>Android:</strong> use the download button below
+                </div>
+                <a
+                  href={mp4Url}
+                  download="neuralboard.mp4"
+                  onClick={() => {
+                    if (!isSubscribed) setCanGenerate(false);
+                    fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ event: "download", durationSeconds: duration }) }).catch(() => {});
+                  }}
+                  style={{ ...sketchButton, display: "block", marginTop: 8, background: "white", textAlign: "center", textDecoration: "none", minHeight: 44, lineHeight: "44px", padding: "0 12px" }}
+                >
+                  DOWNLOAD MP4
+                </a>
+              </div>
+            ) : (
+              <a
+                href={mp4Url}
+                download="neuralboard.mp4"
+                onClick={() => {
+                  if (!isSubscribed) setCanGenerate(false);
+                  // Non-blocking analytics only — do NOT rely on this for paywall enforcement.
+                  // The gate uses renderCount from /api/render/complete (server-side, source of truth).
+                  fetch("/api/log", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ event: "download", durationSeconds: duration }),
+                  }).catch(() => {});
+                }}
+                style={{ ...sketchButton, display: "block", marginTop: 12, background: "white", textAlign: "center", textDecoration: "none" }}
+              >
+                DOWNLOAD MP4
+              </a>
+            )
           ) : null}
         </section>
 
