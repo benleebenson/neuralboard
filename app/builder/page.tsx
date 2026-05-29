@@ -45,6 +45,14 @@ type CardStyle = "card" | "bare";
 type AppMode = "board" | "compilation";
 type Stroke = { color: string; size: number; points: Array<{ x: number; y: number }> };
 
+type ProposedBeat = Beat & {
+  wantsVideo?: boolean;
+  youtubeId?: string;
+  youtubeTitle?: string;
+  youtubeThumbnail?: string;
+  youtubeDurationSecs?: number;
+};
+
 type OverlayType = "text" | "arrow" | "circle";
 type Overlay = {
   id: string;
@@ -168,6 +176,12 @@ export default function BuilderPage() {
   const compMediaDragRef = useRef<{ beatIdx: number; ox: number; oy: number; startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   const compMediaResizeRef = useRef<{ beatIdx: number; ox: number; startRect: CompRect; aspect: number; currentRect: CompRect } | null>(null);
   const resizeRef = useRef<{ idx: number; startX: number; startSize: number; currentSize: number } | null>(null);
+
+  const [directorNotes, setDirectorNotes] = useState("");
+  const [directorLoading, setDirectorLoading] = useState(false);
+  const [directorError, setDirectorError] = useState("");
+  const [proposedBeats, setProposedBeats] = useState<ProposedBeat[] | null>(null);
+  const [confirmingDirector, setConfirmingDirector] = useState(false);
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
     id: string;
@@ -1601,6 +1615,83 @@ export default function BuilderPage() {
     );
   }
 
+  async function applyDirectorNotes() {
+    if (!directorNotes.trim() || beats.length === 0) return;
+    setDirectorLoading(true);
+    setDirectorError("");
+    setProposedBeats(null);
+    try {
+      const res = await fetch("/api/director", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes: directorNotes, beats }),
+      });
+      if (res.status === 401) {
+        setDirectorError("Session expired — please sign in again");
+        return;
+      }
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Director AI failed");
+      setProposedBeats(data.beats);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "Unknown error";
+      setDirectorError(message);
+    } finally {
+      setDirectorLoading(false);
+    }
+  }
+
+  async function confirmDirectorChanges() {
+    if (!proposedBeats) return;
+    setConfirmingDirector(true);
+    try {
+      const confirmedBeats: Beat[] = await Promise.all(
+        proposedBeats.map(async (pb, i): Promise<Beat> => {
+          const base: Beat = {
+            startTime: pb.startTime,
+            endTime: pb.endTime,
+            searchQuery: pb.searchQuery,
+            reasoning: pb.reasoning,
+            images: pb.images,
+            selectedImageIdx: pb.selectedImageIdx ?? 0,
+            pos: pb.pos ?? {
+              x: 40 + (i % 3) * 160 + (i * 17) % 30,
+              y: 40 + Math.floor(i / 3) * 210 + (i * 31) % 40,
+            },
+            size: pb.size,
+            customImageUrl: undefined,
+            customVideoUrl: undefined,
+          };
+
+          if (pb.wantsVideo && pb.youtubeId && config?.railwayUrl) {
+            try {
+              const beatDuration = pb.endTime - pb.startTime;
+              const clipEnd = pb.youtubeDurationSecs
+                ? Math.min(beatDuration, pb.youtubeDurationSecs)
+                : beatDuration;
+              const dlRes = await fetch("/api/ytdl", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ youtubeId: pb.youtubeId, start: 0, end: clipEnd }),
+              });
+              if (dlRes.ok) {
+                const blob = await dlRes.blob();
+                return { ...base, customVideoUrl: URL.createObjectURL(blob) };
+              }
+            } catch { /* fall through to image */ }
+          }
+
+          return base;
+        })
+      );
+      setBeats(confirmedBeats);
+      setProposedBeats(null);
+      setDirectorNotes("");
+    } finally {
+      setConfirmingDirector(false);
+    }
+  }
+
   const activeBeat = beats[activeBeatIdx];
   const activeBeatImage = activeBeat?.images?.[activeBeat.selectedImageIdx ?? 0];
 
@@ -1951,7 +2042,41 @@ export default function BuilderPage() {
 
           {appMode === "board" && beats.length > 0 ? (
             <>
-              <SectionLabel n="4" title="Background" />
+              <SectionLabel n="4" title="Director Notes" />
+              <textarea
+                value={directorNotes}
+                onChange={(e) => setDirectorNotes(e.target.value)}
+                placeholder={'e.g. "make this 5 beats, beat 2 should be a video of UFOs lasting 12 seconds"'}
+                rows={3}
+                style={{ ...inputStyle, resize: "vertical", marginBottom: 8, fontSize: 12 }}
+              />
+              <button
+                onClick={applyDirectorNotes}
+                disabled={directorLoading || !directorNotes.trim()}
+                style={{
+                  ...sketchButton,
+                  width: "100%",
+                  background: directorLoading ? "#fffdf5" : "#c8f135",
+                  opacity: directorLoading || !directorNotes.trim() ? 0.5 : 1,
+                  marginBottom: 4,
+                  fontSize: 13,
+                  padding: "10px",
+                }}>
+                {directorLoading ? "Thinking..." : "Apply"}
+              </button>
+              {directorError ? (
+                <p style={{ color: "#ff3a3a", fontSize: 11, fontFamily: "monospace", marginTop: 4, marginBottom: 8 }}>
+                  {directorError}
+                </p>
+              ) : (
+                <div style={{ marginBottom: 20 }} />
+              )}
+            </>
+          ) : null}
+
+          {appMode === "board" && beats.length > 0 ? (
+            <>
+              <SectionLabel n="5" title="Background" />
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 24 }}>
                 <BgTile name="cork" current={background} bgPreview={bgPreviews.cork} onClick={() => setBackground("cork")} />
                 <BgTile name="beige" current={background} bgPreview={bgPreviews.beige} onClick={() => setBackground("beige")} />
@@ -1972,7 +2097,7 @@ export default function BuilderPage() {
 
           {appMode === "board" && beats.length > 0 ? (
             <>
-              <SectionLabel n="5" title="Card Style" />
+              <SectionLabel n="6" title="Card Style" />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
                 {(["card", "bare"] as CardStyle[]).map((s) => (
                   <div key={s} onClick={() => setCardStyle(s)}
@@ -2773,6 +2898,89 @@ export default function BuilderPage() {
           </div>
         </div>
       )}
+
+      {proposedBeats && (
+        <div style={modalOverlayStyle}>
+          <div style={modalStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
+              <span style={{ fontFamily: "'Caveat', cursive", fontSize: 24, fontWeight: 700, color: "#2a2a2a" }}>
+                Proposed Changes
+              </span>
+              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#6a6a6a" }}>
+                {beats.length} beat{beats.length !== 1 ? "s" : ""} → {proposedBeats.length} beat{proposedBeats.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+
+            <div style={{ maxHeight: "55vh", overflowY: "auto", marginBottom: 14 }}>
+              {proposedBeats.map((pb, i) => {
+                const oldBeat = beats[i];
+                const oldDur = oldBeat ? (oldBeat.endTime - oldBeat.startTime).toFixed(1) : "—";
+                const newDur = (pb.endTime - pb.startTime).toFixed(1);
+                const changed = !oldBeat || oldDur !== newDur;
+                return (
+                  <div key={i} style={previewBeatRowStyle}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+                      <span style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: "#2a2a2a" }}>
+                        BEAT {i + 1}
+                      </span>
+                      <span style={{ fontFamily: "monospace", fontSize: 10, color: changed ? "#ff3a3a" : "#6a6a6a" }}>
+                        {oldBeat ? `${oldDur}s → ` : ""}{newDur}s
+                      </span>
+                    </div>
+                    {pb.wantsVideo && pb.youtubeThumbnail ? (
+                      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <img
+                          src={pb.youtubeThumbnail}
+                          alt=""
+                          style={{ width: 80, height: 45, objectFit: "cover", border: "1px solid #2a2a2a", flexShrink: 0 }}
+                        />
+                        <div>
+                          <div style={{ fontSize: 9, fontFamily: "monospace", fontWeight: 700, color: "#c8f135", background: "#2a2a2a", padding: "1px 5px", display: "inline-block", marginBottom: 3 }}>
+                            VIDEO
+                          </div>
+                          <div style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", lineHeight: 1.35 }}>
+                            {pb.youtubeTitle}
+                          </div>
+                        </div>
+                      </div>
+                    ) : pb.wantsVideo ? (
+                      <div style={{ fontSize: 10, fontFamily: "monospace", color: "#ff7a3a" }}>
+                        video requested — no result found, using image
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        {pb.images?.[0] && (
+                          <img
+                            src={pb.images[0]}
+                            alt=""
+                            style={{ width: 36, height: 36, objectFit: "cover", border: "1px solid rgba(42,42,42,0.3)", flexShrink: 0 }}
+                          />
+                        )}
+                        <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a" }}>{pb.searchQuery}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={confirmDirectorChanges}
+                disabled={confirmingDirector}
+                style={{ ...sketchButton, flex: 1, background: "#c8f135", opacity: confirmingDirector ? 0.5 : 1 }}>
+                {confirmingDirector ? "Downloading videos..." : "Confirm"}
+              </button>
+              <button
+                onClick={() => setProposedBeats(null)}
+                disabled={confirmingDirector}
+                style={{ ...sketchButton, flex: 1, opacity: confirmingDirector ? 0.5 : 1 }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
@@ -3190,6 +3398,35 @@ function formatTimestamp(totalSeconds: number): string {
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   return `${m}:${String(s).padStart(2, '0')}`;
 }
+
+const modalOverlayStyle: React.CSSProperties = {
+  position: "fixed",
+  inset: 0,
+  background: "rgba(42,42,42,0.72)",
+  zIndex: 1000,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  padding: 24,
+};
+
+const modalStyle: React.CSSProperties = {
+  background: "#fffdf5",
+  border: "2px solid #2a2a2a",
+  boxShadow: "4px 4px 0 #2a2a2a",
+  padding: "20px 24px",
+  maxWidth: 500,
+  width: "100%",
+  maxHeight: "85vh",
+  overflowY: "auto",
+};
+
+const previewBeatRowStyle: React.CSSProperties = {
+  border: "1px solid rgba(42,42,42,0.2)",
+  padding: "8px 10px",
+  marginBottom: 6,
+  background: "rgba(255,253,245,0.6)",
+};
 
 function redrawCanvas(canvas: HTMLCanvasElement, strokesToDraw: Stroke[]) {
   const ctx = canvas.getContext("2d");
