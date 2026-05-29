@@ -97,6 +97,18 @@ const COMP_H = 1920;
 // If you change the Polaroid card layout (~line 1661), update this constant too.
 const CARD_STYLE_CHROME_H = 37;
 
+function useWindowSize() {
+  const [width, setWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : 0
+  );
+  useEffect(() => {
+    function update() { setWidth(window.innerWidth); }
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return { isMobile: width > 0 && width < 640 };
+}
+
 export default function BuilderPage() {
   const { data: session, status } = useSession();
   const [config, setConfig] = useState<{ railwayUrl: string; railwayPassword: string } | null>(null);
@@ -182,6 +194,11 @@ export default function BuilderPage() {
   const [directorError, setDirectorError] = useState("");
   const [proposedBeats, setProposedBeats] = useState<ProposedBeat[] | null>(null);
   const [confirmingDirector, setConfirmingDirector] = useState(false);
+
+  const { isMobile } = useWindowSize();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const mobileDefaultApplied = useRef(false);
+
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
     id: string;
@@ -275,6 +292,13 @@ export default function BuilderPage() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (isMobile && !mobileDefaultApplied.current) {
+      setAppMode("compilation");
+      mobileDefaultApplied.current = true;
+    }
+  }, [isMobile]);
 
   async function startRecording() {
     setError("");
@@ -1695,6 +1719,34 @@ export default function BuilderPage() {
   const activeBeat = beats[activeBeatIdx];
   const activeBeatImage = activeBeat?.images?.[activeBeat.selectedImageIdx ?? 0];
 
+  // Mobile-responsive layout styles (computed here so they can reference isMobile/sidebarOpen)
+  const mobileSplitStyle: React.CSSProperties = isMobile
+    ? { display: "block" }
+    : splitStyle;
+
+  const mobileSidebarStyle: React.CSSProperties = isMobile
+    ? {
+        position: "fixed",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        height: "72vh",
+        zIndex: 200,
+        background: "#fffdf5",
+        overflowY: "auto",
+        padding: "16px 20px",
+        paddingBottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
+        borderTop: "2px solid #2a2a2a",
+        boxShadow: "0 -4px 24px rgba(0,0,0,0.18)",
+        transform: sidebarOpen ? "translateY(0)" : "translateY(100%)",
+        transition: "transform 0.3s cubic-bezier(0.32, 0.72, 0, 1)",
+      }
+    : leftPanelStyle;
+
+  const mobileRightStyle: React.CSSProperties = isMobile
+    ? { display: "flex", flexDirection: "column", minHeight: "calc(100vh - 104px)" }
+    : rightPanelStyle;
+
   return (
     <main style={pageStyle}>
       <header style={headerStyle}>
@@ -1728,8 +1780,14 @@ export default function BuilderPage() {
         })}
       </div>
 
-      <div style={splitStyle}>
-        <section style={leftPanelStyle}>
+      <div style={mobileSplitStyle}>
+        <section style={mobileSidebarStyle}>
+          {isMobile && (
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, paddingBottom: 12, borderBottom: "1px dashed rgba(42,42,42,0.25)" }}>
+              <span style={{ fontFamily: "monospace", fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>CONTROLS</span>
+              <button onClick={() => setSidebarOpen(false)} style={{ ...miniButton, padding: "6px 10px", fontSize: 16, lineHeight: 1 }}>✕</button>
+            </div>
+          )}
           <SectionLabel n="1" title="Audio" />
           <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
             <button
@@ -1740,7 +1798,8 @@ export default function BuilderPage() {
               disabled={processing || rendering}
               style={{ ...sketchButton, flex: 1, background: recording ? "#ff5e3a" : "#fffdf5",
                 color: recording ? "white" : "#2a2a2a",
-                opacity: processing || rendering ? 0.5 : 1 }}>
+                opacity: processing || rendering ? 0.5 : 1,
+                minHeight: isMobile ? 44 : undefined }}>
               {recording
                 ? `STOP  0:${String(recSeconds).padStart(2, "0")}${!isSubscribed ? " / 0:59" : ""}`
                 : "RECORD"}
@@ -1751,7 +1810,7 @@ export default function BuilderPage() {
                 audioFileInputRef.current?.click();
               }}
               disabled={recording || processing || rendering}
-              style={{ ...sketchButton, flex: 1, opacity: recording || processing || rendering ? 0.5 : 1 }}>
+              style={{ ...sketchButton, flex: 1, opacity: recording || processing || rendering ? 0.5 : 1, minHeight: isMobile ? 44 : undefined }}>
               UPLOAD
             </button>
             <input ref={audioFileInputRef} type="file" accept="audio/*" onChange={handleAudioFile} style={{ display: "none" }} />
@@ -2112,7 +2171,7 @@ export default function BuilderPage() {
           ) : null}
 
           {beats.length > 0 && audioBlob && config?.railwayUrl ? (
-            <button onClick={renderVideo} disabled={rendering} style={renderButtonStyle}>
+            <button onClick={renderVideo} disabled={rendering} style={{ ...renderButtonStyle, minHeight: isMobile ? 44 : undefined }}>
               {rendering ? (renderStatus || "RENDERING...") : appMode === "compilation" ? "RENDER COMPILATION" : "RENDER VIDEO"}
             </button>
           ) : beats.length > 0 && audioBlob && !config?.railwayUrl ? (
@@ -2157,7 +2216,7 @@ export default function BuilderPage() {
           ) : null}
         </section>
 
-        <section style={{ ...rightPanelStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
+        <section style={{ ...mobileRightStyle, pointerEvents: rendering ? "none" : "auto", opacity: rendering ? 0.6 : 1 }}>
           {appMode === "compilation" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, background: "#101010", padding: 18 }}>
               {beats.length > 0 && (
@@ -2187,7 +2246,7 @@ export default function BuilderPage() {
                   })}
                 </div>
               )}
-              <div style={{ position: "relative", width: "min(100%, 980px)", height: "min(calc(100vh - 190px), 860px)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", background: "#050505" }}>
+              <div style={{ position: "relative", width: "min(100%, 980px)", height: isMobile ? "calc(100dvh - 190px)" : "min(calc(100vh - 190px), 860px)", flex: isMobile ? 1 : undefined, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", background: "#050505" }}>
               <div
                 ref={compPreviewRef}
                 style={{ position: "relative", aspectRatio: "9 / 16", height: "82%", maxHeight: "100%", background: "#000", overflow: "visible", boxShadow: "0 0 0 1.5px rgba(200,241,53,0.95), 0 0 0 2.5px rgba(255,255,255,0.2)", flex: "0 0 auto" }}
@@ -2980,6 +3039,40 @@ export default function BuilderPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Mobile sidebar backdrop */}
+      {isMobile && sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 150 }}
+        />
+      )}
+
+      {/* Mobile floating sidebar toggle button */}
+      {isMobile && (
+        <button
+          onClick={() => setSidebarOpen((o) => !o)}
+          style={{
+            position: "fixed",
+            bottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
+            right: 20,
+            zIndex: 300,
+            background: "#c8f135",
+            color: "#2a2a2a",
+            border: "2px solid #2a2a2a",
+            boxShadow: "3px 3px 0 #2a2a2a",
+            fontFamily: "monospace",
+            fontWeight: 700,
+            fontSize: 13,
+            padding: "10px 16px",
+            cursor: "pointer",
+            minHeight: 44,
+            letterSpacing: 0.5,
+          }}
+        >
+          {sidebarOpen ? "✕ close" : "☰ controls"}
+        </button>
       )}
     </main>
   );
