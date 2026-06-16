@@ -982,7 +982,7 @@ export default function BuilderPage() {
     ));
   }
 
-  async function handleYtSearch() {
+  async function handleYtSearch(shortsOnlyOverride?: boolean) {
     if (!config?.railwayUrl || !ytQuery.trim()) return;
     setYtLoading(true);
     setYtError('');
@@ -994,7 +994,7 @@ export default function BuilderPage() {
           'Content-Type': 'application/json',
           'x-neuralboard-password': config.railwayPassword,
         },
-        body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: ytShortsOnly }),
+        body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: shortsOnlyOverride !== undefined ? shortsOnlyOverride : ytShortsOnly }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
       const data = await res.json();
@@ -3086,7 +3086,7 @@ export default function BuilderPage() {
                         const active = label === 'Shorts' ? ytShortsOnly : !ytShortsOnly;
                         return (
                           <button key={label}
-                            onClick={() => setYtShortsOnly(label === 'Shorts')}
+                            onClick={() => { const v = label === 'Shorts'; setYtShortsOnly(v); handleYtSearch(v); }}
                             style={{ ...miniButton, fontSize: 11, padding: '4px 8px',
                               background: active ? '#2a2a2a' : 'transparent',
                               color: active ? '#fffdf5' : '#2a2a2a',
