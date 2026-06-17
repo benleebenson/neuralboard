@@ -22,6 +22,8 @@ const LAYER_BG = [
 
 type ClipType = "audio" | "video" | "image";
 
+type ClipTransform = { x: number; y: number; scaleX: number; scaleY: number };
+
 type Clip = {
   id: string;
   type: ClipType;
@@ -32,6 +34,8 @@ type Clip = {
   startTime: number;
   layer: number;
   trimStart: number;
+  transform: ClipTransform;
+  muted: boolean;
 };
 
 type Ghost = {
@@ -56,6 +60,22 @@ type DragInfo = {
   validLayer: number;
   validTrimStart: number;
 };
+
+const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+
+type PreviewDragKind = 'move' | 'corner-nw' | 'corner-ne' | 'corner-sw' | 'corner-se';
+type PreviewDragState = {
+  kind: PreviewDragKind;
+  clipId: string;
+  startMouseX: number;
+  startMouseY: number;
+  origX: number;
+  origY: number;
+  origScaleX: number;
+  origScaleY: number;
+  containerW: number;
+  containerH: number;
+} | null;
 
 type YtSearchResult = {
   id: string;
@@ -162,6 +182,7 @@ export default function EditorPage() {
   const [recError, setRecError] = useState("");
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -187,6 +208,8 @@ export default function EditorPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const recSecondsRef = useRef(0);
   const mediaUploadRef = useRef<HTMLInputElement | null>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const previewDragRef = useRef<PreviewDragState>(null);
 
   // Playback
   const isPlayingRef = useRef(false);
@@ -278,6 +301,7 @@ export default function EditorPage() {
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
     currentClips.forEach((clip) => {
       if (clip.type === "image") return;
+      if (clip.muted) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx);
     });
@@ -340,6 +364,7 @@ export default function EditorPage() {
     // start newly active clips
     currentClips.forEach((clip) => {
       if (clip.type === "image") return;
+      if (clip.muted) return;
       if (activeAudioRef.current.has(clip.id)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx);
@@ -548,9 +573,9 @@ export default function EditorPage() {
         const blobUrl = URL.createObjectURL(blob);
         const durationSec = await getMediaDuration(blobUrl, "audio");
         setClips((prev) => {
-          const startTime = prev.length > 0 ? Math.max(...prev.map((c) => c.startTime + c.durationSec)) : 0;
+          const startTime = playheadSecRef.current;
           const dur = durationSec || recSecondsRef.current;
-          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0 }];
+          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false }];
         });
       };
       recorder.start();
@@ -584,13 +609,13 @@ export default function EditorPage() {
     const valid = processed.filter((x): x is NonNullable<typeof x> => x !== null);
     if (!valid.length) return;
     setClips((prev) => {
-      let cursor = prev.length > 0 ? Math.max(...prev.map((c) => c.startTime + c.durationSec)) : 0;
-      const newClips: Clip[] = valid.map((item) => {
-        const startTime = cursor;
+      const startTime = playheadSecRef.current;
+      const newClips: Clip[] = [];
+      for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
-        cursor += dur;
-        return { id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0 };
-      });
+        const layer = findFreeLayer([...prev, ...newClips], startTime, dur);
+        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false });
+      }
       return [...prev, ...newClips];
     });
     e.target.value = "";
@@ -644,9 +669,9 @@ export default function EditorPage() {
       const durationSec = await getMediaDuration(blobUrl, "video");
       const title = (ytSelected.title ?? "YouTube clip").slice(0, 40);
       setClips((prev) => {
-        const startTime = prev.length > 0 ? Math.max(...prev.map((c) => c.startTime + c.durationSec)) : 0;
+        const startTime = playheadSecRef.current;
         const dur = durationSec || (ytEnd - ytStart);
-        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0 }];
+        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false }];
       });
       setYtModalOpen(false);
       setYtView("search");
@@ -683,6 +708,83 @@ export default function EditorPage() {
     const leftClip: Clip = { ...clip, id: crypto.randomUUID(), durationSec: leftDur };
     const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur };
     setClips((prev) => prev.filter((c) => c.id !== clip.id).concat([leftClip, rightClip]));
+  }
+
+  // ─── Preview transform drag ──────────────────────────────────────────────────
+
+  function onPreviewPointerDown(
+    e: React.PointerEvent<HTMLDivElement>,
+    clip: Clip,
+    kind: PreviewDragKind,
+  ) {
+    e.stopPropagation();
+    const container = previewContainerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const t = clip.transform;
+    previewDragRef.current = {
+      kind,
+      clipId: clip.id,
+      startMouseX: e.clientX,
+      startMouseY: e.clientY,
+      origX: t.x,
+      origY: t.y,
+      origScaleX: t.scaleX,
+      origScaleY: t.scaleY,
+      containerW: rect.width,
+      containerH: rect.height,
+    };
+    container.setPointerCapture(e.pointerId);
+  }
+
+  function onPreviewPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = previewDragRef.current;
+    if (!drag) return;
+    const dx = e.clientX - drag.startMouseX;
+    const dy = e.clientY - drag.startMouseY;
+    const dxPct = (dx / drag.containerW) * 100;
+    const dyPct = (dy / drag.containerH) * 100;
+    const dxScale = dx / drag.containerW;
+    const dyScale = dy / drag.containerH;
+    let newX = drag.origX;
+    let newY = drag.origY;
+    let newSX = drag.origScaleX;
+    let newSY = drag.origScaleY;
+    if (drag.kind === 'move') {
+      newX = drag.origX + dxPct;
+      newY = drag.origY + dyPct;
+    } else if (drag.kind === 'corner-se') {
+      newSX = drag.origScaleX + dxScale;
+      newSY = drag.origScaleY + dyScale;
+    } else if (drag.kind === 'corner-nw') {
+      newX = drag.origX + dxPct;
+      newY = drag.origY + dyPct;
+      newSX = drag.origScaleX - dxScale;
+      newSY = drag.origScaleY - dyScale;
+    } else if (drag.kind === 'corner-ne') {
+      newY = drag.origY + dyPct;
+      newSX = drag.origScaleX + dxScale;
+      newSY = drag.origScaleY - dyScale;
+    } else if (drag.kind === 'corner-sw') {
+      newX = drag.origX + dxPct;
+      newSX = drag.origScaleX - dxScale;
+      newSY = drag.origScaleY + dyScale;
+    }
+    newSX = Math.max(0.05, Math.min(3, newSX));
+    newSY = Math.max(0.05, Math.min(3, newSY));
+    newX = Math.max(-150, Math.min(150, newX));
+    newY = Math.max(-150, Math.min(150, newY));
+    setClips((prev) =>
+      prev.map((c) =>
+        c.id === drag.clipId
+          ? { ...c, transform: { x: newX, y: newY, scaleX: newSX, scaleY: newSY } }
+          : c
+      )
+    );
+  }
+
+  function onPreviewPointerUp() {
+    previewDragRef.current = null;
   }
 
   // ─── Auth gates ──────────────────────────────────────────────────────────────
@@ -755,33 +857,92 @@ export default function EditorPage() {
         {/* Preview */}
         <div style={{ flex: 1, padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase" }}>Preview</div>
+          <div style={{ display: "flex", gap: 0, marginBottom: 2 }}>
+            {(['16:9', '9:16'] as const).map((fmt) => (
+              <button
+                key={fmt}
+                onClick={() => setOutputFormat(fmt)}
+                style={{ ...miniButton, fontSize: 10, padding: "3px 8px", background: outputFormat === fmt ? "#2a2a2a" : "transparent", color: outputFormat === fmt ? "#fffdf5" : "#2a2a2a" }}
+              >
+                {fmt === '16:9' ? '16:9 (Long)' : '9:16 (Short)'}
+              </button>
+            ))}
+          </div>
           <div style={{
-            width: 400,
-            aspectRatio: "16/9",
+            width: outputFormat === '16:9' ? 400 : 127,
+            aspectRatio: outputFormat === '16:9' ? '16/9' : '9/16',
             background: "#111",
             border: "1.5px solid #2a2a2a",
             boxShadow: "3px 3px 0 #2a2a2a",
             overflow: "hidden",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
             flexShrink: 0,
+            position: "relative",
           }}>
-            {activeVisualClips.length === 0 ? (
-              <span style={{ fontSize: 10, fontFamily: "monospace", color: "#555" }}>no video at playhead</span>
-            ) : (
-              <div style={{ position: "relative", width: "100%", height: "100%" }}>
-                {activeVisualClips.map((clip) => (
-                  <div key={clip.id} style={{ position: "absolute", inset: 0, zIndex: NUM_LAYERS + 1 - clip.layer }}>
+            {activeVisualClips.length === 0 && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#555" }}>no video at playhead</span>
+              </div>
+            )}
+            <div
+              ref={previewContainerRef}
+              style={{ position: "absolute", inset: 0 }}
+              onPointerMove={onPreviewPointerMove}
+              onPointerUp={onPreviewPointerUp}
+              onPointerCancel={onPreviewPointerUp}
+            >
+              {activeVisualClips.map((clip) => {
+                const t = clip.transform;
+                const isSelected = selectedClipId === clip.id;
+                return (
+                  <div
+                    key={clip.id}
+                    style={{
+                      position: "absolute",
+                      left: `${t.x}%`,
+                      top: `${t.y}%`,
+                      width: `${t.scaleX * 100}%`,
+                      height: `${t.scaleY * 100}%`,
+                      zIndex: NUM_LAYERS + 1 - clip.layer,
+                      cursor: isSelected ? "move" : "default",
+                    }}
+                    onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
+                  >
                     {clip.type === "image" ? (
-                      <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                      <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
                     ) : (
                       <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
                     )}
+                    {isSelected && (
+                      <>
+                        <div style={{ position: "absolute", inset: 0, border: "1.5px solid #ff5e3a", pointerEvents: "none", zIndex: 1 }} />
+                        {(["nw", "ne", "sw", "se"] as const).map((corner) => {
+                          const kind = `corner-${corner}` as PreviewDragKind;
+                          return (
+                            <div
+                              key={corner}
+                              onPointerDown={(e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, kind); }}
+                              style={{
+                                position: "absolute",
+                                width: 10,
+                                height: 10,
+                                background: "#ff5e3a",
+                                border: "1px solid #fff",
+                                zIndex: 2,
+                                cursor: `${corner}-resize`,
+                                ...(corner === "nw" ? { top: -5, left: -5 } :
+                                    corner === "ne" ? { top: -5, right: -5 } :
+                                    corner === "sw" ? { bottom: -5, left: -5 } :
+                                                      { bottom: -5, right: -5 }),
+                              }}
+                            />
+                          );
+                        })}
+                      </>
+                    )}
                   </div>
-                ))}
-              </div>
-            )}
+                );
+              })}
+            </div>
           </div>
         </div>
       </div>
@@ -813,6 +974,19 @@ export default function EditorPage() {
         >
           ✂ Split
         </button>
+        {(() => {
+          const selClip = selectedClipId ? clips.find((c) => c.id === selectedClipId) : null;
+          if (!selClip) return null;
+          return (
+            <button
+              onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
+              style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined }}
+              title="Toggle mute for selected clip"
+            >
+              {selClip.muted ? "Unmute" : "Mute"}
+            </button>
+          );
+        })()}
         <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb", marginLeft: 6 }}>[space] play/pause · [⌫] delete selected</span>
       </div>
 
