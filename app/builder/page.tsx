@@ -3108,7 +3108,7 @@ export default function BuilderPage() {
                       style={{ flex: 1, fontFamily: 'monospace', fontSize: 13, padding: '8px 10px',
                         border: '1.5px solid #2a2a2a', background: '#fffdf5', outline: 'none', boxShadow: '2px 2px 0 #2a2a2a' }}
                     />
-                    <button onClick={handleYtSearch} disabled={ytLoading}
+                    <button onClick={() => handleYtSearch()} disabled={ytLoading}
                       style={{ ...miniButton, padding: '8px 16px', fontSize: 12, fontWeight: 700, opacity: ytLoading ? 0.5 : 1 }}>
                       {ytLoading ? '...' : 'search'}
                     </button>
