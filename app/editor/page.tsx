@@ -11,6 +11,7 @@ const NUM_LAYERS = 5;
 const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
+const CURVE_H = 12;
 const LAYER_LABELS = ["Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5"];
 const LAYER_BG = [
   "rgba(255,253,245,0.55)",
@@ -21,8 +22,8 @@ const LAYER_BG = [
 ];
 
 type ClipType = "audio" | "video" | "image";
-
 type ClipTransform = { x: number; y: number; scaleX: number; scaleY: number };
+type CurvePoint = { time: number; volume: number };
 
 type Clip = {
   id: string;
@@ -36,6 +37,7 @@ type Clip = {
   trimStart: number;
   transform: ClipTransform;
   muted: boolean;
+  volumeCurve: CurvePoint[];
 };
 
 type Ghost = {
@@ -62,6 +64,7 @@ type DragInfo = {
 };
 
 const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+const DEFAULT_CURVE: CurvePoint[] = [{ time: 0, volume: 100 }];
 
 type PreviewDragKind = 'move' | 'corner-nw' | 'corner-ne' | 'corner-sw' | 'corner-se';
 type PreviewDragState = {
@@ -87,8 +90,22 @@ type YtSearchResult = {
 type YtModalView = "search" | "trim";
 
 type AudioEntry =
-  | { kind: "element"; elem: HTMLMediaElement; source: MediaElementAudioSourceNode }
-  | { kind: "buffer"; bufNode: AudioBufferSourceNode };
+  | { kind: "element"; elem: HTMLMediaElement; source: MediaElementAudioSourceNode; gainNode: GainNode }
+  | { kind: "buffer"; bufNode: AudioBufferSourceNode; gainNode: GainNode };
+
+type CurveDragState = {
+  clipId: string;
+  pointIdx: number;
+  startX: number;
+  startY: number;
+  origTime: number;
+  origVolume: number;
+  clipDuration: number;
+  svgLeft: number;
+  svgWidth: number;
+  svgTop: number;
+  svgHeight: number;
+} | null;
 
 const snapTo = (t: number) => Math.round(t / SNAP) * SNAP;
 
@@ -170,6 +187,20 @@ function formatTimestamp(totalSeconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function interpolateVolume(curve: CurvePoint[], t: number): number {
+  if (curve.length === 0) return 1;
+  const sorted = curve.slice().sort((a, b) => a.time - b.time);
+  if (t <= sorted[0].time) return sorted[0].volume / 100;
+  if (t >= sorted[sorted.length - 1].time) return sorted[sorted.length - 1].volume / 100;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (t >= sorted[i].time && t <= sorted[i + 1].time) {
+      const frac = (t - sorted[i].time) / (sorted[i + 1].time - sorted[i].time);
+      return (sorted[i].volume + frac * (sorted[i + 1].volume - sorted[i].volume)) / 100;
+    }
+  }
+  return 1;
+}
+
 export default function EditorPage() {
   const { data: session, status } = useSession();
   const [config, setConfig] = useState<{ railwayUrl: string; railwayPassword: string } | null>(null);
@@ -183,6 +214,8 @@ export default function EditorPage() {
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -210,6 +243,10 @@ export default function EditorPage() {
   const mediaUploadRef = useRef<HTMLInputElement | null>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewDragRef = useRef<PreviewDragState>(null);
+  const curveDragRef = useRef<CurveDragState>(null);
+  const exportCancelRef = useRef(false);
+  const exportRafRef = useRef<number | null>(null);
+  const isExportingRef = useRef(false);
 
   // Playback
   const isPlayingRef = useRef(false);
@@ -264,6 +301,7 @@ export default function EditorPage() {
   useEffect(() => {
     return () => {
       pausePlayback();
+      if (exportRafRef.current !== null) cancelAnimationFrame(exportRafRef.current);
       audioCtxRef.current?.close().catch(() => {});
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -287,15 +325,17 @@ export default function EditorPage() {
       if (entry.kind === "element") {
         entry.elem.pause();
         try { entry.source.disconnect(); } catch {}
+        try { entry.gainNode.disconnect(); } catch {}
       } else {
         try { entry.bufNode.stop(); } catch {}
         try { entry.bufNode.disconnect(); } catch {}
+        try { entry.gainNode.disconnect(); } catch {}
       }
     });
     activeAudioRef.current.clear();
   }
 
-  function startAudioAt(atSec: number, currentClips: Clip[]) {
+  function startAudioAt(atSec: number, currentClips: Clip[], extraDest?: AudioNode) {
     stopAllAudio();
     const ctx = getAudioCtx();
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
@@ -303,26 +343,30 @@ export default function EditorPage() {
       if (clip.type === "image") return;
       if (clip.muted) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
-      spawnClipAudio(clip, atSec - clip.startTime, ctx);
+      spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
     });
   }
 
-  function spawnClipAudio(clip: Clip, clipOffset: number, ctx: AudioContext) {
+  function spawnClipAudio(clip: Clip, clipOffset: number, ctx: AudioContext, extraDest?: AudioNode) {
     const sourceOffset = clip.trimStart + clipOffset;
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = interpolateVolume(clip.volumeCurve, clipOffset);
+    gainNode.connect(ctx.destination);
+    if (extraDest) gainNode.connect(extraDest);
 
     if (clip.type === "audio") {
       fetch(clip.blobUrl)
         .then((r) => r.arrayBuffer())
         .then((ab) => ctx.decodeAudioData(ab))
         .then((buffer) => {
-          if (!isPlayingRef.current) return;
+          if (!isPlayingRef.current && !isExportingRef.current) return;
           if (activeAudioRef.current.has(clip.id)) return;
           const bufNode = ctx.createBufferSource();
           bufNode.buffer = buffer;
-          bufNode.connect(ctx.destination);
+          bufNode.connect(gainNode);
           const safeOffset = Math.min(sourceOffset, buffer.duration - 0.01);
           bufNode.start(0, Math.max(0, safeOffset));
-          activeAudioRef.current.set(clip.id, { kind: "buffer", bufNode });
+          activeAudioRef.current.set(clip.id, { kind: "buffer", bufNode, gainNode });
         })
         .catch(() => {});
       return;
@@ -333,41 +377,43 @@ export default function EditorPage() {
     elem.preload = "auto";
     try {
       const source = ctx.createMediaElementSource(elem);
-      source.connect(ctx.destination);
+      source.connect(gainNode);
       const play = () => {
         elem.currentTime = sourceOffset;
         elem.play().catch(() => {});
       };
       if (elem.readyState >= 2) { play(); } else { elem.addEventListener("canplay", play, { once: true }); }
       elem.load();
-      activeAudioRef.current.set(clip.id, { kind: "element", elem, source });
+      activeAudioRef.current.set(clip.id, { kind: "element", elem, source, gainNode });
     } catch {}
   }
 
-  function tickAudio(atSec: number, currentClips: Clip[]) {
+  function tickAudio(atSec: number, currentClips: Clip[], extraDest?: AudioNode) {
     const ctx = audioCtxRef.current;
     if (!ctx) return;
-    // stop clips that are no longer active
     activeAudioRef.current.forEach((entry, clipId) => {
       const clip = currentClips.find((c) => c.id === clipId);
       if (!clip || atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) {
         if (entry.kind === "element") {
           entry.elem.pause();
           try { entry.source.disconnect(); } catch {}
+          try { entry.gainNode.disconnect(); } catch {}
         } else {
           try { entry.bufNode.stop(); } catch {}
           try { entry.bufNode.disconnect(); } catch {}
+          try { entry.gainNode.disconnect(); } catch {}
         }
         activeAudioRef.current.delete(clipId);
+      } else {
+        entry.gainNode.gain.value = interpolateVolume(clip.volumeCurve, atSec - clip.startTime);
       }
     });
-    // start newly active clips
     currentClips.forEach((clip) => {
       if (clip.type === "image") return;
       if (clip.muted) return;
       if (activeAudioRef.current.has(clip.id)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
-      spawnClipAudio(clip, atSec - clip.startTime, ctx);
+      spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
     });
   }
 
@@ -515,7 +561,6 @@ export default function EditorPage() {
       newStart = snapTo(Math.max(0, drag.origStartTime + dtSec));
       newLayer = hoverLayer;
     } else if (drag.kind === "resize-left") {
-      // Can't trim further left than the source start
       const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart);
       const clampedDelta = Math.min(dtSec, drag.origDuration - MIN_DURATION);
       newStart = snapTo(Math.max(minStart, drag.origStartTime + clampedDelta));
@@ -575,7 +620,7 @@ export default function EditorPage() {
         setClips((prev) => {
           const startTime = playheadSecRef.current;
           const dur = durationSec || recSecondsRef.current;
-          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false }];
+          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
         });
       };
       recorder.start();
@@ -614,7 +659,7 @@ export default function EditorPage() {
       for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
         const layer = findFreeLayer([...prev, ...newClips], startTime, dur);
-        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false });
+        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] });
       }
       return [...prev, ...newClips];
     });
@@ -671,7 +716,7 @@ export default function EditorPage() {
       setClips((prev) => {
         const startTime = playheadSecRef.current;
         const dur = durationSec || (ytEnd - ytStart);
-        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false }];
+        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
       });
       setYtModalOpen(false);
       setYtView("search");
@@ -687,7 +732,6 @@ export default function EditorPage() {
 
   // ─── Preview ─────────────────────────────────────────────────────────────────
 
-  // Layer 1 = topmost overlay (highest z-index). Sort descending so Layer 5 renders first (behind).
   const activeVisualClips = clips
     .filter(
       (c) => (c.type === "video" || c.type === "image") &&
@@ -705,8 +749,20 @@ export default function EditorPage() {
     if (!clip) return;
     const leftDur = t - clip.startTime;
     const rightDur = clip.durationSec - leftDur;
-    const leftClip: Clip = { ...clip, id: crypto.randomUUID(), durationSec: leftDur };
-    const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur };
+
+    const sorted = clip.volumeCurve.slice().sort((a, b) => a.time - b.time);
+    const volAtSplit = Math.round(interpolateVolume(sorted, leftDur) * 100);
+    const leftCurve: CurvePoint[] = [
+      ...sorted.filter(p => p.time < leftDur),
+      { time: leftDur, volume: volAtSplit },
+    ];
+    const rightCurve: CurvePoint[] = [
+      { time: 0, volume: volAtSplit },
+      ...sorted.filter(p => p.time > leftDur).map(p => ({ time: p.time - leftDur, volume: p.volume })),
+    ];
+
+    const leftClip: Clip = { ...clip, id: crypto.randomUUID(), durationSec: leftDur, volumeCurve: leftCurve.length ? leftCurve : [...DEFAULT_CURVE] };
+    const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur, volumeCurve: rightCurve.length ? rightCurve : [...DEFAULT_CURVE] };
     setClips((prev) => prev.filter((c) => c.id !== clip.id).concat([leftClip, rightClip]));
   }
 
@@ -785,6 +841,192 @@ export default function EditorPage() {
 
   function onPreviewPointerUp() {
     previewDragRef.current = null;
+  }
+
+  // ─── Export ──────────────────────────────────────────────────────────────────
+
+  function cancelExport() {
+    exportCancelRef.current = true;
+  }
+
+  async function startExport() {
+    const currentClips = clipsRef.current;
+    if (currentClips.length === 0) {
+      alert("No clips to export");
+      return;
+    }
+
+    if (isPlayingRef.current) pausePlayback();
+    setIsExporting(true);
+    isExportingRef.current = true;
+    exportCancelRef.current = false;
+    setExportProgress(0);
+
+    const totalDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
+    const [canvasW, canvasH] = outputFormat === '16:9' ? [1280, 720] : [720, 1280];
+
+    const canvas = document.createElement("canvas");
+    canvas.width = canvasW;
+    canvas.height = canvasH;
+    const ctx2d = canvas.getContext("2d")!;
+
+    // Load video elements for canvas rendering (muted — audio handled by Web Audio)
+    const exportVideoEls = new Map<string, HTMLVideoElement>();
+    for (const clip of currentClips) {
+      if (clip.type !== "video") continue;
+      const vid = document.createElement("video");
+      vid.src = clip.blobUrl;
+      vid.muted = true;
+      vid.preload = "auto";
+      await new Promise<void>((res) => {
+        if (vid.readyState >= 2) { res(); return; }
+        vid.addEventListener("loadedmetadata", () => res(), { once: true });
+        vid.addEventListener("error", () => res(), { once: true });
+        vid.load();
+      });
+      exportVideoEls.set(clip.id, vid);
+    }
+
+    // Load image elements
+    const exportImageEls = new Map<string, HTMLImageElement>();
+    await Promise.all(
+      currentClips.filter((c) => c.type === "image").map((clip) =>
+        new Promise<void>((res) => {
+          const img = new Image();
+          img.onload = () => { exportImageEls.set(clip.id, img); res(); };
+          img.onerror = () => res();
+          img.src = clip.blobUrl;
+        })
+      )
+    );
+
+    const audioCtx = getAudioCtx();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    const exportAudioDest = audioCtx.createMediaStreamDestination();
+
+    const canvasStream = canvas.captureStream(30);
+    const combined = new MediaStream([
+      ...canvasStream.getVideoTracks(),
+      ...exportAudioDest.stream.getAudioTracks(),
+    ]);
+
+    const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
+    const recorder = new MediaRecorder(combined, { mimeType });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = mimeType === "video/mp4" ? "neuralboard-export.mp4" : "neuralboard-export.webm";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setIsExporting(false);
+      isExportingRef.current = false;
+      setExportProgress(0);
+    };
+
+    // Seed audio at t=0
+    startAudioAt(0, currentClips, exportAudioDest);
+
+    // Seed video elements that are active at t=0
+    for (const [clipId, vid] of exportVideoEls) {
+      const clip = currentClips.find((c) => c.id === clipId)!;
+      if (clip.startTime === 0) {
+        vid.currentTime = clip.trimStart;
+        vid.play().catch(() => {});
+      }
+    }
+
+    recorder.start(100); // collect data every 100ms
+
+    const exportWallStart = performance.now();
+
+    function exportFrame() {
+      if (exportCancelRef.current) {
+        stopAllAudio();
+        for (const vid of exportVideoEls.values()) vid.pause();
+        recorder.stop();
+        setIsExporting(false);
+        isExportingRef.current = false;
+        setExportProgress(0);
+        return;
+      }
+
+      const elapsed = (performance.now() - exportWallStart) / 1000;
+
+      if (elapsed >= totalDur) {
+        stopAllAudio();
+        for (const vid of exportVideoEls.values()) vid.pause();
+        recorder.stop();
+        return;
+      }
+
+      setExportProgress(elapsed / totalDur);
+
+      // Manage audio (gain updates + clip lifecycle)
+      tickAudio(elapsed, currentClips, exportAudioDest);
+
+      // Manage video element lifecycle
+      for (const [clipId, vid] of exportVideoEls) {
+        const clip = currentClips.find((c) => c.id === clipId)!;
+        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.durationSec;
+        if (isActive && vid.paused) {
+          vid.currentTime = clip.trimStart + (elapsed - clip.startTime);
+          vid.play().catch(() => {});
+        } else if (!isActive && !vid.paused) {
+          vid.pause();
+        }
+      }
+
+      // Draw frame
+      ctx2d.fillStyle = "#111";
+      ctx2d.fillRect(0, 0, canvasW, canvasH);
+
+      const visClips = currentClips
+        .filter((c) => (c.type === "video" || c.type === "image") &&
+          elapsed >= c.startTime && elapsed < c.startTime + c.durationSec)
+        .sort((a, b) => b.layer - a.layer); // layer 5 first (bg), layer 1 last (fg)
+
+      for (const clip of visClips) {
+        let el: HTMLVideoElement | HTMLImageElement | null = null;
+        if (clip.type === "video") el = exportVideoEls.get(clip.id) ?? null;
+        else if (clip.type === "image") el = exportImageEls.get(clip.id) ?? null;
+        if (!el) continue;
+
+        const tr = clip.transform;
+        const x = (tr.x / 100) * canvasW;
+        const y = (tr.y / 100) * canvasH;
+        const w = tr.scaleX * canvasW;
+        const h = tr.scaleY * canvasH;
+
+        const mW = el instanceof HTMLVideoElement ? el.videoWidth : (el as HTMLImageElement).naturalWidth;
+        const mH = el instanceof HTMLVideoElement ? el.videoHeight : (el as HTMLImageElement).naturalHeight;
+
+        if (mW > 0 && mH > 0) {
+          const mAspect = mW / mH;
+          const bAspect = w / h;
+          let dW: number, dH: number, dX: number, dY: number;
+          if (mAspect > bAspect) {
+            dW = w; dH = w / mAspect;
+            dX = x; dY = y + (h - dH) / 2;
+          } else {
+            dH = h; dW = h * mAspect;
+            dX = x + (w - dW) / 2; dY = y;
+          }
+          ctx2d.drawImage(el, dX, dY, dW, dH);
+        } else {
+          ctx2d.drawImage(el, x, y, w, h);
+        }
+      }
+
+      exportRafRef.current = requestAnimationFrame(exportFrame);
+    }
+
+    exportRafRef.current = requestAnimationFrame(exportFrame);
   }
 
   // ─── Auth gates ──────────────────────────────────────────────────────────────
@@ -948,17 +1190,19 @@ export default function EditorPage() {
       </div>
 
       {/* Transport */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 16px", borderBottom: "1.5px solid rgba(42,42,42,0.15)", background: "rgba(255,253,245,0.85)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 16px", borderBottom: "1.5px solid rgba(42,42,42,0.15)", background: "rgba(255,253,245,0.85)", flexWrap: "wrap" }}>
         <button
           onClick={() => isPlaying ? pausePlayback() : startPlayback()}
-          style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, background: isPlaying ? "#ff5e3a" : "#c8f135" }}
+          disabled={isExporting}
+          style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, background: isPlaying ? "#ff5e3a" : "#c8f135", opacity: isExporting ? 0.4 : 1 }}
           title={isPlaying ? "Pause" : "Play"}
         >
           {isPlaying ? "⏸" : "▶"}
         </button>
         <button
           onClick={stopAndRewind}
-          style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}
+          disabled={isExporting}
+          style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, opacity: isExporting ? 0.4 : 1 }}
           title="Stop and rewind"
         >
           ⏹
@@ -969,7 +1213,8 @@ export default function EditorPage() {
         <span style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>/ {formatTime(totalDuration)}</span>
         <button
           onClick={splitAtPlayhead}
-          style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12 }}
+          disabled={isExporting}
+          style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
           title="Split clip at playhead"
         >
           ✂ Split
@@ -980,14 +1225,29 @@ export default function EditorPage() {
           return (
             <button
               onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
-              style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined }}
+              disabled={isExporting}
+              style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined, opacity: isExporting ? 0.4 : 1 }}
               title="Toggle mute for selected clip"
             >
               {selClip.muted ? "Unmute" : "Mute"}
             </button>
           );
         })()}
-        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb", marginLeft: 6 }}>[space] play/pause · [⌫] delete selected</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+          {isExporting && (
+            <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>
+              {formatTime(exportProgress * totalDuration)} / {formatTime(totalDuration)}
+            </span>
+          )}
+          <button
+            onClick={isExporting ? cancelExport : startExport}
+            style={{ ...sketchButton, height: 36, padding: "0 14px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
+            title={isExporting ? "Cancel export" : "Export to MP4"}
+          >
+            {isExporting ? `✕ Cancel (${Math.round(exportProgress * 100)}%)` : "⬇ Export"}
+          </button>
+        </div>
+        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · [⌫] delete selected</span>
       </div>
 
       {/* Timeline */}
@@ -1028,6 +1288,12 @@ export default function EditorPage() {
                   const isBeingDragged = ghost?.clipId === clip.id;
                   const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * PX_PER_SEC - 2);
                   const showHandles = clipPx >= HANDLE_W * 3;
+                  const sortedCurve = clip.volumeCurve.slice().sort((a, b) => a.time - b.time);
+                  const linePoints = sortedCurve.map((pt) => {
+                    const px = clipPx > 0 ? (pt.time / clip.durationSec) * clipPx : 0;
+                    const py = CURVE_H - 2 - (pt.volume / 100) * (CURVE_H - 4);
+                    return `${px},${py}`;
+                  }).join(" ");
                   return (
                     <div
                       key={clip.id}
@@ -1035,11 +1301,110 @@ export default function EditorPage() {
                       style={{ position: "absolute", left: clip.startTime * PX_PER_SEC, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
                     >
                       {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
-                      <div style={{ paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
+                      <div style={{ paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, paddingBottom: CURVE_H, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
                         <div style={{ fontSize: 10, fontFamily: "'Courier New', monospace", fontWeight: 700, color: "#2a2a2a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{clip.name}</div>
                         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#555", whiteSpace: "nowrap" }}>{formatDuration(clip.durationSec)}</div>
                       </div>
                       {showHandles && <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
+                      {/* Volume curve SVG — audio and video clips only */}
+                      {clip.type !== "image" && (
+                        <svg
+                          style={{ position: "absolute", bottom: 0, left: 0, width: "100%", height: CURVE_H, overflow: "visible", zIndex: 4, cursor: "crosshair" }}
+                          viewBox={`0 0 ${clipPx} ${CURVE_H}`}
+                          preserveAspectRatio="none"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+                            const svgX = e.clientX - rect.left;
+                            const svgY = e.clientY - rect.top;
+                            const time = Math.max(0, Math.min(clip.durationSec, (svgX / rect.width) * clip.durationSec));
+                            const volume = Math.max(0, Math.min(100, Math.round(100 - (svgY / rect.height) * 100)));
+                            setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
+                              ...c,
+                              volumeCurve: [...c.volumeCurve, { time, volume }].sort((a, b) => a.time - b.time),
+                            }));
+                          }}
+                        >
+                          {/* Background strip */}
+                          <rect x={0} y={0} width={clipPx} height={CURVE_H} fill="rgba(0,0,0,0.08)" />
+                          {/* Curve line */}
+                          {sortedCurve.length > 1 && (
+                            <polyline
+                              points={linePoints}
+                              fill="none"
+                              stroke="rgba(0,0,0,0.5)"
+                              strokeWidth={1.5}
+                              pointerEvents="none"
+                            />
+                          )}
+                          {/* Curve points */}
+                          {clip.volumeCurve.map((pt, ptIdx) => {
+                            const px = clipPx > 0 ? (pt.time / clip.durationSec) * clipPx : 0;
+                            const py = CURVE_H - 2 - (pt.volume / 100) * (CURVE_H - 4);
+                            return (
+                              <circle
+                                key={ptIdx}
+                                cx={px}
+                                cy={py}
+                                r={3.5}
+                                fill="rgba(0,0,0,0.7)"
+                                stroke="#fffdf5"
+                                strokeWidth={1}
+                                style={{ cursor: "ns-resize" }}
+                                onClick={(e) => e.stopPropagation()}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  if (clip.volumeCurve.length <= 1) return;
+                                  setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
+                                    ...c,
+                                    volumeCurve: c.volumeCurve.filter((_, i) => i !== ptIdx),
+                                  }));
+                                }}
+                                onPointerDown={(e) => {
+                                  e.stopPropagation();
+                                  const svgEl = (e.currentTarget as SVGCircleElement).ownerSVGElement!;
+                                  const rect = svgEl.getBoundingClientRect();
+                                  (e.currentTarget as SVGCircleElement).setPointerCapture(e.pointerId);
+                                  curveDragRef.current = {
+                                    clipId: clip.id,
+                                    pointIdx: ptIdx,
+                                    startX: e.clientX,
+                                    startY: e.clientY,
+                                    origTime: pt.time,
+                                    origVolume: pt.volume,
+                                    clipDuration: clip.durationSec,
+                                    svgLeft: rect.left,
+                                    svgWidth: rect.width,
+                                    svgTop: rect.top,
+                                    svgHeight: rect.height,
+                                  };
+                                }}
+                                onPointerMove={(e) => {
+                                  const drag = curveDragRef.current;
+                                  if (!drag || drag.clipId !== clip.id || drag.pointIdx !== ptIdx) return;
+                                  const dx = e.clientX - drag.startX;
+                                  const dy = e.clientY - drag.startY;
+                                  const dt = (dx / drag.svgWidth) * drag.clipDuration;
+                                  const dv = -(dy / drag.svgHeight) * 100;
+                                  const newTime = Math.max(0, Math.min(drag.clipDuration, drag.origTime + dt));
+                                  const newVolume = Math.max(0, Math.min(100, Math.round(drag.origVolume + dv)));
+                                  setClips((prev) => prev.map((c) => c.id !== drag.clipId ? c : {
+                                    ...c,
+                                    volumeCurve: c.volumeCurve.map((p, i) => i === drag.pointIdx ? { time: newTime, volume: newVolume } : p),
+                                  }));
+                                }}
+                                onPointerUp={() => {
+                                  curveDragRef.current = null;
+                                  setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
+                                    ...c,
+                                    volumeCurve: c.volumeCurve.slice().sort((a, b) => a.time - b.time),
+                                  }));
+                                }}
+                              />
+                            );
+                          })}
+                        </svg>
+                      )}
                     </div>
                   );
                 })}
