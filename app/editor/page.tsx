@@ -38,6 +38,9 @@ type Clip = {
   transform: ClipTransform;
   muted: boolean;
   volumeCurve: CurvePoint[];
+  removeGreenScreen?: boolean;
+  chromaSimilarity?: number;
+  chromaSmoothness?: number;
 };
 
 type Ghost = {
@@ -65,6 +68,8 @@ type DragInfo = {
 
 const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
 const DEFAULT_CURVE: CurvePoint[] = [{ time: 0, volume: 100 }];
+const DEFAULT_CHROMA_SIMILARITY = 0.42;
+const DEFAULT_CHROMA_SMOOTHNESS = 0.08;
 
 type PreviewDragKind = 'move' | 'corner-nw' | 'corner-ne' | 'corner-sw' | 'corner-se';
 type PreviewDragState = {
@@ -199,6 +204,91 @@ function interpolateVolume(curve: CurvePoint[], t: number): number {
     }
   }
   return 1;
+}
+
+function chromaSettings(clip: Clip) {
+  return {
+    enabled: !!clip.removeGreenScreen,
+    similarity: clip.chromaSimilarity ?? DEFAULT_CHROMA_SIMILARITY,
+    smoothness: clip.chromaSmoothness ?? DEFAULT_CHROMA_SMOOTHNESS,
+  };
+}
+
+function chromaAlpha(r: number, g: number, b: number, similarity: number, smoothness: number): number {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const greenDistance = Math.sqrt(rn * rn + (gn - 1) * (gn - 1) + bn * bn);
+  const greenDominance = Math.max(0, gn - Math.max(rn, bn));
+  const edge0 = Math.max(0.01, similarity - smoothness);
+  const edge1 = Math.min(1.5, similarity + smoothness);
+  const byDistance = Math.max(0, Math.min(1, (greenDistance - edge0) / (edge1 - edge0)));
+  const byDominance = Math.max(0, Math.min(1, 1 - greenDominance * 1.35));
+  return Math.max(byDistance, byDominance);
+}
+
+function applyGreenScreenToImageData(data: Uint8ClampedArray, similarity: number, smoothness: number) {
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3] / 255;
+    if (a <= 0) continue;
+    const alpha = chromaAlpha(data[i], data[i + 1], data[i + 2], similarity, smoothness);
+    data[i + 3] = Math.round(data[i + 3] * alpha);
+    if (alpha < 1) {
+      const spill = 1 - alpha;
+      data[i + 1] = Math.round(data[i + 1] * (1 - spill * 0.45));
+    }
+  }
+}
+
+function drawContainedRect(
+  sourceW: number,
+  sourceH: number,
+  boxX: number,
+  boxY: number,
+  boxW: number,
+  boxH: number,
+) {
+  if (sourceW <= 0 || sourceH <= 0) return { x: boxX, y: boxY, w: boxW, h: boxH };
+  const sourceAspect = sourceW / sourceH;
+  const boxAspect = boxW / boxH;
+  if (sourceAspect > boxAspect) {
+    const h = boxW / sourceAspect;
+    return { x: boxX, y: boxY + (boxH - h) / 2, w: boxW, h };
+  }
+  const w = boxH * sourceAspect;
+  return { x: boxX + (boxW - w) / 2, y: boxY, w, h: boxH };
+}
+
+function drawMaybeKeyedMedia(
+  ctx: CanvasRenderingContext2D,
+  media: HTMLVideoElement | HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+  clip: Clip,
+) {
+  const settings = chromaSettings(clip);
+  if (!settings.enabled) {
+    ctx.drawImage(media, dx, dy, dw, dh);
+    return;
+  }
+
+  const w = Math.max(1, Math.round(dw));
+  const h = Math.max(1, Math.round(dh));
+  const off = document.createElement("canvas");
+  off.width = w;
+  off.height = h;
+  const offCtx = off.getContext("2d", { willReadFrequently: true });
+  if (!offCtx) {
+    ctx.drawImage(media, dx, dy, dw, dh);
+    return;
+  }
+  offCtx.drawImage(media, 0, 0, w, h);
+  const frame = offCtx.getImageData(0, 0, w, h);
+  applyGreenScreenToImageData(frame.data, settings.similarity, settings.smoothness);
+  offCtx.putImageData(frame, 0, 0);
+  ctx.drawImage(off, dx, dy, dw, dh);
 }
 
 export default function EditorPage() {
@@ -1007,19 +1097,10 @@ export default function EditorPage() {
         const mH = el instanceof HTMLVideoElement ? el.videoHeight : (el as HTMLImageElement).naturalHeight;
 
         if (mW > 0 && mH > 0) {
-          const mAspect = mW / mH;
-          const bAspect = w / h;
-          let dW: number, dH: number, dX: number, dY: number;
-          if (mAspect > bAspect) {
-            dW = w; dH = w / mAspect;
-            dX = x; dY = y + (h - dH) / 2;
-          } else {
-            dH = h; dW = h * mAspect;
-            dX = x + (w - dW) / 2; dY = y;
-          }
-          ctx2d.drawImage(el, dX, dY, dW, dH);
+          const rect = drawContainedRect(mW, mH, x, y, w, h);
+          drawMaybeKeyedMedia(ctx2d, el, rect.x, rect.y, rect.w, rect.h, clip);
         } else {
-          ctx2d.drawImage(el, x, y, w, h);
+          drawMaybeKeyedMedia(ctx2d, el, x, y, w, h, clip);
         }
       }
 
@@ -1151,6 +1232,8 @@ export default function EditorPage() {
                   >
                     {clip.type === "image" ? (
                       <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
+                    ) : clip.removeGreenScreen ? (
+                      <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
                     ) : (
                       <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
                     )}
@@ -1223,14 +1306,54 @@ export default function EditorPage() {
           const selClip = selectedClipId ? clips.find((c) => c.id === selectedClipId) : null;
           if (!selClip) return null;
           return (
-            <button
-              onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
-              disabled={isExporting}
-              style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined, opacity: isExporting ? 0.4 : 1 }}
-              title="Toggle mute for selected clip"
-            >
-              {selClip.muted ? "Unmute" : "Mute"}
-            </button>
+            <>
+              {selClip.type !== "image" && (
+                <button
+                  onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
+                  disabled={isExporting}
+                  style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined, opacity: isExporting ? 0.4 : 1 }}
+                  title="Toggle mute for selected clip"
+                >
+                  {selClip.muted ? "Unmute" : "Mute"}
+                </button>
+              )}
+              {selClip.type === "video" && (
+                <>
+                  <button
+                    onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, removeGreenScreen: !c.removeGreenScreen } : c))}
+                    disabled={isExporting}
+                    style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.removeGreenScreen ? "#c8f135" : undefined, opacity: isExporting ? 0.4 : 1 }}
+                    title="Remove green background from selected video"
+                  >
+                    Remove green
+                  </button>
+                  {selClip.removeGreenScreen && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a" }}>
+                      <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>key</span>
+                      <input
+                        type="range"
+                        min={0.18}
+                        max={0.85}
+                        step={0.01}
+                        value={selClip.chromaSimilarity ?? DEFAULT_CHROMA_SIMILARITY}
+                        onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaSimilarity: Number(e.target.value) } : c))}
+                        style={{ width: 90 }}
+                      />
+                      <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>edge</span>
+                      <input
+                        type="range"
+                        min={0.01}
+                        max={0.25}
+                        step={0.01}
+                        value={selClip.chromaSmoothness ?? DEFAULT_CHROMA_SMOOTHNESS}
+                        onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaSmoothness: Number(e.target.value) } : c))}
+                        style={{ width: 70 }}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </>
           );
         })()}
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
@@ -1631,6 +1754,120 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
       preload="auto"
       style={{ width: "100%", height: "100%", objectFit: "contain" }}
     />
+  );
+}
+
+function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSec: number; isPlaying: boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef<number | null>(null);
+  const isPlayingRef = useRef(isPlaying);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+
+  const sourceTime = (ph: number) => clip.trimStart + Math.max(0, ph - clip.startTime);
+  const trimEndSrc = clip.trimStart + clip.durationSec;
+
+  function draw() {
+    const vid = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!vid || !canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const targetW = Math.max(1, Math.round(rect.width * dpr));
+    const targetH = Math.max(1, Math.round(rect.height * dpr));
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    const mediaW = vid.videoWidth;
+    const mediaH = vid.videoHeight;
+    if (mediaW > 0 && mediaH > 0 && vid.readyState >= 2) {
+      const drawRect = drawContainedRect(mediaW, mediaH, 0, 0, rect.width, rect.height);
+      drawMaybeKeyedMedia(ctx, vid, drawRect.x, drawRect.y, drawRect.w, drawRect.h, clip);
+    }
+  }
+
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    const offset = sourceTime(playheadSec);
+    vid.src = clip.blobUrl;
+    vid.load();
+    const onReady = () => {
+      vid.currentTime = offset;
+      if (isPlayingRef.current) vid.play().catch(() => {});
+      draw();
+    };
+    vid.addEventListener("loadedmetadata", onReady, { once: true });
+    vid.addEventListener("canplay", draw);
+    return () => {
+      vid.removeEventListener("canplay", draw);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clip.id, clip.blobUrl]);
+
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    const onTimeUpdate = () => { if (vid.currentTime >= trimEndSrc) vid.pause(); };
+    vid.addEventListener("timeupdate", onTimeUpdate);
+    return () => vid.removeEventListener("timeupdate", onTimeUpdate);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimEndSrc]);
+
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    const offset = sourceTime(playheadSec);
+    if (isPlaying) {
+      vid.currentTime = offset;
+      vid.play().catch(() => {});
+    } else {
+      vid.pause();
+      vid.currentTime = offset;
+      vid.addEventListener("seeked", draw, { once: true });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (isPlayingRef.current) return;
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid.currentTime = sourceTime(playheadSec);
+    vid.addEventListener("seeked", draw, { once: true });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness]);
+
+  useEffect(() => {
+    function tick() {
+      draw();
+      if (isPlayingRef.current) rafRef.current = requestAnimationFrame(tick);
+    }
+    if (isPlaying) {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(tick);
+    } else if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      draw();
+    }
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness]);
+
+  return (
+    <>
+      <video ref={videoRef} muted playsInline preload="auto" style={{ display: "none" }} />
+      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block", pointerEvents: "none" }} />
+    </>
   );
 }
 
