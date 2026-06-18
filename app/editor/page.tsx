@@ -41,6 +41,7 @@ type Clip = {
   removeGreenScreen?: boolean;
   chromaSimilarity?: number;
   chromaSmoothness?: number;
+  chromaAmount?: number;
 };
 
 type Ghost = {
@@ -70,6 +71,7 @@ const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
 const DEFAULT_CURVE: CurvePoint[] = [{ time: 0, volume: 100 }];
 const DEFAULT_CHROMA_SIMILARITY = 0.42;
 const DEFAULT_CHROMA_SMOOTHNESS = 0.08;
+const DEFAULT_CHROMA_AMOUNT = 0.55;
 
 type PreviewDragKind = 'move' | 'corner-nw' | 'corner-ne' | 'corner-sw' | 'corner-se';
 type PreviewDragState = {
@@ -211,31 +213,35 @@ function chromaSettings(clip: Clip) {
     enabled: !!clip.removeGreenScreen,
     similarity: clip.chromaSimilarity ?? DEFAULT_CHROMA_SIMILARITY,
     smoothness: clip.chromaSmoothness ?? DEFAULT_CHROMA_SMOOTHNESS,
+    amount: clip.chromaAmount ?? DEFAULT_CHROMA_AMOUNT,
   };
 }
 
-function chromaAlpha(r: number, g: number, b: number, similarity: number, smoothness: number): number {
+function chromaAlpha(r: number, g: number, b: number, similarity: number, smoothness: number, amount: number): number {
   const rn = r / 255;
   const gn = g / 255;
   const bn = b / 255;
   const greenDistance = Math.sqrt(rn * rn + (gn - 1) * (gn - 1) + bn * bn);
   const greenDominance = Math.max(0, gn - Math.max(rn, bn));
-  const edge0 = Math.max(0.01, similarity - smoothness);
-  const edge1 = Math.min(1.5, similarity + smoothness);
+  const strength = Math.max(0, Math.min(1, amount));
+  const effectiveSimilarity = similarity + strength * 0.28;
+  const effectiveDominance = 1.15 + strength * 0.95;
+  const edge0 = Math.max(0.01, effectiveSimilarity - smoothness);
+  const edge1 = Math.min(1.5, effectiveSimilarity + smoothness);
   const byDistance = Math.max(0, Math.min(1, (greenDistance - edge0) / (edge1 - edge0)));
-  const byDominance = Math.max(0, Math.min(1, 1 - greenDominance * 1.35));
+  const byDominance = Math.max(0, Math.min(1, 1 - greenDominance * effectiveDominance));
   return Math.max(byDistance, byDominance);
 }
 
-function applyGreenScreenToImageData(data: Uint8ClampedArray, similarity: number, smoothness: number) {
+function applyGreenScreenToImageData(data: Uint8ClampedArray, similarity: number, smoothness: number, amount: number) {
   for (let i = 0; i < data.length; i += 4) {
     const a = data[i + 3] / 255;
     if (a <= 0) continue;
-    const alpha = chromaAlpha(data[i], data[i + 1], data[i + 2], similarity, smoothness);
+    const alpha = chromaAlpha(data[i], data[i + 1], data[i + 2], similarity, smoothness, amount);
     data[i + 3] = Math.round(data[i + 3] * alpha);
     if (alpha < 1) {
       const spill = 1 - alpha;
-      data[i + 1] = Math.round(data[i + 1] * (1 - spill * 0.45));
+      data[i + 1] = Math.round(data[i + 1] * (1 - spill * (0.35 + amount * 0.35)));
     }
   }
 }
@@ -286,7 +292,7 @@ function drawMaybeKeyedMedia(
   }
   offCtx.drawImage(media, 0, 0, w, h);
   const frame = offCtx.getImageData(0, 0, w, h);
-  applyGreenScreenToImageData(frame.data, settings.similarity, settings.smoothness);
+  applyGreenScreenToImageData(frame.data, settings.similarity, settings.smoothness, settings.amount);
   offCtx.putImageData(frame, 0, 0);
   ctx.drawImage(off, dx, dy, dw, dh);
 }
@@ -1328,7 +1334,17 @@ export default function EditorPage() {
                     Remove green
                   </button>
                   {selClip.removeGreenScreen && (
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a", flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>amount</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        value={selClip.chromaAmount ?? DEFAULT_CHROMA_AMOUNT}
+                        onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaAmount: Number(e.target.value) } : c))}
+                        style={{ width: 90 }}
+                      />
                       <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>key</span>
                       <input
                         type="range"
@@ -1842,7 +1858,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     vid.currentTime = sourceTime(playheadSec);
     vid.addEventListener("seeked", draw, { once: true });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness]);
+  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount]);
 
   useEffect(() => {
     function tick() {
@@ -1861,7 +1877,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness]);
+  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount]);
 
   return (
     <>
