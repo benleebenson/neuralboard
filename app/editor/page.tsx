@@ -12,6 +12,7 @@ const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
 const CURVE_H = 12;
+const MAX_EXPORT_DURATION = 90;
 const LAYER_LABELS = ["Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5"];
 const LAYER_BG = [
   "rgba(255,253,245,0.55)",
@@ -312,6 +313,7 @@ export default function EditorPage() {
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportDurationSec, setExportDurationSec] = useState(0);
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -958,7 +960,9 @@ export default function EditorPage() {
     exportCancelRef.current = false;
     setExportProgress(0);
 
-    const totalDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
+    const sourceTotalDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
+    const totalDur = Math.min(MAX_EXPORT_DURATION, sourceTotalDur);
+    setExportDurationSec(totalDur);
     const [canvasW, canvasH] = outputFormat === '16:9' ? [1280, 720] : [720, 1280];
 
     const canvas = document.createElement("canvas");
@@ -1023,6 +1027,7 @@ export default function EditorPage() {
       setIsExporting(false);
       isExportingRef.current = false;
       setExportProgress(0);
+      setExportDurationSec(0);
     };
 
     // Seed audio at t=0
@@ -1049,6 +1054,7 @@ export default function EditorPage() {
         setIsExporting(false);
         isExportingRef.current = false;
         setExportProgress(0);
+        setExportDurationSec(0);
         return;
       }
 
@@ -1171,7 +1177,7 @@ export default function EditorPage() {
           )}
           <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
           <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
-          {isSubscribed && config?.railwayUrl && (
+          {config?.railwayUrl && (
             <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }}
               style={sketchButton}
@@ -1374,7 +1380,7 @@ export default function EditorPage() {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
           {isExporting && (
             <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>
-              {formatTime(exportProgress * totalDuration)} / {formatTime(totalDuration)}
+              {formatTime(exportProgress * (exportDurationSec || Math.min(totalDuration, MAX_EXPORT_DURATION)))} / {formatTime(exportDurationSec || Math.min(totalDuration, MAX_EXPORT_DURATION))}
             </span>
           )}
           <button
