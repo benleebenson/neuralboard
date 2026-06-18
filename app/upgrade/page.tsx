@@ -94,8 +94,8 @@ export default function UpgradePage() {
         </p>
 
         <div style={{ textAlign: "center", marginTop: 20 }}>
-          <a href="/builder" style={{ fontSize: 11, color: "#2a2a2a", textDecoration: "underline" }}>
-            ← back to builder
+          <a href="/editor" style={{ fontSize: 11, color: "#2a2a2a", textDecoration: "underline" }}>
+            ← back to editor
           </a>
         </div>
       </div>

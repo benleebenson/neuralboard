@@ -27,7 +27,7 @@ export async function POST() {
     customer: customerId,
     mode: "subscription",
     line_items: [{ price: process.env.STRIPE_PRICE_ID!, quantity: 1 }],
-    success_url: `${APP_URL}/builder?upgraded=1`,
+    success_url: `${APP_URL}/editor?upgraded=1`,
     cancel_url: `${APP_URL}/upgrade`,
     metadata: { email },
   });

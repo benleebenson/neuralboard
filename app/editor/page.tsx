@@ -1151,7 +1151,6 @@ export default function EditorPage() {
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ EDITOR</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <a href="/builder" style={navLinkStyle}>Builder</a>
           <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
         </div>
       </header>
@@ -1933,17 +1932,6 @@ const primaryButtonStyle: React.CSSProperties = {
   background: "#c8f135",
   padding: 14,
   fontSize: 14,
-};
-
-const navLinkStyle: React.CSSProperties = {
-  fontSize: 10,
-  fontFamily: "monospace",
-  color: "#2a2a2a",
-  textDecoration: "none",
-  border: "1px solid #2a2a2a",
-  padding: "3px 8px",
-  borderRadius: 3,
-  letterSpacing: 0.5,
 };
 
 const miniButton: React.CSSProperties = {
