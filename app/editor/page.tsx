@@ -11,6 +11,7 @@ const NUM_LAYERS = 5;
 const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
+const EDGE_SNAP = 0.18;
 const CURVE_H = 12;
 const MAX_EXPORT_DURATION = 90;
 const MIN_PLAYBACK_RATE = 0.25;
@@ -48,6 +49,11 @@ type Clip = {
   chromaSimilarity?: number;
   chromaSmoothness?: number;
   chromaAmount?: number;
+};
+
+type EditorSnapshot = {
+  clips: Clip[];
+  selectedClipId: string | null;
 };
 
 type Ghost = {
@@ -143,6 +149,25 @@ function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: numb
     }
   }
   return null;
+}
+
+function nearestEdgeSnap(value: number, candidates: number[], tolerance = EDGE_SNAP): number {
+  let best = value;
+  let bestDistance = tolerance;
+  for (const candidate of candidates) {
+    const distance = Math.abs(value - candidate);
+    if (distance <= bestDistance) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function sameLayerEdgeCandidates(clips: Clip[], clipId: string, layer: number): number[] {
+  return clips
+    .filter((c) => c.id !== clipId && c.layer === layer)
+    .flatMap((c) => [c.startTime, c.startTime + c.durationSec]);
 }
 
 function clipPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
@@ -434,6 +459,7 @@ export default function EditorPage() {
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
+  const undoStackRef = useRef<EditorSnapshot[]>([]);
   const isRecordingNarrationRef = useRef(false);
   const recStartSecRef = useRef(0);
   const recLayerRef = useRef(1);
@@ -488,6 +514,11 @@ export default function EditorPage() {
         }
         return;
       }
+      if (modifier && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undoLastEdit();
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         if (isRecordingNarrationRef.current) { stopRecording(); return; }
@@ -498,6 +529,7 @@ export default function EditorPage() {
         const selId = selectedClipIdRef.current;
         if (selId) {
           e.preventDefault();
+          pushUndoSnapshot();
           setClips((prev) => prev.filter((c) => c.id !== selId));
           setSelectedClipId(null);
         }
@@ -523,13 +555,40 @@ export default function EditorPage() {
   const timelineW = totalDuration * PX_PER_SEC + 200;
   const isDraggingClip = ghost !== null;
 
-  function copyClip(clip: Clip) {
-    clipboardClipRef.current = {
+  function cloneClipForHistory(clip: Clip): Clip {
+    return {
       ...clip,
       transform: { ...clip.transform },
       volumeCurve: clip.volumeCurve.map((pt) => ({ ...pt })),
       waveform: clip.waveform ? [...clip.waveform] : undefined,
     };
+  }
+
+  function pushUndoSnapshot() {
+    undoStackRef.current.push({
+      clips: clipsRef.current.map(cloneClipForHistory),
+      selectedClipId: selectedClipIdRef.current,
+    });
+    if (undoStackRef.current.length > 80) undoStackRef.current.shift();
+  }
+
+  function undoLastEdit() {
+    const snapshot = undoStackRef.current.pop();
+    if (!snapshot) return;
+    if (isPlayingRef.current) pausePlayback();
+    setGhost(null);
+    dragRef.current = null;
+    curveDragRef.current = null;
+    previewDragRef.current = null;
+    const restored = snapshot.clips.map(cloneClipForHistory);
+    clipsRef.current = restored;
+    selectedClipIdRef.current = snapshot.selectedClipId;
+    setClips(restored);
+    setSelectedClipId(snapshot.selectedClipId);
+  }
+
+  function copyClip(clip: Clip) {
+    clipboardClipRef.current = cloneClipForHistory(clip);
     setClipboardReady(true);
   }
 
@@ -537,6 +596,7 @@ export default function EditorPage() {
     const source = clipboardClipRef.current;
     if (!source || isExportingRef.current) return;
     const pastedId = crypto.randomUUID();
+    pushUndoSnapshot();
     setClips((prev) => {
       let startTime = Math.max(0, playheadSecRef.current);
       let layer = findFreeLayerOrNull(prev, startTime, source.durationSec);
@@ -818,12 +878,19 @@ export default function EditorPage() {
     const src = clipsRef.current.find((c) => c.id === drag.clipId)!;
     const rate = clipPlaybackRate(src);
     if (drag.kind === "move") {
-      newStart = snapTo(Math.max(0, drag.origStartTime + dtSec));
+      const baseStart = snapTo(Math.max(0, drag.origStartTime + dtSec));
       newLayer = hoverLayer;
+      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, newLayer);
+      newStart = Math.max(0, snapTo(nearestEdgeSnap(baseStart, [
+        ...edgeCandidates,
+        ...edgeCandidates.map((edge) => edge - newDur),
+      ])));
     } else if (drag.kind === "resize-left") {
       const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart / rate);
       const maxStart = drag.origStartTime + drag.origDuration - MIN_DURATION;
-      newStart = snapTo(clamp(drag.origStartTime + dtSec, minStart, maxStart));
+      const baseStart = snapTo(clamp(drag.origStartTime + dtSec, minStart, maxStart));
+      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, drag.origLayer);
+      newStart = snapTo(clamp(nearestEdgeSnap(baseStart, edgeCandidates), minStart, maxStart));
       const sourceDelta = (newStart - drag.origStartTime) * rate;
       drag.validTrimStart = clamp(drag.origTrimStart + sourceDelta, 0, src.sourceDuration);
       newDur = Math.max(MIN_DURATION, (drag.origTrimStart + drag.origDuration * rate - drag.validTrimStart) / rate);
@@ -833,6 +900,9 @@ export default function EditorPage() {
       newDur = clamp(snapTo(Math.max(MIN_DURATION, drag.origDuration + dtSec)), MIN_DURATION, maxTimelineDur);
       newStart = drag.origStartTime;
       newLayer = drag.origLayer;
+      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, newLayer);
+      const snappedEnd = nearestEdgeSnap(newStart + newDur, edgeCandidates);
+      newDur = clamp(snapTo(snappedEnd - newStart), MIN_DURATION, maxTimelineDur);
     }
     const noOverlap = !clipsRef.current.some(
       (c) => c.id !== drag.clipId && c.layer === newLayer &&
@@ -851,6 +921,13 @@ export default function EditorPage() {
     if (!drag) return;
     dragRef.current = null;
     setGhost(null);
+    const changed =
+      drag.validStartTime !== drag.origStartTime ||
+      drag.validDuration !== drag.origDuration ||
+      drag.validLayer !== drag.origLayer ||
+      drag.validTrimStart !== drag.origTrimStart;
+    if (!changed) return;
+    pushUndoSnapshot();
     setClips((prev) =>
       prev.map((c) =>
         c.id === drag.clipId
@@ -903,6 +980,7 @@ export default function EditorPage() {
         const waveform = await generateWaveform(blobUrl).catch(() => undefined);
         const dur = durationSec || recSecondsRef.current;
         if (dur < 0.1) return;
+        pushUndoSnapshot();
         setClips((prev) => {
           const startTime = recStartSecRef.current;
           return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE], waveform }];
@@ -946,6 +1024,7 @@ export default function EditorPage() {
     );
     const valid = processed.filter((x): x is NonNullable<typeof x> => x !== null);
     if (!valid.length) return;
+    pushUndoSnapshot();
     setClips((prev) => {
       const startTime = playheadSecRef.current;
       const newClips: Clip[] = [];
@@ -1006,6 +1085,7 @@ export default function EditorPage() {
       const blobUrl = URL.createObjectURL(blob);
       const durationSec = await getMediaDuration(blobUrl, "video");
       const title = (ytSelected.title ?? "YouTube clip").slice(0, 40);
+      pushUndoSnapshot();
       setClips((prev) => {
         const startTime = playheadSecRef.current;
         const dur = durationSec || (ytEnd - ytStart);
@@ -1036,10 +1116,9 @@ export default function EditorPage() {
 
   function splitAtPlayhead() {
     const t = playheadSecRef.current;
-    const clip = clipsRef.current.find(
-      (c) => t > c.startTime + 0.05 && t < c.startTime + c.durationSec - 0.05
-    );
-    if (!clip) return;
+    const selectedId = selectedClipIdRef.current;
+    const clip = selectedId ? clipsRef.current.find((c) => c.id === selectedId) : null;
+    if (!clip || t <= clip.startTime + 0.05 || t >= clip.startTime + clip.durationSec - 0.05) return;
     const leftDur = t - clip.startTime;
     const rightDur = clip.durationSec - leftDur;
     const rate = clipPlaybackRate(clip);
@@ -1057,7 +1136,9 @@ export default function EditorPage() {
 
     const leftClip: Clip = { ...clip, id: crypto.randomUUID(), durationSec: leftDur, volumeCurve: leftCurve.length ? leftCurve : [...DEFAULT_CURVE] };
     const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur * rate, volumeCurve: rightCurve.length ? rightCurve : [...DEFAULT_CURVE] };
+    pushUndoSnapshot();
     setClips((prev) => prev.filter((c) => c.id !== clip.id).concat([leftClip, rightClip]));
+    setSelectedClipId(leftClip.id);
   }
 
   // ─── Preview transform drag ──────────────────────────────────────────────────
@@ -1072,6 +1153,7 @@ export default function EditorPage() {
     if (!container) return;
     const rect = container.getBoundingClientRect();
     const t = clip.transform;
+    pushUndoSnapshot();
     previewDragRef.current = {
       kind,
       clipId: clip.id,
@@ -1595,7 +1677,10 @@ export default function EditorPage() {
               </button>
               {selClip.type !== "image" && (
                 <button
-                  onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
+                  onClick={() => {
+                    pushUndoSnapshot();
+                    setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c));
+                  }}
                   disabled={isExporting}
                   style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.muted ? "#ff5e3a" : undefined, color: selClip.muted ? "#fff" : undefined, opacity: isExporting ? 0.4 : 1 }}
                   title="Toggle mute for selected clip"
@@ -1612,6 +1697,7 @@ export default function EditorPage() {
                     max={MAX_PLAYBACK_RATE}
                     step={0.05}
                     value={clipPlaybackRate(selClip)}
+                    onPointerDown={pushUndoSnapshot}
                     onChange={(e) => updateClipPlaybackRate(selClip.id, Number(e.target.value))}
                     disabled={isExporting}
                     style={{ width: 130 }}
@@ -1620,7 +1706,10 @@ export default function EditorPage() {
                     {clipPlaybackRate(selClip).toFixed(2)}x
                   </span>
                   <button
-                    onClick={() => updateClipPlaybackRate(selClip.id, 1)}
+                    onClick={() => {
+                      pushUndoSnapshot();
+                      updateClipPlaybackRate(selClip.id, 1);
+                    }}
                     disabled={isExporting}
                     style={{ ...miniButton, fontSize: 10, padding: "2px 7px", opacity: isExporting ? 0.4 : 1 }}
                     title="Reset speed"
@@ -1632,7 +1721,10 @@ export default function EditorPage() {
               {selClip.type === "video" && (
                 <>
                   <button
-                    onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, removeGreenScreen: !c.removeGreenScreen } : c))}
+                    onClick={() => {
+                      pushUndoSnapshot();
+                      setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, removeGreenScreen: !c.removeGreenScreen } : c));
+                    }}
                     disabled={isExporting}
                     style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: selClip.removeGreenScreen ? "#c8f135" : undefined, opacity: isExporting ? 0.4 : 1 }}
                     title="Remove green background from selected video"
@@ -1648,6 +1740,7 @@ export default function EditorPage() {
                         max={1}
                         step={0.01}
                         value={selClip.chromaAmount ?? DEFAULT_CHROMA_AMOUNT}
+                        onPointerDown={pushUndoSnapshot}
                         onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaAmount: Number(e.target.value) } : c))}
                         style={{ width: 90 }}
                       />
@@ -1658,6 +1751,7 @@ export default function EditorPage() {
                         max={0.85}
                         step={0.01}
                         value={selClip.chromaSimilarity ?? DEFAULT_CHROMA_SIMILARITY}
+                        onPointerDown={pushUndoSnapshot}
                         onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaSimilarity: Number(e.target.value) } : c))}
                         style={{ width: 90 }}
                       />
@@ -1668,6 +1762,7 @@ export default function EditorPage() {
                         max={0.25}
                         step={0.01}
                         value={selClip.chromaSmoothness ?? DEFAULT_CHROMA_SMOOTHNESS}
+                        onPointerDown={pushUndoSnapshot}
                         onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, chromaSmoothness: Number(e.target.value) } : c))}
                         style={{ width: 70 }}
                       />
@@ -1692,7 +1787,7 @@ export default function EditorPage() {
             {isExporting ? `✕ Cancel (${Math.round(exportProgress * 100)}%)` : "⬇ Export"}
           </button>
         </div>
-        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · [⌫] delete selected</span>
+        <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · [cmd/ctrl+z] undo · [⌫] delete selected</span>
       </div>
 
       {/* Timeline */}
@@ -1796,6 +1891,7 @@ export default function EditorPage() {
                             const svgY = e.clientY - rect.top;
                             const time = Math.max(0, Math.min(clip.durationSec, (svgX / rect.width) * clip.durationSec));
                             const volume = Math.max(0, Math.min(100, Math.round(100 - (svgY / rect.height) * 100)));
+                            pushUndoSnapshot();
                             setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
                               ...c,
                               volumeCurve: [...c.volumeCurve, { time, volume }].sort((a, b) => a.time - b.time),
@@ -1832,6 +1928,7 @@ export default function EditorPage() {
                                 onDoubleClick={(e) => {
                                   e.stopPropagation();
                                   if (clip.volumeCurve.length <= 1) return;
+                                  pushUndoSnapshot();
                                   setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
                                     ...c,
                                     volumeCurve: c.volumeCurve.filter((_, i) => i !== ptIdx),
@@ -1839,6 +1936,7 @@ export default function EditorPage() {
                                 }}
                                 onPointerDown={(e) => {
                                   e.stopPropagation();
+                                  pushUndoSnapshot();
                                   const svgEl = (e.currentTarget as SVGCircleElement).ownerSVGElement!;
                                   const rect = svgEl.getBoundingClientRect();
                                   (e.currentTarget as SVGCircleElement).setPointerCapture(e.pointerId);
