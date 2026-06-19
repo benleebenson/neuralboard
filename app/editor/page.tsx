@@ -7,7 +7,7 @@ const PX_PER_SEC = 100;
 const IMAGE_DEFAULT_DURATION = 3;
 const RULER_H = 30;
 const LAYER_H = 56;
-const NUM_LAYERS = 5;
+const INITIAL_LAYER_COUNT = 5;
 const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
@@ -17,13 +17,9 @@ const MAX_EXPORT_DURATION = 90;
 const MIN_PLAYBACK_RATE = 0.25;
 const MAX_PLAYBACK_RATE = 4;
 const MASTER_PLAYBACK_RATE = 1;
-const LAYER_LABELS = ["Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5"];
 const LAYER_BG = [
   "rgba(255,253,245,0.55)",
   "rgba(228,238,255,0.40)",
-  "rgba(255,253,245,0.55)",
-  "rgba(228,238,255,0.40)",
-  "rgba(255,253,245,0.55)",
 ];
 
 type ClipType = "audio" | "video" | "image";
@@ -54,6 +50,8 @@ type Clip = {
 type EditorSnapshot = {
   clips: Clip[];
   selectedClipId: string | null;
+  layerCount: number;
+  mutedLayers: Record<number, boolean>;
 };
 
 type Ghost = {
@@ -133,17 +131,17 @@ function clipsOverlap(s1: number, d1: number, s2: number, d2: number): boolean {
   return s1 < s2 + d2 - 0.001 && s1 + d1 > s2 + 0.001;
 }
 
-function findFreeLayer(existing: Clip[], startTime: number, duration: number): number {
-  for (let l = 1; l <= NUM_LAYERS; l++) {
+function findFreeLayer(existing: Clip[], startTime: number, duration: number, layerCount: number): number {
+  for (let l = 1; l <= layerCount; l++) {
     if (!existing.some((c) => c.layer === l && clipsOverlap(startTime, duration, c.startTime, c.durationSec))) {
       return l;
     }
   }
-  return 1;
+  return layerCount + 1;
 }
 
-function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: number): number | null {
-  for (let l = 1; l <= NUM_LAYERS; l++) {
+function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: number, layerCount: number): number | null {
+  for (let l = 1; l <= layerCount; l++) {
     if (!existing.some((c) => c.layer === l && clipsOverlap(startTime, duration, c.startTime, c.durationSec))) {
       return l;
     }
@@ -168,6 +166,10 @@ function sameLayerEdgeCandidates(clips: Clip[], clipId: string, layer: number): 
   return clips
     .filter((c) => c.id !== clipId && c.layer === layer)
     .flatMap((c) => [c.startTime, c.startTime + c.durationSec]);
+}
+
+function layerBg(layer: number): string {
+  return LAYER_BG[(layer - 1) % LAYER_BG.length] ?? LAYER_BG[0];
 }
 
 function clipPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
@@ -420,6 +422,8 @@ export default function EditorPage() {
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
+  const [layerCount, setLayerCount] = useState(INITIAL_LAYER_COUNT);
+  const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -460,6 +464,8 @@ export default function EditorPage() {
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
   const undoStackRef = useRef<EditorSnapshot[]>([]);
+  const layerCountRef = useRef(INITIAL_LAYER_COUNT);
+  const mutedLayersRef = useRef<Record<number, boolean>>({});
   const isRecordingNarrationRef = useRef(false);
   const recStartSecRef = useRef(0);
   const recLayerRef = useRef(1);
@@ -480,6 +486,8 @@ export default function EditorPage() {
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadSecRef.current = playheadSec; }, [playheadSec]);
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
+  useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
+  useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
 
   useEffect(() => {
     if (!recording) return;
@@ -555,6 +563,16 @@ export default function EditorPage() {
   const timelineW = totalDuration * PX_PER_SEC + 200;
   const isDraggingClip = ghost !== null;
 
+  function ensureLayerCount(nextLayer: number) {
+    if (nextLayer <= layerCountRef.current) return;
+    layerCountRef.current = nextLayer;
+    setLayerCount(nextLayer);
+  }
+
+  function isLayerMuted(layer: number): boolean {
+    return !!mutedLayersRef.current[layer];
+  }
+
   function cloneClipForHistory(clip: Clip): Clip {
     return {
       ...clip,
@@ -568,6 +586,8 @@ export default function EditorPage() {
     undoStackRef.current.push({
       clips: clipsRef.current.map(cloneClipForHistory),
       selectedClipId: selectedClipIdRef.current,
+      layerCount: layerCountRef.current,
+      mutedLayers: { ...mutedLayersRef.current },
     });
     if (undoStackRef.current.length > 80) undoStackRef.current.shift();
   }
@@ -583,8 +603,27 @@ export default function EditorPage() {
     const restored = snapshot.clips.map(cloneClipForHistory);
     clipsRef.current = restored;
     selectedClipIdRef.current = snapshot.selectedClipId;
+    layerCountRef.current = snapshot.layerCount;
+    mutedLayersRef.current = { ...snapshot.mutedLayers };
     setClips(restored);
     setSelectedClipId(snapshot.selectedClipId);
+    setLayerCount(snapshot.layerCount);
+    setMutedLayers({ ...snapshot.mutedLayers });
+  }
+
+  function addLayer() {
+    pushUndoSnapshot();
+    const next = layerCountRef.current + 1;
+    layerCountRef.current = next;
+    setLayerCount(next);
+  }
+
+  function toggleLayerMute(layer: number) {
+    pushUndoSnapshot();
+    const next = { ...mutedLayersRef.current, [layer]: !mutedLayersRef.current[layer] };
+    mutedLayersRef.current = next;
+    setMutedLayers(next);
+    if (isPlayingRef.current) startAudioAt(playheadSecRef.current, clipsRef.current);
   }
 
   function copyClip(clip: Clip) {
@@ -599,11 +638,11 @@ export default function EditorPage() {
     pushUndoSnapshot();
     setClips((prev) => {
       let startTime = Math.max(0, playheadSecRef.current);
-      let layer = findFreeLayerOrNull(prev, startTime, source.durationSec);
+      let layer = findFreeLayerOrNull(prev, startTime, source.durationSec, layerCountRef.current);
       if (!layer) {
         for (let offset = SNAP; offset <= 60; offset += SNAP) {
           const candidateStart = snapTo(startTime + offset);
-          const candidateLayer = findFreeLayerOrNull(prev, candidateStart, source.durationSec);
+          const candidateLayer = findFreeLayerOrNull(prev, candidateStart, source.durationSec, layerCountRef.current);
           if (candidateLayer) {
             startTime = candidateStart;
             layer = candidateLayer;
@@ -611,12 +650,14 @@ export default function EditorPage() {
           }
         }
       }
+      layer = layer ?? layerCountRef.current + 1;
+      ensureLayerCount(layer);
       const pasted: Clip = {
         ...source,
         id: pastedId,
         name: `${source.name} copy`,
         startTime,
-        layer: layer ?? source.layer,
+        layer,
         transform: { ...source.transform },
         volumeCurve: source.volumeCurve.map((pt) => ({ ...pt })),
         waveform: source.waveform ? [...source.waveform] : undefined,
@@ -655,6 +696,7 @@ export default function EditorPage() {
     currentClips.forEach((clip) => {
       if (clip.type === "image") return;
       if (clip.muted) return;
+      if (isLayerMuted(clip.layer)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
     });
@@ -709,7 +751,7 @@ export default function EditorPage() {
     if (!ctx) return;
     activeAudioRef.current.forEach((entry, clipId) => {
       const clip = currentClips.find((c) => c.id === clipId);
-      if (!clip || atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) {
+      if (!clip || clip.muted || isLayerMuted(clip.layer) || atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) {
         if (entry.kind === "element") {
           entry.elem.pause();
           try { entry.source.disconnect(); } catch {}
@@ -729,6 +771,7 @@ export default function EditorPage() {
     currentClips.forEach((clip) => {
       if (clip.type === "image") return;
       if (clip.muted) return;
+      if (isLayerMuted(clip.layer)) return;
       if (activeAudioRef.current.has(clip.id)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
@@ -870,8 +913,8 @@ export default function EditorPage() {
     const rect = scroller.getBoundingClientRect();
     const dx = clientX - drag.startMouseX;
     const dtSec = dx / PX_PER_SEC;
-    const yInLayers = clientY - rect.top - RULER_H;
-    const hoverLayer = Math.min(NUM_LAYERS, Math.max(1, Math.floor(yInLayers / LAYER_H) + 1));
+    const yInLayers = clientY - rect.top + scroller.scrollTop - RULER_H;
+    const hoverLayer = Math.min(layerCountRef.current, Math.max(1, Math.floor(yInLayers / LAYER_H) + 1));
     let newStart = drag.validStartTime;
     let newDur = drag.validDuration;
     let newLayer = drag.validLayer;
@@ -949,7 +992,8 @@ export default function EditorPage() {
       // Capture start position and pick layer before playback advances
       const startSec = playheadSecRef.current;
       recStartSecRef.current = startSec;
-      const layer = findFreeLayer(clipsRef.current, startSec, 9999);
+      const layer = findFreeLayer(clipsRef.current, startSec, 9999, layerCountRef.current);
+      ensureLayerCount(layer);
       recLayerRef.current = layer;
 
       // Mute all clip audio and start visual-only playback
@@ -1030,7 +1074,8 @@ export default function EditorPage() {
       const newClips: Clip[] = [];
       for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
-        const layer = findFreeLayer([...prev, ...newClips], startTime, dur);
+        const layer = findFreeLayer([...prev, ...newClips], startTime, dur, layerCountRef.current);
+        ensureLayerCount(layer);
         newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE], waveform: item.waveform });
       }
       return [...prev, ...newClips];
@@ -1089,7 +1134,9 @@ export default function EditorPage() {
       setClips((prev) => {
         const startTime = playheadSecRef.current;
         const dur = durationSec || (ytEnd - ytStart);
-        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
+        const layer = findFreeLayer(prev, startTime, dur, layerCountRef.current);
+        ensureLayerCount(layer);
+        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
       });
       setYtModalOpen(false);
       setYtView("search");
@@ -1230,20 +1277,16 @@ export default function EditorPage() {
         availableSource,
         Math.max(MIN_DURATION * oldRate, target.durationSec * oldRate),
       );
-      let durationSec = Math.max(MIN_DURATION, sourceSpan / playbackRate);
+      const durationSec = Math.max(MIN_DURATION, sourceSpan / playbackRate);
       const others = prev.filter((c) => c.id !== clipId);
       let layer = target.layer;
       if (others.some((c) => c.layer === target.layer && clipsOverlap(target.startTime, durationSec, c.startTime, c.durationSec))) {
-        const freeLayer = findFreeLayerOrNull(others, target.startTime, durationSec);
+        const freeLayer = findFreeLayerOrNull(others, target.startTime, durationSec, layerCountRef.current);
         if (freeLayer) {
           layer = freeLayer;
         } else {
-          const nextClipStart = others
-            .filter((c) => c.layer === target.layer && c.startTime >= target.startTime)
-            .reduce((min, c) => Math.min(min, c.startTime), Infinity);
-          if (Number.isFinite(nextClipStart)) {
-            durationSec = Math.max(MIN_DURATION, nextClipStart - target.startTime);
-          }
+          layer = layerCountRef.current + 1;
+          ensureLayerCount(layer);
         }
       }
 
@@ -1528,7 +1571,7 @@ export default function EditorPage() {
                     top: `${t.y}%`,
                     width: `${t.scaleX * 100}%`,
                     height: `${t.scaleY * 100}%`,
-                    zIndex: NUM_LAYERS + 1 - clip.layer,
+                    zIndex: layerCount + 1 - clip.layer,
                     cursor: isSelected ? "move" : "default",
                   }}
                   onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
@@ -1653,6 +1696,14 @@ export default function EditorPage() {
           title="Split clip at playhead"
         >
           ✂ Split
+        </button>
+        <button
+          onClick={addLayer}
+          disabled={isExporting}
+          style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
+          title="Add a new timeline layer"
+        >
+          + Layer
         </button>
         {(() => {
           const selClip = selectedClipId ? clips.find((c) => c.id === selectedClipId) : null;
@@ -1797,9 +1848,9 @@ export default function EditorPage() {
         onPointerMove={onScrollerPointerMove}
         onPointerUp={onScrollerPointerUp}
         onPointerCancel={onScrollerPointerUp}
-        style={{ overflowX: "auto", overflowY: "hidden", cursor: isDraggingClip ? "grabbing" : "crosshair", userSelect: "none", position: "relative", flex: 1 }}
+        style={{ overflowX: "auto", overflowY: "auto", cursor: isDraggingClip ? "grabbing" : "crosshair", userSelect: "none", position: "relative", flex: 1 }}
       >
-        <div style={{ position: "relative", width: timelineW, minHeight: RULER_H + NUM_LAYERS * LAYER_H }}>
+        <div style={{ position: "relative", width: timelineW, minHeight: RULER_H + layerCount * LAYER_H }}>
 
           {/* Ruler */}
           <div style={{ position: "relative", height: RULER_H, borderBottom: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.9)" }}>
@@ -1815,15 +1866,26 @@ export default function EditorPage() {
           </div>
 
           {/* Layers */}
-          {LAYER_LABELS.map((label, idx) => {
+          {Array.from({ length: layerCount }, (_, idx) => {
             const layerNum = idx + 1;
+            const label = `Layer ${layerNum}`;
             const layerClips = clips.filter((c) => c.layer === layerNum);
             const layerGhost = ghost?.layer === layerNum ? ghost : null;
+            const layerMuted = !!mutedLayers[layerNum];
             return (
-              <div key={layerNum} style={{ position: "relative", height: LAYER_H, borderBottom: `1px solid rgba(42,42,42,${layerNum === NUM_LAYERS ? 0.3 : 0.1})`, background: LAYER_BG[idx] }}>
-                <span style={{ position: "absolute", left: 6, top: "50%", transform: "translateY(-50%)", fontSize: 9, fontFamily: "monospace", color: "rgba(42,42,42,0.22)", letterSpacing: 0.5, textTransform: "uppercase", pointerEvents: "none", userSelect: "none", zIndex: 0 }}>
+              <div key={layerNum} style={{ position: "relative", height: LAYER_H, borderBottom: `1px solid rgba(42,42,42,${layerNum === layerCount ? 0.3 : 0.1})`, background: layerBg(layerNum) }}>
+                <span style={{ position: "absolute", left: 6, top: 7, fontSize: 9, fontFamily: "monospace", color: "rgba(42,42,42,0.28)", letterSpacing: 0.5, textTransform: "uppercase", pointerEvents: "none", userSelect: "none", zIndex: 0 }}>
                   {label}
                 </span>
+                <button
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); toggleLayerMute(layerNum); }}
+                  disabled={isExporting}
+                  style={{ position: "absolute", left: 6, bottom: 6, zIndex: 7, fontSize: 8, fontFamily: "monospace", padding: "1px 5px", border: "1px solid rgba(42,42,42,0.45)", background: layerMuted ? "#ff5e3a" : "rgba(255,253,245,0.88)", color: layerMuted ? "#fff" : "#2a2a2a", boxShadow: "1px 1px 0 rgba(42,42,42,0.35)", cursor: isExporting ? "default" : "pointer", opacity: isExporting ? 0.4 : 1 }}
+                  title={layerMuted ? "Unmute this layer" : "Mute this layer"}
+                >
+                  {layerMuted ? "MUTED" : "MUTE"}
+                </button>
                 {layerClips.map((clip) => {
                   const isBeingDragged = ghost?.clipId === clip.id;
                   const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * PX_PER_SEC - 2);
@@ -1996,7 +2058,7 @@ export default function EditorPage() {
           })}
 
           {clips.length === 0 && (
-            <div style={{ position: "absolute", left: "50%", top: RULER_H + (NUM_LAYERS * LAYER_H) / 2, transform: "translate(-50%, -50%)", fontSize: 11, fontFamily: "monospace", color: "#ccc", pointerEvents: "none", whiteSpace: "nowrap" }}>
+            <div style={{ position: "absolute", left: "50%", top: RULER_H + (layerCount * LAYER_H) / 2, transform: "translate(-50%, -50%)", fontSize: 11, fontFamily: "monospace", color: "#ccc", pointerEvents: "none", whiteSpace: "nowrap" }}>
               Record or upload to add clips
             </div>
           )}
