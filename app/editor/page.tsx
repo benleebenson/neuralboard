@@ -115,6 +115,20 @@ type PreviewDragState = {
   containerH: number;
 } | null;
 
+type CropDragKind = "move" | "resize-nw" | "resize-ne" | "resize-sw" | "resize-se";
+type CropDraft = { clipId: string; x: number; y: number; size: number } | null;
+type CropDragState = {
+  kind: CropDragKind;
+  clipId: string;
+  startMouseX: number;
+  startMouseY: number;
+  startX: number;
+  startY: number;
+  startSize: number;
+  boxW: number;
+  boxH: number;
+} | null;
+
 type YtSearchResult = {
   id: string;
   title: string;
@@ -546,6 +560,7 @@ export default function EditorPage() {
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
+  const [cropDraft, setCropDraft] = useState<CropDraft>(null);
   const [layerCount, setLayerCount] = useState(INITIAL_LAYER_COUNT);
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
@@ -583,6 +598,8 @@ export default function EditorPage() {
   const mediaUploadRef = useRef<HTMLInputElement | null>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewDragRef = useRef<PreviewDragState>(null);
+  const cropDraftRef = useRef<CropDraft>(null);
+  const cropDragRef = useRef<CropDragState>(null);
   const curveDragRef = useRef<CurveDragState>(null);
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
@@ -608,6 +625,7 @@ export default function EditorPage() {
   const activeAudioRef = useRef<Map<string, AudioEntry>>(new Map());
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  useEffect(() => { cropDraftRef.current = cropDraft; }, [cropDraft]);
   useEffect(() => { playheadSecRef.current = playheadSec; }, [playheadSec]);
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
   useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
@@ -649,6 +667,16 @@ export default function EditorPage() {
       if (modifier && e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
         undoLastEdit();
+        return;
+      }
+      if (e.key === "Enter" && cropDraftRef.current) {
+        e.preventDefault();
+        finishCropMode();
+        return;
+      }
+      if (e.key === "Escape" && cropDraftRef.current) {
+        e.preventDefault();
+        cancelCropMode();
         return;
       }
       if (e.code === "Space") {
@@ -724,6 +752,8 @@ export default function EditorPage() {
     dragRef.current = null;
     curveDragRef.current = null;
     previewDragRef.current = null;
+    cropDragRef.current = null;
+    cropDraftRef.current = null;
     const restored = snapshot.clips.map(cloneClipForHistory);
     clipsRef.current = restored;
     selectedClipIdRef.current = snapshot.selectedClipId;
@@ -731,6 +761,7 @@ export default function EditorPage() {
     mutedLayersRef.current = { ...snapshot.mutedLayers };
     setClips(restored);
     setSelectedClipId(snapshot.selectedClipId);
+    setCropDraft(null);
     setLayerCount(snapshot.layerCount);
     setMutedLayers({ ...snapshot.mutedLayers });
   }
@@ -1345,6 +1376,119 @@ export default function EditorPage() {
 
   // ─── Preview transform drag ──────────────────────────────────────────────────
 
+  function draftFromClipCrop(clip: Clip): Exclude<CropDraft, null> {
+    const zoom = clipCropZoom(clip);
+    const size = clamp(100 / zoom, 25, 100);
+    const travel = (100 - size) / 2;
+    const x = travel === 0 ? 0 : travel + (clipCropX(clip) / 100) * travel;
+    const y = travel === 0 ? 0 : travel + (clipCropY(clip) / 100) * travel;
+    return {
+      clipId: clip.id,
+      x: clamp(x, 0, 100 - size),
+      y: clamp(y, 0, 100 - size),
+      size,
+    };
+  }
+
+  function startCropMode(clip: Clip) {
+    if (!isCroppableClip(clip) || isExportingRef.current) return;
+    if (isPlayingRef.current) pausePlayback();
+    if (playheadSecRef.current < clip.startTime || playheadSecRef.current >= clip.startTime + clip.durationSec) {
+      playheadSecRef.current = clip.startTime;
+      setPlayheadSec(clip.startTime);
+    }
+    setSelectedClipId(clip.id);
+    selectedClipIdRef.current = clip.id;
+    const draft = draftFromClipCrop(clip);
+    cropDraftRef.current = draft;
+    setCropDraft(draft);
+  }
+
+  function cancelCropMode() {
+    cropDragRef.current = null;
+    cropDraftRef.current = null;
+    setCropDraft(null);
+  }
+
+  function finishCropMode() {
+    const draft = cropDraftRef.current;
+    if (!draft) return;
+    const size = clamp(draft.size, 25, 100);
+    const travel = (100 - size) / 2;
+    const cropX = travel === 0 ? DEFAULT_CROP_X : clamp(((draft.x - travel) / travel) * 100, -100, 100);
+    const cropY = travel === 0 ? DEFAULT_CROP_Y : clamp(((draft.y - travel) / travel) * 100, -100, 100);
+    const cropZoom = clamp(100 / size, 1, 4);
+    pushUndoSnapshot();
+    setClips((prev) =>
+      prev.map((c) =>
+        c.id === draft.clipId
+          ? { ...c, cropZoom, cropX, cropY }
+          : c
+      )
+    );
+    cancelCropMode();
+  }
+
+  function onCropPointerDown(
+    e: React.PointerEvent<HTMLDivElement>,
+    clip: Clip,
+    kind: CropDragKind,
+  ) {
+    e.stopPropagation();
+    const draft = cropDraftRef.current;
+    const box = e.currentTarget.closest("[data-crop-surface='true']");
+    if (!draft || draft.clipId !== clip.id || !(box instanceof HTMLElement)) return;
+    const rect = box.getBoundingClientRect();
+    cropDragRef.current = {
+      kind,
+      clipId: clip.id,
+      startMouseX: e.clientX,
+      startMouseY: e.clientY,
+      startX: draft.x,
+      startY: draft.y,
+      startSize: draft.size,
+      boxW: Math.max(1, rect.width),
+      boxH: Math.max(1, rect.height),
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function updateCropDrag(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = cropDragRef.current;
+    const current = cropDraftRef.current;
+    if (!drag || !current || current.clipId !== drag.clipId) return;
+
+    const dxPct = ((e.clientX - drag.startMouseX) / drag.boxW) * 100;
+    const dyPct = ((e.clientY - drag.startMouseY) / drag.boxH) * 100;
+    let x = drag.startX;
+    let y = drag.startY;
+    let size = drag.startSize;
+
+    if (drag.kind === "move") {
+      x = drag.startX + dxPct;
+      y = drag.startY + dyPct;
+    } else if (drag.kind === "resize-se") {
+      size = drag.startSize + Math.max(dxPct, dyPct);
+    } else if (drag.kind === "resize-nw") {
+      size = drag.startSize - Math.min(dxPct, dyPct);
+      x = drag.startX + drag.startSize - size;
+      y = drag.startY + drag.startSize - size;
+    } else if (drag.kind === "resize-ne") {
+      size = drag.startSize + Math.max(dxPct, -dyPct);
+      y = drag.startY + drag.startSize - size;
+    } else if (drag.kind === "resize-sw") {
+      size = drag.startSize + Math.max(-dxPct, dyPct);
+      x = drag.startX + drag.startSize - size;
+    }
+
+    size = clamp(size, 25, 100);
+    x = clamp(x, 0, 100 - size);
+    y = clamp(y, 0, 100 - size);
+    const next = { clipId: drag.clipId, x, y, size };
+    cropDraftRef.current = next;
+    setCropDraft(next);
+  }
+
   function onPreviewPointerDown(
     e: React.PointerEvent<HTMLDivElement>,
     clip: Clip,
@@ -1372,6 +1516,10 @@ export default function EditorPage() {
   }
 
   function onPreviewPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (cropDragRef.current) {
+      updateCropDrag(e);
+      return;
+    }
     const drag = previewDragRef.current;
     if (!drag) return;
     const dx = e.clientX - drag.startMouseX;
@@ -1418,6 +1566,7 @@ export default function EditorPage() {
   }
 
   function onPreviewPointerUp() {
+    cropDragRef.current = null;
     previewDragRef.current = null;
   }
 
@@ -1722,9 +1871,12 @@ export default function EditorPage() {
             {activeVisualClips.map((clip) => {
               const t = clip.transform;
               const isSelected = selectedClipId === clip.id;
+              const activeCropDraft = cropDraft?.clipId === clip.id ? cropDraft : null;
+              const cropActive = !!activeCropDraft;
               return (
                 <div
                   key={clip.id}
+                  data-crop-surface="true"
                   style={{
                     position: "absolute",
                     left: `${t.x}%`,
@@ -1732,9 +1884,9 @@ export default function EditorPage() {
                     width: `${t.scaleX * 100}%`,
                     height: `${t.scaleY * 100}%`,
                     zIndex: layerCount + 1 - clip.layer,
-                    cursor: isSelected ? "move" : "default",
+                    cursor: isSelected && !cropActive ? "move" : "default",
                   }}
-                  onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
+                  onPointerDown={isSelected && !cropActive ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
                 >
                   {clip.type === "text" ? (
                     <div
@@ -1758,14 +1910,58 @@ export default function EditorPage() {
                     >
                       {clip.text || DEFAULT_TEXT}
                     </div>
-                  ) : clip.type === "image" ? (
-                    <img src={clip.blobUrl} alt="" style={cropMediaStyle(clip)} />
-                  ) : clip.removeGreenScreen ? (
-                    <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
                   ) : (
-                    <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
+                    <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none" }}>
+                      {clip.type === "image" ? (
+                        <img src={clip.blobUrl} alt="" style={cropActive ? { width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" } : cropMediaStyle(clip)} />
+                      ) : clip.removeGreenScreen ? (
+                        <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} disableCrop={cropActive} />
+                      ) : (
+                        <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} disableCrop={cropActive} />
+                      )}
+                    </div>
                   )}
-                  {isSelected && (
+                  {activeCropDraft && (
+                    <div
+                      onPointerDown={(e) => onCropPointerDown(e, clip, "move")}
+                      style={{
+                        position: "absolute",
+                        left: `${activeCropDraft.x}%`,
+                        top: `${activeCropDraft.y}%`,
+                        width: `${activeCropDraft.size}%`,
+                        height: `${activeCropDraft.size}%`,
+                        border: "2px dotted #000",
+                        boxShadow: "0 0 0 9999px rgba(0,0,0,0.16)",
+                        zIndex: 5,
+                        cursor: "move",
+                        boxSizing: "border-box",
+                      }}
+                    >
+                      {(["nw", "ne", "sw", "se"] as const).map((corner) => {
+                        const kind = `resize-${corner}` as CropDragKind;
+                        return (
+                          <div
+                            key={corner}
+                            onPointerDown={(e) => onCropPointerDown(e, clip, kind)}
+                            style={{
+                              position: "absolute",
+                              width: 10,
+                              height: 10,
+                              background: "#000",
+                              border: "1px solid #fffdf5",
+                              boxSizing: "border-box",
+                              cursor: `${corner}-resize`,
+                              ...(corner === "nw" ? { top: -6, left: -6 } :
+                                  corner === "ne" ? { top: -6, right: -6 } :
+                                  corner === "sw" ? { bottom: -6, left: -6 } :
+                                                    { bottom: -6, right: -6 }),
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  )}
+                  {isSelected && !cropActive && (
                     <>
                       <div style={{ position: "absolute", inset: 0, border: "1.5px solid #ff5e3a", pointerEvents: "none", zIndex: 1 }} />
                       {(["nw", "ne", "sw", "se"] as const).map((corner) => {
@@ -1999,59 +2195,35 @@ export default function EditorPage() {
                 </div>
               )}
               {isCroppableClip(selClip) && (
-                <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a", flexWrap: "wrap" }}>
-                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>crop</span>
-                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>zoom</span>
-                  <input
-                    type="range"
-                    min={1}
-                    max={4}
-                    step={0.01}
-                    value={clipCropZoom(selClip)}
-                    onPointerDown={pushUndoSnapshot}
-                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropZoom: Number(e.target.value) } : c))}
-                    disabled={isExporting}
-                    style={{ width: 90 }}
-                  />
-                  <span style={{ minWidth: 28, fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", fontWeight: 700 }}>
-                    {clipCropZoom(selClip).toFixed(2)}x
-                  </span>
-                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>x</span>
-                  <input
-                    type="range"
-                    min={-100}
-                    max={100}
-                    step={1}
-                    value={clipCropX(selClip)}
-                    onPointerDown={pushUndoSnapshot}
-                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropX: Number(e.target.value) } : c))}
-                    disabled={isExporting}
-                    style={{ width: 70 }}
-                  />
-                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>y</span>
-                  <input
-                    type="range"
-                    min={-100}
-                    max={100}
-                    step={1}
-                    value={clipCropY(selClip)}
-                    onPointerDown={pushUndoSnapshot}
-                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropY: Number(e.target.value) } : c))}
-                    disabled={isExporting}
-                    style={{ width: 70 }}
-                  />
+                cropDraft?.clipId === selClip.id ? (
+                  <>
+                    <button
+                      onClick={finishCropMode}
+                      disabled={isExporting}
+                      style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, background: "#c8f135", opacity: isExporting ? 0.4 : 1 }}
+                      title="Apply crop to selected clip"
+                    >
+                      Finish crop
+                    </button>
+                    <button
+                      onClick={cancelCropMode}
+                      disabled={isExporting}
+                      style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
+                      title="Cancel crop"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
                   <button
-                    onClick={() => {
-                      pushUndoSnapshot();
-                      setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropZoom: DEFAULT_CROP_ZOOM, cropX: DEFAULT_CROP_X, cropY: DEFAULT_CROP_Y } : c));
-                    }}
+                    onClick={() => startCropMode(selClip)}
                     disabled={isExporting}
-                    style={{ ...miniButton, fontSize: 10, padding: "2px 7px", opacity: isExporting ? 0.4 : 1 }}
-                    title="Reset crop"
+                    style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
+                    title="Crop selected photo or video"
                   >
-                    Reset
+                    Crop
                   </button>
-                </div>
+                )
               )}
               {selClip.type === "video" && (
                 <>
@@ -2599,7 +2771,7 @@ export default function EditorPage() {
   );
 }
 
-function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSec: number; isPlaying: boolean }) {
+function PreviewVideo({ clip, playheadSec, isPlaying, disableCrop = false }: { clip: Clip; playheadSec: number; isPlaying: boolean; disableCrop?: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const isPlayingRef = useRef(isPlaying);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
@@ -2664,12 +2836,12 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
       muted
       playsInline
       preload="auto"
-      style={cropMediaStyle(clip)}
+      style={disableCrop ? { width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" } : cropMediaStyle(clip)}
     />
   );
 }
 
-function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSec: number; isPlaying: boolean }) {
+function KeyedPreviewVideo({ clip, playheadSec, isPlaying, disableCrop = false }: { clip: Clip; playheadSec: number; isPlaying: boolean; disableCrop?: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number | null>(null);
@@ -2699,7 +2871,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     const mediaH = vid.videoHeight;
     if (mediaW > 0 && mediaH > 0 && vid.readyState >= 2) {
       const drawRect = drawContainedRect(mediaW, mediaH, 0, 0, rect.width, rect.height);
-      drawMaybeKeyedMedia(ctx, vid, drawRect.x, drawRect.y, drawRect.w, drawRect.h, clip);
+      drawMaybeKeyedMedia(ctx, vid, drawRect.x, drawRect.y, drawRect.w, drawRect.h, disableCrop ? { ...clip, cropZoom: DEFAULT_CROP_ZOOM, cropX: DEFAULT_CROP_X, cropY: DEFAULT_CROP_Y } : clip);
     }
   }
 
@@ -2723,7 +2895,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip.id, clip.blobUrl, clip.playbackRate]);
+  }, [clip.id, clip.blobUrl, clip.playbackRate, disableCrop]);
 
   useEffect(() => {
     const vid = videoRef.current;
@@ -2757,7 +2929,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     vid.currentTime = sourceTime(playheadSec);
     vid.addEventListener("seeked", draw, { once: true });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY]);
+  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY, disableCrop]);
 
   useEffect(() => {
     function tick() {
@@ -2776,7 +2948,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY]);
+  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY, disableCrop]);
 
   return (
     <>
