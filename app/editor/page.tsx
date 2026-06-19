@@ -308,6 +308,7 @@ export default function EditorPage() {
   const [recording, setRecording] = useState(false);
   const [recSeconds, setRecSeconds] = useState(0);
   const [recError, setRecError] = useState("");
+  const [recGrowingBar, setRecGrowingBar] = useState<{ startSec: number; layer: number; elapsedSec: number } | null>(null);
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
@@ -345,6 +346,11 @@ export default function EditorPage() {
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
+  const isRecordingNarrationRef = useRef(false);
+  const recStartSecRef = useRef(0);
+  const recLayerRef = useRef(1);
+  const recNarrationRafRef = useRef<number | null>(null);
+  const recNarrationStartWallRef = useRef(0);
 
   // Playback
   const isPlayingRef = useRef(false);
@@ -379,6 +385,7 @@ export default function EditorPage() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.code === "Space") {
         e.preventDefault();
+        if (isRecordingNarrationRef.current) { stopRecording(); return; }
         if (isPlayingRef.current) { pausePlayback(); } else { startPlayback(); }
         return;
       }
@@ -448,7 +455,7 @@ export default function EditorPage() {
   function spawnClipAudio(clip: Clip, clipOffset: number, ctx: AudioContext, extraDest?: AudioNode) {
     const sourceOffset = clip.trimStart + clipOffset;
     const gainNode = ctx.createGain();
-    gainNode.gain.value = interpolateVolume(clip.volumeCurve, clipOffset);
+    gainNode.gain.value = isRecordingNarrationRef.current ? 0 : interpolateVolume(clip.volumeCurve, clipOffset);
     gainNode.connect(ctx.destination);
     if (extraDest) gainNode.connect(extraDest);
 
@@ -503,7 +510,7 @@ export default function EditorPage() {
         }
         activeAudioRef.current.delete(clipId);
       } else {
-        entry.gainNode.gain.value = interpolateVolume(clip.volumeCurve, atSec - clip.startTime);
+        entry.gainNode.gain.value = isRecordingNarrationRef.current ? 0 : interpolateVolume(clip.volumeCurve, atSec - clip.startTime);
       }
     });
     currentClips.forEach((clip) => {
@@ -705,6 +712,28 @@ export default function EditorPage() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       chunksRef.current = [];
+
+      // Capture start position and pick layer before playback advances
+      const startSec = playheadSecRef.current;
+      recStartSecRef.current = startSec;
+      const layer = findFreeLayer(clipsRef.current, startSec, 9999);
+      recLayerRef.current = layer;
+
+      // Mute all clip audio and start visual-only playback
+      isRecordingNarrationRef.current = true;
+      startPlayback();
+
+      // Start growing bar animation
+      const startWall = performance.now();
+      recNarrationStartWallRef.current = startWall;
+      setRecGrowingBar({ startSec, layer, elapsedSec: 0 });
+      function growTick() {
+        const elapsed = (performance.now() - recNarrationStartWallRef.current) / 1000;
+        setRecGrowingBar((prev) => prev ? { ...prev, elapsedSec: elapsed } : null);
+        recNarrationRafRef.current = requestAnimationFrame(growTick);
+      }
+      recNarrationRafRef.current = requestAnimationFrame(growTick);
+
       const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm"
         : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
@@ -715,24 +744,30 @@ export default function EditorPage() {
         const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
         const blobUrl = URL.createObjectURL(blob);
         const durationSec = await getMediaDuration(blobUrl, "audio");
+        const dur = durationSec || recSecondsRef.current;
+        if (dur < 0.1) return;
         setClips((prev) => {
-          const startTime = playheadSecRef.current;
-          const dur = durationSec || recSecondsRef.current;
-          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
+          const startTime = recStartSecRef.current;
+          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
         });
       };
       recorder.start();
       setRecording(true);
     } catch (e: unknown) {
+      isRecordingNarrationRef.current = false;
+      if (recNarrationRafRef.current !== null) { cancelAnimationFrame(recNarrationRafRef.current); recNarrationRafRef.current = null; }
+      setRecGrowingBar(null);
       setRecError(e instanceof Error ? e.message : "Microphone access denied");
     }
   }
 
   function stopRecording() {
-    if (recorderRef.current && recorderRef.current.state === "recording") {
-      recorderRef.current.stop();
-      setRecording(false);
-    }
+    if (recNarrationRafRef.current !== null) { cancelAnimationFrame(recNarrationRafRef.current); recNarrationRafRef.current = null; }
+    setRecGrowingBar(null);
+    if (recorderRef.current && recorderRef.current.state === "recording") recorderRef.current.stop();
+    pausePlayback();
+    isRecordingNarrationRef.current = false;
+    setRecording(false);
   }
 
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -948,6 +983,10 @@ export default function EditorPage() {
   }
 
   async function startExport() {
+    if (isRecordingNarrationRef.current) {
+      alert("Stop recording before exporting");
+      return;
+    }
     const currentClips = clipsRef.current;
     if (currentClips.length === 0) {
       alert("No clips to export");
@@ -1170,7 +1209,7 @@ export default function EditorPage() {
           {recording ? (
             <button onClick={stopRecording} style={{ ...sketchButton, background: "#ff5e3a", color: "#fff", display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#fff", animation: "nbpulse 1s infinite" }} />
-              Stop ({recSeconds}s)
+              Stop Recording
             </button>
           ) : (
             <button onClick={startRecording} style={sketchButton}>● Record narration</button>
@@ -1555,6 +1594,11 @@ export default function EditorPage() {
                 {layerGhost && (
                   <div style={{ position: "absolute", left: layerGhost.startTime * PX_PER_SEC, top: 5, width: Math.max(4, layerGhost.durationSec * PX_PER_SEC - 2), height: LAYER_H - 10, background: CLIP_COLORS[layerGhost.type], opacity: 0.6, border: "2px dashed #2a2a2a", boxShadow: "3px 3px 10px rgba(42,42,42,0.22)", pointerEvents: "none", zIndex: 6, transform: "scale(1.03)", transformOrigin: "center center" }} />
                 )}
+                {recGrowingBar?.layer === layerNum && (
+                  <div style={{ position: "absolute", left: recGrowingBar.startSec * PX_PER_SEC, top: 7, width: Math.max(2, recGrowingBar.elapsedSec * PX_PER_SEC), height: LAYER_H - 14, background: "rgba(255,94,58,0.22)", border: "2px solid #ff5e3a", pointerEvents: "none", zIndex: 5, display: "flex", alignItems: "center", paddingLeft: 5, overflow: "hidden" }}>
+                    <span style={{ fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", fontWeight: 700, whiteSpace: "nowrap" }}>REC</span>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1568,6 +1612,11 @@ export default function EditorPage() {
           {/* Playhead */}
           <div style={{ position: "absolute", left: playheadX, top: 0, bottom: 0, width: 2, background: "#ff5e3a", zIndex: 10, pointerEvents: "none" }}>
             <div style={{ position: "absolute", top: 0, left: -5, width: 0, height: 0, borderLeft: "6px solid transparent", borderRight: "6px solid transparent", borderTop: "10px solid #ff5e3a" }} />
+            {recording && recGrowingBar && (
+              <div style={{ position: "absolute", top: 12, left: 5, fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", background: "rgba(255,253,245,0.92)", padding: "1px 4px", borderRadius: 2, whiteSpace: "nowrap", border: "1px solid rgba(255,94,58,0.4)" }}>
+                REC ● {formatDuration(recGrowingBar.elapsedSec)}
+              </div>
+            )}
           </div>
 
         </div>
