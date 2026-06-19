@@ -1384,6 +1384,115 @@ export default function EditorPage() {
   }
 
   const playheadX = playheadSec * PX_PER_SEC;
+  const isShortFormat = outputFormat === '9:16';
+  const renderPreviewPanel = (placement: "top" | "side") => {
+    const side = placement === "side";
+    return (
+      <div style={{
+        flex: side ? "0 0 auto" : 1,
+        padding: side ? "16px 18px" : "16px 20px",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: side ? "center" : "flex-start",
+        gap: 8,
+        minWidth: 0,
+      }}>
+        <div style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: side ? "center" : "flex-start", gap: 10 }}>
+          <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase" }}>Preview</div>
+          <div style={{ display: "flex", gap: 0 }}>
+            {(['16:9', '9:16'] as const).map((fmt) => (
+              <button
+                key={fmt}
+                onClick={() => setOutputFormat(fmt)}
+                style={{ ...miniButton, fontSize: 10, padding: "3px 8px", background: outputFormat === fmt ? "#2a2a2a" : "transparent", color: outputFormat === fmt ? "#fffdf5" : "#2a2a2a" }}
+              >
+                {fmt === '16:9' ? '16:9 (Long)' : '9:16 (Short)'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{
+          width: side ? "min(100%, 340px)" : outputFormat === '16:9' ? 400 : 220,
+          maxHeight: side ? "calc(100vh - 180px)" : undefined,
+          aspectRatio: outputFormat === '16:9' ? '16/9' : '9/16',
+          background: "#111",
+          border: "1.5px solid #2a2a2a",
+          boxShadow: "3px 3px 0 #2a2a2a",
+          overflow: "hidden",
+          flexShrink: 0,
+          position: "relative",
+        }}>
+          {activeVisualClips.length === 0 && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+              <span style={{ fontSize: 10, fontFamily: "monospace", color: "#555" }}>no video at playhead</span>
+            </div>
+          )}
+          <div
+            ref={previewContainerRef}
+            style={{ position: "absolute", inset: 0 }}
+            onPointerMove={onPreviewPointerMove}
+            onPointerUp={onPreviewPointerUp}
+            onPointerCancel={onPreviewPointerUp}
+          >
+            {activeVisualClips.map((clip) => {
+              const t = clip.transform;
+              const isSelected = selectedClipId === clip.id;
+              return (
+                <div
+                  key={clip.id}
+                  style={{
+                    position: "absolute",
+                    left: `${t.x}%`,
+                    top: `${t.y}%`,
+                    width: `${t.scaleX * 100}%`,
+                    height: `${t.scaleY * 100}%`,
+                    zIndex: NUM_LAYERS + 1 - clip.layer,
+                    cursor: isSelected ? "move" : "default",
+                  }}
+                  onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
+                >
+                  {clip.type === "image" ? (
+                    <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
+                  ) : clip.removeGreenScreen ? (
+                    <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
+                  ) : (
+                    <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
+                  )}
+                  {isSelected && (
+                    <>
+                      <div style={{ position: "absolute", inset: 0, border: "1.5px solid #ff5e3a", pointerEvents: "none", zIndex: 1 }} />
+                      {(["nw", "ne", "sw", "se"] as const).map((corner) => {
+                        const kind = `corner-${corner}` as PreviewDragKind;
+                        return (
+                          <div
+                            key={corner}
+                            onPointerDown={(e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, kind); }}
+                            style={{
+                              position: "absolute",
+                              width: 10,
+                              height: 10,
+                              background: "#ff5e3a",
+                              border: "1px solid #fff",
+                              zIndex: 2,
+                              cursor: `${corner}-resize`,
+                              ...(corner === "nw" ? { top: -5, left: -5 } :
+                                  corner === "ne" ? { top: -5, right: -5 } :
+                                  corner === "sw" ? { bottom: -5, left: -5 } :
+                                                    { bottom: -5, right: -5 }),
+                            }}
+                          />
+                        );
+                      })}
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <main style={pageStyle}>
@@ -1399,6 +1508,9 @@ export default function EditorPage() {
           <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
         </div>
       </header>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        <div style={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minWidth: 0, minHeight: 0 }}>
 
       {/* Top workspace */}
       <div style={{ display: "flex", borderBottom: "1.5px solid rgba(42,42,42,0.15)", background: "rgba(255,253,245,0.5)" }}>
@@ -1427,99 +1539,7 @@ export default function EditorPage() {
           {recError && <span style={{ fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>{recError}</span>}
         </div>
 
-        {/* Preview */}
-        <div style={{ flex: 1, padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase" }}>Preview</div>
-          <div style={{ display: "flex", gap: 0, marginBottom: 2 }}>
-            {(['16:9', '9:16'] as const).map((fmt) => (
-              <button
-                key={fmt}
-                onClick={() => setOutputFormat(fmt)}
-                style={{ ...miniButton, fontSize: 10, padding: "3px 8px", background: outputFormat === fmt ? "#2a2a2a" : "transparent", color: outputFormat === fmt ? "#fffdf5" : "#2a2a2a" }}
-              >
-                {fmt === '16:9' ? '16:9 (Long)' : '9:16 (Short)'}
-              </button>
-            ))}
-          </div>
-          <div style={{
-            width: outputFormat === '16:9' ? 400 : 127,
-            aspectRatio: outputFormat === '16:9' ? '16/9' : '9/16',
-            background: "#111",
-            border: "1.5px solid #2a2a2a",
-            boxShadow: "3px 3px 0 #2a2a2a",
-            overflow: "hidden",
-            flexShrink: 0,
-            position: "relative",
-          }}>
-            {activeVisualClips.length === 0 && (
-              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#555" }}>no video at playhead</span>
-              </div>
-            )}
-            <div
-              ref={previewContainerRef}
-              style={{ position: "absolute", inset: 0 }}
-              onPointerMove={onPreviewPointerMove}
-              onPointerUp={onPreviewPointerUp}
-              onPointerCancel={onPreviewPointerUp}
-            >
-              {activeVisualClips.map((clip) => {
-                const t = clip.transform;
-                const isSelected = selectedClipId === clip.id;
-                return (
-                  <div
-                    key={clip.id}
-                    style={{
-                      position: "absolute",
-                      left: `${t.x}%`,
-                      top: `${t.y}%`,
-                      width: `${t.scaleX * 100}%`,
-                      height: `${t.scaleY * 100}%`,
-                      zIndex: NUM_LAYERS + 1 - clip.layer,
-                      cursor: isSelected ? "move" : "default",
-                    }}
-                    onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
-                  >
-                    {clip.type === "image" ? (
-                      <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
-                    ) : clip.removeGreenScreen ? (
-                      <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
-                    ) : (
-                      <PreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
-                    )}
-                    {isSelected && (
-                      <>
-                        <div style={{ position: "absolute", inset: 0, border: "1.5px solid #ff5e3a", pointerEvents: "none", zIndex: 1 }} />
-                        {(["nw", "ne", "sw", "se"] as const).map((corner) => {
-                          const kind = `corner-${corner}` as PreviewDragKind;
-                          return (
-                            <div
-                              key={corner}
-                              onPointerDown={(e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, kind); }}
-                              style={{
-                                position: "absolute",
-                                width: 10,
-                                height: 10,
-                                background: "#ff5e3a",
-                                border: "1px solid #fff",
-                                zIndex: 2,
-                                cursor: `${corner}-resize`,
-                                ...(corner === "nw" ? { top: -5, left: -5 } :
-                                    corner === "ne" ? { top: -5, right: -5 } :
-                                    corner === "sw" ? { bottom: -5, left: -5 } :
-                                                      { bottom: -5, right: -5 }),
-                              }}
-                            />
-                          );
-                        })}
-                      </>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
+        {!isShortFormat && renderPreviewPanel("top")}
       </div>
 
       {/* Transport */}
@@ -1894,6 +1914,23 @@ export default function EditorPage() {
           </div>
 
         </div>
+      </div>
+        </div>
+
+        {isShortFormat && (
+          <aside style={{
+            width: "min(38vw, 390px)",
+            minWidth: 300,
+            flexShrink: 0,
+            borderLeft: "1.5px solid rgba(42,42,42,0.15)",
+            background: "rgba(255,253,245,0.72)",
+            display: "flex",
+            justifyContent: "center",
+            overflowY: "auto",
+          }}>
+            {renderPreviewPanel("side")}
+          </aside>
+        )}
       </div>
 
       {/* YouTube Modal */}
