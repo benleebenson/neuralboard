@@ -394,6 +394,7 @@ export default function EditorPage() {
   const [recGrowingBar, setRecGrowingBar] = useState<{ startSec: number; layer: number; elapsedSec: number } | null>(null);
   const [ghost, setGhost] = useState<Ghost>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [clipboardReady, setClipboardReady] = useState(false);
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -419,6 +420,7 @@ export default function EditorPage() {
   const dragRef = useRef<DragInfo | null>(null);
   const selectedClipIdRef = useRef<string | null>(null);
   useEffect(() => { selectedClipIdRef.current = selectedClipId; }, [selectedClipId]);
+  const clipboardClipRef = useRef<Clip | null>(null);
   const clipsRef = useRef<Clip[]>([]);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -469,6 +471,23 @@ export default function EditorPage() {
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const modifier = e.metaKey || e.ctrlKey;
+      if (modifier && e.key.toLowerCase() === "c") {
+        const selId = selectedClipIdRef.current;
+        const clip = clipsRef.current.find((c) => c.id === selId);
+        if (clip) {
+          e.preventDefault();
+          copyClip(clip);
+        }
+        return;
+      }
+      if (modifier && e.key.toLowerCase() === "v") {
+        if (clipboardClipRef.current) {
+          e.preventDefault();
+          pasteClip();
+        }
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         if (isRecordingNarrationRef.current) { stopRecording(); return; }
@@ -503,6 +522,49 @@ export default function EditorPage() {
     : 10;
   const timelineW = totalDuration * PX_PER_SEC + 200;
   const isDraggingClip = ghost !== null;
+
+  function copyClip(clip: Clip) {
+    clipboardClipRef.current = {
+      ...clip,
+      transform: { ...clip.transform },
+      volumeCurve: clip.volumeCurve.map((pt) => ({ ...pt })),
+      waveform: clip.waveform ? [...clip.waveform] : undefined,
+    };
+    setClipboardReady(true);
+  }
+
+  function pasteClip() {
+    const source = clipboardClipRef.current;
+    if (!source || isExportingRef.current) return;
+    const pastedId = crypto.randomUUID();
+    setClips((prev) => {
+      let startTime = Math.max(0, playheadSecRef.current);
+      let layer = findFreeLayerOrNull(prev, startTime, source.durationSec);
+      if (!layer) {
+        for (let offset = SNAP; offset <= 60; offset += SNAP) {
+          const candidateStart = snapTo(startTime + offset);
+          const candidateLayer = findFreeLayerOrNull(prev, candidateStart, source.durationSec);
+          if (candidateLayer) {
+            startTime = candidateStart;
+            layer = candidateLayer;
+            break;
+          }
+        }
+      }
+      const pasted: Clip = {
+        ...source,
+        id: pastedId,
+        name: `${source.name} copy`,
+        startTime,
+        layer: layer ?? source.layer,
+        transform: { ...source.transform },
+        volumeCurve: source.volumeCurve.map((pt) => ({ ...pt })),
+        waveform: source.waveform ? [...source.waveform] : undefined,
+      };
+      return [...prev, pasted];
+    });
+    setSelectedClipId(pastedId);
+  }
 
   // ─── Audio ──────────────────────────────────────────────────────────────────
 
@@ -1495,6 +1557,22 @@ export default function EditorPage() {
           if (!selClip) return null;
           return (
             <>
+              <button
+                onClick={() => copyClip(selClip)}
+                disabled={isExporting}
+                style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
+                title="Copy selected clip"
+              >
+                Copy
+              </button>
+              <button
+                onClick={pasteClip}
+                disabled={isExporting || !clipboardReady}
+                style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting || !clipboardReady ? 0.4 : 1 }}
+                title="Paste copied clip at playhead"
+              >
+                Paste
+              </button>
               {selClip.type !== "image" && (
                 <button
                   onClick={() => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, muted: !c.muted } : c))}
