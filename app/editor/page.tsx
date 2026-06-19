@@ -5,6 +5,8 @@ import { useSession, signIn } from "next-auth/react";
 
 const PX_PER_SEC = 100;
 const IMAGE_DEFAULT_DURATION = 3;
+const TEXT_DEFAULT_DURATION = 4;
+const TEXT_SOURCE_DURATION = 600;
 const RULER_H = 30;
 const LAYER_H = 56;
 const INITIAL_LAYER_COUNT = 5;
@@ -22,7 +24,7 @@ const LAYER_BG = [
   "rgba(228,238,255,0.40)",
 ];
 
-type ClipType = "audio" | "video" | "image";
+type ClipType = "audio" | "video" | "image" | "text";
 type ClipTransform = { x: number; y: number; scaleX: number; scaleY: number };
 type CurvePoint = { time: number; volume: number };
 
@@ -41,6 +43,10 @@ type Clip = {
   muted: boolean;
   volumeCurve: CurvePoint[];
   waveform?: number[];
+  text?: string;
+  textFontFamily?: string;
+  textFontSize?: number;
+  textColor?: string;
   removeGreenScreen?: boolean;
   chromaSimilarity?: number;
   chromaSmoothness?: number;
@@ -78,7 +84,13 @@ type DragInfo = {
 };
 
 const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+const DEFAULT_TEXT_TRANSFORM: ClipTransform = { x: 20, y: 38, scaleX: 0.6, scaleY: 0.18 };
 const DEFAULT_CURVE: CurvePoint[] = [{ time: 0, volume: 100 }];
+const DEFAULT_TEXT = "Double click to edit";
+const DEFAULT_TEXT_FONT = "Arial";
+const DEFAULT_TEXT_SIZE = 56;
+const DEFAULT_TEXT_COLOR = "#ffffff";
+const TEXT_FONTS = ["Arial", "Helvetica", "Georgia", "Times New Roman", "Courier New", "Impact", "Verdana"];
 const DEFAULT_CHROMA_SIMILARITY = 0.42;
 const DEFAULT_CHROMA_SMOOTHNESS = 0.08;
 const DEFAULT_CHROMA_AMOUNT = 0.55;
@@ -172,6 +184,14 @@ function layerBg(layer: number): string {
   return LAYER_BG[(layer - 1) % LAYER_BG.length] ?? LAYER_BG[0];
 }
 
+function isVisualClip(clip: Pick<Clip, "type">): boolean {
+  return clip.type === "video" || clip.type === "image" || clip.type === "text";
+}
+
+function hasClipAudio(clip: Pick<Clip, "type">): boolean {
+  return clip.type === "audio" || clip.type === "video";
+}
+
 function clipPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
   return clamp(clip.playbackRate || 1, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
 }
@@ -222,6 +242,7 @@ function formatDuration(sec: number): string {
 
 async function getMediaDuration(blobUrl: string, type: ClipType): Promise<number> {
   if (type === "image") return IMAGE_DEFAULT_DURATION;
+  if (type === "text") return TEXT_DEFAULT_DURATION;
   return new Promise((resolve) => {
     const el = type === "video" ? document.createElement("video") : document.createElement("audio");
     el.preload = "metadata";
@@ -271,6 +292,7 @@ const CLIP_COLORS: Record<ClipType, string> = {
   audio: "#c8f135",
   video: "#a0d8ef",
   image: "#f5c6a0",
+  text: "#f6f1a2",
 };
 
 function parseDurationSec(dur: string | number | undefined): number {
@@ -406,6 +428,52 @@ function drawMaybeKeyedMedia(
   applyGreenScreenToImageData(frame.data, settings.similarity, settings.smoothness, settings.amount);
   offCtx.putImageData(frame, 0, 0);
   ctx.drawImage(off, dx, dy, dw, dh);
+}
+
+function drawTextClip(
+  ctx: CanvasRenderingContext2D,
+  clip: Clip,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  canvasH: number,
+) {
+  const text = clip.text || DEFAULT_TEXT;
+  const fontFamily = clip.textFontFamily || DEFAULT_TEXT_FONT;
+  const fontSize = clip.textFontSize ?? DEFAULT_TEXT_SIZE;
+  const scaledFontSize = Math.max(8, fontSize * (canvasH / 720));
+  const color = clip.textColor || DEFAULT_TEXT_COLOR;
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = "";
+
+  ctx.save();
+  ctx.font = `700 ${scaledFontSize}px ${fontFamily}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = "rgba(0,0,0,0.65)";
+  ctx.shadowBlur = Math.max(2, scaledFontSize * 0.08);
+  ctx.shadowOffsetY = Math.max(1, scaledFontSize * 0.04);
+
+  for (const word of words.length ? words : [text]) {
+    const test = line ? `${line} ${word}` : word;
+    if (ctx.measureText(test).width > w && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+
+  const lineHeight = scaledFontSize * 1.12;
+  const startY = y + h / 2 - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((textLine, idx) => {
+    ctx.fillText(textLine, x + w / 2, startY + idx * lineHeight, w);
+  });
+  ctx.restore();
 }
 
 export default function EditorPage() {
@@ -667,6 +735,37 @@ export default function EditorPage() {
     setSelectedClipId(pastedId);
   }
 
+  function addTextClip() {
+    const clipId = crypto.randomUUID();
+    pushUndoSnapshot();
+    setClips((prev) => {
+      const startTime = playheadSecRef.current;
+      const layer = findFreeLayer(prev, startTime, TEXT_DEFAULT_DURATION, layerCountRef.current);
+      ensureLayerCount(layer);
+      const clip: Clip = {
+        id: clipId,
+        type: "text",
+        name: "Text",
+        blobUrl: "",
+        sourceDuration: TEXT_SOURCE_DURATION,
+        durationSec: TEXT_DEFAULT_DURATION,
+        startTime,
+        layer,
+        trimStart: 0,
+        playbackRate: 1,
+        transform: DEFAULT_TEXT_TRANSFORM,
+        muted: false,
+        volumeCurve: [...DEFAULT_CURVE],
+        text: DEFAULT_TEXT,
+        textFontFamily: DEFAULT_TEXT_FONT,
+        textFontSize: DEFAULT_TEXT_SIZE,
+        textColor: DEFAULT_TEXT_COLOR,
+      };
+      return [...prev, clip];
+    });
+    setSelectedClipId(clipId);
+  }
+
   // ─── Audio ──────────────────────────────────────────────────────────────────
 
   function getAudioCtx(): AudioContext {
@@ -694,7 +793,7 @@ export default function EditorPage() {
     const ctx = getAudioCtx();
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
     currentClips.forEach((clip) => {
-      if (clip.type === "image") return;
+      if (!hasClipAudio(clip)) return;
       if (clip.muted) return;
       if (isLayerMuted(clip.layer)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
@@ -769,7 +868,7 @@ export default function EditorPage() {
       }
     });
     currentClips.forEach((clip) => {
-      if (clip.type === "image") return;
+      if (!hasClipAudio(clip)) return;
       if (clip.muted) return;
       if (isLayerMuted(clip.layer)) return;
       if (activeAudioRef.current.has(clip.id)) return;
@@ -1154,7 +1253,7 @@ export default function EditorPage() {
 
   const activeVisualClips = clips
     .filter(
-      (c) => (c.type === "video" || c.type === "image") &&
+      (c) => isVisualClip(c) &&
         playheadSec >= c.startTime && playheadSec < c.startTime + c.durationSec
     )
     .sort((a, b) => b.layer - a.layer);
@@ -1453,21 +1552,26 @@ export default function EditorPage() {
       ctx2d.fillRect(0, 0, canvasW, canvasH);
 
       const visClips = currentClips
-        .filter((c) => (c.type === "video" || c.type === "image") &&
+        .filter((c) => isVisualClip(c) &&
           elapsed >= c.startTime && elapsed < c.startTime + c.durationSec)
         .sort((a, b) => b.layer - a.layer); // layer 5 first (bg), layer 1 last (fg)
 
       for (const clip of visClips) {
-        let el: HTMLVideoElement | HTMLImageElement | null = null;
-        if (clip.type === "video") el = exportVideoEls.get(clip.id) ?? null;
-        else if (clip.type === "image") el = exportImageEls.get(clip.id) ?? null;
-        if (!el) continue;
-
         const tr = clip.transform;
         const x = (tr.x / 100) * canvasW;
         const y = (tr.y / 100) * canvasH;
         const w = tr.scaleX * canvasW;
         const h = tr.scaleY * canvasH;
+
+        if (clip.type === "text") {
+          drawTextClip(ctx2d, clip, x, y, w, h, canvasH);
+          continue;
+        }
+
+        let el: HTMLVideoElement | HTMLImageElement | null = null;
+        if (clip.type === "video") el = exportVideoEls.get(clip.id) ?? null;
+        else if (clip.type === "image") el = exportImageEls.get(clip.id) ?? null;
+        if (!el) continue;
 
         const mW = el instanceof HTMLVideoElement ? el.videoWidth : (el as HTMLImageElement).naturalWidth;
         const mH = el instanceof HTMLVideoElement ? el.videoHeight : (el as HTMLImageElement).naturalHeight;
@@ -1576,7 +1680,29 @@ export default function EditorPage() {
                   }}
                   onPointerDown={isSelected ? (e) => { e.stopPropagation(); onPreviewPointerDown(e, clip, "move"); } : undefined}
                 >
-                  {clip.type === "image" ? (
+                  {clip.type === "text" ? (
+                    <div
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        textAlign: "center",
+                        whiteSpace: "pre-wrap",
+                        overflow: "hidden",
+                        color: clip.textColor || DEFAULT_TEXT_COLOR,
+                        fontFamily: clip.textFontFamily || DEFAULT_TEXT_FONT,
+                        fontSize: Math.max(8, (clip.textFontSize ?? DEFAULT_TEXT_SIZE) / 2),
+                        fontWeight: 700,
+                        lineHeight: 1.1,
+                        textShadow: "0 2px 8px rgba(0,0,0,0.8)",
+                        pointerEvents: "none",
+                      }}
+                    >
+                      {clip.text || DEFAULT_TEXT}
+                    </div>
+                  ) : clip.type === "image" ? (
                     <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
                   ) : clip.removeGreenScreen ? (
                     <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
@@ -1653,6 +1779,7 @@ export default function EditorPage() {
           )}
           <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
           <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+          <button onClick={addTextClip} style={sketchButton}>T Add text</button>
           {config?.railwayUrl && (
             <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }}
@@ -1726,7 +1853,53 @@ export default function EditorPage() {
               >
                 Paste
               </button>
-              {selClip.type !== "image" && (
+              {selClip.type === "text" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>text</span>
+                  <input
+                    type="text"
+                    value={selClip.text ?? DEFAULT_TEXT}
+                    onFocus={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, text: e.target.value, name: e.target.value.trim() ? e.target.value.trim().slice(0, 24) : "Text" } : c))}
+                    disabled={isExporting}
+                    style={{ width: 170, fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid #2a2a2a", background: "#fffdf5" }}
+                  />
+                  <select
+                    value={selClip.textFontFamily ?? DEFAULT_TEXT_FONT}
+                    onFocus={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, textFontFamily: e.target.value } : c))}
+                    disabled={isExporting}
+                    style={{ fontFamily: "monospace", fontSize: 10, padding: "4px 6px", border: "1px solid #2a2a2a", background: "#fffdf5" }}
+                  >
+                    {TEXT_FONTS.map((font) => <option key={font} value={font}>{font}</option>)}
+                  </select>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>size</span>
+                  <input
+                    type="range"
+                    min={16}
+                    max={140}
+                    step={1}
+                    value={selClip.textFontSize ?? DEFAULT_TEXT_SIZE}
+                    onPointerDown={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, textFontSize: Number(e.target.value) } : c))}
+                    disabled={isExporting}
+                    style={{ width: 100 }}
+                  />
+                  <span style={{ minWidth: 30, fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", fontWeight: 700 }}>
+                    {Math.round(selClip.textFontSize ?? DEFAULT_TEXT_SIZE)}
+                  </span>
+                  <input
+                    type="color"
+                    value={selClip.textColor ?? DEFAULT_TEXT_COLOR}
+                    onPointerDown={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, textColor: e.target.value } : c))}
+                    disabled={isExporting}
+                    style={{ width: 30, height: 24, border: "1px solid #2a2a2a", padding: 0, background: "#fffdf5" }}
+                    title="Text color"
+                  />
+                </div>
+              )}
+              {hasClipAudio(selClip) && (
                 <button
                   onClick={() => {
                     pushUndoSnapshot();
@@ -1739,7 +1912,7 @@ export default function EditorPage() {
                   {selClip.muted ? "Unmute" : "Mute"}
                 </button>
               )}
-              {selClip.type !== "image" && (
+              {hasClipAudio(selClip) && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a" }}>
                   <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>speed</span>
                   <input
@@ -1941,7 +2114,7 @@ export default function EditorPage() {
                       </div>
                       {showHandles && <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
                       {/* Volume curve SVG — audio and video clips only */}
-                      {clip.type !== "image" && (
+                      {hasClipAudio(clip) && (
                         <svg
                           style={{ position: "absolute", bottom: 0, left: 0, width: "100%", height: CURVE_H, overflow: "visible", zIndex: 4, cursor: "crosshair" }}
                           viewBox={`0 0 ${clipPx} ${CURVE_H}`}
