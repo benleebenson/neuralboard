@@ -13,6 +13,9 @@ const MIN_DURATION = 0.5;
 const SNAP = 0.1;
 const CURVE_H = 12;
 const MAX_EXPORT_DURATION = 90;
+const MIN_PLAYBACK_RATE = 0.25;
+const MAX_PLAYBACK_RATE = 4;
+const MASTER_PLAYBACK_RATE = 1;
 const LAYER_LABELS = ["Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5"];
 const LAYER_BG = [
   "rgba(255,253,245,0.55)",
@@ -36,6 +39,7 @@ type Clip = {
   startTime: number;
   layer: number;
   trimStart: number;
+  playbackRate: number;
   transform: ClipTransform;
   muted: boolean;
   volumeCurve: CurvePoint[];
@@ -116,6 +120,7 @@ type CurveDragState = {
 } | null;
 
 const snapTo = (t: number) => Math.round(t / SNAP) * SNAP;
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
 function clipsOverlap(s1: number, d1: number, s2: number, d2: number): boolean {
   return s1 < s2 + d2 - 0.001 && s1 + d1 > s2 + 0.001;
@@ -128,6 +133,43 @@ function findFreeLayer(existing: Clip[], startTime: number, duration: number): n
     }
   }
   return 1;
+}
+
+function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: number): number | null {
+  for (let l = 1; l <= NUM_LAYERS; l++) {
+    if (!existing.some((c) => c.layer === l && clipsOverlap(startTime, duration, c.startTime, c.durationSec))) {
+      return l;
+    }
+  }
+  return null;
+}
+
+function clipPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
+  return clamp(clip.playbackRate || 1, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+}
+
+function mediaPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
+  return clipPlaybackRate(clip) * MASTER_PLAYBACK_RATE;
+}
+
+function clipSourceSpan(clip: Pick<Clip, "durationSec" | "playbackRate" | "sourceDuration" | "trimStart">): number {
+  const available = Math.max(0, clip.sourceDuration - clip.trimStart);
+  return Math.min(available, Math.max(0, clip.durationSec * clipPlaybackRate(clip)));
+}
+
+function clipSourceTimeAtTimeline(clip: Pick<Clip, "trimStart" | "startTime" | "durationSec" | "playbackRate" | "sourceDuration">, timelineSec: number): number {
+  const sourceOffset = Math.max(0, timelineSec - clip.startTime) * clipPlaybackRate(clip);
+  const sourceEnd = clip.trimStart + clipSourceSpan(clip);
+  return clamp(clip.trimStart + sourceOffset, clip.trimStart, sourceEnd);
+}
+
+function setElementPlaybackRate(elem: HTMLMediaElement, clip: Pick<Clip, "playbackRate">) {
+  const rate = mediaPlaybackRate(clip);
+  elem.playbackRate = rate;
+  const pitchy = elem as HTMLMediaElement & { preservesPitch?: boolean; mozPreservesPitch?: boolean; webkitPreservesPitch?: boolean };
+  pitchy.preservesPitch = false;
+  pitchy.mozPreservesPitch = false;
+  pitchy.webkitPreservesPitch = false;
 }
 
 function formatTime(sec: number): string {
@@ -371,7 +413,7 @@ export default function EditorPage() {
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
 
   useEffect(() => {
-    if (!recording) { setRecSeconds(0); return; }
+    if (!recording) return;
     const id = setInterval(() => setRecSeconds((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, [recording]);
@@ -456,7 +498,7 @@ export default function EditorPage() {
   }
 
   function spawnClipAudio(clip: Clip, clipOffset: number, ctx: AudioContext, extraDest?: AudioNode) {
-    const sourceOffset = clip.trimStart + clipOffset;
+    const sourceOffset = clip.trimStart + clipOffset * clipPlaybackRate(clip);
     const gainNode = ctx.createGain();
     gainNode.gain.value = isRecordingNarrationRef.current ? 0 : interpolateVolume(clip.volumeCurve, clipOffset);
     gainNode.connect(ctx.destination);
@@ -471,6 +513,7 @@ export default function EditorPage() {
           if (activeAudioRef.current.has(clip.id)) return;
           const bufNode = ctx.createBufferSource();
           bufNode.buffer = buffer;
+          bufNode.playbackRate.value = mediaPlaybackRate(clip);
           bufNode.connect(gainNode);
           const safeOffset = Math.min(sourceOffset, buffer.duration - 0.01);
           bufNode.start(0, Math.max(0, safeOffset));
@@ -483,10 +526,12 @@ export default function EditorPage() {
     const elem = document.createElement("video");
     elem.src = clip.blobUrl;
     elem.preload = "auto";
+    setElementPlaybackRate(elem, clip);
     try {
       const source = ctx.createMediaElementSource(elem);
       source.connect(gainNode);
       const play = () => {
+        setElementPlaybackRate(elem, clip);
         elem.currentTime = sourceOffset;
         elem.play().catch(() => {});
       };
@@ -514,6 +559,8 @@ export default function EditorPage() {
         activeAudioRef.current.delete(clipId);
       } else {
         entry.gainNode.gain.value = isRecordingNarrationRef.current ? 0 : interpolateVolume(clip.volumeCurve, atSec - clip.startTime);
+        if (entry.kind === "element") setElementPlaybackRate(entry.elem, clip);
+        else entry.bufNode.playbackRate.value = mediaPlaybackRate(clip);
       }
     });
     currentClips.forEach((clip) => {
@@ -665,18 +712,22 @@ export default function EditorPage() {
     let newStart = drag.validStartTime;
     let newDur = drag.validDuration;
     let newLayer = drag.validLayer;
+    const src = clipsRef.current.find((c) => c.id === drag.clipId)!;
+    const rate = clipPlaybackRate(src);
     if (drag.kind === "move") {
       newStart = snapTo(Math.max(0, drag.origStartTime + dtSec));
       newLayer = hoverLayer;
     } else if (drag.kind === "resize-left") {
-      const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart);
-      const clampedDelta = Math.min(dtSec, drag.origDuration - MIN_DURATION);
-      newStart = snapTo(Math.max(minStart, drag.origStartTime + clampedDelta));
-      newDur = Math.max(MIN_DURATION, snapTo(drag.origStartTime + drag.origDuration - newStart));
-      drag.validTrimStart = drag.origTrimStart + (newStart - drag.origStartTime);
+      const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart / rate);
+      const maxStart = drag.origStartTime + drag.origDuration - MIN_DURATION;
+      newStart = snapTo(clamp(drag.origStartTime + dtSec, minStart, maxStart));
+      const sourceDelta = (newStart - drag.origStartTime) * rate;
+      drag.validTrimStart = clamp(drag.origTrimStart + sourceDelta, 0, src.sourceDuration);
+      newDur = Math.max(MIN_DURATION, (drag.origTrimStart + drag.origDuration * rate - drag.validTrimStart) / rate);
       newLayer = drag.origLayer;
     } else {
-      newDur = Math.max(MIN_DURATION, snapTo(drag.origDuration + dtSec));
+      const maxTimelineDur = Math.max(MIN_DURATION, (src.sourceDuration - drag.origTrimStart) / rate);
+      newDur = clamp(snapTo(Math.max(MIN_DURATION, drag.origDuration + dtSec)), MIN_DURATION, maxTimelineDur);
       newStart = drag.origStartTime;
       newLayer = drag.origLayer;
     }
@@ -689,7 +740,6 @@ export default function EditorPage() {
       drag.validDuration = newDur;
       drag.validLayer = newLayer;
     }
-    const src = clipsRef.current.find((c) => c.id === drag.clipId)!;
     setGhost({ clipId: drag.clipId, startTime: drag.validStartTime, durationSec: drag.validDuration, layer: drag.validLayer, type: src.type });
   }
 
@@ -751,10 +801,11 @@ export default function EditorPage() {
         if (dur < 0.1) return;
         setClips((prev) => {
           const startTime = recStartSecRef.current;
-          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
+          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
         });
       };
       recorder.start();
+      setRecSeconds(0);
       setRecording(true);
     } catch (e: unknown) {
       isRecordingNarrationRef.current = false;
@@ -795,7 +846,7 @@ export default function EditorPage() {
       for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
         const layer = findFreeLayer([...prev, ...newClips], startTime, dur);
-        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] });
+        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] });
       }
       return [...prev, ...newClips];
     });
@@ -852,7 +903,7 @@ export default function EditorPage() {
       setClips((prev) => {
         const startTime = playheadSecRef.current;
         const dur = durationSec || (ytEnd - ytStart);
-        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
+        return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: findFreeLayer(prev, startTime, dur), trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
       });
       setYtModalOpen(false);
       setYtView("search");
@@ -885,6 +936,7 @@ export default function EditorPage() {
     if (!clip) return;
     const leftDur = t - clip.startTime;
     const rightDur = clip.durationSec - leftDur;
+    const rate = clipPlaybackRate(clip);
 
     const sorted = clip.volumeCurve.slice().sort((a, b) => a.time - b.time);
     const volAtSplit = Math.round(interpolateVolume(sorted, leftDur) * 100);
@@ -898,7 +950,7 @@ export default function EditorPage() {
     ];
 
     const leftClip: Clip = { ...clip, id: crypto.randomUUID(), durationSec: leftDur, volumeCurve: leftCurve.length ? leftCurve : [...DEFAULT_CURVE] };
-    const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur, volumeCurve: rightCurve.length ? rightCurve : [...DEFAULT_CURVE] };
+    const rightClip: Clip = { ...clip, id: crypto.randomUUID(), startTime: t, durationSec: rightDur, trimStart: clip.trimStart + leftDur * rate, volumeCurve: rightCurve.length ? rightCurve : [...DEFAULT_CURVE] };
     setClips((prev) => prev.filter((c) => c.id !== clip.id).concat([leftClip, rightClip]));
   }
 
@@ -979,6 +1031,42 @@ export default function EditorPage() {
     previewDragRef.current = null;
   }
 
+  function updateClipPlaybackRate(clipId: string, nextRate: number) {
+    const playbackRate = clamp(nextRate, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+    setClips((prev) => {
+      const target = prev.find((c) => c.id === clipId);
+      if (!target) return prev;
+      const oldRate = clipPlaybackRate(target);
+      const availableSource = Math.max(0, target.sourceDuration - target.trimStart);
+      const sourceSpan = Math.min(
+        availableSource,
+        Math.max(MIN_DURATION * oldRate, target.durationSec * oldRate),
+      );
+      let durationSec = Math.max(MIN_DURATION, sourceSpan / playbackRate);
+      const others = prev.filter((c) => c.id !== clipId);
+      let layer = target.layer;
+      if (others.some((c) => c.layer === target.layer && clipsOverlap(target.startTime, durationSec, c.startTime, c.durationSec))) {
+        const freeLayer = findFreeLayerOrNull(others, target.startTime, durationSec);
+        if (freeLayer) {
+          layer = freeLayer;
+        } else {
+          const nextClipStart = others
+            .filter((c) => c.layer === target.layer && c.startTime >= target.startTime)
+            .reduce((min, c) => Math.min(min, c.startTime), Infinity);
+          if (Number.isFinite(nextClipStart)) {
+            durationSec = Math.max(MIN_DURATION, nextClipStart - target.startTime);
+          }
+        }
+      }
+
+      return prev.map((c) =>
+        c.id === clipId
+          ? { ...c, playbackRate, durationSec, layer }
+          : c
+      );
+    });
+  }
+
   // ─── Export ──────────────────────────────────────────────────────────────────
 
   function cancelExport() {
@@ -1020,6 +1108,7 @@ export default function EditorPage() {
       vid.src = clip.blobUrl;
       vid.muted = true;
       vid.preload = "auto";
+      setElementPlaybackRate(vid, clip);
       await new Promise<void>((res) => {
         if (vid.readyState >= 2) { res(); return; }
         vid.addEventListener("loadedmetadata", () => res(), { once: true });
@@ -1079,7 +1168,8 @@ export default function EditorPage() {
     for (const [clipId, vid] of exportVideoEls) {
       const clip = currentClips.find((c) => c.id === clipId)!;
       if (clip.startTime === 0) {
-        vid.currentTime = clip.trimStart;
+        setElementPlaybackRate(vid, clip);
+        vid.currentTime = clipSourceTimeAtTimeline(clip, 0);
         vid.play().catch(() => {});
       }
     }
@@ -1118,8 +1208,9 @@ export default function EditorPage() {
       for (const [clipId, vid] of exportVideoEls) {
         const clip = currentClips.find((c) => c.id === clipId)!;
         const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.durationSec;
+        setElementPlaybackRate(vid, clip);
         if (isActive && vid.paused) {
-          vid.currentTime = clip.trimStart + (elapsed - clip.startTime);
+          vid.currentTime = clipSourceTimeAtTimeline(clip, elapsed);
           vid.play().catch(() => {});
         } else if (!isActive && !vid.paused) {
           vid.pause();
@@ -1369,6 +1460,32 @@ export default function EditorPage() {
                 >
                   {selClip.muted ? "Unmute" : "Mute"}
                 </button>
+              )}
+              {selClip.type !== "image" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a" }}>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>speed</span>
+                  <input
+                    type="range"
+                    min={MIN_PLAYBACK_RATE}
+                    max={MAX_PLAYBACK_RATE}
+                    step={0.05}
+                    value={clipPlaybackRate(selClip)}
+                    onChange={(e) => updateClipPlaybackRate(selClip.id, Number(e.target.value))}
+                    disabled={isExporting}
+                    style={{ width: 130 }}
+                  />
+                  <span style={{ minWidth: 42, fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", fontWeight: 700 }}>
+                    {clipPlaybackRate(selClip).toFixed(2)}x
+                  </span>
+                  <button
+                    onClick={() => updateClipPlaybackRate(selClip.id, 1)}
+                    disabled={isExporting}
+                    style={{ ...miniButton, fontSize: 10, padding: "2px 7px", opacity: isExporting ? 0.4 : 1 }}
+                    title="Reset speed"
+                  >
+                    Reset
+                  </button>
+                </div>
               )}
               {selClip.type === "video" && (
                 <>
@@ -1852,8 +1969,8 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
   const isPlayingRef = useRef(isPlaying);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
-  const sourceTime = (ph: number) => clip.trimStart + Math.max(0, ph - clip.startTime);
-  const trimEndSrc = clip.trimStart + clip.durationSec;
+  const sourceTime = (ph: number) => clipSourceTimeAtTimeline(clip, ph);
+  const trimEndSrc = clip.trimStart + clipSourceSpan(clip);
 
   // Reinit when clip changes
   useEffect(() => {
@@ -1861,14 +1978,15 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
     if (!vid) return;
     const offset = sourceTime(playheadSec);
     vid.src = clip.blobUrl;
+    setElementPlaybackRate(vid, clip);
     vid.load();
     if (isPlayingRef.current) {
-      vid.addEventListener("canplay", () => { vid.currentTime = offset; vid.play().catch(() => {}); }, { once: true });
+      vid.addEventListener("canplay", () => { setElementPlaybackRate(vid, clip); vid.currentTime = offset; vid.play().catch(() => {}); }, { once: true });
     } else {
       vid.addEventListener("loadedmetadata", () => { vid.currentTime = offset; }, { once: true });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip.id, clip.blobUrl]);
+  }, [clip.id, clip.blobUrl, clip.playbackRate]);
 
   // Enforce trim end during playback
   useEffect(() => {
@@ -1885,6 +2003,7 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
     const vid = videoRef.current;
     if (!vid) return;
     const offset = sourceTime(playheadSec);
+    setElementPlaybackRate(vid, clip);
     if (isPlaying) {
       vid.currentTime = offset;
       vid.play().catch(() => {});
@@ -1922,8 +2041,8 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
   const isPlayingRef = useRef(isPlaying);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
-  const sourceTime = (ph: number) => clip.trimStart + Math.max(0, ph - clip.startTime);
-  const trimEndSrc = clip.trimStart + clip.durationSec;
+  const sourceTime = (ph: number) => clipSourceTimeAtTimeline(clip, ph);
+  const trimEndSrc = clip.trimStart + clipSourceSpan(clip);
 
   function draw() {
     const vid = videoRef.current;
@@ -1954,8 +2073,10 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     if (!vid) return;
     const offset = sourceTime(playheadSec);
     vid.src = clip.blobUrl;
+    setElementPlaybackRate(vid, clip);
     vid.load();
     const onReady = () => {
+      setElementPlaybackRate(vid, clip);
       vid.currentTime = offset;
       if (isPlayingRef.current) vid.play().catch(() => {});
       draw();
@@ -1967,7 +2088,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip.id, clip.blobUrl]);
+  }, [clip.id, clip.blobUrl, clip.playbackRate]);
 
   useEffect(() => {
     const vid = videoRef.current;
@@ -1982,6 +2103,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     const vid = videoRef.current;
     if (!vid) return;
     const offset = sourceTime(playheadSec);
+    setElementPlaybackRate(vid, clip);
     if (isPlaying) {
       vid.currentTime = offset;
       vid.play().catch(() => {});
