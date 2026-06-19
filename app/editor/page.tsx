@@ -47,6 +47,9 @@ type Clip = {
   textFontFamily?: string;
   textFontSize?: number;
   textColor?: string;
+  cropZoom?: number;
+  cropX?: number;
+  cropY?: number;
   removeGreenScreen?: boolean;
   chromaSimilarity?: number;
   chromaSmoothness?: number;
@@ -91,6 +94,9 @@ const DEFAULT_TEXT_FONT = "Arial";
 const DEFAULT_TEXT_SIZE = 56;
 const DEFAULT_TEXT_COLOR = "#ffffff";
 const TEXT_FONTS = ["Arial", "Helvetica", "Georgia", "Times New Roman", "Courier New", "Impact", "Verdana"];
+const DEFAULT_CROP_ZOOM = 1;
+const DEFAULT_CROP_X = 0;
+const DEFAULT_CROP_Y = 0;
 const DEFAULT_CHROMA_SIMILARITY = 0.42;
 const DEFAULT_CHROMA_SMOOTHNESS = 0.08;
 const DEFAULT_CHROMA_AMOUNT = 0.55;
@@ -190,6 +196,33 @@ function isVisualClip(clip: Pick<Clip, "type">): boolean {
 
 function hasClipAudio(clip: Pick<Clip, "type">): boolean {
   return clip.type === "audio" || clip.type === "video";
+}
+
+function isCroppableClip(clip: Pick<Clip, "type">): boolean {
+  return clip.type === "image" || clip.type === "video";
+}
+
+function clipCropZoom(clip: Pick<Clip, "cropZoom">): number {
+  return clamp(clip.cropZoom ?? DEFAULT_CROP_ZOOM, 1, 4);
+}
+
+function clipCropX(clip: Pick<Clip, "cropX">): number {
+  return clamp(clip.cropX ?? DEFAULT_CROP_X, -100, 100);
+}
+
+function clipCropY(clip: Pick<Clip, "cropY">): number {
+  return clamp(clip.cropY ?? DEFAULT_CROP_Y, -100, 100);
+}
+
+function cropMediaStyle(clip: Pick<Clip, "cropZoom" | "cropX" | "cropY">): React.CSSProperties {
+  return {
+    width: "100%",
+    height: "100%",
+    objectFit: "contain",
+    pointerEvents: "none",
+    transformOrigin: "center center",
+    transform: `translate(${-clipCropX(clip) * 0.35}%, ${-clipCropY(clip) * 0.35}%) scale(${clipCropZoom(clip)})`,
+  };
 }
 
 function clipPlaybackRate(clip: Pick<Clip, "playbackRate">): number {
@@ -398,6 +431,23 @@ function drawContainedRect(
   return { x: boxX + (boxW - w) / 2, y: boxY, w, h: boxH };
 }
 
+function cropSourceRect(sourceW: number, sourceH: number, clip: Clip) {
+  const zoom = clipCropZoom(clip);
+  const sw = sourceW / zoom;
+  const sh = sourceH / zoom;
+  const sx = clamp(
+    (sourceW - sw) / 2 + (clipCropX(clip) / 100) * ((sourceW - sw) / 2),
+    0,
+    Math.max(0, sourceW - sw),
+  );
+  const sy = clamp(
+    (sourceH - sh) / 2 + (clipCropY(clip) / 100) * ((sourceH - sh) / 2),
+    0,
+    Math.max(0, sourceH - sh),
+  );
+  return { sx, sy, sw, sh };
+}
+
 function drawMaybeKeyedMedia(
   ctx: CanvasRenderingContext2D,
   media: HTMLVideoElement | HTMLImageElement,
@@ -407,9 +457,13 @@ function drawMaybeKeyedMedia(
   dh: number,
   clip: Clip,
 ) {
+  const sourceW = media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+  const sourceH = media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+  const crop = sourceW > 0 && sourceH > 0 ? cropSourceRect(sourceW, sourceH, clip) : null;
   const settings = chromaSettings(clip);
   if (!settings.enabled) {
-    ctx.drawImage(media, dx, dy, dw, dh);
+    if (crop) ctx.drawImage(media, crop.sx, crop.sy, crop.sw, crop.sh, dx, dy, dw, dh);
+    else ctx.drawImage(media, dx, dy, dw, dh);
     return;
   }
 
@@ -420,10 +474,12 @@ function drawMaybeKeyedMedia(
   off.height = h;
   const offCtx = off.getContext("2d", { willReadFrequently: true });
   if (!offCtx) {
-    ctx.drawImage(media, dx, dy, dw, dh);
+    if (crop) ctx.drawImage(media, crop.sx, crop.sy, crop.sw, crop.sh, dx, dy, dw, dh);
+    else ctx.drawImage(media, dx, dy, dw, dh);
     return;
   }
-  offCtx.drawImage(media, 0, 0, w, h);
+  if (crop) offCtx.drawImage(media, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, w, h);
+  else offCtx.drawImage(media, 0, 0, w, h);
   const frame = offCtx.getImageData(0, 0, w, h);
   applyGreenScreenToImageData(frame.data, settings.similarity, settings.smoothness, settings.amount);
   offCtx.putImageData(frame, 0, 0);
@@ -1703,7 +1759,7 @@ export default function EditorPage() {
                       {clip.text || DEFAULT_TEXT}
                     </div>
                   ) : clip.type === "image" ? (
-                    <img src={clip.blobUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }} />
+                    <img src={clip.blobUrl} alt="" style={cropMediaStyle(clip)} />
                   ) : clip.removeGreenScreen ? (
                     <KeyedPreviewVideo clip={clip} playheadSec={playheadSec} isPlaying={isPlaying} />
                   ) : (
@@ -1937,6 +1993,61 @@ export default function EditorPage() {
                     disabled={isExporting}
                     style={{ ...miniButton, fontSize: 10, padding: "2px 7px", opacity: isExporting ? 0.4 : 1 }}
                     title="Reset speed"
+                  >
+                    Reset
+                  </button>
+                </div>
+              )}
+              {isCroppableClip(selClip) && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, border: "1.5px solid #2a2a2a", background: "#fffdf5", padding: "4px 8px", boxShadow: "2px 2px 0 #2a2a2a", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>crop</span>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>zoom</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={4}
+                    step={0.01}
+                    value={clipCropZoom(selClip)}
+                    onPointerDown={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropZoom: Number(e.target.value) } : c))}
+                    disabled={isExporting}
+                    style={{ width: 90 }}
+                  />
+                  <span style={{ minWidth: 28, fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", fontWeight: 700 }}>
+                    {clipCropZoom(selClip).toFixed(2)}x
+                  </span>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>x</span>
+                  <input
+                    type="range"
+                    min={-100}
+                    max={100}
+                    step={1}
+                    value={clipCropX(selClip)}
+                    onPointerDown={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropX: Number(e.target.value) } : c))}
+                    disabled={isExporting}
+                    style={{ width: 70 }}
+                  />
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>y</span>
+                  <input
+                    type="range"
+                    min={-100}
+                    max={100}
+                    step={1}
+                    value={clipCropY(selClip)}
+                    onPointerDown={pushUndoSnapshot}
+                    onChange={(e) => setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropY: Number(e.target.value) } : c))}
+                    disabled={isExporting}
+                    style={{ width: 70 }}
+                  />
+                  <button
+                    onClick={() => {
+                      pushUndoSnapshot();
+                      setClips((prev) => prev.map((c) => c.id === selClip.id ? { ...c, cropZoom: DEFAULT_CROP_ZOOM, cropX: DEFAULT_CROP_X, cropY: DEFAULT_CROP_Y } : c));
+                    }}
+                    disabled={isExporting}
+                    style={{ ...miniButton, fontSize: 10, padding: "2px 7px", opacity: isExporting ? 0.4 : 1 }}
+                    title="Reset crop"
                   >
                     Reset
                   </button>
@@ -2553,7 +2664,7 @@ function PreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playheadSe
       muted
       playsInline
       preload="auto"
-      style={{ width: "100%", height: "100%", objectFit: "contain" }}
+      style={cropMediaStyle(clip)}
     />
   );
 }
@@ -2646,7 +2757,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
     vid.currentTime = sourceTime(playheadSec);
     vid.addEventListener("seeked", draw, { once: true });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount]);
+  }, [playheadSec, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY]);
 
   useEffect(() => {
     function tick() {
@@ -2665,7 +2776,7 @@ function KeyedPreviewVideo({ clip, playheadSec, isPlaying }: { clip: Clip; playh
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     };
-  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount]);
+  }, [isPlaying, clip.chromaSimilarity, clip.chromaSmoothness, clip.chromaAmount, clip.cropZoom, clip.cropX, clip.cropY]);
 
   return (
     <>
