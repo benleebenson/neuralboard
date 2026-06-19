@@ -164,13 +164,13 @@ const CLIP_COLORS: Record<ClipType, string> = {
 };
 
 function parseDurationSec(dur: string | number | undefined): number {
-  if (typeof dur === "number") return dur > 0 ? dur : 30;
-  if (!dur) return 30;
+  if (typeof dur === "number") return dur > 0 ? dur : 600;
+  if (!dur) return 600;
   const parts = dur.split(":").map(Number);
   if (parts.length === 2) return (parts[0] ?? 0) * 60 + (parts[1] ?? 0);
   if (parts.length === 3) return (parts[0] ?? 0) * 3600 + (parts[1] ?? 0) * 60 + (parts[2] ?? 0);
   const asNum = Number(dur);
-  return Number.isFinite(asNum) && asNum > 0 ? asNum : 30;
+  return Number.isFinite(asNum) && asNum > 0 ? asNum : 600;
 }
 
 function parseTimestampSec(value: string): number | null {
@@ -325,9 +325,12 @@ export default function EditorPage() {
   const [ytStart, setYtStart] = useState(0);
   const [ytStartInput, setYtStartInput] = useState("0:00");
   const [ytEnd, setYtEnd] = useState(30);
+  const [ytEndInput, setYtEndInput] = useState("0:30");
   const [ytError, setYtError] = useState("");
   const [ytLoading, setYtLoading] = useState(false);
   const [ytShortsOnly, setYtShortsOnly] = useState(true);
+  const ytSliderTrackRef = useRef<HTMLDivElement>(null);
+  const ytRangeRef = useRef({ start: 0, end: 30 });
 
   const playheadDraggingRef = useRef(false);
   const dragRef = useRef<DragInfo | null>(null);
@@ -1674,9 +1677,12 @@ export default function EditorPage() {
                         onClick={() => {
                           setYtSelected(r);
                           const maxSec = parseDurationSec(r.duration);
+                          const initEnd = Math.min(30, maxSec);
                           setYtStart(0);
                           setYtStartInput("0:00");
-                          setYtEnd(Math.min(30, maxSec));
+                          setYtEnd(initEnd);
+                          setYtEndInput(formatTimestamp(initEnd));
+                          ytRangeRef.current = { start: 0, end: initEnd };
                           setYtView("trim");
                         }}
                         style={{ border: "1.5px solid #2a2a2a", cursor: "pointer", background: "rgba(255,253,245,0.9)", boxShadow: "2px 2px 0 #2a2a2a", overflow: "hidden" }}
@@ -1697,49 +1703,131 @@ export default function EditorPage() {
                 </>
               ) : (
                 <>
-                  {ytSelected && (
-                    <div style={{ marginBottom: 14, background: "#000", lineHeight: 0 }}>
-                      <iframe
-                        src={`https://www.youtube.com/embed/${ytSelected.id}?start=${Math.floor(ytStart)}&end=${Math.ceil(ytEnd)}&autoplay=0`}
-                        style={{ width: "100%", aspectRatio: "16/9", border: "none" }}
-                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                        allowFullScreen
-                      />
-                    </div>
-                  )}
-                  {(() => {
-                    const maxSec = parseDurationSec(ytSelected?.duration);
-                    const clipLen = Math.max(1, Math.round(ytEnd - ytStart));
-                    const maxClipLen = Math.max(1, Math.min(30, Math.floor(maxSec - ytStart)));
-                    const setStartAndKeepLength = (nextStart: number) => {
-                      const cs = Math.max(0, Math.min(Math.max(0, maxSec - 1), nextStart));
-                      const nl = Math.min(clipLen, Math.max(1, Math.min(30, Math.floor(maxSec - cs))));
-                      setYtStart(cs);
-                      setYtEnd(cs + nl);
+                  {ytSelected && (() => {
+                    const maxSec = parseDurationSec(ytSelected.duration);
+                    const pctOf = (v: number) => Math.max(0, Math.min(100, (v / Math.max(0.1, maxSec)) * 100));
+                    const clipLen = Math.max(0, ytEnd - ytStart);
+
+                    const handleSliderMouseDown = (which: "start" | "end") => (e: React.MouseEvent) => {
+                      e.preventDefault();
+                      const track = ytSliderTrackRef.current;
+                      if (!track) return;
+                      const onMove = (ev: MouseEvent) => {
+                        const rect = track.getBoundingClientRect();
+                        const raw = ((ev.clientX - rect.left) / rect.width) * maxSec;
+                        const clamped = Math.max(0, Math.min(maxSec, raw));
+                        if (which === "start") {
+                          const curEnd = ytRangeRef.current.end;
+                          const newStart = Math.max(0, Math.min(clamped, curEnd - 0.5));
+                          ytRangeRef.current.start = newStart;
+                          setYtStart(newStart);
+                          setYtStartInput(formatTimestamp(newStart));
+                          if (curEnd - newStart > 30) {
+                            const newEnd = newStart + 30;
+                            ytRangeRef.current.end = newEnd;
+                            setYtEnd(newEnd);
+                            setYtEndInput(formatTimestamp(newEnd));
+                          }
+                        } else {
+                          const curStart = ytRangeRef.current.start;
+                          const newEnd = Math.max(curStart + 0.5, Math.min(maxSec, Math.min(clamped, curStart + 30)));
+                          ytRangeRef.current.end = newEnd;
+                          setYtEnd(newEnd);
+                          setYtEndInput(formatTimestamp(newEnd));
+                        }
+                      };
+                      const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+                      window.addEventListener("mousemove", onMove);
+                      window.addEventListener("mouseup", onUp);
                     };
-                    const setClipLen = (nl: number) => setYtEnd(ytStart + Math.max(1, Math.min(maxClipLen, nl)));
+
                     return (
-                      <div style={{ marginBottom: 12 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                          <span style={{ fontSize: 11, width: 76 }}>source time</span>
-                          <input type="text" value={ytStartInput} placeholder="1:23"
-                            onChange={(e) => { setYtStartInput(e.target.value); const p = parseTimestampSec(e.target.value); if (p !== null) setStartAndKeepLength(p); }}
-                            onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
-                            style={{ width: 90, fontFamily: "monospace", fontSize: 12, border: "1px solid #2a2a2a", padding: "4px 6px", background: "#fffdf5" }}
+                      <div>
+                        {/* YouTube embed */}
+                        <div style={{ marginBottom: 14, background: "#000", lineHeight: 0 }}>
+                          <iframe
+                            src={`https://www.youtube.com/embed/${ytSelected.id}?start=${Math.floor(ytStart)}&autoplay=0`}
+                            style={{ width: "100%", aspectRatio: "16/9", border: "none" }}
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                            allowFullScreen
                           />
-                          <span style={{ fontSize: 10, color: "#6a6a6a" }}>of {formatTimestamp(maxSec)}</span>
                         </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <span style={{ fontSize: 11, width: 76 }}>clip length</span>
-                          <input type="range" min={1} max={maxClipLen} step={1} value={Math.min(clipLen, maxClipLen)} onChange={(e) => setClipLen(Number(e.target.value))} style={{ flex: 1 }} />
-                          <input type="number" min={1} max={maxClipLen} step={1} value={Math.min(clipLen, maxClipLen)} onChange={(e) => setClipLen(Number(e.target.value))} style={{ width: 50, fontFamily: "monospace", fontSize: 11, border: "1px solid #2a2a2a", padding: "2px 4px", background: "#fffdf5" }} />
-                          <span style={{ fontSize: 10, color: "#6a6a6a" }}>s</span>
+
+                        {/* Dual-handle selection bar */}
+                        <div
+                          ref={ytSliderTrackRef}
+                          style={{ position: "relative", height: 36, margin: "0 4px 14px", userSelect: "none" }}
+                        >
+                          <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: 0, right: 0, height: 8, background: "#d8d5c9", border: "1.5px solid #2a2a2a" }} />
+                          <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: `${pctOf(ytStart)}%`, width: `${Math.max(0, pctOf(ytEnd) - pctOf(ytStart))}%`, height: 8, background: "#c8f135", borderTop: "1.5px solid #2a2a2a", borderBottom: "1.5px solid #2a2a2a" }} />
+                          <div onMouseDown={handleSliderMouseDown("start")} style={{ position: "absolute", top: "50%", left: `${pctOf(ytStart)}%`, transform: "translate(-50%, -50%)", width: 12, height: 24, background: "#2a2a2a", cursor: "ew-resize", zIndex: 3 }} />
+                          <div onMouseDown={handleSliderMouseDown("end")} style={{ position: "absolute", top: "50%", left: `${pctOf(ytEnd)}%`, transform: "translate(-50%, -50%)", width: 12, height: 24, background: "#2a2a2a", cursor: "ew-resize", zIndex: 3 }} />
                         </div>
-                        <div style={{ fontSize: 10, color: "#6a6a6a", marginTop: 8 }}>pulls {formatTimestamp(ytStart)}–{formatTimestamp(ytEnd)} · max 30s</div>
+
+                        {/* Start / End time inputs */}
+                        <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>Start</div>
+                            <input
+                              type="text"
+                              value={ytStartInput}
+                              placeholder="0:00"
+                              onChange={(e) => {
+                                setYtStartInput(e.target.value);
+                                const p = parseTimestampSec(e.target.value);
+                                if (p !== null) {
+                                  const newStart = Math.max(0, Math.min(maxSec - 0.5, p));
+                                  const curEnd = ytRangeRef.current.end;
+                                  ytRangeRef.current.start = newStart;
+                                  setYtStart(newStart);
+                                  if (curEnd <= newStart + 0.5) {
+                                    const newEnd = Math.min(newStart + 30, maxSec);
+                                    ytRangeRef.current.end = newEnd;
+                                    setYtEnd(newEnd);
+                                    setYtEndInput(formatTimestamp(newEnd));
+                                  } else if (curEnd - newStart > 30) {
+                                    const newEnd = newStart + 30;
+                                    ytRangeRef.current.end = newEnd;
+                                    setYtEnd(newEnd);
+                                    setYtEndInput(formatTimestamp(newEnd));
+                                  }
+                                }
+                              }}
+                              onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                            />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>End</div>
+                            <input
+                              type="text"
+                              value={ytEndInput}
+                              placeholder="0:30"
+                              onChange={(e) => {
+                                setYtEndInput(e.target.value);
+                                const p = parseTimestampSec(e.target.value);
+                                if (p !== null) {
+                                  const newEnd = Math.max(ytRangeRef.current.start + 0.5, Math.min(maxSec, Math.min(p, ytRangeRef.current.start + 30)));
+                                  ytRangeRef.current.end = newEnd;
+                                  setYtEnd(newEnd);
+                                }
+                              }}
+                              onBlur={() => setYtEndInput(formatTimestamp(ytEnd))}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                            />
+                          </div>
+                        </div>
+
+                        {/* Clip length readout */}
+                        <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>
+                          Clip length: {formatTimestamp(clipLen)}
+                          <span style={{ marginLeft: 8 }}>· {formatTimestamp(maxSec)} total</span>
+                        </div>
+
+                        {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, fontFamily: "monospace", marginTop: 6, marginBottom: 0 }}>{ytError}</p>}
                       </div>
                     );
                   })()}
-                  {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, fontFamily: "monospace" }}>{ytError}</p>}
                 </>
               )}
             </div>
@@ -1748,7 +1836,7 @@ export default function EditorPage() {
               <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, alignItems: "center" }}>
                 <button onClick={() => { setYtView("search"); setYtSelected(null); setYtError(""); }} style={{ ...miniButton, padding: "6px 12px", fontSize: 11 }}>← back</button>
                 <button onClick={handleYtConfirm} disabled={ytLoading} style={{ ...miniButton, marginLeft: "auto", padding: "6px 18px", fontSize: 12, fontWeight: 700, background: "#c8f135", borderColor: "#2a2a2a", opacity: ytLoading ? 0.5 : 1 }}>
-                  {ytLoading ? "downloading…" : "confirm"}
+                  {ytLoading ? "downloading…" : "Add to timeline"}
                 </button>
               </div>
             )}
