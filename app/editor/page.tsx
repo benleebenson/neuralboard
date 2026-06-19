@@ -13,7 +13,7 @@ const INITIAL_LAYER_COUNT = 5;
 const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
-const EDGE_SNAP = 0.18;
+const MAGNETIC_SNAP = 10 / PX_PER_SEC;
 const CURVE_H = 12;
 const MAX_EXPORT_DURATION = 90;
 const MIN_PLAYBACK_RATE = 0.25;
@@ -181,22 +181,24 @@ function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: numb
   return null;
 }
 
-function nearestEdgeSnap(value: number, candidates: number[], tolerance = EDGE_SNAP): number {
-  let best = value;
-  let bestDistance = tolerance;
-  for (const candidate of candidates) {
-    const distance = Math.abs(value - candidate);
-    if (distance <= bestDistance) {
-      best = candidate;
-      bestDistance = distance;
+function magneticSnap(value: number, candidates: number[], threshold = MAGNETIC_SNAP): { snapped: number; target: number | null } {
+  let bestSnapped = value;
+  let bestDist = threshold;
+  let bestTarget: number | null = null;
+  for (const c of candidates) {
+    const d = Math.abs(value - c);
+    if (d <= bestDist) {
+      bestSnapped = c;
+      bestDist = d;
+      bestTarget = c;
     }
   }
-  return best;
+  return { snapped: bestSnapped, target: bestTarget };
 }
 
-function sameLayerEdgeCandidates(clips: Clip[], clipId: string, layer: number): number[] {
+function allOtherClipEdges(clips: Clip[], clipId: string): number[] {
   return clips
-    .filter((c) => c.id !== clipId && c.layer === layer)
+    .filter((c) => c.id !== clipId)
     .flatMap((c) => [c.startTime, c.startTime + c.durationSec]);
 }
 
@@ -558,6 +560,7 @@ export default function EditorPage() {
   const [recError, setRecError] = useState("");
   const [recGrowingBar, setRecGrowingBar] = useState<{ startSec: number; layer: number; elapsedSec: number } | null>(null);
   const [ghost, setGhost] = useState<Ghost>(null);
+  const [snapGuideSec, setSnapGuideSec] = useState<number | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
   const [cropDraft, setCropDraft] = useState<CropDraft>(null);
@@ -1106,32 +1109,65 @@ export default function EditorPage() {
     let newLayer = drag.validLayer;
     const src = clipsRef.current.find((c) => c.id === drag.clipId)!;
     const rate = clipPlaybackRate(src);
+
+    // Snap candidates: time 0, playhead, and all edges of every other clip on every layer
+    const snapCandidates = [0, playheadSecRef.current, ...allOtherClipEdges(clipsRef.current, drag.clipId)];
+    let activeSnapTarget: number | null = null;
+
     if (drag.kind === "move") {
-      const baseStart = snapTo(Math.max(0, drag.origStartTime + dtSec));
+      const rawStart = Math.max(0, drag.origStartTime + dtSec);
       newLayer = hoverLayer;
-      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, newLayer);
-      newStart = Math.max(0, snapTo(nearestEdgeSnap(baseStart, [
-        ...edgeCandidates,
-        ...edgeCandidates.map((edge) => edge - newDur),
-      ])));
+      newDur = drag.origDuration;
+
+      // Try LEFT edge first; fall back to RIGHT edge; fall back to grid snap
+      const { snapped: snappedLeft, target: leftTarget } = magneticSnap(rawStart, snapCandidates);
+      if (leftTarget !== null) {
+        newStart = Math.max(0, snappedLeft);
+        activeSnapTarget = leftTarget;
+      } else {
+        const { snapped: snappedRight, target: rightTarget } = magneticSnap(rawStart + newDur, snapCandidates);
+        if (rightTarget !== null) {
+          newStart = Math.max(0, snappedRight - newDur);
+          activeSnapTarget = rightTarget;
+        } else {
+          newStart = Math.max(0, snapTo(rawStart));
+          activeSnapTarget = null;
+        }
+      }
     } else if (drag.kind === "resize-left") {
       const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart / rate);
       const maxStart = drag.origStartTime + drag.origDuration - MIN_DURATION;
-      const baseStart = snapTo(clamp(drag.origStartTime + dtSec, minStart, maxStart));
-      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, drag.origLayer);
-      newStart = snapTo(clamp(nearestEdgeSnap(baseStart, edgeCandidates), minStart, maxStart));
+      const rawStart = clamp(drag.origStartTime + dtSec, minStart, maxStart);
+
+      const { snapped, target } = magneticSnap(rawStart, snapCandidates);
+      if (target !== null) {
+        newStart = clamp(snapped, minStart, maxStart);
+        activeSnapTarget = target;
+      } else {
+        newStart = snapTo(clamp(rawStart, minStart, maxStart));
+        activeSnapTarget = null;
+      }
+
       const sourceDelta = (newStart - drag.origStartTime) * rate;
       drag.validTrimStart = clamp(drag.origTrimStart + sourceDelta, 0, src.sourceDuration);
       newDur = Math.max(MIN_DURATION, (drag.origTrimStart + drag.origDuration * rate - drag.validTrimStart) / rate);
       newLayer = drag.origLayer;
     } else {
       const maxTimelineDur = Math.max(MIN_DURATION, (src.sourceDuration - drag.origTrimStart) / rate);
-      newDur = clamp(snapTo(Math.max(MIN_DURATION, drag.origDuration + dtSec)), MIN_DURATION, maxTimelineDur);
+      const rawDur = clamp(drag.origDuration + dtSec, MIN_DURATION, maxTimelineDur);
+      const rawEnd = drag.origStartTime + rawDur;
       newStart = drag.origStartTime;
       newLayer = drag.origLayer;
-      const edgeCandidates = sameLayerEdgeCandidates(clipsRef.current, drag.clipId, newLayer);
-      const snappedEnd = nearestEdgeSnap(newStart + newDur, edgeCandidates);
-      newDur = clamp(snapTo(snappedEnd - newStart), MIN_DURATION, maxTimelineDur);
+
+      const { snapped: snappedEnd, target } = magneticSnap(rawEnd, snapCandidates);
+      const snappedDur = snappedEnd - drag.origStartTime;
+      if (target !== null && snappedDur >= MIN_DURATION) {
+        newDur = clamp(snappedDur, MIN_DURATION, maxTimelineDur);
+        activeSnapTarget = target;
+      } else {
+        newDur = clamp(snapTo(rawDur), MIN_DURATION, maxTimelineDur);
+        activeSnapTarget = null;
+      }
     }
     const noOverlap = !clipsRef.current.some(
       (c) => c.id !== drag.clipId && c.layer === newLayer &&
@@ -1143,6 +1179,7 @@ export default function EditorPage() {
       drag.validLayer = newLayer;
     }
     setGhost({ clipId: drag.clipId, startTime: drag.validStartTime, durationSec: drag.validDuration, layer: drag.validLayer, type: src.type });
+    setSnapGuideSec(noOverlap ? activeSnapTarget : null);
   }
 
   function commitClipDrag() {
@@ -1150,6 +1187,7 @@ export default function EditorPage() {
     if (!drag) return;
     dragRef.current = null;
     setGhost(null);
+    setSnapGuideSec(null);
     const changed =
       drag.validStartTime !== drag.origStartTime ||
       drag.validDuration !== drag.origDuration ||
@@ -2517,6 +2555,11 @@ export default function EditorPage() {
             <div style={{ position: "absolute", left: "50%", top: RULER_H + (layerCount * LAYER_H) / 2, transform: "translate(-50%, -50%)", fontSize: 11, fontFamily: "monospace", color: "#ccc", pointerEvents: "none", whiteSpace: "nowrap" }}>
               Record or upload to add clips
             </div>
+          )}
+
+          {/* Magnetic snap guide */}
+          {snapGuideSec !== null && (
+            <div style={{ position: "absolute", left: snapGuideSec * PX_PER_SEC, top: 0, bottom: 0, width: 1, background: "rgba(80,200,255,0.9)", zIndex: 9, pointerEvents: "none", boxShadow: "0 0 4px rgba(80,200,255,0.6)" }} />
           )}
 
           {/* Playhead */}
