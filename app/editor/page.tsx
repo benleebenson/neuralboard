@@ -43,6 +43,7 @@ type Clip = {
   transform: ClipTransform;
   muted: boolean;
   volumeCurve: CurvePoint[];
+  waveform?: number[];
   removeGreenScreen?: boolean;
   chromaSimilarity?: number;
   chromaSmoothness?: number;
@@ -172,6 +173,12 @@ function setElementPlaybackRate(elem: HTMLMediaElement, clip: Pick<Clip, "playba
   pitchy.webkitPreservesPitch = false;
 }
 
+function waveformValueAtSourceSec(clip: Clip, sourceSec: number): number {
+  if (!clip.waveform?.length || clip.sourceDuration <= 0) return 0;
+  const idx = clamp(Math.floor((sourceSec / clip.sourceDuration) * clip.waveform.length), 0, clip.waveform.length - 1);
+  return clip.waveform[idx] ?? 0;
+}
+
 function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
@@ -197,6 +204,40 @@ async function getMediaDuration(blobUrl: string, type: ClipType): Promise<number
     el.addEventListener("error", () => resolve(0), { once: true });
     el.src = blobUrl;
   });
+}
+
+async function generateWaveform(blobUrl: string, bins = 180): Promise<number[]> {
+  const res = await fetch(blobUrl);
+  const arrayBuffer = await res.arrayBuffer();
+  const ctx = new AudioContext();
+  try {
+    const buffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    const channelCount = Math.max(1, buffer.numberOfChannels);
+    const samplesPerBin = Math.max(1, Math.floor(buffer.length / bins));
+    const peaks: number[] = [];
+
+    for (let i = 0; i < bins; i++) {
+      const start = i * samplesPerBin;
+      const end = i === bins - 1 ? buffer.length : Math.min(buffer.length, start + samplesPerBin);
+      let sum = 0;
+      let count = 0;
+
+      for (let channel = 0; channel < channelCount; channel++) {
+        const data = buffer.getChannelData(channel);
+        for (let sample = start; sample < end; sample++) {
+          sum += data[sample] * data[sample];
+          count++;
+        }
+      }
+
+      peaks.push(count > 0 ? Math.sqrt(sum / count) : 0);
+    }
+
+    const max = Math.max(...peaks, 0.001);
+    return peaks.map((peak) => clamp(peak / max, 0.03, 1));
+  } finally {
+    ctx.close().catch(() => {});
+  }
 }
 
 const CLIP_COLORS: Record<ClipType, string> = {
@@ -797,11 +838,12 @@ export default function EditorPage() {
         const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
         const blobUrl = URL.createObjectURL(blob);
         const durationSec = await getMediaDuration(blobUrl, "audio");
+        const waveform = await generateWaveform(blobUrl).catch(() => undefined);
         const dur = durationSec || recSecondsRef.current;
         if (dur < 0.1) return;
         setClips((prev) => {
           const startTime = recStartSecRef.current;
-          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
+          return [...prev, { id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer: recLayerRef.current, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE], waveform }];
         });
       };
       recorder.start();
@@ -835,7 +877,9 @@ export default function EditorPage() {
         else if (file.type.startsWith("image/")) type = "image";
         else return null;
         const blobUrl = URL.createObjectURL(file);
-        return { type, name: file.name, blobUrl, durationSec: await getMediaDuration(blobUrl, type) };
+        const durationSec = await getMediaDuration(blobUrl, type);
+        const waveform = type === "audio" ? await generateWaveform(blobUrl).catch(() => undefined) : undefined;
+        return { type, name: file.name, blobUrl, durationSec, waveform };
       })
     );
     const valid = processed.filter((x): x is NonNullable<typeof x> => x !== null);
@@ -846,7 +890,7 @@ export default function EditorPage() {
       for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
         const layer = findFreeLayer([...prev, ...newClips], startTime, dur);
-        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] });
+        newClips.push({ id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE], waveform: item.waveform });
       }
       return [...prev, ...newClips];
     });
@@ -1592,6 +1636,11 @@ export default function EditorPage() {
                   const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * PX_PER_SEC - 2);
                   const showHandles = clipPx >= HANDLE_W * 3;
                   const sortedCurve = clip.volumeCurve.slice().sort((a, b) => a.time - b.time);
+                  const waveformBarCount = clip.type === "audio" && clip.waveform?.length
+                    ? Math.max(10, Math.min(160, Math.floor(clipPx / 3)))
+                    : 0;
+                  const waveformH = LAYER_H - CURVE_H - 18;
+                  const waveformSourceSpan = clipSourceSpan(clip);
                   const linePoints = sortedCurve.map((pt) => {
                     const px = clipPx > 0 ? (pt.time / clip.durationSec) * clipPx : 0;
                     const py = CURVE_H - 2 - (pt.volume / 100) * (CURVE_H - 4);
@@ -1604,7 +1653,34 @@ export default function EditorPage() {
                       style={{ position: "absolute", left: clip.startTime * PX_PER_SEC, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
                     >
                       {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
-                      <div style={{ paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, paddingBottom: CURVE_H, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
+                      {waveformBarCount > 0 && (
+                        <svg
+                          style={{ position: "absolute", left: showHandles ? HANDLE_W + 2 : 4, right: showHandles ? HANDLE_W + 2 : 4, top: 6, height: waveformH, opacity: 0.55, pointerEvents: "none", zIndex: 1 }}
+                          viewBox={`0 0 ${Math.max(1, clipPx - (showHandles ? HANDLE_W * 2 + 4 : 8))} ${waveformH}`}
+                          preserveAspectRatio="none"
+                        >
+                          {Array.from({ length: waveformBarCount }, (_, i) => {
+                            const innerW = Math.max(1, clipPx - (showHandles ? HANDLE_W * 2 + 4 : 8));
+                            const x = (i / waveformBarCount) * innerW;
+                            const sourceSec = clip.trimStart + (waveformBarCount <= 1 ? 0 : (i / (waveformBarCount - 1)) * waveformSourceSpan);
+                            const peak = waveformValueAtSourceSec(clip, sourceSec);
+                            const h = Math.max(1, peak * waveformH);
+                            const y = (waveformH - h) / 2;
+                            return (
+                              <rect
+                                key={i}
+                                x={x}
+                                y={y}
+                                width={Math.max(1, innerW / waveformBarCount - 1)}
+                                height={h}
+                                rx={0.5}
+                                fill="rgba(42,42,42,0.58)"
+                              />
+                            );
+                          })}
+                        </svg>
+                      )}
+                      <div style={{ position: "relative", zIndex: 2, paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, paddingBottom: CURVE_H, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
                         <div style={{ fontSize: 10, fontFamily: "'Courier New', monospace", fontWeight: 700, color: "#2a2a2a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{clip.name}</div>
                         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#555", whiteSpace: "nowrap" }}>{formatDuration(clip.durationSec)}</div>
                       </div>
