@@ -146,6 +146,17 @@ type YtSearchResult = {
 };
 type YtModalView = "search" | "trim";
 
+type LibraryVideo = {
+  id: string;
+  email: string;
+  youtube_url: string;
+  youtube_video_id: string;
+  title: string;
+  thumbnail_url: string;
+  duration_seconds: number;
+  created_at: string;
+};
+
 type AudioEntry =
   | { kind: "element"; elem: HTMLMediaElement; source: MediaElementAudioSourceNode; gainNode: GainNode }
   | { kind: "buffer"; bufNode: AudioBufferSourceNode; gainNode: GainNode };
@@ -667,6 +678,13 @@ export default function EditorPage() {
   const [ytLoading, setYtLoading] = useState(false);
   const [ytShortsOnly, setYtShortsOnly] = useState(true);
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
+  // Saved videos library panel
+  const [savedVideosOpen, setSavedVideosOpen] = useState(false);
+  const [savedVideos, setSavedVideos] = useState<LibraryVideo[]>([]);
+  const [savedVideosLoading, setSavedVideosLoading] = useState(false);
+  const [savedVideosError, setSavedVideosError] = useState("");
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Countdown modal
   const [countdownModalOpen, setCountdownModalOpen] = useState(false);
@@ -1648,6 +1666,18 @@ export default function EditorPage() {
         return [...prev, { id: crypto.randomUUID(), type: "video", name: title, blobUrl, sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1, transform: DEFAULT_TRANSFORM, muted: false, volumeCurve: [...DEFAULT_CURVE] }];
       });
       setYtModalOpen(false);
+      // Best-effort: save video metadata to library
+      fetch("/api/library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          youtube_url: `https://www.youtube.com/watch?v=${ytSelected.id}`,
+          youtube_video_id: ytSelected.id,
+          title: ytSelected.title ?? "YouTube video",
+          thumbnail_url: ytSelected.thumbnail ?? "",
+          duration_seconds: Math.round(parseDurationSec(ytSelected.duration)),
+        }),
+      }).catch(() => {});
       setYtView("search");
       setYtSelected(null);
       setYtResults([]);
@@ -1657,6 +1687,48 @@ export default function EditorPage() {
     } finally {
       setYtLoading(false);
     }
+  }
+
+  // ─── Library ─────────────────────────────────────────────────────────────────
+
+  function showToast(msg: string) {
+    setToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2500);
+  }
+
+  async function fetchLibrary() {
+    setSavedVideosLoading(true);
+    setSavedVideosError("");
+    try {
+      const res = await fetch("/api/library");
+      if (!res.ok) throw new Error();
+      setSavedVideos(await res.json());
+    } catch {
+      setSavedVideosError("Failed to load library");
+    } finally {
+      setSavedVideosLoading(false);
+    }
+  }
+
+  async function deleteLibraryEntry(id: string) {
+    setSavedVideos((prev) => prev.filter((v) => v.id !== id));
+    await fetch(`/api/library?id=${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
+  }
+
+  function openFromLibrary(video: LibraryVideo) {
+    setSavedVideosOpen(false);
+    const maxSec = video.duration_seconds || 600;
+    const initEnd = Math.min(30, maxSec);
+    setYtSelected({ id: video.youtube_video_id, title: video.title, channel: "", duration: video.duration_seconds, thumbnail: video.thumbnail_url });
+    setYtStart(0);
+    setYtStartInput("0:00");
+    setYtEnd(initEnd);
+    setYtEndInput(formatTimestamp(initEnd));
+    ytRangeRef.current = { start: 0, end: initEnd };
+    setYtView("trim");
+    setYtError("");
+    setYtModalOpen(true);
   }
 
   // ─── Preview ─────────────────────────────────────────────────────────────────
@@ -2357,7 +2429,7 @@ export default function EditorPage() {
 
   return (
     <main style={pageStyle}>
-      <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
+      <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} } @keyframes nbslide-in { from { transform: translateX(100%); } to { transform: translateX(0); } } @keyframes nbtoast { 0%{opacity:0;transform:translate(-50%,8px)} 100%{opacity:1;transform:translate(-50%,0)} }`}</style>
 
       {/* Header */}
       <header style={headerStyle}>
@@ -2900,6 +2972,15 @@ export default function EditorPage() {
             );
           })}
 
+          {/* Add Layer placeholder row */}
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); showToast("Coming soon"); }}
+            style={{ position: "relative", height: 40, borderTop: "1px dashed rgba(42,42,42,0.18)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", userSelect: "none" }}
+          >
+            <span style={{ fontSize: 10, fontFamily: "monospace", color: "rgba(42,42,42,0.32)", letterSpacing: 1 }}>+ Add Layer</span>
+          </div>
+
           {clips.length === 0 && (
             <div style={{ position: "absolute", left: "50%", top: RULER_H + (layerCount * LAYER_H) / 2, transform: "translate(-50%, -50%)", fontSize: 11, fontFamily: "monospace", color: "#ccc", pointerEvents: "none", whiteSpace: "nowrap" }}>
               Record or upload to add clips
@@ -3240,6 +3321,76 @@ export default function EditorPage() {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Saved Videos button */}
+      {!savedVideosOpen && (
+        <button
+          onClick={() => { setSavedVideosOpen(true); fetchLibrary(); }}
+          style={{ position: "fixed", bottom: 16, right: 16, zIndex: 900, fontFamily: "monospace", fontSize: 11, fontWeight: 700, background: "#4caf7d", color: "#fff", border: "1.5px solid #2a2a2a", padding: "7px 14px", cursor: "pointer", boxShadow: "2px 2px 0 #2a2a2a", letterSpacing: 0.5 }}
+        >
+          ▶ Saved Videos
+        </button>
+      )}
+
+      {/* Saved Videos side panel */}
+      {savedVideosOpen && (
+        <>
+          <div onClick={() => setSavedVideosOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 950 }} />
+          <div style={{ position: "fixed", right: 0, top: 0, bottom: 0, width: 300, background: "#fffdf5", borderLeft: "2px solid #2a2a2a", zIndex: 960, display: "flex", flexDirection: "column", fontFamily: "monospace", boxShadow: "-4px 0 0 rgba(42,42,42,0.18)", animation: "nbslide-in 0.18s ease" }}>
+            <div style={{ padding: "12px 14px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>Saved Videos</span>
+              <button onClick={() => setSavedVideosOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+              {savedVideosLoading && (
+                <div style={{ fontSize: 11, color: "#6a6a6a", textAlign: "center", paddingTop: 32 }}>Loading…</div>
+              )}
+              {savedVideosError && !savedVideosLoading && (
+                <div style={{ fontSize: 11, color: "#ff3a3a", textAlign: "center", paddingTop: 32 }}>
+                  {savedVideosError}
+                  <button onClick={fetchLibrary} style={{ ...miniButton, display: "block", margin: "10px auto 0", fontSize: 11, padding: "4px 12px" }}>Retry</button>
+                </div>
+              )}
+              {!savedVideosLoading && !savedVideosError && savedVideos.length === 0 && (
+                <div style={{ fontSize: 11, color: "#6a6a6a", textAlign: "center", paddingTop: 40, lineHeight: 1.7 }}>
+                  No saved videos yet.<br />Add a YouTube clip to start your library.
+                </div>
+              )}
+              {!savedVideosLoading && !savedVideosError && savedVideos.map((v) => (
+                <div
+                  key={v.id}
+                  onClick={() => openFromLibrary(v)}
+                  style={{ display: "flex", gap: 8, padding: "9px 0", borderBottom: "1px solid rgba(42,42,42,0.1)", cursor: "pointer", alignItems: "flex-start" }}
+                >
+                  <div style={{ flexShrink: 0, width: 72, height: 40, background: "#000", overflow: "hidden", border: "1px solid rgba(42,42,42,0.2)" }}>
+                    {v.thumbnail_url && <img src={v.thumbnail_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, lineHeight: 1.35, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } as React.CSSProperties}>
+                      {v.title || "(no title)"}
+                    </div>
+                    {v.duration_seconds > 0 && (
+                      <div style={{ fontSize: 9, color: "#6a6a6a", marginTop: 3 }}>{formatDuration(v.duration_seconds)}</div>
+                    )}
+                  </div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); deleteLibraryEntry(v.id); }}
+                    style={{ ...miniButton, flexShrink: 0, alignSelf: "center", padding: "2px 6px", fontSize: 14, lineHeight: 1 }}
+                    title="Remove from library"
+                  >×</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#fffdf5", padding: "7px 18px", fontSize: 11, fontFamily: "monospace", zIndex: 9999, boxShadow: "2px 2px 0 rgba(0,0,0,0.3)", animation: "nbtoast 0.2s ease", whiteSpace: "nowrap" }}>
+          {toast}
         </div>
       )}
     </main>
