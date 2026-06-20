@@ -58,9 +58,13 @@ lib/
   supabase.ts         — Supabase client + all DB helpers (users, events, costs, subscriptions)
 ```
 
+### Path alias
+
+`@/` resolves to the project root (configured in `tsconfig.json`). Use `@/lib/...`, `@/app/...` etc.
+
 ### Editor (`app/editor/page.tsx`)
 
-The entire editor is a single large client component. Key subsystems:
+The entire editor is a single large client component (~3150 lines). Key subsystems:
 
 - **Timeline**: canvas-like div layout; clips have `startTime`, `layer`, `durationSec`. Drag/resize uses pointer capture. Grid snap (`SNAP = 0.1s`) + magnetic snap to clip edges and playhead (`MAGNETIC_SNAP_PX = 10`).
 - **Clip types**: `audio | video | image | text`. Text clips render via canvas `drawTextClip`.
@@ -80,20 +84,22 @@ The entire editor is a single large client component. Key subsystems:
 3. Serper fetches Google Images for each beat in parallel
 4. Returns `{ transcript, duration, beats }` to the editor
 
+Sending `x-neuralboard-mode: compilation` header reduces beats to a max of 5 (for highlight-reel style output rather than full beat-per-2s density).
+
 The `/api/director` route uses GPT-4o to revise beats based on free-text director notes.
 The `/api/arrange` route uses Claude (`claude-sonnet-4-6`) to position beat cards as a "detective board" layout.
 
 ### Auth + access control
 
 - Google OAuth only. `ADMIN_EMAIL = "bbtvhq@gmail.com"` in `lib/auth.ts`.
-- Non-admin users get **1 free render**; after that they must subscribe ($10/mo via Stripe).
+- Non-admin users get **1 free render**: gating logic is `renderCount > 0 && !isSubscribed` → 403. The first render is free; all subsequent ones require a subscription.
 - Subscription status stored in `nb_users.subscription_status` + `subscription_period_end`.
 - Middleware at `middleware.ts` only handles `/builder` → `/editor` redirect.
 
 ### Database (Supabase)
 
-Three tables (schema in `supabase-schema.sql`):
-- `nb_users` — one row per email, tracks subscription, Stripe IDs, last_seen
+Three tables (see `lib/supabase.ts` for the authoritative column list — `supabase-schema.sql` is stale and missing the subscription/Stripe columns on `nb_users` and the entire `nb_api_costs` table):
+- `nb_users` — one row per email; tracks `subscription_status`, `subscription_period_end`, `stripe_customer_id`, `stripe_subscription_id`, `last_seen`
 - `nb_events` — event log: `login | transcribe | render | download`
 - `nb_api_costs` — per-call API cost tracking (Whisper, GPT-4o-mini, Serper, Claude)
 
