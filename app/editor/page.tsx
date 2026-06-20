@@ -1,9 +1,11 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import { useSession, signIn } from "next-auth/react";
 
-const PX_PER_SEC = 100;
+const DEFAULT_PX_PER_SEC = 100;
+const MIN_PX_PER_SEC = 10;
+const MAX_PX_PER_SEC = 500;
 const IMAGE_DEFAULT_DURATION = 3;
 const TEXT_DEFAULT_DURATION = 4;
 const TEXT_SOURCE_DURATION = 600;
@@ -13,7 +15,7 @@ const INITIAL_LAYER_COUNT = 5;
 const HANDLE_W = 6;
 const MIN_DURATION = 0.5;
 const SNAP = 0.1;
-const MAGNETIC_SNAP = 10 / PX_PER_SEC;
+const MAGNETIC_SNAP_PX = 10;
 const CURVE_H = 12;
 const MAX_EXPORT_DURATION = 90;
 const MIN_PLAYBACK_RATE = 0.25;
@@ -24,7 +26,7 @@ const LAYER_BG = [
   "rgba(228,238,255,0.40)",
 ];
 
-type ClipType = "audio" | "video" | "image" | "text";
+type ClipType = "audio" | "video" | "image" | "text" | "countdown";
 type ClipTransform = { x: number; y: number; scaleX: number; scaleY: number };
 type CurvePoint = { time: number; volume: number };
 
@@ -54,6 +56,9 @@ type Clip = {
   chromaSimilarity?: number;
   chromaSmoothness?: number;
   chromaAmount?: number;
+  countdownTitle?: string;
+  countdownItems?: Array<{ rank: number; label: string }>;
+  revealOffsets?: number[];
 };
 
 type EditorSnapshot = {
@@ -88,6 +93,7 @@ type DragInfo = {
 
 const DEFAULT_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
 const DEFAULT_TEXT_TRANSFORM: ClipTransform = { x: 20, y: 38, scaleX: 0.6, scaleY: 0.18 };
+const DEFAULT_COUNTDOWN_TRANSFORM: ClipTransform = { x: 0, y: 0, scaleX: 1, scaleY: 1 };
 const DEFAULT_CURVE: CurvePoint[] = [{ time: 0, volume: 100 }];
 const DEFAULT_TEXT = "Double click to edit";
 const DEFAULT_TEXT_FONT = "Arial";
@@ -97,6 +103,8 @@ const TEXT_FONTS = ["Arial", "Helvetica", "Georgia", "Times New Roman", "Courier
 const DEFAULT_CROP_ZOOM = 1;
 const DEFAULT_CROP_X = 0;
 const DEFAULT_CROP_Y = 0;
+const COUNTDOWN_DEFAULT_DURATION = 10;
+const COUNTDOWN_COLOR = "#cde7f5";
 const DEFAULT_CHROMA_SIMILARITY = 0.42;
 const DEFAULT_CHROMA_SMOOTHNESS = 0.08;
 const DEFAULT_CHROMA_AMOUNT = 0.55;
@@ -156,6 +164,14 @@ type CurveDragState = {
   svgHeight: number;
 } | null;
 
+type RevealDragState = {
+  clipId: string;
+  handleIdx: number;
+  origOffsets: number[];
+  clipStartPx: number;
+  clipDuration: number;
+} | null;
+
 const snapTo = (t: number) => Math.round(t / SNAP) * SNAP;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
@@ -181,7 +197,7 @@ function findFreeLayerOrNull(existing: Clip[], startTime: number, duration: numb
   return null;
 }
 
-function magneticSnap(value: number, candidates: number[], threshold = MAGNETIC_SNAP): { snapped: number; target: number | null } {
+function magneticSnap(value: number, candidates: number[], threshold: number): { snapped: number; target: number | null } {
   let bestSnapped = value;
   let bestDist = threshold;
   let bestTarget: number | null = null;
@@ -207,7 +223,7 @@ function layerBg(layer: number): string {
 }
 
 function isVisualClip(clip: Pick<Clip, "type">): boolean {
-  return clip.type === "video" || clip.type === "image" || clip.type === "text";
+  return clip.type === "video" || clip.type === "image" || clip.type === "text" || clip.type === "countdown";
 }
 
 function hasClipAudio(clip: Pick<Clip, "type">): boolean {
@@ -342,6 +358,7 @@ const CLIP_COLORS: Record<ClipType, string> = {
   video: "#a0d8ef",
   image: "#f5c6a0",
   text: "#f6f1a2",
+  countdown: COUNTDOWN_COLOR,
 };
 
 function parseDurationSec(dur: string | number | undefined): number {
@@ -548,6 +565,70 @@ function drawTextClip(
   ctx.restore();
 }
 
+function drawCountdownClip(
+  ctx: CanvasRenderingContext2D,
+  clip: Clip,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  canvasH: number,
+  clipElapsed: number,
+) {
+  const title = clip.countdownTitle ?? "Top 5";
+  const items = clip.countdownItems ?? [];
+  const offsets = clip.revealOffsets ?? [];
+  const n = items.length;
+  if (n === 0) return;
+
+  ctx.save();
+
+  const scale = canvasH / 720;
+  const titleFontSize = Math.max(14, 40 * scale);
+  const itemFontSize = Math.max(10, 28 * scale);
+  const lineH = itemFontSize * 1.9;
+
+  ctx.textBaseline = "middle";
+
+  // Title
+  ctx.font = `700 ${titleFontSize}px Arial, sans-serif`;
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.shadowColor = "rgba(0,0,0,0.85)";
+  ctx.shadowBlur = titleFontSize * 0.18;
+  ctx.shadowOffsetY = titleFontSize * 0.05;
+  const titleY = y + h * 0.06 + titleFontSize * 0.6;
+  ctx.fillText(title, x + w / 2, titleY, w * 0.9);
+
+  // Items — countdown order: rank N at top, rank 1 at bottom
+  for (let i = 0; i < n; i++) {
+    const rankNum = n - i;
+    const item = items.find((it) => it.rank === rankNum);
+    const offset = offsets[i] ?? 0;
+    const revealed = clipElapsed >= offset;
+
+    const itemY = titleY + titleFontSize * 0.8 + (i + 0.7) * lineH;
+    if (itemY + lineH / 2 > y + h * 0.98) break;
+
+    ctx.font = `700 ${itemFontSize}px Arial, sans-serif`;
+    ctx.shadowColor = "rgba(0,0,0,0.85)";
+    ctx.shadowBlur = itemFontSize * 0.12;
+    ctx.shadowOffsetY = 2 * scale;
+
+    ctx.textAlign = "right";
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    ctx.fillText(`${rankNum}.`, x + w * 0.15, itemY, w * 0.13);
+
+    if (revealed) {
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(item?.label ?? "", x + w * 0.18, itemY, w * 0.79);
+    }
+  }
+
+  ctx.restore();
+}
+
 export default function EditorPage() {
   const { data: session, status } = useSession();
   const [config, setConfig] = useState<{ railwayUrl: string; railwayPassword: string } | null>(null);
@@ -566,6 +647,7 @@ export default function EditorPage() {
   const [cropDraft, setCropDraft] = useState<CropDraft>(null);
   const [layerCount, setLayerCount] = useState(INITIAL_LAYER_COUNT);
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
+  const [pxPerSec, setPxPerSec] = useState(DEFAULT_PX_PER_SEC);
   const [outputFormat, setOutputFormat] = useState<'16:9' | '9:16'>('16:9');
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
@@ -585,6 +667,13 @@ export default function EditorPage() {
   const [ytLoading, setYtLoading] = useState(false);
   const [ytShortsOnly, setYtShortsOnly] = useState(true);
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
+
+  // Countdown modal
+  const [countdownModalOpen, setCountdownModalOpen] = useState(false);
+  const [countdownEditClipId, setCountdownEditClipId] = useState<string | null>(null);
+  const [countdownDraftTitle, setCountdownDraftTitle] = useState("Top 5");
+  const [countdownDraftCount, setCountdownDraftCount] = useState(5);
+  const [countdownDraftLabels, setCountdownDraftLabels] = useState<string[]>(Array(5).fill(""));
   const ytRangeRef = useRef({ start: 0, end: 30 });
 
   const playheadDraggingRef = useRef(false);
@@ -604,6 +693,9 @@ export default function EditorPage() {
   const cropDraftRef = useRef<CropDraft>(null);
   const cropDragRef = useRef<CropDragState>(null);
   const curveDragRef = useRef<CurveDragState>(null);
+  const revealDragRef = useRef<RevealDragState>(null);
+  const pxPerSecRef = useRef(DEFAULT_PX_PER_SEC);
+  const pendingScrollLeftRef = useRef<number | null>(null);
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
@@ -633,6 +725,15 @@ export default function EditorPage() {
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
   useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
+  useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
+
+  // Apply pending scroll after zoom re-render so cursor-anchored zoom works
+  useLayoutEffect(() => {
+    const el = scrollerRef.current;
+    if (!el || pendingScrollLeftRef.current === null) return;
+    el.scrollLeft = pendingScrollLeftRef.current;
+    pendingScrollLeftRef.current = null;
+  });
 
   useEffect(() => {
     if (!recording) return;
@@ -670,6 +771,26 @@ export default function EditorPage() {
       if (modifier && e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
         undoLastEdit();
+        return;
+      }
+      if (modifier && (e.key === "+" || e.key === "=")) {
+        e.preventDefault();
+        const next = clamp(pxPerSecRef.current * 1.25, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+        pxPerSecRef.current = next;
+        setPxPerSec(next);
+        return;
+      }
+      if (modifier && e.key === "-") {
+        e.preventDefault();
+        const next = clamp(pxPerSecRef.current / 1.25, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+        pxPerSecRef.current = next;
+        setPxPerSec(next);
+        return;
+      }
+      if (modifier && e.key === "0") {
+        e.preventDefault();
+        pxPerSecRef.current = DEFAULT_PX_PER_SEC;
+        setPxPerSec(DEFAULT_PX_PER_SEC);
         return;
       }
       if (e.key === "Enter" && cropDraftRef.current) {
@@ -712,10 +833,31 @@ export default function EditorPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    function onWheel(e: WheelEvent) {
+      if (!e.metaKey && !e.ctrlKey) return;
+      e.preventDefault();
+      const rect = el!.getBoundingClientRect();
+      const cursorX = e.clientX - rect.left + el!.scrollLeft;
+      const cursorTimeSec = cursorX / pxPerSecRef.current;
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const newPxPerSec = clamp(pxPerSecRef.current * factor, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+      const newScrollLeft = cursorTimeSec * newPxPerSec - (e.clientX - rect.left);
+      pendingScrollLeftRef.current = Math.max(0, newScrollLeft);
+      pxPerSecRef.current = newPxPerSec;
+      setPxPerSec(newPxPerSec);
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const totalDuration = clips.length > 0
     ? Math.max(...clips.map((c) => c.startTime + c.durationSec))
     : 10;
-  const timelineW = totalDuration * PX_PER_SEC + 200;
+  const timelineW = totalDuration * pxPerSec + 200;
   const isDraggingClip = ghost !== null;
 
   function ensureLayerCount(nextLayer: number) {
@@ -734,6 +876,8 @@ export default function EditorPage() {
       transform: { ...clip.transform },
       volumeCurve: clip.volumeCurve.map((pt) => ({ ...pt })),
       waveform: clip.waveform ? [...clip.waveform] : undefined,
+      countdownItems: clip.countdownItems ? clip.countdownItems.map((it) => ({ ...it })) : undefined,
+      revealOffsets: clip.revealOffsets ? [...clip.revealOffsets] : undefined,
     };
   }
 
@@ -854,6 +998,142 @@ export default function EditorPage() {
       return [...prev, clip];
     });
     setSelectedClipId(clipId);
+  }
+
+  function openCountdownCreateModal() {
+    setCountdownDraftTitle("Top 5");
+    setCountdownDraftCount(5);
+    setCountdownDraftLabels(Array(5).fill(""));
+    setCountdownEditClipId(null);
+    setCountdownModalOpen(true);
+  }
+
+  function openCountdownEditModal(clip: Clip) {
+    const n = clip.countdownItems?.length ?? 5;
+    const labels = Array.from({ length: n }, (_, i) => {
+      const item = clip.countdownItems?.find((it) => it.rank === i + 1);
+      return item?.label ?? "";
+    });
+    setCountdownDraftTitle(clip.countdownTitle ?? "Top 5");
+    setCountdownDraftCount(n);
+    setCountdownDraftLabels(labels);
+    setCountdownEditClipId(clip.id);
+    setCountdownModalOpen(true);
+  }
+
+  function confirmCountdownModal() {
+    const title = countdownDraftTitle.trim();
+    if (!title) return;
+    const n = countdownDraftCount;
+    const items: Array<{ rank: number; label: string }> = Array.from({ length: n }, (_, i) => ({
+      rank: i + 1,
+      label: countdownDraftLabels[i] ?? "",
+    }));
+    // revealOffsets: evenly spaced, rank N first (index 0), rank 1 last (index n-1)
+    const dur = COUNTDOWN_DEFAULT_DURATION;
+    const defaultOffsets = Array.from({ length: n }, (_, i) => parseFloat(((i + 1) * (dur / n)).toFixed(1)));
+
+    if (countdownEditClipId) {
+      // Edit existing
+      pushUndoSnapshot();
+      setClips((prev) => prev.map((c) => {
+        if (c.id !== countdownEditClipId) return c;
+        const existingOffsets = c.revealOffsets;
+        // Keep existing offsets if count matches, otherwise generate defaults scaled to current duration
+        let newOffsets: number[];
+        if (existingOffsets && existingOffsets.length === n) {
+          newOffsets = existingOffsets;
+        } else {
+          const d = c.durationSec;
+          newOffsets = Array.from({ length: n }, (_, i) => parseFloat(((i + 1) * (d / n)).toFixed(1)));
+        }
+        return { ...c, countdownTitle: title, countdownItems: items, revealOffsets: newOffsets };
+      }));
+    } else {
+      // Create new
+      const clipId = crypto.randomUUID();
+      pushUndoSnapshot();
+      setClips((prev) => {
+        const startTime = playheadSecRef.current;
+        const layer = findFreeLayer(prev, startTime, COUNTDOWN_DEFAULT_DURATION, layerCountRef.current);
+        ensureLayerCount(layer);
+        const clip: Clip = {
+          id: clipId,
+          type: "countdown",
+          name: title,
+          blobUrl: "",
+          sourceDuration: TEXT_SOURCE_DURATION,
+          durationSec: COUNTDOWN_DEFAULT_DURATION,
+          startTime,
+          layer,
+          trimStart: 0,
+          playbackRate: 1,
+          transform: DEFAULT_COUNTDOWN_TRANSFORM,
+          muted: false,
+          volumeCurve: [...DEFAULT_CURVE],
+          countdownTitle: title,
+          countdownItems: items,
+          revealOffsets: defaultOffsets,
+        };
+        return [...prev, clip];
+      });
+      setSelectedClipId(clipId);
+    }
+    setCountdownModalOpen(false);
+  }
+
+  function onRevealHandlePointerDown(e: React.PointerEvent<HTMLDivElement>, clip: Clip, handleIdx: number) {
+    e.stopPropagation();
+    setSelectedClipId(clip.id);
+    selectedClipIdRef.current = clip.id;
+    pushUndoSnapshot();
+    revealDragRef.current = {
+      clipId: clip.id,
+      handleIdx,
+      origOffsets: [...(clip.revealOffsets ?? [])],
+      clipStartPx: clip.startTime * pxPerSecRef.current,
+      clipDuration: clip.durationSec,
+    };
+    scrollerRef.current?.setPointerCapture(e.pointerId);
+  }
+
+  function updateRevealDrag(clientX: number) {
+    const drag = revealDragRef.current;
+    if (!drag) return;
+    const scroller = scrollerRef.current!;
+    const rect = scroller.getBoundingClientRect();
+    const xInTimeline = clientX - rect.left + scroller.scrollLeft;
+    const xInClip = xInTimeline - drag.clipStartPx;
+    const rawOffset = clamp(xInClip / pxPerSecRef.current, 0, drag.clipDuration);
+    const snapped = snapTo(rawOffset);
+
+    const offsets = [...drag.origOffsets];
+    offsets[drag.handleIdx] = snapped;
+
+    const i = drag.handleIdx;
+    if (i > 0 && offsets[i] < offsets[i - 1]) offsets[i] = offsets[i - 1]!;
+    if (i < offsets.length - 1 && offsets[i] > offsets[i + 1]) offsets[i] = offsets[i + 1]!;
+
+    setClips((prev) => prev.map((c) => c.id === drag.clipId ? { ...c, revealOffsets: offsets } : c));
+  }
+
+  function commitRevealDrag() {
+    revealDragRef.current = null;
+  }
+
+  function fitToTimeline() {
+    if (clips.length === 0) {
+      pxPerSecRef.current = DEFAULT_PX_PER_SEC;
+      setPxPerSec(DEFAULT_PX_PER_SEC);
+      return;
+    }
+    const total = Math.max(...clips.map((c) => c.startTime + c.durationSec));
+    if (total <= 0) return;
+    const containerW = scrollerRef.current?.offsetWidth ?? 800;
+    const next = clamp((containerW - 80) / total, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+    pxPerSecRef.current = next;
+    setPxPerSec(next);
+    pendingScrollLeftRef.current = 0;
   }
 
   // ─── Audio ──────────────────────────────────────────────────────────────────
@@ -1049,7 +1329,7 @@ export default function EditorPage() {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const x = clientX - rect.left + el.scrollLeft;
-    seekTo(x / PX_PER_SEC);
+    seekTo(x / pxPerSecRef.current);
   }
 
   // ─── Timeline pointer handlers ──────────────────────────────────────────────
@@ -1064,11 +1344,13 @@ export default function EditorPage() {
 
   function onScrollerPointerMove(e: React.PointerEvent<HTMLDivElement>) {
     if (dragRef.current) { updateClipDrag(e.clientX, e.clientY); return; }
+    if (revealDragRef.current) { updateRevealDrag(e.clientX); return; }
     if (playheadDraggingRef.current) seekFromClientX(e.clientX);
   }
 
   function onScrollerPointerUp() {
     if (dragRef.current) { commitClipDrag(); return; }
+    if (revealDragRef.current) { commitRevealDrag(); return; }
     playheadDraggingRef.current = false;
   }
 
@@ -1101,7 +1383,8 @@ export default function EditorPage() {
     const scroller = scrollerRef.current!;
     const rect = scroller.getBoundingClientRect();
     const dx = clientX - drag.startMouseX;
-    const dtSec = dx / PX_PER_SEC;
+    const dtSec = dx / pxPerSecRef.current;
+    const snapThreshold = MAGNETIC_SNAP_PX / pxPerSecRef.current;
     const yInLayers = clientY - rect.top + scroller.scrollTop - RULER_H;
     const hoverLayer = Math.min(layerCountRef.current, Math.max(1, Math.floor(yInLayers / LAYER_H) + 1));
     let newStart = drag.validStartTime;
@@ -1115,36 +1398,38 @@ export default function EditorPage() {
     let activeSnapTarget: number | null = null;
 
     if (drag.kind === "move") {
-      const rawStart = Math.max(0, drag.origStartTime + dtSec);
+      // Grid-snap the raw position first — this creates dead-zones (±5px per grid cell)
+      // that stabilise the clip so snap doesn't disengage with every pixel of cursor movement.
+      const baseStart = Math.max(0, snapTo(drag.origStartTime + dtSec));
       newLayer = hoverLayer;
       newDur = drag.origDuration;
 
-      // Try LEFT edge first; fall back to RIGHT edge; fall back to grid snap
-      const { snapped: snappedLeft, target: leftTarget } = magneticSnap(rawStart, snapCandidates);
+      // Try LEFT edge first; fall back to RIGHT edge; fall back to grid-snapped base
+      const { snapped: snappedLeft, target: leftTarget } = magneticSnap(baseStart, snapCandidates, snapThreshold);
       if (leftTarget !== null) {
         newStart = Math.max(0, snappedLeft);
         activeSnapTarget = leftTarget;
       } else {
-        const { snapped: snappedRight, target: rightTarget } = magneticSnap(rawStart + newDur, snapCandidates);
+        const { snapped: snappedRight, target: rightTarget } = magneticSnap(baseStart + newDur, snapCandidates, snapThreshold);
         if (rightTarget !== null) {
           newStart = Math.max(0, snappedRight - newDur);
           activeSnapTarget = rightTarget;
         } else {
-          newStart = Math.max(0, snapTo(rawStart));
+          newStart = baseStart;
           activeSnapTarget = null;
         }
       }
     } else if (drag.kind === "resize-left") {
       const minStart = Math.max(0, drag.origStartTime - drag.origTrimStart / rate);
       const maxStart = drag.origStartTime + drag.origDuration - MIN_DURATION;
-      const rawStart = clamp(drag.origStartTime + dtSec, minStart, maxStart);
+      const baseStart = snapTo(clamp(drag.origStartTime + dtSec, minStart, maxStart));
 
-      const { snapped, target } = magneticSnap(rawStart, snapCandidates);
+      const { snapped, target } = magneticSnap(baseStart, snapCandidates, snapThreshold);
       if (target !== null) {
         newStart = clamp(snapped, minStart, maxStart);
         activeSnapTarget = target;
       } else {
-        newStart = snapTo(clamp(rawStart, minStart, maxStart));
+        newStart = clamp(baseStart, minStart, maxStart);
         activeSnapTarget = null;
       }
 
@@ -1154,18 +1439,18 @@ export default function EditorPage() {
       newLayer = drag.origLayer;
     } else {
       const maxTimelineDur = Math.max(MIN_DURATION, (src.sourceDuration - drag.origTrimStart) / rate);
-      const rawDur = clamp(drag.origDuration + dtSec, MIN_DURATION, maxTimelineDur);
-      const rawEnd = drag.origStartTime + rawDur;
+      const baseDur = clamp(snapTo(drag.origDuration + dtSec), MIN_DURATION, maxTimelineDur);
+      const baseEnd = drag.origStartTime + baseDur;
       newStart = drag.origStartTime;
       newLayer = drag.origLayer;
 
-      const { snapped: snappedEnd, target } = magneticSnap(rawEnd, snapCandidates);
+      const { snapped: snappedEnd, target } = magneticSnap(baseEnd, snapCandidates, snapThreshold);
       const snappedDur = snappedEnd - drag.origStartTime;
       if (target !== null && snappedDur >= MIN_DURATION) {
         newDur = clamp(snappedDur, MIN_DURATION, maxTimelineDur);
         activeSnapTarget = target;
       } else {
-        newDur = clamp(snapTo(rawDur), MIN_DURATION, maxTimelineDur);
+        newDur = baseDur;
         activeSnapTarget = null;
       }
     }
@@ -1811,6 +2096,11 @@ export default function EditorPage() {
           continue;
         }
 
+        if (clip.type === "countdown") {
+          drawCountdownClip(ctx2d, clip, x, y, w, h, canvasH, elapsed - clip.startTime);
+          continue;
+        }
+
         let el: HTMLVideoElement | HTMLImageElement | null = null;
         if (clip.type === "video") el = exportVideoEls.get(clip.id) ?? null;
         else if (clip.type === "image") el = exportImageEls.get(clip.id) ?? null;
@@ -1855,7 +2145,7 @@ export default function EditorPage() {
     );
   }
 
-  const playheadX = playheadSec * PX_PER_SEC;
+  const playheadX = playheadSec * pxPerSec;
   const isShortFormat = outputFormat === '9:16';
   const renderPreviewPanel = (placement: "top" | "side") => {
     const side = placement === "side";
@@ -1948,7 +2238,37 @@ export default function EditorPage() {
                     >
                       {clip.text || DEFAULT_TEXT}
                     </div>
-                  ) : (
+                  ) : clip.type === "countdown" ? (() => {
+                    const cdItems = clip.countdownItems ?? [];
+                    const cdOffsets = clip.revealOffsets ?? [];
+                    const cdN = cdItems.length;
+                    const cdElapsed = playheadSec - clip.startTime;
+                    const fontSize = Math.max(10, 20 - cdN);
+                    const rankFontSize = Math.max(9, 17 - cdN);
+                    return (
+                      <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none", display: "flex", flexDirection: "column", alignItems: "center", padding: "6% 8% 0", boxSizing: "border-box" }}>
+                        <div style={{ fontSize, fontWeight: 700, fontFamily: "Arial, sans-serif", color: "#ffffff", textShadow: "0 2px 8px rgba(0,0,0,0.85)", marginBottom: "4%", textAlign: "center", lineHeight: 1.2 }}>
+                          {clip.countdownTitle ?? "Top 5"}
+                        </div>
+                        {Array.from({ length: cdN }, (_, i) => {
+                          const rankNum = cdN - i;
+                          const item = cdItems.find((it) => it.rank === rankNum);
+                          const offset = cdOffsets[i] ?? 0;
+                          const revealed = cdElapsed >= offset;
+                          return (
+                            <div key={i} style={{ display: "flex", alignItems: "baseline", width: "100%", marginBottom: "2%", gap: "4%" }}>
+                              <span style={{ fontSize: rankFontSize, fontWeight: 700, fontFamily: "Arial, sans-serif", color: "rgba(255,255,255,0.65)", textShadow: "0 1px 4px rgba(0,0,0,0.8)", flexShrink: 0, minWidth: "14%", textAlign: "right" }}>
+                                {rankNum}.
+                              </span>
+                              <span style={{ fontSize: rankFontSize, fontWeight: 700, fontFamily: "Arial, sans-serif", color: "#ffffff", textShadow: "0 1px 6px rgba(0,0,0,0.85)", opacity: revealed ? 1 : 0, transition: "opacity 0.2s ease", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {item?.label ?? ""}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })() : (
                     <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none" }}>
                       {clip.type === "image" ? (
                         <img src={clip.blobUrl} alt="" style={cropActive ? { width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" } : cropMediaStyle(clip)} />
@@ -2070,6 +2390,7 @@ export default function EditorPage() {
           <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
           <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
           <button onClick={addTextClip} style={sketchButton}>T Add text</button>
+          <button onClick={openCountdownCreateModal} style={{ ...sketchButton, background: COUNTDOWN_COLOR }}>↓ Top List</button>
           {config?.railwayUrl && (
             <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }}
@@ -2121,6 +2442,14 @@ export default function EditorPage() {
           title="Add a new timeline layer"
         >
           + Layer
+        </button>
+        <button
+          onClick={fitToTimeline}
+          disabled={isExporting}
+          style={{ ...sketchButton, height: 36, padding: "0 12px", display: "flex", alignItems: "center", gap: 5, fontSize: 12, opacity: isExporting ? 0.4 : 1 }}
+          title="Fit timeline to window (Cmd/Ctrl+0 resets to 100px/s)"
+        >
+          Fit
         </button>
         {(() => {
           const selClip = selectedClipId ? clips.find((c) => c.id === selectedClipId) : null;
@@ -2348,15 +2677,21 @@ export default function EditorPage() {
 
           {/* Ruler */}
           <div style={{ position: "relative", height: RULER_H, borderBottom: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.9)" }}>
-            {Array.from({ length: Math.ceil(totalDuration) + 1 }, (_, i) => {
-              const showLabel = i % 5 === 0;
-              return (
-                <div key={i} style={{ position: "absolute", left: i * PX_PER_SEC, top: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
-                  <div style={{ width: 1, background: "#2a2a2a", height: showLabel ? 14 : 7, marginTop: showLabel ? 4 : 12 }} />
-                  {showLabel && <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", marginLeft: 3, lineHeight: 1 }}>{i}s</span>}
-                </div>
-              );
-            })}
+            {(() => {
+              const tickSec = pxPerSec > 200 ? 0.5 : pxPerSec >= 100 ? 1 : pxPerSec >= 30 ? 5 : 10;
+              const labelSec = pxPerSec > 200 ? 1 : pxPerSec >= 100 ? 5 : pxPerSec >= 30 ? 10 : 30;
+              const tickCount = Math.min(Math.ceil(totalDuration / tickSec) + 1, 2000);
+              return Array.from({ length: tickCount }, (_, i) => {
+                const timeSec = i * tickSec;
+                const showLabel = Math.abs(timeSec % labelSec) < 0.001;
+                return (
+                  <div key={i} style={{ position: "absolute", left: timeSec * pxPerSec, top: 0, height: "100%", display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
+                    <div style={{ width: 1, background: "#2a2a2a", height: showLabel ? 14 : 7, marginTop: showLabel ? 4 : 12 }} />
+                    {showLabel && <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", marginLeft: 3, lineHeight: 1 }}>{timeSec}s</span>}
+                  </div>
+                );
+              });
+            })()}
           </div>
 
           {/* Layers */}
@@ -2382,7 +2717,7 @@ export default function EditorPage() {
                 </button>
                 {layerClips.map((clip) => {
                   const isBeingDragged = ghost?.clipId === clip.id;
-                  const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * PX_PER_SEC - 2);
+                  const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * pxPerSec - 2);
                   const showHandles = clipPx >= HANDLE_W * 3;
                   const sortedCurve = clip.volumeCurve.slice().sort((a, b) => a.time - b.time);
                   const waveformBarCount = clip.type === "audio" && clip.waveform?.length
@@ -2399,7 +2734,8 @@ export default function EditorPage() {
                     <div
                       key={clip.id}
                       onPointerDown={(e) => onClipPointerDown(e, clip)}
-                      style={{ position: "absolute", left: clip.startTime * PX_PER_SEC, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
+                      onDoubleClick={clip.type === "countdown" ? (e) => { e.stopPropagation(); openCountdownEditModal(clip); } : undefined}
+                      style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
                     >
                       {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
                       {waveformBarCount > 0 && (
@@ -2434,6 +2770,19 @@ export default function EditorPage() {
                         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#555", whiteSpace: "nowrap" }}>{formatDuration(clip.durationSec)}</div>
                       </div>
                       {showHandles && <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
+                      {/* Reveal offset handles — countdown clips only */}
+                      {clip.type === "countdown" && (clip.revealOffsets ?? []).map((offset, hi) => {
+                        const handlePx = clipPx > 0 ? clamp((offset / clip.durationSec) * clipPx, 0, clipPx) : 0;
+                        return (
+                          <div
+                            key={hi}
+                            onPointerDown={(e) => onRevealHandlePointerDown(e, clip, hi)}
+                            style={{ position: "absolute", left: handlePx - 3, top: 0, bottom: 0, width: 6, zIndex: 5, cursor: "ew-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                          >
+                            <div style={{ width: 2, height: "70%", background: "rgba(42,42,42,0.65)", borderRadius: 1, pointerEvents: "none" }} />
+                          </div>
+                        );
+                      })}
                       {/* Volume curve SVG — audio and video clips only */}
                       {hasClipAudio(clip) && (
                         <svg
@@ -2540,10 +2889,10 @@ export default function EditorPage() {
                   );
                 })}
                 {layerGhost && (
-                  <div style={{ position: "absolute", left: layerGhost.startTime * PX_PER_SEC, top: 5, width: Math.max(4, layerGhost.durationSec * PX_PER_SEC - 2), height: LAYER_H - 10, background: CLIP_COLORS[layerGhost.type], opacity: 0.6, border: "2px dashed #2a2a2a", boxShadow: "3px 3px 10px rgba(42,42,42,0.22)", pointerEvents: "none", zIndex: 6, transform: "scale(1.03)", transformOrigin: "center center" }} />
+                  <div style={{ position: "absolute", left: layerGhost.startTime * pxPerSec, top: 5, width: Math.max(4, layerGhost.durationSec * pxPerSec - 2), height: LAYER_H - 10, background: CLIP_COLORS[layerGhost.type], opacity: 0.6, border: "2px dashed #2a2a2a", boxShadow: "3px 3px 10px rgba(42,42,42,0.22)", pointerEvents: "none", zIndex: 6, transform: "scale(1.03)", transformOrigin: "center center" }} />
                 )}
                 {recGrowingBar?.layer === layerNum && (
-                  <div style={{ position: "absolute", left: recGrowingBar.startSec * PX_PER_SEC, top: 7, width: Math.max(2, recGrowingBar.elapsedSec * PX_PER_SEC), height: LAYER_H - 14, background: "rgba(255,94,58,0.22)", border: "2px solid #ff5e3a", pointerEvents: "none", zIndex: 5, display: "flex", alignItems: "center", paddingLeft: 5, overflow: "hidden" }}>
+                  <div style={{ position: "absolute", left: recGrowingBar.startSec * pxPerSec, top: 7, width: Math.max(2, recGrowingBar.elapsedSec * pxPerSec), height: LAYER_H - 14, background: "rgba(255,94,58,0.22)", border: "2px solid #ff5e3a", pointerEvents: "none", zIndex: 5, display: "flex", alignItems: "center", paddingLeft: 5, overflow: "hidden" }}>
                     <span style={{ fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", fontWeight: 700, whiteSpace: "nowrap" }}>REC</span>
                   </div>
                 )}
@@ -2559,7 +2908,7 @@ export default function EditorPage() {
 
           {/* Magnetic snap guide */}
           {snapGuideSec !== null && (
-            <div style={{ position: "absolute", left: snapGuideSec * PX_PER_SEC, top: 0, bottom: 0, width: 1, background: "rgba(80,200,255,0.9)", zIndex: 9, pointerEvents: "none", boxShadow: "0 0 4px rgba(80,200,255,0.6)" }} />
+            <div style={{ position: "absolute", left: snapGuideSec * pxPerSec, top: 0, bottom: 0, width: 1, background: "rgba(80,200,255,0.9)", zIndex: 9, pointerEvents: "none", boxShadow: "0 0 4px rgba(80,200,255,0.6)" }} />
           )}
 
           {/* Playhead */}
@@ -2591,6 +2940,89 @@ export default function EditorPage() {
           </aside>
         )}
       </div>
+
+      {/* Countdown Modal */}
+      {countdownModalOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setCountdownModalOpen(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 460, maxWidth: "95vw", maxHeight: "90vh", display: "flex", flexDirection: "column", fontFamily: "monospace", overflow: "hidden" }}>
+            <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>
+                {countdownEditClipId ? "✏ EDIT COUNTDOWN LIST" : "↓ NEW COUNTDOWN LIST"}
+              </span>
+              <button onClick={() => setCountdownModalOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "14px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* Title */}
+              <div>
+                <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 4 }}>Title</div>
+                <input
+                  autoFocus
+                  type="text"
+                  value={countdownDraftTitle}
+                  onChange={(e) => setCountdownDraftTitle(e.target.value)}
+                  placeholder="Top 5"
+                  style={{ width: "100%", fontFamily: "monospace", fontSize: 13, padding: "7px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a", boxSizing: "border-box" }}
+                />
+              </div>
+              {/* Count */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ fontSize: 10, color: "#6a6a6a" }}>Number of items</div>
+                <input
+                  type="number"
+                  min={2}
+                  max={10}
+                  value={countdownDraftCount}
+                  onChange={(e) => {
+                    const n = clamp(Math.round(Number(e.target.value)), 2, 10);
+                    setCountdownDraftCount(n);
+                    setCountdownDraftLabels((prev) => {
+                      const next = [...prev];
+                      while (next.length < n) next.push("");
+                      return next.slice(0, n);
+                    });
+                  }}
+                  style={{ width: 60, fontFamily: "monospace", fontSize: 13, padding: "5px 8px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none" }}
+                />
+              </div>
+              {/* Items — listed rank 1 at top for easy entry */}
+              <div>
+                <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 6 }}>Items (rank 1 = revealed last / #1 pick)</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {Array.from({ length: countdownDraftCount }, (_, i) => (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: "#2a2a2a", minWidth: 24, textAlign: "right" }}>{i + 1}.</span>
+                      <input
+                        type="text"
+                        value={countdownDraftLabels[i] ?? ""}
+                        onChange={(e) => setCountdownDraftLabels((prev) => {
+                          const next = [...prev];
+                          next[i] = e.target.value;
+                          return next;
+                        })}
+                        placeholder={`Item ${i + 1}`}
+                        style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "5px 8px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none" }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => setCountdownModalOpen(false)} style={{ ...miniButton, padding: "7px 16px", fontSize: 12 }}>Cancel</button>
+              <button
+                onClick={confirmCountdownModal}
+                disabled={!countdownDraftTitle.trim()}
+                style={{ ...sketchButton, padding: "7px 20px", fontSize: 12, background: COUNTDOWN_COLOR, opacity: countdownDraftTitle.trim() ? 1 : 0.4 }}
+              >
+                {countdownEditClipId ? "Save" : "Add to timeline"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* YouTube Modal */}
       {ytModalOpen && (
