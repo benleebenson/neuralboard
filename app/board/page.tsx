@@ -50,6 +50,7 @@ type BoardClip = Clip & {
   boardY: number;
   boardW: number;
   boardH: number;
+  cameraZoomTarget: number;
 };
 
 type BoardSnapshot = {
@@ -101,6 +102,56 @@ type LibraryVideo = {
   duration_seconds: number;
   created_at: string;
 };
+
+// ─── Camera keyframe helpers ──────────────────────────────────────────────────
+
+type CameraStop = { time: number; targetX: number; targetY: number; targetZoom: number; name: string };
+
+function easeInOut(t: number): number { return t * t * (3 - 2 * t); }
+
+function defaultCameraZoom(clipW: number, clipH: number): number {
+  return clamp(Math.min((VIEWPORT_W * 0.7) / clipW, (VIEWPORT_H * 0.7) / clipH), 0.5, 5.0);
+}
+
+function buildCameraStops(clips: BoardClip[]): CameraStop[] {
+  return clips
+    .filter(isVisualClip)
+    .sort((a, b) => a.startTime - b.startTime)
+    .map((c) => ({
+      time: c.startTime,
+      targetX: c.boardX + c.boardW / 2,
+      targetY: c.boardY + c.boardH / 2,
+      targetZoom: c.cameraZoomTarget,
+      name: c.name,
+    }));
+}
+
+function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y: number; zoom: number; label: string } | null {
+  const stops = buildCameraStops(clips);
+  if (stops.length === 0) return null;
+  if (atSec <= stops[0].time) {
+    const s = stops[0];
+    return { x: s.targetX, y: s.targetY, zoom: s.targetZoom, label: `Stop 1/${stops.length}: ${s.name}` };
+  }
+  const last = stops[stops.length - 1];
+  if (atSec >= last.time) {
+    return { x: last.targetX, y: last.targetY, zoom: last.targetZoom, label: `Stop ${stops.length}/${stops.length}: ${last.name}` };
+  }
+  let prevIdx = 0;
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (atSec >= stops[i].time && atSec < stops[i + 1].time) { prevIdx = i; break; }
+  }
+  const prev = stops[prevIdx];
+  const next = stops[prevIdx + 1];
+  const span = next.time - prev.time;
+  const t = easeInOut(span > 0 ? clamp((atSec - prev.time) / span, 0, 1) : 1);
+  return {
+    x: prev.targetX + (next.targetX - prev.targetX) * t,
+    y: prev.targetY + (next.targetY - prev.targetY) * t,
+    zoom: prev.targetZoom + (next.targetZoom - prev.targetZoom) * t,
+    label: `Traveling → ${next.name}`,
+  };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -246,6 +297,7 @@ export default function BoardPage() {
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [boardDraggingClipId, setBoardDraggingClipId] = useState<string | null>(null);
   const [isPanning, setIsPanning] = useState(false);
+  const [cameraStatusLabel, setCameraStatusLabel] = useState("");
 
   // Playback
   const isPlayingRef = useRef(false);
@@ -696,6 +748,7 @@ export default function BoardPage() {
       setPlayheadSec(newHead);
       playheadSecRef.current = newHead;
       tickAudio(newHead, clips2);
+      applyKeyframeCameraAt(newHead, clips2);
       rafRef.current = requestAnimationFrame(tick);
     }
     rafRef.current = requestAnimationFrame(tick);
@@ -712,6 +765,7 @@ export default function BoardPage() {
     pausePlayback();
     setPlayheadSec(0);
     playheadSecRef.current = 0;
+    applyKeyframeCameraAt(0, clipsRef.current);
   }
 
   function seekTo(newSec: number) {
@@ -724,6 +778,7 @@ export default function BoardPage() {
       playStartHeadRef.current = clamped;
       startAudioAt(clamped, clipsRef.current);
     }
+    applyKeyframeCameraAt(clamped, clipsRef.current);
   }
 
   function seekFromClientX(clientX: number) {
@@ -826,6 +881,31 @@ export default function BoardPage() {
     const cy = (minY + maxY) / 2;
     cameraXRef.current = cx; cameraYRef.current = cy; boardZoomRef.current = zoom;
     setCameraX(cx); setCameraY(cy); setBoardZoom(zoom);
+  }
+
+  function applyKeyframeCameraAt(atSec: number, currentClips: BoardClip[]) {
+    const cam = computeCameraAtTime(atSec, currentClips);
+    if (!cam) return;
+    cameraXRef.current = cam.x;
+    cameraYRef.current = cam.y;
+    boardZoomRef.current = cam.zoom;
+    setCameraX(cam.x);
+    setCameraY(cam.y);
+    setBoardZoom(cam.zoom);
+    setCameraStatusLabel(cam.label);
+  }
+
+  function resetCamera() {
+    const stops = buildCameraStops(clipsRef.current);
+    if (stops.length === 0) return;
+    const first = stops[0];
+    cameraXRef.current = first.targetX;
+    cameraYRef.current = first.targetY;
+    boardZoomRef.current = first.targetZoom;
+    setCameraX(first.targetX);
+    setCameraY(first.targetY);
+    setBoardZoom(first.targetZoom);
+    setCameraStatusLabel(`Stop 1/${stops.length}: ${first.name}`);
   }
 
   // ─── Timeline drag ──────────────────────────────────────────────────────────
@@ -1012,6 +1092,7 @@ export default function BoardPage() {
             transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
             volumeCurve: [...DEFAULT_CURVE], waveform,
             boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
+            cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
           }];
         });
       };
@@ -1068,6 +1149,7 @@ export default function BoardPage() {
           transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
           volumeCurve: [...DEFAULT_CURVE], waveform: item.waveform,
           boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
+          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
         });
       }
       return [...prev, ...newClips];
@@ -1130,6 +1212,7 @@ export default function BoardPage() {
           transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
           volumeCurve: [...DEFAULT_CURVE],
           boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
+          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
         }];
       });
       setYtModalOpen(false);
@@ -1201,10 +1284,6 @@ export default function BoardPage() {
     setExportDurationSec(totalDur);
     const canvasW = 1600;
     const canvasH = 1200;
-    const scaleX = canvasW / VIEWPORT_W;
-    const scaleY = canvasH / VIEWPORT_H;
-    const camLeft = cameraXRef.current - VIEWPORT_W / 2;
-    const camTop = cameraYRef.current - VIEWPORT_H / 2;
 
     const canvas = document.createElement("canvas");
     canvas.width = canvasW;
@@ -1299,7 +1378,16 @@ export default function BoardPage() {
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
-      // Draw board frame to export canvas
+      // Draw board frame to export canvas — camera driven by keyframes
+      const exportCam = computeCameraAtTime(elapsed, currentClips);
+      const exportZoom = exportCam ? exportCam.zoom : 1;
+      const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
+      const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
+      const scaleX = (canvasW / VIEWPORT_W) * exportZoom;
+      const scaleY = (canvasH / VIEWPORT_H) * exportZoom;
+      const camLeft = exportCamX - VIEWPORT_W / (2 * exportZoom);
+      const camTop = exportCamY - VIEWPORT_H / (2 * exportZoom);
+
       ctx2d.fillStyle = BOARD_BG;
       ctx2d.fillRect(0, 0, canvasW, canvasH);
 
@@ -1411,17 +1499,22 @@ export default function BoardPage() {
 
             {/* Board preview */}
             <div style={{ flex: 1, padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase" }}>
-                  Board Preview · {Math.round(cameraX)},{Math.round(cameraY)} · zoom {boardZoom.toFixed(2)}×
-                  <span style={{ color: "#bbb", marginLeft: 8 }}>[space+drag] pan</span>
+                  Board Preview · {Math.round(cameraX)},{Math.round(cameraY)} · {boardZoom.toFixed(2)}×
                 </div>
-                <button
-                  onClick={frameAll}
-                  style={{ ...sketchButton, padding: "3px 10px", fontSize: 10, height: 24, marginLeft: "auto", flexShrink: 0 }}
-                >
-                  ⊞ Frame All
-                </button>
+                <span style={{ fontSize: 9, fontFamily: "monospace", padding: "1px 6px", background: isPlaying ? "rgba(200,241,53,0.25)" : "rgba(42,42,42,0.08)", border: `1px solid ${isPlaying ? "#c8f135" : "rgba(42,42,42,0.2)"}`, color: isPlaying ? "#5a7a00" : "#999" }}>
+                  {isPlaying ? "Auto (keyframes)" : "Manual"}
+                </span>
+                {cameraStatusLabel && (
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {cameraStatusLabel}
+                  </span>
+                )}
+                <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button onClick={resetCamera} style={{ ...sketchButton, padding: "3px 10px", fontSize: 10, height: 24 }}>↩ Reset</button>
+                  <button onClick={frameAll} style={{ ...sketchButton, padding: "3px 10px", fontSize: 10, height: 24 }}>⊞ Frame All</button>
+                </div>
               </div>
               <div
                 ref={boardContainerRef}
