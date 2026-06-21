@@ -51,6 +51,7 @@ type BoardClip = Clip & {
   boardW: number;
   boardH: number;
   cameraZoomTarget: number;
+  holdFraction: number;
 };
 
 type BoardSnapshot = {
@@ -105,52 +106,62 @@ type LibraryVideo = {
 
 // ─── Camera keyframe helpers ──────────────────────────────────────────────────
 
-type CameraStop = { time: number; targetX: number; targetY: number; targetZoom: number; name: string };
-
 function easeInOut(t: number): number { return t * t * (3 - 2 * t); }
 
 function defaultCameraZoom(clipW: number, clipH: number): number {
   return clamp(Math.min((VIEWPORT_W * 0.7) / clipW, (VIEWPORT_H * 0.7) / clipH), 0.5, 5.0);
 }
 
-function buildCameraStops(clips: BoardClip[]): CameraStop[] {
-  return clips
-    .filter(isVisualClip)
-    .sort((a, b) => a.startTime - b.startTime)
-    .map((c) => ({
-      time: c.startTime,
-      targetX: c.boardX + c.boardW / 2,
-      targetY: c.boardY + c.boardH / 2,
-      targetZoom: c.cameraZoomTarget,
-      name: c.name,
-    }));
+function computeFrameAllTarget(clips: BoardClip[]): { x: number; y: number; zoom: number } {
+  const visuals = clips.filter(isVisualClip);
+  if (visuals.length === 0) return { x: BOARD_W / 2, y: BOARD_H / 2, zoom: 1 };
+  const pad = 100;
+  const minX = Math.min(...visuals.map((c) => c.boardX)) - pad;
+  const minY = Math.min(...visuals.map((c) => c.boardY)) - pad;
+  const maxX = Math.max(...visuals.map((c) => c.boardX + c.boardW)) + pad;
+  const maxY = Math.max(...visuals.map((c) => c.boardY + c.boardH)) + pad;
+  const zoom = Math.min(VIEWPORT_W / (maxX - minX), VIEWPORT_H / (maxY - minY), 4);
+  return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom };
 }
 
 function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y: number; zoom: number; label: string } | null {
-  const stops = buildCameraStops(clips);
-  if (stops.length === 0) return null;
-  if (atSec <= stops[0].time) {
-    const s = stops[0];
-    return { x: s.targetX, y: s.targetY, zoom: s.targetZoom, label: `Stop 1/${stops.length}: ${s.name}` };
+  const sorted = clips.filter(isVisualClip).sort((a, b) => a.startTime - b.startTime);
+  if (sorted.length === 0) return null;
+
+  const frameAll = computeFrameAllTarget(clips);
+  const first = sorted[0];
+
+  if (atSec <= first.startTime) {
+    return { x: first.boardX + first.boardW / 2, y: first.boardY + first.boardH / 2, zoom: first.cameraZoomTarget, label: `Hold: ${first.name}` };
   }
-  const last = stops[stops.length - 1];
-  if (atSec >= last.time) {
-    return { x: last.targetX, y: last.targetY, zoom: last.targetZoom, label: `Stop ${stops.length}/${stops.length}: ${last.name}` };
+
+  for (let i = 0; i < sorted.length; i++) {
+    const clip = sorted[i];
+    const clipEnd = clip.startTime + clip.durationSec;
+    if (atSec < clipEnd) {
+      const clipX = clip.boardX + clip.boardW / 2;
+      const clipY = clip.boardY + clip.boardH / 2;
+      const holdEnd = clip.startTime + clip.durationSec * clip.holdFraction;
+      if (atSec <= holdEnd) {
+        return { x: clipX, y: clipY, zoom: clip.cameraZoomTarget, label: `Hold: ${clip.name}` };
+      }
+      const next = sorted[i + 1];
+      const nextX = next ? next.boardX + next.boardW / 2 : frameAll.x;
+      const nextY = next ? next.boardY + next.boardH / 2 : frameAll.y;
+      const nextZoom = next ? next.cameraZoomTarget : frameAll.zoom;
+      const nextName = next ? next.name : "Frame All";
+      const transSpan = clipEnd - holdEnd;
+      const t = easeInOut(transSpan > 0 ? clamp((atSec - holdEnd) / transSpan, 0, 1) : 1);
+      return {
+        x: clipX + (nextX - clipX) * t,
+        y: clipY + (nextY - clipY) * t,
+        zoom: clip.cameraZoomTarget + (nextZoom - clip.cameraZoomTarget) * t,
+        label: `Transition → ${nextName}`,
+      };
+    }
   }
-  let prevIdx = 0;
-  for (let i = 0; i < stops.length - 1; i++) {
-    if (atSec >= stops[i].time && atSec < stops[i + 1].time) { prevIdx = i; break; }
-  }
-  const prev = stops[prevIdx];
-  const next = stops[prevIdx + 1];
-  const span = next.time - prev.time;
-  const t = easeInOut(span > 0 ? clamp((atSec - prev.time) / span, 0, 1) : 1);
-  return {
-    x: prev.targetX + (next.targetX - prev.targetX) * t,
-    y: prev.targetY + (next.targetY - prev.targetY) * t,
-    zoom: prev.targetZoom + (next.targetZoom - prev.targetZoom) * t,
-    label: `Traveling → ${next.name}`,
-  };
+
+  return { x: frameAll.x, y: frameAll.y, zoom: frameAll.zoom, label: "Frame All" };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -291,6 +302,7 @@ export default function BoardPage() {
   // Board interactions
   const boardContainerRef = useRef<HTMLDivElement>(null);
   const boardDragRef = useRef<{ clipId: string; offsetX: number; offsetY: number } | null>(null);
+  const holdDragRef = useRef<{ clipId: string; startMouseX: number; startFraction: number } | null>(null);
   const panDragRef = useRef<{ startMouseX: number; startMouseY: number; startCamX: number; startCamY: number } | null>(null);
   const spaceHeldRef = useRef(false);
   const mouseOverBoardRef = useRef(false);
@@ -529,6 +541,13 @@ export default function BoardPage() {
         vid.muted = true;
         vid.preload = "auto";
         setElementPlaybackRate(vid, clip);
+        const seekOnLoad = () => {
+          const atSec = playheadSecRef.current;
+          if (atSec >= clip.startTime && atSec < clip.startTime + clip.durationSec) {
+            vid.currentTime = clipSourceTimeAtTimeline(clip, atSec);
+          }
+        };
+        if (vid.readyState >= 1) { seekOnLoad(); } else { vid.addEventListener("loadedmetadata", seekOnLoad, { once: true }); }
         vid.load();
         boardVideoEls.current.set(clip.id, vid);
       }
@@ -729,6 +748,7 @@ export default function BoardPage() {
     setPlayheadSec(startHead);
     playheadSecRef.current = startHead;
     startAudioAt(startHead, currentClips);
+    startBoardVideosAt(startHead, currentClips);
 
     function tick() {
       if (!isPlayingRef.current) return;
@@ -748,6 +768,7 @@ export default function BoardPage() {
       setPlayheadSec(newHead);
       playheadSecRef.current = newHead;
       tickAudio(newHead, clips2);
+      tickBoardVideoPlayback(newHead, clips2);
       applyKeyframeCameraAt(newHead, clips2);
       rafRef.current = requestAnimationFrame(tick);
     }
@@ -759,6 +780,7 @@ export default function BoardPage() {
     setIsPlaying(false);
     if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     stopAllAudio();
+    pauseAllBoardVideos();
   }
 
   function stopAndRewind() {
@@ -777,6 +799,15 @@ export default function BoardPage() {
       playStartWallRef.current = performance.now();
       playStartHeadRef.current = clamped;
       startAudioAt(clamped, clipsRef.current);
+      startBoardVideosAt(clamped, clipsRef.current);
+    } else {
+      for (const [clipId, vid] of boardVideoEls.current) {
+        const clip = clipsRef.current.find((c) => c.id === clipId);
+        if (!clip) continue;
+        if (clamped >= clip.startTime && clamped < clip.startTime + clip.durationSec) {
+          vid.currentTime = clipSourceTimeAtTimeline(clip, clamped);
+        }
+      }
     }
     applyKeyframeCameraAt(clamped, clipsRef.current);
   }
@@ -786,6 +817,42 @@ export default function BoardPage() {
     if (!el) return;
     const rect = el.getBoundingClientRect();
     seekTo((clientX - rect.left + el.scrollLeft) / pxPerSecRef.current);
+  }
+
+  // ─── Board video sync (Feature A) ──────────────────────────────────────────
+
+  function startBoardVideosAt(atSec: number, currentClips: BoardClip[]) {
+    for (const [clipId, vid] of boardVideoEls.current) {
+      const clip = currentClips.find((c) => c.id === clipId);
+      if (!clip) continue;
+      const isActive = atSec >= clip.startTime && atSec < clip.startTime + clip.durationSec;
+      if (isActive) {
+        setElementPlaybackRate(vid, clip);
+        vid.currentTime = clipSourceTimeAtTimeline(clip, atSec);
+        vid.play().catch(() => {});
+      } else {
+        vid.pause();
+      }
+    }
+  }
+
+  function pauseAllBoardVideos() {
+    for (const vid of boardVideoEls.current.values()) vid.pause();
+  }
+
+  function tickBoardVideoPlayback(atSec: number, currentClips: BoardClip[]) {
+    for (const [clipId, vid] of boardVideoEls.current) {
+      const clip = currentClips.find((c) => c.id === clipId);
+      if (!clip) continue;
+      const isActive = atSec >= clip.startTime && atSec < clip.startTime + clip.durationSec;
+      if (isActive && vid.paused) {
+        setElementPlaybackRate(vid, clip);
+        vid.currentTime = clipSourceTimeAtTimeline(clip, atSec);
+        vid.play().catch(() => {});
+      } else if (!isActive && !vid.paused) {
+        vid.pause();
+      }
+    }
   }
 
   // ─── Board canvas interactions ──────────────────────────────────────────────
@@ -896,16 +963,15 @@ export default function BoardPage() {
   }
 
   function resetCamera() {
-    const stops = buildCameraStops(clipsRef.current);
-    if (stops.length === 0) return;
-    const first = stops[0];
-    cameraXRef.current = first.targetX;
-    cameraYRef.current = first.targetY;
-    boardZoomRef.current = first.targetZoom;
-    setCameraX(first.targetX);
-    setCameraY(first.targetY);
-    setBoardZoom(first.targetZoom);
-    setCameraStatusLabel(`Stop 1/${stops.length}: ${first.name}`);
+    const cam = computeCameraAtTime(0, clipsRef.current);
+    if (!cam) {
+      const cx = BOARD_W / 2, cy = BOARD_H / 2;
+      cameraXRef.current = cx; cameraYRef.current = cy; boardZoomRef.current = 1;
+      setCameraX(cx); setCameraY(cy); setBoardZoom(1); setCameraStatusLabel("");
+      return;
+    }
+    cameraXRef.current = cam.x; cameraYRef.current = cam.y; boardZoomRef.current = cam.zoom;
+    setCameraX(cam.x); setCameraY(cam.y); setBoardZoom(cam.zoom); setCameraStatusLabel(cam.label);
   }
 
   // ─── Timeline drag ──────────────────────────────────────────────────────────
@@ -918,12 +984,27 @@ export default function BoardPage() {
     seekFromClientX(e.clientX);
   }
 
+  function updateHoldDrag(clientX: number) {
+    const hd = holdDragRef.current;
+    if (!hd) return;
+    const clip = clipsRef.current.find((c) => c.id === hd.clipId);
+    if (!clip || clip.durationSec <= 0) return;
+    const dx = clientX - hd.startMouseX;
+    const dtSec = dx / pxPerSecRef.current;
+    const newFrac = clamp(hd.startFraction + dtSec / clip.durationSec, 0.05, 0.95);
+    const newClips = clipsRef.current.map((c) => c.id === hd.clipId ? { ...c, holdFraction: newFrac } : c);
+    clipsRef.current = newClips;
+    setClips(newClips);
+  }
+
   function onScrollerPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (holdDragRef.current) { updateHoldDrag(e.clientX); return; }
     if (dragRef.current) { updateClipDrag(e.clientX, e.clientY); return; }
     if (playheadDraggingRef.current) seekFromClientX(e.clientX);
   }
 
   function onScrollerPointerUp() {
+    if (holdDragRef.current) { holdDragRef.current = null; return; }
     if (dragRef.current) { commitClipDrag(); return; }
     playheadDraggingRef.current = false;
   }
@@ -1092,7 +1173,7 @@ export default function BoardPage() {
             transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
             volumeCurve: [...DEFAULT_CURVE], waveform,
             boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
-            cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
+            cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H), holdFraction: 0.5,
           }];
         });
       };
@@ -1149,7 +1230,7 @@ export default function BoardPage() {
           transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
           volumeCurve: [...DEFAULT_CURVE], waveform: item.waveform,
           boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
-          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
+          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H), holdFraction: 0.5,
         });
       }
       return [...prev, ...newClips];
@@ -1212,7 +1293,7 @@ export default function BoardPage() {
           transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
           volumeCurve: [...DEFAULT_CURVE],
           boardX: pos.boardX, boardY: pos.boardY, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
-          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H),
+          cameraZoomTarget: defaultCameraZoom(CLIP_DEFAULT_W, CLIP_DEFAULT_H), holdFraction: 0.5,
         }];
       });
       setYtModalOpen(false);
@@ -1638,6 +1719,28 @@ export default function BoardPage() {
                           style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
                         >
                           {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
+                          {isVisualClip(clip) && clipPx >= 30 && !isBeingDragged && (() => {
+                            const dividerLeft = clip.holdFraction * clipPx;
+                            const holdSec = (clip.durationSec * clip.holdFraction).toFixed(1);
+                            const transSec = (clip.durationSec * (1 - clip.holdFraction)).toFixed(1);
+                            return (
+                              <>
+                                <div style={{ position: "absolute", left: 0, top: 0, width: dividerLeft, height: "100%", background: "rgba(80,160,255,0.18)", pointerEvents: "none", zIndex: 1 }} />
+                                <div style={{ position: "absolute", left: dividerLeft, top: 0, right: 0, height: "100%", background: "rgba(255,140,0,0.18)", pointerEvents: "none", zIndex: 1 }} />
+                                <div
+                                  title={`Hold ${holdSec}s / Transition ${transSec}s`}
+                                  onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                    scrollerRef.current?.setPointerCapture(e.pointerId);
+                                    holdDragRef.current = { clipId: clip.id, startMouseX: e.clientX, startFraction: clip.holdFraction };
+                                  }}
+                                  style={{ position: "absolute", left: dividerLeft - 4, top: 0, width: 8, height: "100%", cursor: "col-resize", zIndex: 5, display: "flex", alignItems: "stretch", justifyContent: "center" }}
+                                >
+                                  <div style={{ width: 2, background: "rgba(42,42,42,0.5)", height: "100%", pointerEvents: "none" }} />
+                                </div>
+                              </>
+                            );
+                          })()}
                           <div style={{ position: "relative", zIndex: 2, paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
                             <div style={{ fontSize: 10, fontFamily: "'Courier New', monospace", fontWeight: 700, color: "#2a2a2a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{clip.name}</div>
                             <div style={{ fontSize: 9, fontFamily: "monospace", color: "#555", whiteSpace: "nowrap" }}>{formatDuration(clip.durationSec)}</div>
