@@ -22,13 +22,15 @@ import {
 
 // ─── Board constants ──────────────────────────────────────────────────────────
 
-const CAMERA_X = 2000;
-const CAMERA_Y = 1500;
+const BOARD_W = 4000;
+const BOARD_H = 3000;
 const VIEWPORT_W = 800;
 const VIEWPORT_H = 600;
 const CLIP_DEFAULT_W = 300;
 const CLIP_DEFAULT_H = 200;
 const BOARD_BG = "#f5ecd8";
+const BOARD_EDGE_MARGIN = 200;
+const BOARD_CLIP_PAD = 30;
 
 const DEFAULT_PX_PER_SEC = 100;
 const MIN_PX_PER_SEC = 10;
@@ -106,12 +108,33 @@ function layerBg(layer: number): string {
   return LAYER_BG[(layer - 1) % LAYER_BG.length] ?? LAYER_BG[0];
 }
 
-function defaultBoardPos(clipIndex: number): { boardX: number; boardY: number } {
-  const col = clipIndex % 2;
-  const row = Math.floor(clipIndex / 2);
-  const startX = CAMERA_X - VIEWPORT_W / 2 + 40;
-  const startY = CAMERA_Y - VIEWPORT_H / 2 + 30;
-  return { boardX: startX + col * 340, boardY: startY + row * 220 };
+function findFreeBoardPos(existing: BoardClip[], clipW: number, clipH: number): { boardX: number; boardY: number } {
+  const xMin = BOARD_EDGE_MARGIN;
+  const xMax = BOARD_W - BOARD_EDGE_MARGIN - clipW;
+  const yMin = BOARD_EDGE_MARGIN;
+  const yMax = BOARD_H - BOARD_EDGE_MARGIN - clipH;
+  const visuals = existing.filter(isVisualClip);
+  const overlaps = (bx: number, by: number, pad: number) =>
+    visuals.some((c) => !(bx + clipW + pad < c.boardX || bx > c.boardX + c.boardW + pad ||
+      by + clipH + pad < c.boardY || by > c.boardY + c.boardH + pad));
+  for (let i = 0; i < 50; i++) {
+    const bx = xMin + Math.random() * (xMax - xMin);
+    const by = yMin + Math.random() * (yMax - yMin);
+    if (!overlaps(bx, by, BOARD_CLIP_PAD)) return { boardX: bx, boardY: by };
+  }
+  for (let i = 0; i < 50; i++) {
+    const bx = xMin + Math.random() * (xMax - xMin);
+    const by = yMin + Math.random() * (yMax - yMin);
+    if (!overlaps(bx, by, 0)) return { boardX: bx, boardY: by };
+  }
+  for (let i = 0; i < 50; i++) {
+    const bx = Math.random() * Math.max(1, BOARD_W - clipW);
+    const by = Math.random() * Math.max(1, BOARD_H - clipH);
+    if (!overlaps(bx, by, 0)) return { boardX: bx, boardY: by };
+  }
+  const last = visuals.at(-1);
+  if (last) return { boardX: Math.min(last.boardX + 20, BOARD_W - clipW), boardY: Math.min(last.boardY + 20, BOARD_H - clipH) };
+  return { boardX: BOARD_EDGE_MARGIN, boardY: BOARD_EDGE_MARGIN };
 }
 
 // ─── Page component ───────────────────────────────────────────────────────────
@@ -186,6 +209,22 @@ export default function BoardPage() {
   const recNarrationStartWallRef = useRef(0);
   const ytRangeRef = useRef({ start: 0, end: 30 });
 
+  // Camera
+  const [cameraX, setCameraX] = useState(BOARD_W / 2);
+  const [cameraY, setCameraY] = useState(BOARD_H / 2);
+  const cameraXRef = useRef(BOARD_W / 2);
+  const cameraYRef = useRef(BOARD_H / 2);
+
+  // Board interactions
+  const boardContainerRef = useRef<HTMLDivElement>(null);
+  const boardDragRef = useRef<{ clipId: string; offsetX: number; offsetY: number } | null>(null);
+  const panDragRef = useRef<{ startMouseX: number; startMouseY: number; startCamX: number; startCamY: number } | null>(null);
+  const spaceHeldRef = useRef(false);
+  const mouseOverBoardRef = useRef(false);
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const [boardDraggingClipId, setBoardDraggingClipId] = useState<string | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+
   // Playback
   const isPlayingRef = useRef(false);
   const playheadSecRef = useRef(0);
@@ -212,6 +251,8 @@ export default function BoardPage() {
   useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
+  useEffect(() => { cameraXRef.current = cameraX; }, [cameraX]);
+  useEffect(() => { cameraYRef.current = cameraY; }, [cameraY]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -256,8 +297,12 @@ export default function BoardPage() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.code === "Space") {
         e.preventDefault();
-        if (isRecordingNarrationRef.current) { stopRecording(); return; }
-        if (isPlayingRef.current) { pausePlayback(); } else { startPlayback(); }
+        if (!spaceHeldRef.current) { spaceHeldRef.current = true; setSpaceHeld(true); }
+        // Only play/pause when cursor is not over the board (board uses space for pan)
+        if (!mouseOverBoardRef.current) {
+          if (isRecordingNarrationRef.current) { stopRecording(); return; }
+          if (isPlayingRef.current) { pausePlayback(); } else { startPlayback(); }
+        }
         return;
       }
       if ((e.code === "Backspace" || e.code === "Delete") && selectedClipIdRef.current) {
@@ -272,8 +317,15 @@ export default function BoardPage() {
         undoLastEdit();
       }
     }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.code === "Space") { spaceHeldRef.current = false; setSpaceHeld(false); }
+    }
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKeyUp);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -298,15 +350,15 @@ export default function BoardPage() {
     const cH = canvas.height;
     const scaleX = cW / VIEWPORT_W;
     const scaleY = cH / VIEWPORT_H;
-    const camLeft = CAMERA_X - VIEWPORT_W / 2;
-    const camTop = CAMERA_Y - VIEWPORT_H / 2;
+    const camLeft = cameraXRef.current - VIEWPORT_W / 2;
+    const camTop = cameraYRef.current - VIEWPORT_H / 2;
 
     ctx.fillStyle = BOARD_BG;
     ctx.fillRect(0, 0, cW, cH);
 
-    // Draw active clips bottom-layer-first (higher layer number = further back)
+    // Draw all visual clips bottom-layer-first (higher layer number = further back)
     const visClips = currentClips
-      .filter((c) => isVisualClip(c) && atSec >= c.startTime && atSec < c.startTime + c.durationSec)
+      .filter((c) => isVisualClip(c))
       .sort((a, b) => b.layer - a.layer);
 
     for (const clip of visClips) {
@@ -350,6 +402,22 @@ export default function BoardPage() {
       ctx.strokeStyle = "#2a2a2a";
       ctx.lineWidth = 2;
       ctx.strokeRect(cx, cy, cw, ch);
+
+      // Red tint when dragged clip overlaps another
+      if (boardDragRef.current?.clipId === clip.id) {
+        const isOverlapping = currentClips.some((other) =>
+          other.id !== clip.id && isVisualClip(other) &&
+          !(clip.boardX + clip.boardW < other.boardX || clip.boardX > other.boardX + other.boardW ||
+            clip.boardY + clip.boardH < other.boardY || clip.boardY > other.boardY + other.boardH)
+        );
+        if (isOverlapping) {
+          ctx.fillStyle = "rgba(255,40,40,0.3)";
+          ctx.fillRect(cx, cy, cw, ch);
+          ctx.strokeStyle = "#ff2828";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(cx, cy, cw, ch);
+        }
+      }
 
       // Clip name overlay
       ctx.fillStyle = "rgba(0,0,0,0.45)";
@@ -641,6 +709,76 @@ export default function BoardPage() {
     seekTo((clientX - rect.left + el.scrollLeft) / pxPerSecRef.current);
   }
 
+  // ─── Board canvas interactions ──────────────────────────────────────────────
+
+  function clientToBoardCoords(clientX: number, clientY: number): { bx: number; by: number } {
+    const container = boardContainerRef.current;
+    if (!container) return { bx: 0, by: 0 };
+    const rect = container.getBoundingClientRect();
+    const cssX = clientX - rect.left;
+    const cssY = clientY - rect.top;
+    const canvasX = cssX * (VIEWPORT_W / rect.width);
+    const canvasY = cssY * (VIEWPORT_H / rect.height);
+    const camLeft = cameraXRef.current - VIEWPORT_W / 2;
+    const camTop = cameraYRef.current - VIEWPORT_H / 2;
+    return { bx: canvasX + camLeft, by: canvasY + camTop };
+  }
+
+  function onBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0 && e.button !== 1) return;
+    const isMiddleClick = e.button === 1;
+    if (spaceHeldRef.current || isMiddleClick) {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      panDragRef.current = { startMouseX: e.clientX, startMouseY: e.clientY, startCamX: cameraXRef.current, startCamY: cameraYRef.current };
+      setIsPanning(true);
+      return;
+    }
+    const { bx, by } = clientToBoardCoords(e.clientX, e.clientY);
+    const visuals = clipsRef.current.filter(isVisualClip).sort((a, b) => a.layer - b.layer);
+    const hit = visuals.find((c) => bx >= c.boardX && bx <= c.boardX + c.boardW && by >= c.boardY && by <= c.boardY + c.boardH);
+    if (!hit) return;
+    pushUndoSnapshot();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    boardDragRef.current = { clipId: hit.id, offsetX: bx - hit.boardX, offsetY: by - hit.boardY };
+    setBoardDraggingClipId(hit.id);
+    setSelectedClipId(hit.id);
+    selectedClipIdRef.current = hit.id;
+  }
+
+  function onBoardPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (panDragRef.current) {
+      const pan = panDragRef.current;
+      const containerW = boardContainerRef.current?.offsetWidth ?? VIEWPORT_W;
+      const containerH = boardContainerRef.current?.offsetHeight ?? VIEWPORT_H;
+      const dx = (e.clientX - pan.startMouseX) * (VIEWPORT_W / containerW);
+      const dy = (e.clientY - pan.startMouseY) * (VIEWPORT_H / containerH);
+      const newCamX = clamp(pan.startCamX - dx, VIEWPORT_W / 2, BOARD_W - VIEWPORT_W / 2);
+      const newCamY = clamp(pan.startCamY - dy, VIEWPORT_H / 2, BOARD_H - VIEWPORT_H / 2);
+      cameraXRef.current = newCamX;
+      cameraYRef.current = newCamY;
+      setCameraX(newCamX);
+      setCameraY(newCamY);
+      return;
+    }
+    const drag = boardDragRef.current;
+    if (!drag) return;
+    const { bx, by } = clientToBoardCoords(e.clientX, e.clientY);
+    const newClips = clipsRef.current.map((c) => {
+      if (c.id !== drag.clipId) return c;
+      const newBoardX = clamp(bx - drag.offsetX, 0, BOARD_W - c.boardW);
+      const newBoardY = clamp(by - drag.offsetY, 0, BOARD_H - c.boardH);
+      return { ...c, boardX: newBoardX, boardY: newBoardY };
+    });
+    clipsRef.current = newClips;
+    setClips(newClips);
+  }
+
+  function onBoardPointerUp() {
+    if (panDragRef.current) { panDragRef.current = null; setIsPanning(false); return; }
+    if (boardDragRef.current) { boardDragRef.current = null; setBoardDraggingClipId(null); }
+  }
+
   // ─── Timeline drag ──────────────────────────────────────────────────────────
 
   function onScrollerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
@@ -817,7 +955,7 @@ export default function BoardPage() {
         if (dur < 0.1) return;
         pushUndoSnapshot();
         setClips((prev) => {
-          const pos = defaultBoardPos(prev.length);
+          const pos = findFreeBoardPos(prev, CLIP_DEFAULT_W, CLIP_DEFAULT_H);
           return [...prev, {
             id: crypto.randomUUID(), type: "audio", name: "Narration", blobUrl,
             sourceDuration: dur, durationSec: dur, startTime: recStartSecRef.current,
@@ -874,7 +1012,7 @@ export default function BoardPage() {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
         const layer = findFreeLayer([...prev, ...newClips], startTime, dur, layerCountRef.current);
         ensureLayerCount(layer);
-        const pos = defaultBoardPos(prev.length + newClips.length);
+        const pos = findFreeBoardPos([...prev, ...newClips], CLIP_DEFAULT_W, CLIP_DEFAULT_H);
         newClips.push({
           id: crypto.randomUUID(), type: item.type, name: item.name, blobUrl: item.blobUrl,
           sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1,
@@ -936,7 +1074,7 @@ export default function BoardPage() {
         const dur = durationSec || (ytEnd - ytStart);
         const layer = findFreeLayer(prev, startTime, dur, layerCountRef.current);
         ensureLayerCount(layer);
-        const pos = defaultBoardPos(prev.length);
+        const pos = findFreeBoardPos(prev, CLIP_DEFAULT_W, CLIP_DEFAULT_H);
         return [...prev, {
           id: crypto.randomUUID(), type: "video", name: title, blobUrl,
           sourceDuration: dur, durationSec: dur, startTime, layer, trimStart: 0, playbackRate: 1,
@@ -1016,8 +1154,8 @@ export default function BoardPage() {
     const canvasH = 1200;
     const scaleX = canvasW / VIEWPORT_W;
     const scaleY = canvasH / VIEWPORT_H;
-    const camLeft = CAMERA_X - VIEWPORT_W / 2;
-    const camTop = CAMERA_Y - VIEWPORT_H / 2;
+    const camLeft = cameraXRef.current - VIEWPORT_W / 2;
+    const camTop = cameraYRef.current - VIEWPORT_H / 2;
 
     const canvas = document.createElement("canvas");
     canvas.width = canvasW;
@@ -1225,22 +1363,34 @@ export default function BoardPage() {
             {/* Board preview */}
             <div style={{ flex: 1, padding: "16px 20px", display: "flex", flexDirection: "column", gap: 8, minWidth: 0 }}>
               <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase" }}>
-                Board Preview · camera ({CAMERA_X}, {CAMERA_Y}) · {VIEWPORT_W}×{VIEWPORT_H}
+                Board Preview · camera ({Math.round(cameraX)}, {Math.round(cameraY)}) · {VIEWPORT_W}×{VIEWPORT_H}
+                <span style={{ color: "#bbb", marginLeft: 8 }}>[space+drag] pan · drag clips to reposition</span>
               </div>
-              <div style={{
-                width: "min(100%, 640px)",
-                aspectRatio: `${VIEWPORT_W}/${VIEWPORT_H}`,
-                border: "1.5px solid #2a2a2a",
-                boxShadow: "3px 3px 0 #2a2a2a",
-                overflow: "hidden",
-                flexShrink: 0,
-                background: BOARD_BG,
-              }}>
+              <div
+                ref={boardContainerRef}
+                onPointerDown={onBoardPointerDown}
+                onPointerMove={onBoardPointerMove}
+                onPointerUp={onBoardPointerUp}
+                onPointerCancel={onBoardPointerUp}
+                onMouseEnter={() => { mouseOverBoardRef.current = true; }}
+                onMouseLeave={() => { mouseOverBoardRef.current = false; }}
+                style={{
+                  width: "min(100%, 640px)",
+                  aspectRatio: `${VIEWPORT_W}/${VIEWPORT_H}`,
+                  border: "1.5px solid #2a2a2a",
+                  boxShadow: "3px 3px 0 #2a2a2a",
+                  overflow: "hidden",
+                  flexShrink: 0,
+                  background: BOARD_BG,
+                  cursor: isPanning ? "grabbing" : spaceHeld ? "grab" : boardDraggingClipId ? "grabbing" : "default",
+                  touchAction: "none",
+                }}
+              >
                 <canvas
                   ref={boardCanvasRef}
                   width={VIEWPORT_W}
                   height={VIEWPORT_H}
-                  style={{ width: "100%", height: "100%", display: "block" }}
+                  style={{ width: "100%", height: "100%", display: "block", pointerEvents: "none" }}
                 />
               </div>
             </div>
