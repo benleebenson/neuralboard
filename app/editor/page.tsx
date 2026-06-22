@@ -185,6 +185,7 @@ export default function EditorPage() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportDurationSec, setExportDurationSec] = useState(0);
+  const [signInPrompt, setSignInPrompt] = useState<string | null>(null);
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -1135,14 +1136,14 @@ export default function EditorPage() {
   // ─── YouTube ────────────────────────────────────────────────────────────────
 
   async function handleYtSearch(shortsOnlyOverride?: boolean) {
-    if (!config?.railwayUrl || !ytQuery.trim()) return;
+    if (!ytQuery.trim()) return;
     setYtLoading(true);
     setYtError("");
     setYtResults([]);
     try {
-      const res = await fetch(`${config.railwayUrl}/video-search`, {
+      const res = await fetch("/api/yt-search", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-neuralboard-password": config.railwayPassword },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: shortsOnlyOverride !== undefined ? shortsOnlyOverride : ytShortsOnly }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
@@ -1156,26 +1157,21 @@ export default function EditorPage() {
   }
 
   async function handleYtConfirm() {
-    if (!config?.railwayUrl || !ytSelected) return;
+    if (!ytSelected) return;
     setYtLoading(true);
     setYtError("");
     try {
       const url = `https://www.youtube.com/watch?v=${ytSelected.id}`;
-      const dlRes = await fetch(`${config.railwayUrl}/ytdl`, {
+      const dlRes = await fetch("/api/ytdl", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-neuralboard-password": config.railwayPassword },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, start: ytStart, end: ytEnd }),
       });
       if (!dlRes.ok) {
         const err = await dlRes.json().catch(() => ({})) as { error?: string };
         throw new Error(err.error || `Download failed (${dlRes.status})`);
       }
-      const { id } = await dlRes.json() as { id: string };
-      const fileRes = await fetch(`${config.railwayUrl}/ytdl-file/${id}`, {
-        headers: { "x-neuralboard-password": config.railwayPassword },
-      });
-      if (!fileRes.ok) throw new Error(`File fetch failed (${fileRes.status})`);
-      const blob = await fileRes.blob();
+      const blob = await dlRes.blob();
       const blobUrl = URL.createObjectURL(blob);
       const durationSec = await getMediaDuration(blobUrl, "video");
       const title = (ytSelected.title ?? "YouTube clip").slice(0, 40);
@@ -1526,6 +1522,10 @@ export default function EditorPage() {
   }
 
   async function startExport() {
+    if (!session?.user?.email) {
+      setSignInPrompt("Sign in with Google to export your video.");
+      return;
+    }
     if (isRecordingNarrationRef.current) {
       alert("Stop recording before exporting");
       return;
@@ -1968,14 +1968,12 @@ export default function EditorPage() {
           <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
           <button onClick={addTextClip} style={sketchButton}>T Add text</button>
           <button onClick={openCountdownCreateModal} style={{ ...sketchButton, background: COUNTDOWN_COLOR }}>↓ Top List</button>
-          {config?.railwayUrl && (
-            <button
-              onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }}
-              style={sketchButton}
-            >
-              ▶ Add YouTube clip
-            </button>
-          )}
+          <button
+            onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }}
+            style={sketchButton}
+          >
+            ▶ Add YouTube clip
+          </button>
           {recError && <span style={{ fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>{recError}</span>}
         </div>
 
@@ -2896,6 +2894,21 @@ export default function EditorPage() {
       {toast && (
         <div style={{ position: "fixed", bottom: 60, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#fffdf5", padding: "7px 18px", fontSize: 11, fontFamily: "monospace", zIndex: 9999, boxShadow: "2px 2px 0 rgba(0,0,0,0.3)", animation: "nbtoast 0.2s ease", whiteSpace: "nowrap" }}>
           {toast}
+        </div>
+      )}
+
+      {signInPrompt && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(42,42,42,0.72)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: "28px 28px", maxWidth: 340, width: "100%", textAlign: "center" }}>
+            <h2 style={{ fontFamily: "'Caveat', cursive", fontSize: 30, color: "#2a2a2a", marginBottom: 6 }}>Sign in to continue</h2>
+            <p style={{ fontFamily: "monospace", fontSize: 12, color: "#6a6a6a", marginBottom: 24 }}>{signInPrompt}</p>
+            <button onClick={() => { setSignInPrompt(null); signIn("google", { callbackUrl: "/editor" }); }} style={primaryButtonStyle}>
+              Sign in with Google
+            </button>
+            <button onClick={() => setSignInPrompt(null)} style={{ ...miniButton, marginTop: 12, display: "block", width: "100%", padding: "8px", fontSize: 11 }}>
+              cancel
+            </button>
+          </div>
         </div>
       )}
     </main>

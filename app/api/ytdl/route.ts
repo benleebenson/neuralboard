@@ -1,30 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
 export async function POST(req: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.email) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    const { youtubeId, url: ytUrlParam, start, end } = await req.json();
+    if (!youtubeId && !ytUrlParam) {
+      return NextResponse.json({ error: "Missing youtubeId or url" }, { status: 400 });
     }
 
-    const { youtubeId, start, end } = await req.json();
-    if (!youtubeId) {
-      return NextResponse.json({ error: "Missing youtubeId" }, { status: 400 });
-    }
-
-    const railwayUrl = process.env.NEXT_PUBLIC_RAILWAY_URL;
+    const railwayUrl = process.env.RAILWAY_URL ?? process.env.NEXT_PUBLIC_RAILWAY_URL;
     const password = process.env.NEURALBOARD_PASSWORD;
 
     if (!railwayUrl || !password) {
       return NextResponse.json({ error: "Railway backend not configured" }, { status: 500 });
     }
 
-    const ytUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+    const ytUrl = ytUrlParam ?? `https://www.youtube.com/watch?v=${youtubeId}`;
     const body: { url: string; start?: number; end?: number } = { url: ytUrl };
     if (typeof start === "number") body.start = start;
     if (typeof end === "number") body.end = end;

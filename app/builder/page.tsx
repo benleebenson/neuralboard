@@ -1050,17 +1050,14 @@ export default function BuilderPage() {
   }
 
   async function handleYtSearch(shortsOnlyOverride?: boolean) {
-    if (!config?.railwayUrl || !ytQuery.trim()) return;
+    if (!ytQuery.trim()) return;
     setYtLoading(true);
     setYtError('');
     setYtResults([]);
     try {
-      const res = await fetch(`${config.railwayUrl}/video-search`, {
+      const res = await fetch('/api/yt-search', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-neuralboard-password': config.railwayPassword,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: shortsOnlyOverride !== undefined ? shortsOnlyOverride : ytShortsOnly }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
@@ -1074,26 +1071,21 @@ export default function BuilderPage() {
   }
 
   async function handleYtConfirm() {
-    if (!config?.railwayUrl || !ytSelected || ytModalBeatIdx === null) return;
+    if (!ytSelected || ytModalBeatIdx === null) return;
     setYtLoading(true);
     setYtError('');
     try {
       const url = `https://www.youtube.com/watch?v=${ytSelected.id}`;
-      const dlRes = await fetch(`${config.railwayUrl}/ytdl`, {
+      const dlRes = await fetch('/api/ytdl', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-neuralboard-password': config.railwayPassword },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, start: ytStart, end: ytEnd }),
       });
       if (!dlRes.ok) {
         const err = await dlRes.json().catch(() => ({})) as { error?: string };
         throw new Error(err.error || `Download failed (${dlRes.status})`);
       }
-      const { id } = await dlRes.json() as { id: string };
-      const fileRes = await fetch(`${config.railwayUrl}/ytdl-file/${id}`, {
-        headers: { 'x-neuralboard-password': config.railwayPassword },
-      });
-      if (!fileRes.ok) throw new Error(`File fetch failed (${fileRes.status})`);
-      const blob = await fileRes.blob();
+      const blob = await dlRes.blob();
       const blobUrl = URL.createObjectURL(blob);
       const idx = ytModalBeatIdx;
       setBeats(prev => prev.map((b, i) => i === idx ? { ...b, customVideoUrl: blobUrl, customImageUrl: undefined } : b));
@@ -2177,14 +2169,12 @@ export default function BuilderPage() {
                               display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                             +
                           </button>
-                          {config?.railwayUrl && isSubscribed && (
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setYtModalBeatIdx(i); setYtView('search'); setYtQuery(''); setYtResults([]); setYtError(''); setYtModalOpen(true); }}
-                              style={{ ...miniButton, height: 22, padding: '0 5px', fontSize: 9, fontWeight: 700, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 2 }}
-                              title="Search YouTube">
-                              ▶ yt
-                            </button>
-                          )}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setYtModalBeatIdx(i); setYtView('search'); setYtQuery(''); setYtResults([]); setYtError(''); setYtModalOpen(true); }}
+                            style={{ ...miniButton, height: 22, padding: '0 5px', fontSize: 9, fontWeight: 700, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 2 }}
+                            title="Search YouTube">
+                            ▶ yt
+                          </button>
                         </div>
                         {/* Camera options */}
                         {appMode === "board" && <div style={{ marginTop: 6, borderTop: "1px dashed rgba(42,42,42,0.15)", paddingTop: 5 }}>
@@ -2364,14 +2354,10 @@ export default function BuilderPage() {
             </>
           ) : null}
 
-          {beats.length > 0 && config?.railwayUrl ? (
+          {beats.length > 0 ? (
             <button onClick={renderVideo} disabled={rendering} style={{ ...renderButtonStyle, minHeight: isMobile ? 44 : undefined }}>
               {rendering ? (renderStatus || "RENDERING...") : appMode === "compilation" ? "RENDER COMPILATION" : "RENDER VIDEO"}
             </button>
-          ) : beats.length > 0 && !config?.railwayUrl ? (
-            <div style={{ marginTop: 12, padding: "10px 12px", border: "1.5px dashed #2a2a2a", fontSize: 11, fontFamily: "monospace", color: "#6a6a6a" }}>
-              {config === null ? "loading config..." : "mp4 export needs railway backend (not configured)"}
-            </div>
           ) : null}
 
           {error === "UPGRADE_REQUIRED" || error === "UPGRADE_REQUIRED_LENGTH" ? (
