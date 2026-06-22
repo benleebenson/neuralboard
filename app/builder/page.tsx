@@ -202,6 +202,8 @@ export default function BuilderPage() {
   const [compSelectedItem, setCompSelectedItem] = useState<'media' | number | null>(null);
   const mobileDefaultApplied = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [signInPrompt, setSignInPrompt] = useState<string | null>(null);
+  const pendingSignInActionRef = useRef<"transcribe" | "director" | "render" | "arrange" | null>(null);
 
   const overlaySvgRef = useRef<SVGSVGElement | null>(null);
   const overlayDragRef = useRef<{
@@ -248,9 +250,7 @@ export default function BuilderPage() {
   useEffect(() => { strokesRef.current = strokes; }, [strokes]);
 
   // Resize the draw canvas to match board, redraw strokes at new scale.
-  // Re-runs after sign-in so the board is mounted before we attach the ResizeObserver.
   useEffect(() => {
-    if (status !== "authenticated") return;
     const board = boardRef.current;
     const canvas = drawCanvasRef.current;
     if (!board || !canvas) return;
@@ -264,7 +264,8 @@ export default function BuilderPage() {
     observer.observe(board);
     resize();
     return () => observer.disconnect();
-  }, [status]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Redraw whenever committed strokes change
   useEffect(() => {
@@ -347,6 +348,66 @@ export default function BuilderPage() {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
   }, [beats, transcript, duration, background, cardStyle, strokes, overlays]);
+
+  // After a sign-in redirect, resume the action the user was trying to do
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    const pendingAction = sessionStorage.getItem("nb_pending_action");
+    if (!pendingAction) return;
+    sessionStorage.removeItem("nb_pending_action");
+    if (pendingAction === "transcribe") {
+      const audioType = sessionStorage.getItem("nb_pending_audio_type") || "audio/webm";
+      const audioB64 = sessionStorage.getItem("nb_pending_audio_b64");
+      sessionStorage.removeItem("nb_pending_audio_type");
+      sessionStorage.removeItem("nb_pending_audio_b64");
+      if (audioB64) {
+        try {
+          const binary = atob(audioB64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const blob = new Blob([bytes], { type: audioType });
+          setAudioBlob(blob);
+          setProcessing(true);
+          sendToTranscribe(blob);
+        } catch { /* restore failed — user will need to re-upload */ }
+      }
+    } else if (pendingAction === "director") {
+      const notes = sessionStorage.getItem("nb_pending_director_notes");
+      sessionStorage.removeItem("nb_pending_director_notes");
+      if (notes) setDirectorNotes(notes);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
+  async function handleSignInConfirm() {
+    const action = pendingSignInActionRef.current;
+    pendingSignInActionRef.current = null;
+    setSignInPrompt(null);
+    if (action === "transcribe" && audioBlob) {
+      await new Promise<void>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const b64 = (reader.result as string).split(",")[1];
+            if (b64) {
+              sessionStorage.setItem("nb_pending_audio_type", audioBlob!.type || "audio/webm");
+              sessionStorage.setItem("nb_pending_audio_b64", b64);
+              sessionStorage.setItem("nb_pending_action", "transcribe");
+            }
+          } catch { /* sessionStorage full */ }
+          resolve();
+        };
+        reader.onerror = () => resolve();
+        reader.readAsDataURL(audioBlob!);
+      });
+    } else if (action === "director" && directorNotes) {
+      try {
+        sessionStorage.setItem("nb_pending_director_notes", directorNotes);
+        sessionStorage.setItem("nb_pending_action", "director");
+      } catch {}
+    }
+    signIn("google", { callbackUrl: "/builder" });
+  }
 
   async function startRecording() {
     setError("");
@@ -447,7 +508,8 @@ export default function BuilderPage() {
       });
       const data = await readJsonResponse<{ ok?: boolean; error?: string; transcript: string; duration: number; beats?: Beat[] }>(res);
       if (res.status === 401) {
-        signIn("google");
+        pendingSignInActionRef.current = "transcribe";
+        setSignInPrompt("Sign in with Google to transcribe audio and generate beats.");
         setProcessing(false);
         return;
       }
@@ -697,6 +759,11 @@ export default function BuilderPage() {
           boardH,
         }),
       });
+      if (res.status === 401) {
+        pendingSignInActionRef.current = "arrange";
+        setSignInPrompt("Sign in with Google to use AI Arrange.");
+        return;
+      }
       if (!res.ok) throw new Error("Arrange failed");
       const data = await res.json();
       if (data.positions) setBeats(prev => prev.map((b, i) => data.positions[i] ? { ...b, pos: data.positions[i] } : b));
@@ -1137,11 +1204,19 @@ export default function BuilderPage() {
       setError("Audio not loaded — please re-upload your audio file to render");
       return;
     }
-    if (!config?.railwayUrl) return;
+    if (!config?.railwayUrl) {
+      pendingSignInActionRef.current = "render";
+      setSignInPrompt("Sign in with Google to export your video.");
+      return;
+    }
 
     // Usage + duration gate
     const usageRes = await fetch("/api/usage/check");
-    if (!usageRes.ok) { setError("Please sign in to render."); return; }
+    if (!usageRes.ok) {
+      pendingSignInActionRef.current = "render";
+      setSignInPrompt("Sign in with Google to export your video.");
+      return;
+    }
     const usage = await usageRes.json();
     if (!usage.canGenerate) {
       setError("UPGRADE_REQUIRED");
@@ -1754,32 +1829,6 @@ export default function BuilderPage() {
     }
   }
 
-  if (status === "loading") {
-    return (
-      <main style={lockScreenStyle}>
-        <div style={{ fontFamily: "monospace", color: "#6a6a6a", fontSize: 13 }}>Loading...</div>
-      </main>
-    );
-  }
-
-  if (!session?.user) {
-    return (
-      <main style={lockScreenStyle}>
-        <div style={{ maxWidth: 360, width: "100%" }}>
-          <h1 style={{ fontFamily: "'Caveat', cursive", fontSize: 38, color: "#2a2a2a", textAlign: "center", marginBottom: 4 }}>
-            Neural Board
-          </h1>
-          <p style={{ fontSize: 12, color: "#6a6a6a", textAlign: "center", marginBottom: 24, fontFamily: "'Courier New', monospace" }}>
-            sign in to continue · 1 free video per account
-          </p>
-          <button onClick={() => signIn("google")} style={primaryButtonStyle}>
-            Sign in with Google
-          </button>
-        </div>
-      </main>
-    );
-  }
-
   async function applyDirectorNotes() {
     if (!directorNotes.trim() || beats.length === 0) return;
     setDirectorLoading(true);
@@ -1792,7 +1841,8 @@ export default function BuilderPage() {
         body: JSON.stringify({ notes: directorNotes, beats }),
       });
       if (res.status === 401) {
-        setDirectorError("Session expired — please sign in again");
+        pendingSignInActionRef.current = "director";
+        setSignInPrompt("Sign in with Google to use the Director AI.");
         return;
       }
       const data = await res.json();
@@ -1899,13 +1949,19 @@ export default function BuilderPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <a href="/editor" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>Editor</a>
-          <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
-          {!isSubscribed && (
-            <a href="/upgrade" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>
-              subscribe →
-            </a>
+          {session?.user ? (
+            <>
+              <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+              {!isSubscribed && (
+                <a href="/upgrade" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>
+                  subscribe →
+                </a>
+              )}
+              <button onClick={() => signOut()} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign out</button>
+            </>
+          ) : (
+            <button onClick={() => signIn("google", { callbackUrl: "/builder" })} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign in →</button>
           )}
-          <button onClick={() => signOut()} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign out</button>
         </div>
       </header>
 
@@ -3330,6 +3386,23 @@ export default function BuilderPage() {
         >
           ▶ Preview
         </button>
+      )}
+
+      {signInPrompt && (
+        <div style={modalOverlayStyle}>
+          <div style={{ ...modalStyle, maxWidth: 360, textAlign: "center" }}>
+            <h2 style={{ fontFamily: "'Caveat', cursive", fontSize: 30, color: "#2a2a2a", marginBottom: 6 }}>Sign in to continue</h2>
+            <p style={{ fontFamily: "monospace", fontSize: 12, color: "#6a6a6a", marginBottom: 24 }}>{signInPrompt}</p>
+            <button onClick={handleSignInConfirm} style={primaryButtonStyle}>
+              Sign in with Google
+            </button>
+            <button
+              onClick={() => { setSignInPrompt(null); pendingSignInActionRef.current = null; }}
+              style={{ ...miniButton, marginTop: 12, display: "block", width: "100%", padding: "8px", fontSize: 11 }}>
+              cancel
+            </button>
+          </div>
+        </div>
       )}
     </main>
   );
