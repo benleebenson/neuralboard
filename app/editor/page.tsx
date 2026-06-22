@@ -1717,28 +1717,6 @@ export default function EditorPage() {
     exportRafRef.current = requestAnimationFrame(exportFrame);
   }
 
-  // ─── Auth gates ──────────────────────────────────────────────────────────────
-
-  if (status === "loading") {
-    return (
-      <main style={lockScreenStyle}>
-        <div style={{ fontFamily: "monospace", color: "#6a6a6a", fontSize: 13 }}>Loading...</div>
-      </main>
-    );
-  }
-
-  if (!session?.user) {
-    return (
-      <main style={lockScreenStyle}>
-        <div style={{ maxWidth: 360, width: "100%" }}>
-          <h1 style={{ fontFamily: "'Caveat', cursive", fontSize: 38, color: "#2a2a2a", textAlign: "center", marginBottom: 4 }}>Neural Board</h1>
-          <p style={{ fontSize: 12, color: "#6a6a6a", textAlign: "center", marginBottom: 24, fontFamily: "'Courier New', monospace" }}>sign in to continue</p>
-          <button onClick={() => signIn("google")} style={primaryButtonStyle}>Sign in with Google</button>
-        </div>
-      </main>
-    );
-  }
-
   const playheadX = playheadSec * pxPerSec;
   const isShortFormat = outputFormat === '9:16';
   const renderPreviewPanel = (placement: "top" | "side") => {
@@ -1961,7 +1939,11 @@ export default function EditorPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <a href="/board" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Neural Board</a>
-          <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+          {session?.user ? (
+            <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+          ) : (
+            <button onClick={() => signIn("google", { callbackUrl: "/editor" })} style={{ fontFamily: "monospace", background: "transparent", border: "1px solid #2a2a2a", padding: "3px 8px", cursor: "pointer", fontSize: 10 }}>sign in →</button>
+          )}
         </div>
       </header>
 
