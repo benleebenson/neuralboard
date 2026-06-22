@@ -3,6 +3,13 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
+const YT_URL_RE = /^https:\/\/(www\.)?youtube\.com\/watch\?.*v=[\w-]{11}/;
+const YT_SHORT_RE = /^https:\/\/youtu\.be\/[\w-]{11}/;
+
+function isYouTubeUrl(url: string): boolean {
+  return YT_URL_RE.test(url) || YT_SHORT_RE.test(url);
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { youtubeId, url: ytUrlParam, start, end } = await req.json();
@@ -18,6 +25,10 @@ export async function POST(req: NextRequest) {
     }
 
     const ytUrl = ytUrlParam ?? `https://www.youtube.com/watch?v=${youtubeId}`;
+
+    if (!isYouTubeUrl(ytUrl)) {
+      return NextResponse.json({ error: "Only YouTube URLs are supported" }, { status: 400 });
+    }
     const body: { url: string; start?: number; end?: number } = { url: ytUrl };
     if (typeof start === "number") body.start = start;
     if (typeof end === "number") body.end = end;
