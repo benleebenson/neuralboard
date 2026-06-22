@@ -52,6 +52,7 @@ type BoardClip = Clip & {
   boardH: number;
   cameraZoomTarget: number;
   holdFraction: number;
+  panZoom?: number;
 };
 
 type BoardSnapshot = {
@@ -162,6 +163,37 @@ function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y:
   }
 
   return { x: frameAll.x, y: frameAll.y, zoom: frameAll.zoom, label: "Frame All" };
+}
+
+function computePanCameraAt(atSec: number, clips: BoardClip[]): { x: number; y: number; zoom: number; label: string } | null {
+  const activePans = clips.filter((c) => c.type === "pan" && atSec >= c.startTime && atSec < c.startTime + c.durationSec);
+  if (activePans.length === 0) return null;
+  const pan = activePans.reduce((best, c) => c.layer < best.layer ? c : best);
+  const panZoom = pan.panZoom ?? 1.0;
+
+  // cameraY from keyframe camera at the moment the pan began (pan clips are not visual, so no recursion)
+  const refCam = computeCameraAtTime(pan.startTime, clips);
+  const camY = refCam ? refCam.y : BOARD_H / 2;
+
+  const visuals = clips.filter(isVisualClip);
+  let camX: number;
+  if (visuals.length === 0) {
+    camX = BOARD_W / 2;
+  } else {
+    const margin = 100;
+    const leftEdge = Math.min(...visuals.map((c) => c.boardX)) - margin;
+    const rightEdge = Math.max(...visuals.map((c) => c.boardX + c.boardW)) + margin;
+    const halfVP = VIEWPORT_W / (2 * panZoom);
+    const panStartCamX = leftEdge + halfVP;
+    const panEndCamX = rightEdge - halfVP;
+    if (panEndCamX <= panStartCamX) {
+      camX = (leftEdge + rightEdge) / 2;
+    } else {
+      const t = easeInOut(clamp((atSec - pan.startTime) / Math.max(0.001, pan.durationSec), 0, 1));
+      camX = panStartCamX + (panEndCamX - panStartCamX) * t;
+    }
+  }
+  return { x: camX, y: camY, zoom: panZoom, label: "Pan ↔" };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -951,7 +983,7 @@ export default function BoardPage() {
   }
 
   function applyKeyframeCameraAt(atSec: number, currentClips: BoardClip[]) {
-    const cam = computeCameraAtTime(atSec, currentClips);
+    const cam = computePanCameraAt(atSec, currentClips) ?? computeCameraAtTime(atSec, currentClips);
     if (!cam) return;
     cameraXRef.current = cam.x;
     cameraYRef.current = cam.y;
@@ -1238,6 +1270,24 @@ export default function BoardPage() {
     e.target.value = "";
   }
 
+  function addPanClip() {
+    pushUndoSnapshot();
+    const startTime = playheadSecRef.current;
+    const durationSec = 5;
+    setClips((prev) => {
+      const layer = findFreeLayer(prev, startTime, durationSec, layerCountRef.current);
+      ensureLayerCount(layer);
+      return [...prev, {
+        id: crypto.randomUUID(), type: "pan" as ClipType, name: "Pan", blobUrl: "",
+        sourceDuration: 9999, durationSec, startTime, layer, trimStart: 0, playbackRate: 1,
+        transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
+        volumeCurve: [...DEFAULT_CURVE],
+        boardX: BOARD_W / 2, boardY: BOARD_H / 2, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
+        cameraZoomTarget: 1, holdFraction: 0, panZoom: 1.0,
+      }];
+    });
+  }
+
   // ─── YouTube ─────────────────────────────────────────────────────────────────
 
   async function handleYtSearch(shortsOnlyOverride?: boolean) {
@@ -1459,8 +1509,8 @@ export default function BoardPage() {
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
-      // Draw board frame to export canvas — camera driven by keyframes
-      const exportCam = computeCameraAtTime(elapsed, currentClips);
+      // Draw board frame to export canvas — pan overrides keyframes if active
+      const exportCam = computePanCameraAt(elapsed, currentClips) ?? computeCameraAtTime(elapsed, currentClips);
       const exportZoom = exportCam ? exportCam.zoom : 1;
       const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
       const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
@@ -1575,6 +1625,9 @@ export default function BoardPage() {
                   ▶ Add YouTube clip
                 </button>
               )}
+              <button onClick={addPanClip} style={{ ...sketchButton, background: "#f0e6a8" }}>
+                ↔ Pan
+              </button>
               {recError && <span style={{ fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>{recError}</span>}
             </div>
 
@@ -1719,6 +1772,9 @@ export default function BoardPage() {
                           style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
                         >
                           {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
+                          {clip.type === "pan" && clipPx >= 30 && !isBeingDragged && (
+                            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 1, fontSize: 16, opacity: 0.55 }}>↔</div>
+                          )}
                           {isVisualClip(clip) && clipPx >= 30 && !isBeingDragged && (() => {
                             const dividerLeft = clip.holdFraction * clipPx;
                             const holdSec = (clip.durationSec * clip.holdFraction).toFixed(1);

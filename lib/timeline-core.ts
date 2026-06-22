@@ -2,7 +2,7 @@
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type ClipType = "audio" | "video" | "image" | "text" | "countdown";
+export type ClipType = "audio" | "video" | "image" | "text" | "countdown" | "pan";
 export type ClipTransform = { x: number; y: number; scaleX: number; scaleY: number };
 export type CurvePoint = { time: number; volume: number };
 
@@ -76,6 +76,7 @@ export const CLIP_COLORS: Record<ClipType, string> = {
   image: "#f5c6a0",
   text: "#f6f1a2",
   countdown: COUNTDOWN_COLOR,
+  pan: "#f0e6a8",
 };
 
 // ─── Timeline math ───────────────────────────────────────────────────────────
