@@ -491,7 +491,6 @@ export default function BoardPage() {
 
   // Board canvas
   const boardCanvasRef = useRef<HTMLCanvasElement>(null);
-  const exportCanvasRef = useRef<HTMLCanvasElement>(null);
   const boardRafRef = useRef<number | null>(null);
   // Media elements for board rendering
   const boardVideoEls = useRef<Map<string, HTMLVideoElement>>(new Map());
@@ -610,15 +609,21 @@ export default function BoardPage() {
     );
   }
 
-  // Start board preview RAF loop
-  useEffect(() => {
+  function startBoardPreviewLoop() {
+    if (boardRafRef.current !== null) return;
     function tick() {
       drawBoardFrame(playheadSecRef.current, clipsRef.current);
       boardRafRef.current = requestAnimationFrame(tick);
     }
     boardRafRef.current = requestAnimationFrame(tick);
+  }
+
+  // Start board preview RAF loop
+  useEffect(() => {
+    startBoardPreviewLoop();
     return () => {
       if (boardRafRef.current !== null) cancelAnimationFrame(boardRafRef.current);
+      boardRafRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1481,11 +1486,28 @@ export default function BoardPage() {
     const canvasW = 1600;
     const canvasH = 1200;
 
-    const canvas = exportCanvasRef.current;
-    if (!canvas) { alert("Export canvas is not ready. Try again in a moment."); setIsExporting(false); isExportingRef.current = false; return; }
-    canvas.width = canvasW;
-    canvas.height = canvasH;
-    const ctx2d = canvas.getContext("2d")!;
+    const canvas = boardCanvasRef.current;
+    if (!canvas) { alert("Board canvas is not ready. Try again in a moment."); setIsExporting(false); isExportingRef.current = false; return; }
+    const exportCanvas = canvas;
+    const previousCanvasW = exportCanvas.width;
+    const previousCanvasH = exportCanvas.height;
+    if (boardRafRef.current !== null) {
+      cancelAnimationFrame(boardRafRef.current);
+      boardRafRef.current = null;
+    }
+    exportCanvas.width = canvasW;
+    exportCanvas.height = canvasH;
+    const ctx2d = exportCanvas.getContext("2d")!;
+    let previewRestored = false;
+
+    function restorePreviewCanvas() {
+      if (previewRestored) return;
+      previewRestored = true;
+      exportCanvas.width = previousCanvasW || VIEWPORT_W;
+      exportCanvas.height = previousCanvasH || VIEWPORT_H;
+      drawBoardFrame(playheadSecRef.current, clipsRef.current);
+      startBoardPreviewLoop();
+    }
 
     // Load video elements
     const exportVideoEls = new Map<string, HTMLVideoElement>();
@@ -1542,11 +1564,11 @@ export default function BoardPage() {
     const audioCtx = getAudioCtx();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     const exportAudioDest = audioCtx.createMediaStreamDestination();
-    let canvasStream = canvas.captureStream(0);
+    let canvasStream = exportCanvas.captureStream(0);
     let [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
     if (!canvasVideoTrack?.requestFrame) {
       canvasStream.getTracks().forEach((track) => track.stop());
-      canvasStream = canvas.captureStream(EXPORT_FPS);
+      canvasStream = exportCanvas.captureStream(EXPORT_FPS);
       [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
     }
     const combined = new MediaStream([
@@ -1594,6 +1616,7 @@ export default function BoardPage() {
       for (const vid of exportVideoEls.values()) vid.pause();
       const recordedBlob = await recordingDone;
       canvasStream.getTracks().forEach((track) => track.stop());
+      restorePreviewCanvas();
       if (recordedBlob.size < 1000) {
         throw new Error(`Recording produced no data (${recordedBlob.size}b, codec: ${actualMimeType || "unknown"}). Try desktop Chrome or Safari 17.2+.`);
       }
@@ -1627,6 +1650,7 @@ export default function BoardPage() {
       canvasStream.getTracks().forEach((track) => track.stop());
       stopAllAudio();
       for (const vid of exportVideoEls.values()) vid.pause();
+      restorePreviewCanvas();
       alert(err instanceof Error ? err.message : "Export failed");
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
     }
@@ -1656,6 +1680,7 @@ export default function BoardPage() {
         canvasStream.getTracks().forEach((track) => track.stop());
         if (recorder.state !== "inactive") recorder.stop();
         exportRafRef.current = null;
+        restorePreviewCanvas();
         setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
         return;
       }
@@ -1719,12 +1744,6 @@ export default function BoardPage() {
   return (
     <main style={pageStyle}>
       <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} } @keyframes nbslide-in { from { transform: translateX(100%); } to { transform: translateX(0); } } @keyframes nbtoast { 0%{opacity:0;transform:translate(-50%,8px)} 100%{opacity:1;transform:translate(-50%,0)} }`}</style>
-      <canvas
-        ref={exportCanvasRef}
-        aria-hidden="true"
-        style={{ position: "fixed", right: 0, bottom: 0, width: 2, height: 2, opacity: 0.01, pointerEvents: "none", zIndex: 0 }}
-      />
-
       {/* Header */}
       <header style={headerStyle}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
