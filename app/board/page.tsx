@@ -490,6 +490,7 @@ export default function BoardPage() {
 
   // Board canvas
   const boardCanvasRef = useRef<HTMLCanvasElement>(null);
+  const exportCanvasRef = useRef<HTMLCanvasElement>(null);
   const boardRafRef = useRef<number | null>(null);
   // Media elements for board rendering
   const boardVideoEls = useRef<Map<string, HTMLVideoElement>>(new Map());
@@ -1479,7 +1480,8 @@ export default function BoardPage() {
     const canvasW = 1600;
     const canvasH = 1200;
 
-    const canvas = document.createElement("canvas");
+    const canvas = exportCanvasRef.current;
+    if (!canvas) { alert("Export canvas is not ready. Try again in a moment."); setIsExporting(false); isExportingRef.current = false; return; }
     canvas.width = canvasW;
     canvas.height = canvasH;
     const ctx2d = canvas.getContext("2d")!;
@@ -1562,12 +1564,25 @@ export default function BoardPage() {
     const actualMimeType = recorder.mimeType || recorderMime || "video/webm";
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    let stopTimer: ReturnType<typeof setTimeout> | null = null;
+    let rejectRecording: (err: Error) => void = () => {};
     const recordingDone = new Promise<Blob>((resolve, reject) => {
+      rejectRecording = reject;
       recorder.onstop = () => {
+        if (stopTimer) clearTimeout(stopTimer);
         resolve(new Blob(chunks, { type: actualMimeType }));
       };
-      recorder.onerror = () => reject(new Error("Browser recorder failed during export."));
+      recorder.onerror = () => {
+        if (stopTimer) clearTimeout(stopTimer);
+        reject(new Error("Browser recorder failed during export."));
+      };
     });
+    const armStopTimeout = () => {
+      stopTimer = setTimeout(() => {
+        stopTimer = null;
+        rejectRecording(new Error("Browser recorder did not finish after stop. Try desktop Chrome, or shorten the export and try again."));
+      }, 15000);
+    };
 
     async function finishRecording() {
       for (const vid of exportVideoEls.values()) vid.pause();
@@ -1639,6 +1654,7 @@ export default function BoardPage() {
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
         try { recorder.requestData(); } catch {}
+        armStopTimeout();
         recorder.stop();
         finishRecording().catch(finishExportError);
         return;
@@ -1690,6 +1706,11 @@ export default function BoardPage() {
   return (
     <main style={pageStyle}>
       <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} } @keyframes nbslide-in { from { transform: translateX(100%); } to { transform: translateX(0); } } @keyframes nbtoast { 0%{opacity:0;transform:translate(-50%,8px)} 100%{opacity:1;transform:translate(-50%,0)} }`}</style>
+      <canvas
+        ref={exportCanvasRef}
+        aria-hidden="true"
+        style={{ position: "fixed", left: -10000, top: -10000, width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+      />
 
       {/* Header */}
       <header style={headerStyle}>
