@@ -1461,6 +1461,11 @@ export default function BoardPage() {
 
   async function startExport() {
     if (isRecordingNarrationRef.current) { alert("Stop recording before exporting"); return; }
+    const railwayUrl = config?.railwayUrl;
+    const railwayPassword = config?.railwayPassword;
+    if (!railwayUrl || !railwayPassword) { alert("Export service is still loading. Try again in a moment."); return; }
+    const renderUrl = railwayUrl;
+    const renderPassword = railwayPassword;
     const currentClips = clipsRef.current;
     if (currentClips.length === 0) { alert("No clips to export"); return; }
     if (isPlayingRef.current) pausePlayback();
@@ -1540,21 +1545,69 @@ export default function BoardPage() {
       ...canvasStream.getVideoTracks(),
       ...exportAudioDest.stream.getAudioTracks(),
     ]);
-    const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
-    const recorder = new MediaRecorder(combined, { mimeType });
+    const recorderMime = (() => {
+      const candidates = [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm",
+        "video/mp4;codecs=avc1,mp4a.40.2",
+        "video/mp4",
+      ];
+      return candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+    })();
+    const recorder = new MediaRecorder(
+      combined,
+      recorderMime ? { mimeType: recorderMime, videoBitsPerSecond: 6_000_000 } : { videoBitsPerSecond: 6_000_000 },
+    );
+    const actualMimeType = recorder.mimeType || recorderMime || "video/webm";
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-    recorder.onstop = () => {
+    const recordingDone = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => {
+        resolve(new Blob(chunks, { type: actualMimeType }));
+      };
+    });
+
+    async function finishRecording() {
       canvasStream.getTracks().forEach((track) => track.stop());
-      const blob = new Blob(chunks, { type: mimeType });
-      const url = URL.createObjectURL(blob);
+      for (const vid of exportVideoEls.values()) vid.pause();
+      const recordedBlob = await recordingDone;
+      if (recordedBlob.size < 1000) {
+        throw new Error(`Recording produced no data (${recordedBlob.size}b, codec: ${actualMimeType || "unknown"}). Try desktop Chrome or Safari 17.2+.`);
+      }
+
+      const mp4Res = await fetch(`${renderUrl}/render`, {
+        method: "POST",
+        headers: { "Content-Type": actualMimeType, "x-neuralboard-password": renderPassword },
+        body: recordedBlob,
+      });
+      if (!mp4Res.ok) {
+        const errText = await mp4Res.text().catch(() => "");
+        throw new Error(`Server render failed (${mp4Res.status}): ${errText}`);
+      }
+      const outputBlob = await mp4Res.blob();
+
+      const url = URL.createObjectURL(outputBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = mimeType === "video/mp4" ? "neuralboard-export.mp4" : "neuralboard-export.webm";
+      a.download = "neuralboard-export.mp4";
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
-    };
+      fetch("/api/render/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ durationSeconds: totalDur }),
+      }).catch(() => {});
+    }
+
+    function finishExportError(err: unknown) {
+      canvasStream.getTracks().forEach((track) => track.stop());
+      stopAllAudio();
+      for (const vid of exportVideoEls.values()) vid.pause();
+      alert(err instanceof Error ? err.message : "Export failed");
+      setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
+    }
 
     recorder.start(100);
     const exportWallStart = performance.now();
@@ -1574,7 +1627,8 @@ export default function BoardPage() {
       if (exportCancelRef.current) {
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
-        recorder.stop();
+        canvasStream.getTracks().forEach((track) => track.stop());
+        if (recorder.state !== "inactive") recorder.stop();
         setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
         return;
       }
@@ -1582,7 +1636,9 @@ export default function BoardPage() {
       if (elapsed >= totalDur) {
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
+        try { recorder.requestData(); } catch {}
         recorder.stop();
+        finishRecording().catch(finishExportError);
         return;
       }
       setExportProgress(elapsed / totalDur);
