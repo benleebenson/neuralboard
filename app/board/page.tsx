@@ -125,75 +125,64 @@ function computeFrameAllTarget(clips: BoardClip[]): { x: number; y: number; zoom
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom };
 }
 
+function isPanOrVisual(clip: BoardClip): boolean {
+  return isVisualClip(clip) || clip.type === "pan";
+}
+
+function getStopForClip(clip: BoardClip, allClips: BoardClip[]): { x: number; y: number; zoom: number; name: string } {
+  if (clip.type === "pan") {
+    const visuals = allClips.filter(isVisualClip);
+    if (visuals.length === 0) return { x: BOARD_W / 2, y: BOARD_H / 2, zoom: 1.0, name: "Pan" };
+    const pad = 100;
+    const minX = Math.min(...visuals.map((c) => c.boardX)) - pad;
+    const minY = Math.min(...visuals.map((c) => c.boardY)) - pad;
+    const maxX = Math.max(...visuals.map((c) => c.boardX + c.boardW)) + pad;
+    const maxY = Math.max(...visuals.map((c) => c.boardY + c.boardH)) + pad;
+    const zoom = clamp(Math.min(VIEWPORT_W / (maxX - minX), VIEWPORT_H / (maxY - minY)), 0.2, 4);
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom, name: "Pan" };
+  }
+  return { x: clip.boardX + clip.boardW / 2, y: clip.boardY + clip.boardH / 2, zoom: clip.cameraZoomTarget, name: clip.name };
+}
+
 function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y: number; zoom: number; label: string } | null {
-  const sorted = clips.filter(isVisualClip).sort((a, b) => a.startTime - b.startTime);
-  if (sorted.length === 0) return null;
+  const stops = clips.filter(isPanOrVisual).sort((a, b) => a.startTime - b.startTime);
+  if (stops.length === 0) return null;
 
   const frameAll = computeFrameAllTarget(clips);
-  const first = sorted[0];
+  const first = stops[0];
+  const firstStop = getStopForClip(first, clips);
 
   if (atSec <= first.startTime) {
-    return { x: first.boardX + first.boardW / 2, y: first.boardY + first.boardH / 2, zoom: first.cameraZoomTarget, label: `Hold: ${first.name}` };
+    return { x: firstStop.x, y: firstStop.y, zoom: firstStop.zoom, label: `Hold: ${firstStop.name}` };
   }
 
-  for (let i = 0; i < sorted.length; i++) {
-    const clip = sorted[i];
+  for (let i = 0; i < stops.length; i++) {
+    const clip = stops[i];
     const clipEnd = clip.startTime + clip.durationSec;
     if (atSec < clipEnd) {
-      const clipX = clip.boardX + clip.boardW / 2;
-      const clipY = clip.boardY + clip.boardH / 2;
+      const { x: clipX, y: clipY, zoom: clipZoom, name: clipName } = getStopForClip(clip, clips);
       const holdEnd = clip.startTime + clip.durationSec * clip.holdFraction;
       if (atSec <= holdEnd) {
-        return { x: clipX, y: clipY, zoom: clip.cameraZoomTarget, label: `Hold: ${clip.name}` };
+        return { x: clipX, y: clipY, zoom: clipZoom, label: `Hold: ${clipName}` };
       }
-      const next = sorted[i + 1];
-      const nextX = next ? next.boardX + next.boardW / 2 : frameAll.x;
-      const nextY = next ? next.boardY + next.boardH / 2 : frameAll.y;
-      const nextZoom = next ? next.cameraZoomTarget : frameAll.zoom;
-      const nextName = next ? next.name : "Frame All";
+      const next = stops[i + 1];
+      const nextStop = next ? getStopForClip(next, clips) : null;
+      const nextX = nextStop ? nextStop.x : frameAll.x;
+      const nextY = nextStop ? nextStop.y : frameAll.y;
+      const nextZoom = nextStop ? nextStop.zoom : frameAll.zoom;
+      const nextName = nextStop ? nextStop.name : "Frame All";
       const transSpan = clipEnd - holdEnd;
       const t = easeInOut(transSpan > 0 ? clamp((atSec - holdEnd) / transSpan, 0, 1) : 1);
       return {
         x: clipX + (nextX - clipX) * t,
         y: clipY + (nextY - clipY) * t,
-        zoom: clip.cameraZoomTarget + (nextZoom - clip.cameraZoomTarget) * t,
+        zoom: clipZoom + (nextZoom - clipZoom) * t,
         label: `Transition → ${nextName}`,
       };
     }
   }
 
   return { x: frameAll.x, y: frameAll.y, zoom: frameAll.zoom, label: "Frame All" };
-}
-
-function computePanCameraAt(atSec: number, clips: BoardClip[]): { x: number; y: number; zoom: number; label: string } | null {
-  const activePans = clips.filter((c) => c.type === "pan" && atSec >= c.startTime && atSec < c.startTime + c.durationSec);
-  if (activePans.length === 0) return null;
-  const pan = activePans.reduce((best, c) => c.layer < best.layer ? c : best);
-  const panZoom = pan.panZoom ?? 1.0;
-
-  // cameraY from keyframe camera at the moment the pan began (pan clips are not visual, so no recursion)
-  const refCam = computeCameraAtTime(pan.startTime, clips);
-  const camY = refCam ? refCam.y : BOARD_H / 2;
-
-  const visuals = clips.filter(isVisualClip);
-  let camX: number;
-  if (visuals.length === 0) {
-    camX = BOARD_W / 2;
-  } else {
-    const margin = 100;
-    const leftEdge = Math.min(...visuals.map((c) => c.boardX)) - margin;
-    const rightEdge = Math.max(...visuals.map((c) => c.boardX + c.boardW)) + margin;
-    const halfVP = VIEWPORT_W / (2 * panZoom);
-    const panStartCamX = leftEdge + halfVP;
-    const panEndCamX = rightEdge - halfVP;
-    if (panEndCamX <= panStartCamX) {
-      camX = (leftEdge + rightEdge) / 2;
-    } else {
-      const t = easeInOut(clamp((atSec - pan.startTime) / Math.max(0.001, pan.durationSec), 0, 1));
-      camX = panStartCamX + (panEndCamX - panStartCamX) * t;
-    }
-  }
-  return { x: camX, y: camY, zoom: panZoom, label: "Pan ↔" };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -983,7 +972,7 @@ export default function BoardPage() {
   }
 
   function applyKeyframeCameraAt(atSec: number, currentClips: BoardClip[]) {
-    const cam = computePanCameraAt(atSec, currentClips) ?? computeCameraAtTime(atSec, currentClips);
+    const cam = computeCameraAtTime(atSec, currentClips);
     if (!cam) return;
     cameraXRef.current = cam.x;
     cameraYRef.current = cam.y;
@@ -1283,7 +1272,7 @@ export default function BoardPage() {
         transform: { x: 0, y: 0, scaleX: 1, scaleY: 1 }, muted: false,
         volumeCurve: [...DEFAULT_CURVE],
         boardX: BOARD_W / 2, boardY: BOARD_H / 2, boardW: CLIP_DEFAULT_W, boardH: CLIP_DEFAULT_H,
-        cameraZoomTarget: 1, holdFraction: 0, panZoom: 1.0,
+        cameraZoomTarget: 1, holdFraction: 0.5, panZoom: 1.0,
       }];
     });
   }
@@ -1509,8 +1498,8 @@ export default function BoardPage() {
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
-      // Draw board frame to export canvas — pan overrides keyframes if active
-      const exportCam = computePanCameraAt(elapsed, currentClips) ?? computeCameraAtTime(elapsed, currentClips);
+      // Draw board frame to export canvas — camera driven by unified keyframe stops
+      const exportCam = computeCameraAtTime(elapsed, currentClips);
       const exportZoom = exportCam ? exportCam.zoom : 1;
       const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
       const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
@@ -1773,9 +1762,9 @@ export default function BoardPage() {
                         >
                           {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
                           {clip.type === "pan" && clipPx >= 30 && !isBeingDragged && (
-                            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 1, fontSize: 16, opacity: 0.55 }}>↔</div>
+                            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 3, fontSize: 16, opacity: 0.55 }}>↔</div>
                           )}
-                          {isVisualClip(clip) && clipPx >= 30 && !isBeingDragged && (() => {
+                          {(isVisualClip(clip) || clip.type === "pan") && clipPx >= 30 && !isBeingDragged && (() => {
                             const dividerLeft = clip.holdFraction * clipPx;
                             const holdSec = (clip.durationSec * clip.holdFraction).toFixed(1);
                             const transSec = (clip.durationSec * (1 - clip.holdFraction)).toFixed(1);
