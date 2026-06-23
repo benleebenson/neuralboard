@@ -1475,6 +1475,13 @@ export default function BoardPage() {
     const renderPassword = railwayPassword;
     const currentClips = clipsRef.current;
     if (currentClips.length === 0) { alert("No clips to export"); return; }
+
+    // ── LOG 1: button clicked ──────────────────────────────────────────────────
+    const _diagCodecs = ['video/mp4', 'video/mp4;codecs=avc1', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    console.log('[export] codec support matrix:', _diagCodecs.map(c => ({ codec: c, supported: MediaRecorder.isTypeSupported(c) })));
+    const _diagTimelineDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
+    console.log('[export] click. clips count:', currentClips.length, 'timeline duration:', _diagTimelineDur, 'browser:', navigator.userAgent);
+
     if (isPlayingRef.current) pausePlayback();
     setIsExporting(true);
     isExportingRef.current = true;
@@ -1564,6 +1571,12 @@ export default function BoardPage() {
     const audioCtx = getAudioCtx();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     const exportAudioDest = audioCtx.createMediaStreamDestination();
+
+    // ── LOG 2: canvas stream setup ─────────────────────────────────────────────
+    console.log('[export] canvas dims:', exportCanvas.width, 'x', exportCanvas.height,
+      'inDOM:', document.contains(exportCanvas),
+      'ctx2d pixelData check:', (() => { try { const p = ctx2d.getImageData(0,0,1,1); return p.data[3] > 0 ? 'has pixels' : 'transparent (may be blank)'; } catch { return 'cross-origin blocked'; } })());
+
     let canvasStream = exportCanvas.captureStream(0);
     let [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
     if (!canvasVideoTrack?.requestFrame) {
@@ -1571,10 +1584,18 @@ export default function BoardPage() {
       canvasStream = exportCanvas.captureStream(EXPORT_FPS);
       [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
     }
+    console.log('[export] stream created. requestFrame available:', !!(canvasVideoTrack?.requestFrame),
+      'tracks:', canvasStream.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState, label: t.label })));
+
     const combined = new MediaStream([
       ...canvasStream.getVideoTracks(),
       ...exportAudioDest.stream.getAudioTracks(),
     ]);
+
+    // ── LOG 3: audio stream setup ──────────────────────────────────────────────
+    console.log('[export] audio. ctx state:', audioCtx.state,
+      'dest stream audio tracks:', exportAudioDest.stream.getAudioTracks().length,
+      'combined total tracks:', combined.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState })));
     const recorderMime = (() => {
       const candidates = [
         "video/webm;codecs=vp8,opus",
@@ -1585,20 +1606,37 @@ export default function BoardPage() {
       ];
       return candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
     })();
+
+    // ── LOG 4: MediaRecorder instantiation ────────────────────────────────────
+    const _diagCandidates = ["video/webm;codecs=vp8,opus","video/webm","video/webm;codecs=vp9,opus","video/mp4;codecs=avc1,mp4a.40.2","video/mp4"];
+    console.log('[export] recorder mime candidates:', _diagCandidates.map(c => ({ mime: c, supported: MediaRecorder.isTypeSupported(c) })));
+    console.log('[export] recorder chosen mimeType:', recorderMime || '(none — browser default)', 'supported:', recorderMime ? MediaRecorder.isTypeSupported(recorderMime) : 'n/a');
+
     const recorder = new MediaRecorder(
       combined,
       recorderMime ? { mimeType: recorderMime, videoBitsPerSecond: 6_000_000 } : { videoBitsPerSecond: 6_000_000 },
     );
     const actualMimeType = recorder.mimeType || recorderMime || "video/webm";
+    console.log('[export] recorder instantiated. actualMimeType:', actualMimeType, 'recorder.state:', recorder.state);
     const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    // ── LOG 7: data available ──────────────────────────────────────────────────
+    recorder.ondataavailable = (e) => {
+      console.log('[export] data chunk:', e.data.size, 'bytes, type:', e.data.type, '— running total chunks:', chunks.length + (e.data.size > 0 ? 1 : 0));
+      if (e.data.size > 0) chunks.push(e.data);
+    };
     let stopTimer: ReturnType<typeof setTimeout> | null = null;
     let rejectRecording: (err: Error) => void = () => {};
     const recordingDone = new Promise<Blob>((resolve, reject) => {
       rejectRecording = reject;
       recorder.onstop = () => {
         if (stopTimer) clearTimeout(stopTimer);
-        resolve(new Blob(chunks, { type: actualMimeType }));
+        // ── LOG 8: recorder stopped ────────────────────────────────────────────
+        const totalBytes = chunks.reduce((s, c) => s + c.size, 0);
+        console.log('[export] recorder stopped. state:', recorder.state, 'chunks:', chunks.length, 'totalBytes:', totalBytes);
+        const finalBlob = new Blob(chunks, { type: actualMimeType });
+        // ── LOG 9: final blob ──────────────────────────────────────────────────
+        console.log('[export] final blob:', finalBlob.size, 'bytes, type:', finalBlob.type);
+        resolve(finalBlob);
       };
       recorder.onerror = () => {
         if (stopTimer) clearTimeout(stopTimer);
@@ -1618,6 +1656,10 @@ export default function BoardPage() {
       canvasStream.getTracks().forEach((track) => track.stop());
       restorePreviewCanvas();
       if (recordedBlob.size < 1000) {
+        console.error('[export] FAILURE — blob too small. Full trace summary:',
+          { blobSize: recordedBlob.size, blobType: recordedBlob.type, chunks: chunks.length, actualMimeType,
+            canvasDims: `${exportCanvas.width}x${exportCanvas.height}`, audioCtxState: audioCtx.state,
+            recorderMime, canvasInDOM: document.contains(exportCanvas) });
         throw new Error(`Recording produced no data (${recordedBlob.size}b, codec: ${actualMimeType || "unknown"}). Try desktop Chrome or Safari 17.2+.`);
       }
 
@@ -1655,7 +1697,9 @@ export default function BoardPage() {
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
     }
 
+    // ── LOG 5: recorder start ─────────────────────────────────────────────────
     recorder.start(100);
+    console.log('[export] recorder started. state:', recorder.state);
     const exportWallStart = performance.now();
     drawExportFrameAt(0);
     canvasVideoTrack?.requestFrame?.();
@@ -1672,6 +1716,8 @@ export default function BoardPage() {
 
     let exportFrameIndex = 1;
     const totalExportFrames = Math.max(1, Math.ceil(totalDur * EXPORT_FPS));
+    // ── LOG 6: loop start ──────────────────────────────────────────────────────
+    console.log('[export] render loop start. virtualTime=0, totalFrames:', totalExportFrames, 'fps:', EXPORT_FPS, 'loop type: setTimeout (async)');
 
     function exportFrame() {
       if (exportCancelRef.current) {
@@ -1687,6 +1733,8 @@ export default function BoardPage() {
       const wallElapsed = (performance.now() - exportWallStart) / 1000;
       const elapsed = Math.min(exportFrameIndex / EXPORT_FPS, totalDur);
       if (exportFrameIndex >= totalExportFrames) {
+        // ── LOG 6: last frame before stop ───────────────────────────────────────
+        console.log('[export] frame', exportFrameIndex, '(LAST) virtualTime:', elapsed, 'wallElapsed:', wallElapsed.toFixed(3), 'recorder.state:', recorder.state, 'chunks so far:', chunks.length);
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
         try { recorder.requestData(); } catch {}
@@ -1695,6 +1743,10 @@ export default function BoardPage() {
         exportRafRef.current = null;
         finishRecording().catch(finishExportError);
         return;
+      }
+      // ── LOG 6: per-frame (throttled: frame 1, every 30th, last) ───────────────
+      if (exportFrameIndex === 1 || exportFrameIndex % 30 === 0) {
+        console.log('[export] frame', exportFrameIndex, '/', totalExportFrames, 'virtualTime:', elapsed.toFixed(3), 'wallElapsed:', wallElapsed.toFixed(3), 'recorder.state:', recorder.state, 'chunks so far:', chunks.length);
       }
       setExportProgress(elapsed / totalDur);
       tickAudio(wallElapsed, currentClips, exportAudioDest);
