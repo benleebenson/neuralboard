@@ -129,17 +129,46 @@ function isPanOrVisual(clip: BoardClip): boolean {
   return isVisualClip(clip) || clip.type === "pan";
 }
 
+function getPanSweepInfo(allClips: BoardClip[]): {
+  sweepStartX: number;
+  sweepEndX: number;
+  centerY: number;
+  zoom: number;
+} {
+  const visuals = allClips.filter(isVisualClip);
+  const margin = 100;
+
+  if (visuals.length === 0) {
+    const defaultZoom = 1.0;
+    const halfVW = VIEWPORT_W / (2 * defaultZoom);
+    return {
+      sweepStartX: clamp(BOARD_W / 2 - VIEWPORT_W, halfVW, BOARD_W - halfVW),
+      sweepEndX: clamp(BOARD_W / 2 + VIEWPORT_W, halfVW, BOARD_W - halfVW),
+      centerY: BOARD_H / 2,
+      zoom: defaultZoom,
+    };
+  }
+
+  const rawMinX = Math.min(...visuals.map((c) => c.boardX));
+  const rawMaxX = Math.max(...visuals.map((c) => c.boardX + c.boardW));
+  const rawMinY = Math.min(...visuals.map((c) => c.boardY));
+  const rawMaxY = Math.max(...visuals.map((c) => c.boardY + c.boardH));
+  const bboxH = rawMaxY - rawMinY;
+  const zoom = clamp(bboxH > 0 ? (VIEWPORT_H * 0.8) / bboxH : 1.0, 0.2, 4);
+  const halfVW = VIEWPORT_W / (2 * zoom);
+
+  return {
+    sweepStartX: clamp(rawMinX - margin, halfVW, BOARD_W - halfVW),
+    sweepEndX: clamp(rawMaxX + margin, halfVW, BOARD_W - halfVW),
+    centerY: (rawMinY + rawMaxY) / 2,
+    zoom,
+  };
+}
+
 function getStopForClip(clip: BoardClip, allClips: BoardClip[]): { x: number; y: number; zoom: number; name: string } {
   if (clip.type === "pan") {
-    const visuals = allClips.filter(isVisualClip);
-    if (visuals.length === 0) return { x: BOARD_W / 2, y: BOARD_H / 2, zoom: 1.0, name: "Pan" };
-    const pad = 100;
-    const minX = Math.min(...visuals.map((c) => c.boardX)) - pad;
-    const minY = Math.min(...visuals.map((c) => c.boardY)) - pad;
-    const maxX = Math.max(...visuals.map((c) => c.boardX + c.boardW)) + pad;
-    const maxY = Math.max(...visuals.map((c) => c.boardY + c.boardH)) + pad;
-    const zoom = clamp(Math.min(VIEWPORT_W / (maxX - minX), VIEWPORT_H / (maxY - minY)), 0.2, 4);
-    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom, name: "Pan" };
+    const pan = getPanSweepInfo(allClips);
+    return { x: pan.sweepStartX, y: pan.centerY, zoom: pan.zoom, name: "Pan" };
   }
   return { x: clip.boardX + clip.boardW / 2, y: clip.boardY + clip.boardH / 2, zoom: clip.cameraZoomTarget, name: clip.name };
 }
@@ -162,9 +191,22 @@ function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y:
     if (atSec < clipEnd) {
       const { x: clipX, y: clipY, zoom: clipZoom, name: clipName } = getStopForClip(clip, clips);
       const holdEnd = clip.startTime + clip.durationSec * clip.holdFraction;
+
       if (atSec <= holdEnd) {
+        if (clip.type === "pan") {
+          const pan = getPanSweepInfo(clips);
+          const holdSpan = holdEnd - clip.startTime;
+          const t = easeInOut(holdSpan > 0 ? clamp((atSec - clip.startTime) / holdSpan, 0, 1) : 0);
+          return {
+            x: pan.sweepStartX + (pan.sweepEndX - pan.sweepStartX) * t,
+            y: pan.centerY,
+            zoom: pan.zoom,
+            label: "Pan Sweep",
+          };
+        }
         return { x: clipX, y: clipY, zoom: clipZoom, label: `Hold: ${clipName}` };
       }
+
       const next = stops[i + 1];
       const nextStop = next ? getStopForClip(next, clips) : null;
       const nextX = nextStop ? nextStop.x : frameAll.x;
@@ -173,6 +215,17 @@ function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y:
       const nextName = nextStop ? nextStop.name : "Frame All";
       const transSpan = clipEnd - holdEnd;
       const t = easeInOut(transSpan > 0 ? clamp((atSec - holdEnd) / transSpan, 0, 1) : 1);
+
+      if (clip.type === "pan") {
+        const pan = getPanSweepInfo(clips);
+        return {
+          x: pan.sweepEndX + (nextX - pan.sweepEndX) * t,
+          y: pan.centerY + (nextY - pan.centerY) * t,
+          zoom: pan.zoom + (nextZoom - pan.zoom) * t,
+          label: `Transition → ${nextName}`,
+        };
+      }
+
       return {
         x: clipX + (nextX - clipX) * t,
         y: clipY + (nextY - clipY) * t,
