@@ -1555,6 +1555,11 @@ export default function BoardPage() {
       const exportZoom = exportCam ? exportCam.zoom : 1;
       const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
       const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
+      // Log camera state at key frames to confirm animation is computing correctly.
+      const frameIdx = Math.round(atSec * EXPORT_FPS);
+      if (frameIdx <= 1 || frameIdx % 30 === 0) {
+        console.log(`[export] camera t=${atSec.toFixed(3)}s frame=${frameIdx}: x=${exportCamX.toFixed(1)} y=${exportCamY.toFixed(1)} zoom=${exportZoom.toFixed(3)} label="${exportCam?.label ?? 'null→fallback'}" stops=${currentClips.filter(isPanOrVisual).length}`);
+      }
       drawBoardClipsToCanvas(
         ctx2d, canvasW, canvasH,
         exportCamX, exportCamY, exportZoom,
@@ -1686,10 +1691,14 @@ export default function BoardPage() {
       }
       const outputBlob = await mp4Res.blob();
 
+      // Use the actual blob type to pick the right extension.
+      // Webm files play in Chrome, Firefox, and VLC. For QuickTime, convert to mp4 with a free tool like HandBrake.
+      const outputMimeType = outputBlob.type || actualMimeType;
+      const outputExt = outputMimeType.includes("mp4") ? "mp4" : "webm";
       const url = URL.createObjectURL(outputBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "neuralboard-export.webm";
+      a.download = `neuralboard-export.${outputExt}`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
