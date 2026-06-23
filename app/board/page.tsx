@@ -1505,6 +1505,13 @@ export default function BoardPage() {
     exportCanvas.width = canvasW;
     exportCanvas.height = canvasH;
     const ctx2d = exportCanvas.getContext("2d")!;
+    // H1: taint check immediately after canvas context is obtained (pre-draw)
+    try {
+      const testData = ctx2d.getImageData(0, 0, 1, 1);
+      console.log('[export] canvas taint check (pre-draw) PASS — pixel readable:', testData.data.length);
+    } catch (e) {
+      console.log('[export] canvas taint check (pre-draw) FAIL — canvas is tainted:', (e as Error).message);
+    }
     let previewRestored = false;
 
     function restorePreviewCanvas() {
@@ -1567,6 +1574,13 @@ export default function BoardPage() {
     // Paint a real first frame before capture starts. This keeps the exported
     // stream aligned with what the preview renderer would show at timeline 0.
     drawExportFrameAt(0);
+    // H1: taint check after first draw (video/image elements may taint on first paint)
+    try {
+      const testData = ctx2d.getImageData(0, 0, 1, 1);
+      console.log('[export] canvas taint check (post-first-draw) PASS — pixel readable:', testData.data.length);
+    } catch (e) {
+      console.log('[export] canvas taint check (post-first-draw) FAIL — canvas is tainted:', (e as Error).message);
+    }
 
     const audioCtx = getAudioCtx();
     if (audioCtx.state === "suspended") await audioCtx.resume();
@@ -1580,6 +1594,10 @@ export default function BoardPage() {
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     console.log('[export] stream created. mode: auto fps=' + EXPORT_FPS,
       'tracks:', canvasStream.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState, label: t.label })));
+    // H2: confirm captureStream canvas and render-loop canvas are the same object
+    const _h2CaptureCanvas = exportCanvas;
+    const _h2RenderCanvas = ctx2d.canvas;
+    console.log('[export] canvas identity: captureStream canvas:', _h2CaptureCanvas, 'render loop canvas:', _h2RenderCanvas, 'same?', _h2CaptureCanvas === _h2RenderCanvas);
 
     const combined = new MediaStream([
       ...canvasStream.getVideoTracks(),
@@ -1754,7 +1772,11 @@ export default function BoardPage() {
       }
 
       // Draw board frame to export canvas using the same path as the preview.
-      drawExportFrameAt(elapsed);
+      const _drawResult = drawExportFrameAt(elapsed);
+      // H3: check if draw function is async (only log on first frame to avoid spam)
+      if (exportFrameIndex === 1) {
+        console.log('[export] drawExportFrameAt return type:', (_drawResult as unknown) instanceof Promise ? 'Promise (async)' : 'sync', 'value:', _drawResult);
+      }
 
       exportFrameIndex += 1;
       exportRafRef.current = window.setTimeout(exportFrame, 1000 / EXPORT_FPS);
