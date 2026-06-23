@@ -1577,14 +1577,8 @@ export default function BoardPage() {
       'inDOM:', document.contains(exportCanvas),
       'ctx2d pixelData check:', (() => { try { const p = ctx2d.getImageData(0,0,1,1); return p.data[3] > 0 ? 'has pixels' : 'transparent (may be blank)'; } catch { return 'cross-origin blocked'; } })());
 
-    let canvasStream = exportCanvas.captureStream(0);
-    let [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
-    if (!canvasVideoTrack?.requestFrame) {
-      canvasStream.getTracks().forEach((track) => track.stop());
-      canvasStream = exportCanvas.captureStream(EXPORT_FPS);
-      [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
-    }
-    console.log('[export] stream created. requestFrame available:', !!(canvasVideoTrack?.requestFrame),
+    const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
+    console.log('[export] stream created. mode: auto fps=' + EXPORT_FPS,
       'tracks:', canvasStream.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState, label: t.label })));
 
     const combined = new MediaStream([
@@ -1677,7 +1671,7 @@ export default function BoardPage() {
       const url = URL.createObjectURL(outputBlob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "neuralboard-export.mp4";
+      a.download = "neuralboard-export.webm";
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
@@ -1702,7 +1696,6 @@ export default function BoardPage() {
     console.log('[export] recorder started. state:', recorder.state);
     const exportWallStart = performance.now();
     drawExportFrameAt(0);
-    canvasVideoTrack?.requestFrame?.();
 
     startAudioAt(0, currentClips, exportAudioDest);
     for (const [clipId, vid] of exportVideoEls) {
@@ -1762,7 +1755,6 @@ export default function BoardPage() {
 
       // Draw board frame to export canvas using the same path as the preview.
       drawExportFrameAt(elapsed);
-      canvasVideoTrack?.requestFrame?.();
 
       exportFrameIndex += 1;
       exportRafRef.current = window.setTimeout(exportFrame, 1000 / EXPORT_FPS);
