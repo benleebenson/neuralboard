@@ -1593,6 +1593,15 @@ export default function EditorPage() {
       ...exportAudioDest.stream.getAudioTracks(),
     ]);
 
+    // DIAGNOSTIC 3: videoTrack state at stream creation
+    const _exportVideoTrack = canvasStream.getVideoTracks()[0];
+    console.log('[export] videoTrack details at creation:', {
+      readyState: _exportVideoTrack?.readyState,
+      enabled: _exportVideoTrack?.enabled,
+      muted: _exportVideoTrack?.muted,
+      hasRequestFrame: typeof (_exportVideoTrack as any)?.requestFrame === 'function',
+    });
+
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
     const recorder = new MediaRecorder(combined, { mimeType });
     const chunks: Blob[] = [];
@@ -1629,6 +1638,7 @@ export default function EditorPage() {
     recorder.start(100); // collect data every 100ms
 
     const exportWallStart = performance.now();
+    let _exportFrameCount = 0;
 
     function exportFrame() {
       if (exportCancelRef.current) {
@@ -1667,6 +1677,17 @@ export default function EditorPage() {
         } else if (!isActive && !vid.paused) {
           vid.pause();
         }
+      }
+
+      _exportFrameCount++;
+      const _logThisFrame = _exportFrameCount % 30 === 1; // frames 1, 31, 61 ...
+
+      // DIAGNOSTIC 1 TOP: confirm draw is actually being called each frame
+      if (_logThisFrame) {
+        const _activeVisCount = currentClips.filter(
+          (c) => isVisualClip(c) && elapsed >= c.startTime && elapsed < c.startTime + c.durationSec
+        ).length;
+        console.log('[export] drawExportFrameAt CALLED for virtualTime:', elapsed, 'visualClips at this time:', _activeVisCount);
       }
 
       // Draw frame
@@ -1709,6 +1730,28 @@ export default function EditorPage() {
         } else {
           drawMaybeKeyedMedia(ctx2d, el, x, y, w, h, clip);
         }
+      }
+
+      // DIAGNOSTIC 1 BOTTOM: confirm draw reached the end (no early return inside)
+      if (_logThisFrame) {
+        console.log('[export] drawExportFrameAt FINISHED for virtualTime:', elapsed);
+      }
+
+      // DIAGNOSTIC 2: pixel sample at frames 1 and 90 to detect blank canvas
+      if (_exportFrameCount === 1 || _exportFrameCount === 90) {
+        const _px = ctx2d.getImageData(400, 300, 1, 1).data;
+        console.log('[export] frame', _exportFrameCount, 'pixel sample at (400,300) RGBA:', _px[0], _px[1], _px[2], _px[3]);
+      }
+
+      // DIAGNOSTIC 3: videoTrack state at frame 90 (check for muted/ended mid-recording)
+      if (_exportFrameCount === 90) {
+        const _vt = canvasStream.getVideoTracks()[0];
+        console.log('[export] videoTrack details at frame 90:', {
+          readyState: _vt?.readyState,
+          enabled: _vt?.enabled,
+          muted: _vt?.muted,
+          hasRequestFrame: typeof (_vt as any)?.requestFrame === 'function',
+        });
       }
 
       exportRafRef.current = requestAnimationFrame(exportFrame);
