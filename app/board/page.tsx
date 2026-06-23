@@ -1547,9 +1547,9 @@ export default function BoardPage() {
     ]);
     const recorderMime = (() => {
       const candidates = [
-        "video/webm;codecs=vp9,opus",
         "video/webm;codecs=vp8,opus",
         "video/webm",
+        "video/webm;codecs=vp9,opus",
         "video/mp4;codecs=avc1,mp4a.40.2",
         "video/mp4",
       ];
@@ -1562,16 +1562,17 @@ export default function BoardPage() {
     const actualMimeType = recorder.mimeType || recorderMime || "video/webm";
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-    const recordingDone = new Promise<Blob>((resolve) => {
+    const recordingDone = new Promise<Blob>((resolve, reject) => {
       recorder.onstop = () => {
         resolve(new Blob(chunks, { type: actualMimeType }));
       };
+      recorder.onerror = () => reject(new Error("Browser recorder failed during export."));
     });
 
     async function finishRecording() {
-      canvasStream.getTracks().forEach((track) => track.stop());
       for (const vid of exportVideoEls.values()) vid.pause();
       const recordedBlob = await recordingDone;
+      canvasStream.getTracks().forEach((track) => track.stop());
       if (recordedBlob.size < 1000) {
         throw new Error(`Recording produced no data (${recordedBlob.size}b, codec: ${actualMimeType || "unknown"}). Try desktop Chrome or Safari 17.2+.`);
       }
@@ -1611,6 +1612,7 @@ export default function BoardPage() {
 
     recorder.start(100);
     const exportWallStart = performance.now();
+    drawExportFrameAt(0);
     canvasVideoTrack?.requestFrame?.();
 
     startAudioAt(0, currentClips, exportAudioDest);
