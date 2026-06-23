@@ -1506,11 +1506,38 @@ export default function BoardPage() {
       })
     ));
 
+    function drawExportFrameAt(atSec: number) {
+      const exportCam = computeCameraAtTime(atSec, currentClips);
+      const exportZoom = exportCam ? exportCam.zoom : 1;
+      const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
+      const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
+      drawBoardClipsToCanvas(
+        ctx2d, canvasW, canvasH,
+        exportCamX, exportCamY, exportZoom,
+        atSec, currentClips,
+        exportVideoEls, exportImageEls,
+      );
+    }
+
+    for (const [clipId, vid] of exportVideoEls) {
+      const clip = currentClips.find((c) => c.id === clipId)!;
+      if (clip.startTime === 0) {
+        setElementPlaybackRate(vid, clip);
+        vid.currentTime = clipSourceTimeAtTimeline(clip, 0);
+      }
+    }
+
+    // Paint a real first frame before capture starts. This keeps the exported
+    // stream aligned with what the preview renderer would show at timeline 0.
+    drawExportFrameAt(0);
+
     const audioCtx = getAudioCtx();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     const exportAudioDest = audioCtx.createMediaStreamDestination();
+    const canvasStream = canvas.captureStream(30);
+    const [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
     const combined = new MediaStream([
-      ...canvas.captureStream(30).getVideoTracks(),
+      ...canvasStream.getVideoTracks(),
       ...exportAudioDest.stream.getAudioTracks(),
     ]);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
@@ -1518,6 +1545,7 @@ export default function BoardPage() {
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
+      canvasStream.getTracks().forEach((track) => track.stop());
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -1528,6 +1556,10 @@ export default function BoardPage() {
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
     };
 
+    recorder.start(100);
+    const exportWallStart = performance.now();
+    canvasVideoTrack?.requestFrame?.();
+
     startAudioAt(0, currentClips, exportAudioDest);
     for (const [clipId, vid] of exportVideoEls) {
       const clip = currentClips.find((c) => c.id === clipId)!;
@@ -1537,8 +1569,6 @@ export default function BoardPage() {
         vid.play().catch(() => {});
       }
     }
-    recorder.start(100);
-    const exportWallStart = performance.now();
 
     function exportFrame() {
       if (exportCancelRef.current) {
@@ -1567,17 +1597,9 @@ export default function BoardPage() {
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
-      // Draw board frame to export canvas using the same path as the preview
-      const exportCam = computeCameraAtTime(elapsed, currentClips);
-      const exportZoom = exportCam ? exportCam.zoom : 1;
-      const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
-      const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
-      drawBoardClipsToCanvas(
-        ctx2d, canvasW, canvasH,
-        exportCamX, exportCamY, exportZoom,
-        elapsed, currentClips,
-        exportVideoEls, exportImageEls,
-      );
+      // Draw board frame to export canvas using the same path as the preview.
+      drawExportFrameAt(elapsed);
+      canvasVideoTrack?.requestFrame?.();
 
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
