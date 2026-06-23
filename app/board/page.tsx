@@ -42,6 +42,7 @@ const HANDLE_W = 6;
 const MAGNETIC_SNAP_PX = 10;
 const CURVE_H = 12;
 const LAYER_BG = ["rgba(245,236,216,0.7)", "rgba(228,218,195,0.5)"];
+const EXPORT_FPS = 30;
 
 // ─── Board-specific types ─────────────────────────────────────────────────────
 
@@ -586,7 +587,7 @@ export default function BoardPage() {
   useEffect(() => {
     return () => {
       pausePlayback();
-      if (exportRafRef.current !== null) cancelAnimationFrame(exportRafRef.current);
+      if (exportRafRef.current !== null) clearTimeout(exportRafRef.current);
       if (boardRafRef.current !== null) cancelAnimationFrame(boardRafRef.current);
       audioCtxRef.current?.close().catch(() => {});
     };
@@ -1541,8 +1542,13 @@ export default function BoardPage() {
     const audioCtx = getAudioCtx();
     if (audioCtx.state === "suspended") await audioCtx.resume();
     const exportAudioDest = audioCtx.createMediaStreamDestination();
-    const canvasStream = canvas.captureStream(30);
-    const [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
+    let canvasStream = canvas.captureStream(0);
+    let [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
+    if (!canvasVideoTrack?.requestFrame) {
+      canvasStream.getTracks().forEach((track) => track.stop());
+      canvasStream = canvas.captureStream(EXPORT_FPS);
+      [canvasVideoTrack] = canvasStream.getVideoTracks() as (MediaStreamTrack & { requestFrame?: () => void })[];
+    }
     const combined = new MediaStream([
       ...canvasStream.getVideoTracks(),
       ...exportAudioDest.stream.getAudioTracks(),
@@ -1640,34 +1646,40 @@ export default function BoardPage() {
       }
     }
 
+    let exportFrameIndex = 1;
+    const totalExportFrames = Math.max(1, Math.ceil(totalDur * EXPORT_FPS));
+
     function exportFrame() {
       if (exportCancelRef.current) {
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
         canvasStream.getTracks().forEach((track) => track.stop());
         if (recorder.state !== "inactive") recorder.stop();
+        exportRafRef.current = null;
         setIsExporting(false); isExportingRef.current = false; setExportProgress(0); setExportDurationSec(0);
         return;
       }
-      const elapsed = (performance.now() - exportWallStart) / 1000;
-      if (elapsed >= totalDur) {
+      const wallElapsed = (performance.now() - exportWallStart) / 1000;
+      const elapsed = Math.min(exportFrameIndex / EXPORT_FPS, totalDur);
+      if (exportFrameIndex >= totalExportFrames) {
         stopAllAudio();
         for (const vid of exportVideoEls.values()) vid.pause();
         try { recorder.requestData(); } catch {}
         armStopTimeout();
         recorder.stop();
+        exportRafRef.current = null;
         finishRecording().catch(finishExportError);
         return;
       }
       setExportProgress(elapsed / totalDur);
-      tickAudio(elapsed, currentClips, exportAudioDest);
+      tickAudio(wallElapsed, currentClips, exportAudioDest);
 
       // Manage video element lifecycle
       for (const [clipId, vid] of exportVideoEls) {
         const clip = currentClips.find((c) => c.id === clipId)!;
-        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.durationSec;
+        const isActive = wallElapsed >= clip.startTime && wallElapsed < clip.startTime + clip.durationSec;
         setElementPlaybackRate(vid, clip);
-        if (isActive && vid.paused) { vid.currentTime = clipSourceTimeAtTimeline(clip, elapsed); vid.play().catch(() => {}); }
+        if (isActive && vid.paused) { vid.currentTime = clipSourceTimeAtTimeline(clip, wallElapsed); vid.play().catch(() => {}); }
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
@@ -1675,9 +1687,10 @@ export default function BoardPage() {
       drawExportFrameAt(elapsed);
       canvasVideoTrack?.requestFrame?.();
 
-      exportRafRef.current = requestAnimationFrame(exportFrame);
+      exportFrameIndex += 1;
+      exportRafRef.current = window.setTimeout(exportFrame, 1000 / EXPORT_FPS);
     }
-    exportRafRef.current = requestAnimationFrame(exportFrame);
+    exportRafRef.current = window.setTimeout(exportFrame, 1000 / EXPORT_FPS);
   }
 
   // ─── Auth gates ──────────────────────────────────────────────────────────────
@@ -1709,7 +1722,7 @@ export default function BoardPage() {
       <canvas
         ref={exportCanvasRef}
         aria-hidden="true"
-        style={{ position: "fixed", left: -10000, top: -10000, width: 1, height: 1, opacity: 0, pointerEvents: "none" }}
+        style={{ position: "fixed", right: 0, bottom: 0, width: 2, height: 2, opacity: 0.01, pointerEvents: "none", zIndex: 0 }}
       />
 
       {/* Header */}
