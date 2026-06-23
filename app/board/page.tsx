@@ -238,6 +238,98 @@ function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y:
   return { x: frameAll.x, y: frameAll.y, zoom: frameAll.zoom, label: "Frame All" };
 }
 
+// ─── Board rendering ─────────────────────────────────────────────────────────
+
+function drawBoardClipsToCanvas(
+  ctx: CanvasRenderingContext2D,
+  canvasW: number,
+  canvasH: number,
+  camX: number,
+  camY: number,
+  zoom: number,
+  atSec: number,
+  clips: BoardClip[],
+  videoEls: Map<string, HTMLVideoElement>,
+  imageEls: Map<string, HTMLImageElement>,
+  draggingClipId?: string,
+) {
+  const scaleX = (canvasW / VIEWPORT_W) * zoom;
+  const scaleY = (canvasH / VIEWPORT_H) * zoom;
+  const camLeft = camX - VIEWPORT_W / (2 * zoom);
+  const camTop = camY - VIEWPORT_H / (2 * zoom);
+
+  ctx.fillStyle = BOARD_BG;
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  // All visual clips always visible — board is a persistent spatial layout
+  const visClips = clips.filter(isVisualClip).sort((a, b) => b.layer - a.layer);
+
+  for (const clip of visClips) {
+    const cx = (clip.boardX - camLeft) * scaleX;
+    const cy = (clip.boardY - camTop) * scaleY;
+    const cw = clip.boardW * scaleX;
+    const ch = clip.boardH * scaleY;
+
+    if (cx + cw < 0 || cx > canvasW || cy + ch < 0 || cy > canvasH) continue;
+
+    if (clip.type === "text") {
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(cx, cy, cw, ch);
+      drawTextClip(ctx, clip, cx, cy, cw, ch, canvasH);
+    } else if (clip.type === "countdown") {
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillRect(cx, cy, cw, ch);
+      drawCountdownClip(ctx, clip, cx, cy, cw, ch, canvasH, atSec - clip.startTime);
+    } else {
+      const vidEl = videoEls.get(clip.id) ?? null;
+      const imgEl = imageEls.get(clip.id) ?? null;
+      const mediaEl = vidEl ?? imgEl ?? null;
+      if (mediaEl) {
+        const mW = mediaEl instanceof HTMLVideoElement ? mediaEl.videoWidth : (mediaEl as HTMLImageElement).naturalWidth;
+        const mH = mediaEl instanceof HTMLVideoElement ? mediaEl.videoHeight : (mediaEl as HTMLImageElement).naturalHeight;
+        if (mW > 0 && mH > 0) {
+          const rect = drawContainedRect(mW, mH, cx, cy, cw, ch);
+          drawMaybeKeyedMedia(ctx, mediaEl, rect.x, rect.y, rect.w, rect.h, clip);
+        } else {
+          ctx.fillStyle = CLIP_COLORS[clip.type];
+          ctx.fillRect(cx, cy, cw, ch);
+        }
+      } else {
+        ctx.fillStyle = CLIP_COLORS[clip.type];
+        ctx.fillRect(cx, cy, cw, ch);
+      }
+    }
+
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(cx, cy, cw, ch);
+
+    if (draggingClipId === clip.id) {
+      const isOverlapping = clips.some(
+        (other) =>
+          other.id !== clip.id && isVisualClip(other) &&
+          !(clip.boardX + clip.boardW < other.boardX || clip.boardX > other.boardX + other.boardW ||
+            clip.boardY + clip.boardH < other.boardY || clip.boardY > other.boardY + other.boardH)
+      );
+      if (isOverlapping) {
+        ctx.fillStyle = "rgba(255,40,40,0.3)";
+        ctx.fillRect(cx, cy, cw, ch);
+        ctx.strokeStyle = "#ff2828";
+        ctx.lineWidth = 3;
+        ctx.strokeRect(cx, cy, cw, ch);
+      }
+    }
+
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(cx, cy, cw, 18);
+    ctx.fillStyle = "#fffdf5";
+    ctx.font = "700 10px 'Courier New', monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(clip.name.slice(0, 30), cx + 4, cy + 9, cw - 8);
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function layerBg(layer: number): string {
@@ -507,89 +599,13 @@ export default function BoardPage() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const cW = canvas.width;
-    const cH = canvas.height;
-    const zoom = boardZoomRef.current;
-    const scaleX = (cW / VIEWPORT_W) * zoom;
-    const scaleY = (cH / VIEWPORT_H) * zoom;
-    const camLeft = cameraXRef.current - VIEWPORT_W / (2 * zoom);
-    const camTop = cameraYRef.current - VIEWPORT_H / (2 * zoom);
-
-    ctx.fillStyle = BOARD_BG;
-    ctx.fillRect(0, 0, cW, cH);
-
-    // Draw all visual clips bottom-layer-first (higher layer number = further back)
-    const visClips = currentClips
-      .filter((c) => isVisualClip(c))
-      .sort((a, b) => b.layer - a.layer);
-
-    for (const clip of visClips) {
-      const cx = (clip.boardX - camLeft) * scaleX;
-      const cy = (clip.boardY - camTop) * scaleY;
-      const cw = clip.boardW * scaleX;
-      const ch = clip.boardH * scaleY;
-
-      // Skip clips completely outside viewport
-      if (cx + cw < 0 || cx > cW || cy + ch < 0 || cy > cH) continue;
-
-      if (clip.type === "text") {
-        ctx.fillStyle = "rgba(0,0,0,0.6)";
-        ctx.fillRect(cx, cy, cw, ch);
-        drawTextClip(ctx, clip, cx, cy, cw, ch, cH);
-      } else if (clip.type === "countdown") {
-        ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.fillRect(cx, cy, cw, ch);
-        drawCountdownClip(ctx, clip, cx, cy, cw, ch, cH, atSec - clip.startTime);
-      } else {
-        const vidEl = boardVideoEls.current.get(clip.id);
-        const imgEl = boardImageEls.current.get(clip.id);
-        const mediaEl = vidEl ?? imgEl ?? null;
-        if (mediaEl) {
-          const mW = mediaEl instanceof HTMLVideoElement ? mediaEl.videoWidth : (mediaEl as HTMLImageElement).naturalWidth;
-          const mH = mediaEl instanceof HTMLVideoElement ? mediaEl.videoHeight : (mediaEl as HTMLImageElement).naturalHeight;
-          if (mW > 0 && mH > 0) {
-            const rect = drawContainedRect(mW, mH, cx, cy, cw, ch);
-            drawMaybeKeyedMedia(ctx, mediaEl, rect.x, rect.y, rect.w, rect.h, clip);
-          } else {
-            ctx.fillStyle = CLIP_COLORS[clip.type];
-            ctx.fillRect(cx, cy, cw, ch);
-          }
-        } else {
-          ctx.fillStyle = CLIP_COLORS[clip.type];
-          ctx.fillRect(cx, cy, cw, ch);
-        }
-      }
-
-      // Simple border
-      ctx.strokeStyle = "#2a2a2a";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(cx, cy, cw, ch);
-
-      // Red tint when dragged clip overlaps another
-      if (boardDragRef.current?.clipId === clip.id) {
-        const isOverlapping = currentClips.some((other) =>
-          other.id !== clip.id && isVisualClip(other) &&
-          !(clip.boardX + clip.boardW < other.boardX || clip.boardX > other.boardX + other.boardW ||
-            clip.boardY + clip.boardH < other.boardY || clip.boardY > other.boardY + other.boardH)
-        );
-        if (isOverlapping) {
-          ctx.fillStyle = "rgba(255,40,40,0.3)";
-          ctx.fillRect(cx, cy, cw, ch);
-          ctx.strokeStyle = "#ff2828";
-          ctx.lineWidth = 3;
-          ctx.strokeRect(cx, cy, cw, ch);
-        }
-      }
-
-      // Clip name overlay
-      ctx.fillStyle = "rgba(0,0,0,0.45)";
-      ctx.fillRect(cx, cy, cw, 18);
-      ctx.fillStyle = "#fffdf5";
-      ctx.font = "700 10px 'Courier New', monospace";
-      ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
-      ctx.fillText(clip.name.slice(0, 30), cx + 4, cy + 9, cw - 8);
-    }
+    drawBoardClipsToCanvas(
+      ctx, canvas.width, canvas.height,
+      cameraXRef.current, cameraYRef.current, boardZoomRef.current,
+      atSec, currentClips,
+      boardVideoEls.current, boardImageEls.current,
+      boardDragRef.current?.clipId,
+    );
   }
 
   // Start board preview RAF loop
@@ -1551,51 +1567,17 @@ export default function BoardPage() {
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
 
-      // Draw board frame to export canvas — camera driven by unified keyframe stops
+      // Draw board frame to export canvas using the same path as the preview
       const exportCam = computeCameraAtTime(elapsed, currentClips);
       const exportZoom = exportCam ? exportCam.zoom : 1;
       const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
       const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
-      const scaleX = (canvasW / VIEWPORT_W) * exportZoom;
-      const scaleY = (canvasH / VIEWPORT_H) * exportZoom;
-      const camLeft = exportCamX - VIEWPORT_W / (2 * exportZoom);
-      const camTop = exportCamY - VIEWPORT_H / (2 * exportZoom);
-
-      ctx2d.fillStyle = BOARD_BG;
-      ctx2d.fillRect(0, 0, canvasW, canvasH);
-
-      const visClips = currentClips
-        .filter((c) => isVisualClip(c) && elapsed >= c.startTime && elapsed < c.startTime + c.durationSec)
-        .sort((a, b) => b.layer - a.layer);
-
-      for (const clip of visClips) {
-        const cx = (clip.boardX - camLeft) * scaleX;
-        const cy = (clip.boardY - camTop) * scaleY;
-        const cw = clip.boardW * scaleX;
-        const ch = clip.boardH * scaleY;
-        if (cx + cw < 0 || cx > canvasW || cy + ch < 0 || cy > canvasH) continue;
-
-        if (clip.type === "text") {
-          ctx2d.fillStyle = "rgba(0,0,0,0.6)"; ctx2d.fillRect(cx, cy, cw, ch);
-          drawTextClip(ctx2d, clip, cx, cy, cw, ch, canvasH);
-        } else if (clip.type === "countdown") {
-          ctx2d.fillStyle = "rgba(0,0,0,0.7)"; ctx2d.fillRect(cx, cy, cw, ch);
-          drawCountdownClip(ctx2d, clip, cx, cy, cw, ch, canvasH, elapsed - clip.startTime);
-        } else {
-          const vidEl = exportVideoEls.get(clip.id) ?? null;
-          const imgEl = exportImageEls.get(clip.id) ?? null;
-          const mediaEl = vidEl ?? imgEl ?? null;
-          if (mediaEl) {
-            const mW = mediaEl instanceof HTMLVideoElement ? mediaEl.videoWidth : (mediaEl as HTMLImageElement).naturalWidth;
-            const mH = mediaEl instanceof HTMLVideoElement ? mediaEl.videoHeight : (mediaEl as HTMLImageElement).naturalHeight;
-            if (mW > 0 && mH > 0) {
-              const rect = drawContainedRect(mW, mH, cx, cy, cw, ch);
-              drawMaybeKeyedMedia(ctx2d, mediaEl, rect.x, rect.y, rect.w, rect.h, clip);
-            } else { ctx2d.fillStyle = CLIP_COLORS[clip.type]; ctx2d.fillRect(cx, cy, cw, ch); }
-          } else { ctx2d.fillStyle = CLIP_COLORS[clip.type]; ctx2d.fillRect(cx, cy, cw, ch); }
-        }
-        ctx2d.strokeStyle = "#2a2a2a"; ctx2d.lineWidth = 3; ctx2d.strokeRect(cx, cy, cw, ch);
-      }
+      drawBoardClipsToCanvas(
+        ctx2d, canvasW, canvasH,
+        exportCamX, exportCamY, exportZoom,
+        elapsed, currentClips,
+        exportVideoEls, exportImageEls,
+      );
 
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
