@@ -840,6 +840,10 @@ export default function BoardPage() {
     const total = currentClips.length > 0 ? Math.max(...currentClips.map((c) => c.startTime + c.durationSec)) : 10;
     let startHead = playheadSecRef.current;
     if (startHead >= total) startHead = 0;
+    if (isExportingRef.current) {
+      console.log('[export] startPlayback() entered. clips:', currentClips.length, 'total:', total.toFixed(2),
+        'startHead:', startHead.toFixed(3), 'isPlayingRef was:', isPlayingRef.current);
+    }
     playStartWallRef.current = performance.now();
     playStartHeadRef.current = startHead;
     isPlayingRef.current = true;
@@ -849,13 +853,30 @@ export default function BoardPage() {
     startAudioAt(startHead, currentClips);
     startBoardVideosAt(startHead, currentClips);
 
+    let _exportTickCount = 0;
     function tick() {
-      if (!isPlayingRef.current) return;
+      if (!isPlayingRef.current) {
+        if (isExportingRef.current) console.log('[export] tick: isPlayingRef=false, RAF loop exiting without stopping recorder');
+        return;
+      }
       const elapsed = (performance.now() - playStartWallRef.current) / 1000;
       const newHead = playStartHeadRef.current + elapsed;
       const clips2 = clipsRef.current;
       const total2 = clips2.length > 0 ? Math.max(...clips2.map((c) => c.startTime + c.durationSec)) : 10;
+      if (isExportingRef.current) {
+        _exportTickCount++;
+        if (_exportTickCount <= 3 || _exportTickCount % 30 === 0) {
+          console.log('[export] playback tick', _exportTickCount, 'newHead:', newHead.toFixed(3),
+            'total2:', total2.toFixed(2), 'recorder.state:', exportRecorderRef.current?.state);
+        }
+      }
       if (newHead >= total2) {
+        const wallElapsedMs = performance.now() - playStartWallRef.current;
+        if (isExportingRef.current) {
+          console.log('[export] playback ended. newHead:', newHead.toFixed(3), 'total2:', total2.toFixed(2),
+            'wallElapsedMs:', wallElapsedMs.toFixed(0), 'clips2.length:', clips2.length,
+            'recorder.state:', exportRecorderRef.current?.state);
+        }
         setPlayheadSec(total2);
         playheadSecRef.current = total2;
         isPlayingRef.current = false;
@@ -1601,12 +1622,16 @@ export default function BoardPage() {
       setIsExporting(false); isExportingRef.current = false; setExportDurationSec(0);
     };
 
+    console.log('[export] about to start recorder. isPlayingRef:', isPlayingRef.current,
+      'playheadSecRef:', playheadSecRef.current, 'clips:', clipsRef.current.length,
+      'totalDur:', totalDur, 'recorder.state:', recorder.state);
     recorder.start(100);
-    console.log('[export] recorder started. state:', recorder.state);
+    console.log('[export] recorder started. state:', recorder.state, '— about to call startPlayback()');
 
     // Start normal playback from 0 — the tick function in startPlayback detects
     // when the timeline ends and calls rec.stop() via exportRecorderRef.
     startPlayback();
+    console.log('[export] startPlayback() returned. isPlayingRef now:', isPlayingRef.current, 'rafRef:', rafRef.current);
   }
 
   // ─── Auth gates ──────────────────────────────────────────────────────────────
