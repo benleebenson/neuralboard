@@ -1634,13 +1634,14 @@ export default function BoardPage() {
       'inDOM:', document.contains(exportCanvas),
       'ctx2d pixelData check:', (() => { try { const p = ctx2d.getImageData(0,0,1,1); return p.data[3] > 0 ? 'has pixels' : 'transparent (may be blank)'; } catch { return 'cross-origin blocked'; } })());
 
-    const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
-    console.log('[export] stream created. mode: auto fps=' + EXPORT_FPS,
+    const canvasStream = exportCanvas.captureStream(0);
+    console.log('[export] stream created. mode: manual (fps=0)',
       'tracks:', canvasStream.getTracks().map(t => ({ kind: t.kind, readyState: t.readyState, label: t.label })));
     // H2: confirm captureStream canvas and render-loop canvas are the same object
     const _h2CaptureCanvas = exportCanvas;
     const _h2RenderCanvas = ctx2d.canvas;
     console.log('[export] canvas identity: captureStream canvas:', _h2CaptureCanvas, 'render loop canvas:', _h2RenderCanvas, 'same?', _h2CaptureCanvas === _h2RenderCanvas);
+    const exportVideoTrack = canvasStream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
 
     const combined = new MediaStream([
       ...canvasStream.getVideoTracks(),
@@ -1761,6 +1762,9 @@ export default function BoardPage() {
     console.log('[export] recorder started. state:', recorder.state);
     const exportWallStart = performance.now();
     drawExportFrameAt(0);
+    if (exportVideoTrack && typeof exportVideoTrack.requestFrame === 'function') {
+      exportVideoTrack.requestFrame();
+    }
 
     startAudioAt(0, currentClips, exportAudioDest);
     for (const [clipId, vid] of exportVideoEls) {
@@ -1823,6 +1827,12 @@ export default function BoardPage() {
       // H3: check if draw function is async (only log on first frame to avoid spam)
       if (exportFrameIndex === 1) {
         console.log('[export] drawExportFrameAt return type:', (_drawResult as unknown) instanceof Promise ? 'Promise (async)' : 'sync', 'value:', _drawResult);
+      }
+      if (exportVideoTrack && typeof exportVideoTrack.requestFrame === 'function') {
+        exportVideoTrack.requestFrame();
+        if (exportFrameIndex === 1 || exportFrameIndex % 30 === 0) {
+          console.log('[export] requestFrame called for frame', exportFrameIndex);
+        }
       }
 
       exportFrameIndex += 1;
