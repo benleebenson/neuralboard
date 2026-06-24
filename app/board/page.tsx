@@ -240,6 +240,50 @@ function computeCameraAtTime(atSec: number, clips: BoardClip[]): { x: number; y:
   return { x: frameAll.x, y: frameAll.y, zoom: frameAll.zoom, label: "Frame All" };
 }
 
+type CameraKeyframe = {
+  timeSec: number;
+  cameraX: number;
+  cameraY: number;
+  boardZoom: number;
+  easing: 'linear' | 'ease-in-out';
+};
+
+function buildCameraKeyframes(clips: BoardClip[]): CameraKeyframe[] {
+  const stops = clips.filter(isPanOrVisual).sort((a, b) => a.startTime - b.startTime);
+  if (stops.length === 0) return [];
+
+  const frameAll = computeFrameAllTarget(clips);
+  const keyframes: CameraKeyframe[] = [];
+
+  for (const clip of stops) {
+    const holdEndSec = clip.startTime + clip.durationSec * clip.holdFraction;
+
+    if (clip.type === 'pan') {
+      const pan = getPanSweepInfo(clips);
+      // KF at sweep start
+      keyframes.push({ timeSec: clip.startTime, cameraX: pan.sweepStartX, cameraY: pan.centerY, boardZoom: pan.zoom, easing: 'ease-in-out' });
+      // KF at sweep end (hold fraction end = sweep end for pan)
+      keyframes.push({ timeSec: holdEndSec, cameraX: pan.sweepEndX, cameraY: pan.centerY, boardZoom: pan.zoom, easing: 'ease-in-out' });
+    } else {
+      const cx = clip.boardX + clip.boardW / 2;
+      const cy = clip.boardY + clip.boardH / 2;
+      // KF at hold start
+      keyframes.push({ timeSec: clip.startTime, cameraX: cx, cameraY: cy, boardZoom: clip.cameraZoomTarget, easing: 'ease-in-out' });
+      // KF at hold end (same position = the backend holds here until the next KF triggers the transition)
+      if (holdEndSec > clip.startTime + 0.01) {
+        keyframes.push({ timeSec: holdEndSec, cameraX: cx, cameraY: cy, boardZoom: clip.cameraZoomTarget, easing: 'ease-in-out' });
+      }
+    }
+  }
+
+  // Frame-all keyframe at the end of the last stop
+  const lastStop = stops[stops.length - 1];
+  const lastEnd = lastStop.startTime + lastStop.durationSec;
+  keyframes.push({ timeSec: lastEnd, cameraX: frameAll.x, cameraY: frameAll.y, boardZoom: frameAll.zoom, easing: 'ease-in-out' });
+
+  return keyframes;
+}
+
 // ─── Board rendering ─────────────────────────────────────────────────────────
 
 function drawBoardClipsToCanvas(
@@ -407,8 +451,11 @@ export default function BoardPage() {
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [pxPerSec, setPxPerSec] = useState(DEFAULT_PX_PER_SEC);
   const [isExporting, setIsExporting] = useState(false);
-  const [exportDurationSec, setExportDurationSec] = useState(0);
   const [showExportConfirm, setShowExportConfirm] = useState(false);
+  type ExportPhase = 'idle' | 'uploading' | 'submitting' | 'rendering' | 'error';
+  const [exportPhase, setExportPhase] = useState<ExportPhase>('idle');
+  const [exportMsg, setExportMsg] = useState('');
+  const [exportError, setExportError] = useState('');
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -452,6 +499,8 @@ export default function BoardPage() {
   const exportRecorderRef = useRef<RecordRTC | null>(null);
   const exportOnStopRef = useRef<(() => void) | null>(null);
   const exportCanvasStreamRef = useRef<MediaStream | null>(null);
+  const exportAbortRef = useRef(false);
+  const exportPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoStackRef = useRef<BoardSnapshot[]>([]);
   const layerCountRef = useRef(INITIAL_LAYER_COUNT);
   const mutedLayersRef = useRef<Record<number, boolean>>({});
@@ -1504,130 +1553,190 @@ export default function BoardPage() {
   function startExport() {
     if (isRecordingNarrationRef.current) { alert("Stop recording before exporting"); return; }
     if (clipsRef.current.length === 0) { alert("No clips to export"); return; }
+    if (!config) { alert("Configuration not loaded yet. Try again in a moment."); return; }
     if (isPlayingRef.current) pausePlayback();
     setShowExportConfirm(true);
   }
 
   function cancelExport() {
-    if (isPlayingRef.current) pausePlayback();
-    exportOnStopRef.current = null; // discard blob on stop
-    const rec = exportRecorderRef.current;
-    if (rec) {
-      try { rec.stopRecording(() => { try { rec.destroy(); } catch {} }); } catch {}
-    }
-    exportRecorderRef.current = null;
-    exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
-    exportCanvasStreamRef.current = null;
-    exportAudioDestRef.current = null;
+    exportAbortRef.current = true;
+    if (exportPollTimerRef.current) { clearTimeout(exportPollTimerRef.current); exportPollTimerRef.current = null; }
     setIsExporting(false);
-    isExportingRef.current = false;
-    setExportDurationSec(0);
+    setExportPhase('idle');
+    setExportMsg('');
+    setExportError('');
+  }
+
+  function resetExportState() {
+    if (exportPollTimerRef.current) { clearTimeout(exportPollTimerRef.current); exportPollTimerRef.current = null; }
+    setIsExporting(false);
+    setExportPhase('idle');
+    setExportMsg('');
+  }
+
+  async function pollRenderStatus(jobId: string, cfg: { railwayUrl: string; railwayPassword: string }) {
+    if (exportAbortRef.current) { resetExportState(); return; }
+
+    let statusData: { status: string; downloadUrl?: string; errorMessage?: string };
+    try {
+      const resp = await fetch(`${cfg.railwayUrl}/api/render/status?jobId=${encodeURIComponent(jobId)}`, {
+        headers: { 'x-neuralboard-password': cfg.railwayPassword },
+      });
+      if (!resp.ok) throw new Error(`Status check failed (${resp.status})`);
+      statusData = await resp.json();
+    } catch (err: unknown) {
+      if (!exportAbortRef.current) {
+        setExportError(err instanceof Error ? err.message : String(err));
+        setExportPhase('error');
+        setIsExporting(false);
+      }
+      return;
+    }
+
+    if (exportAbortRef.current) { resetExportState(); return; }
+
+    const { status, downloadUrl, errorMessage } = statusData;
+
+    if (status === 'done') {
+      const resolvedUrl = downloadUrl ?? `${cfg.railwayUrl}/api/render/download?jobId=${encodeURIComponent(jobId)}`;
+      // Fetch through Railway auth, then trigger browser download as blob
+      fetch(resolvedUrl, { headers: { 'x-neuralboard-password': cfg.railwayPassword } })
+        .then((r) => r.blob())
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = 'neuralboard-export.mp4';
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+          showToast('Export complete — neuralboard-export.mp4 downloaded');
+          fetch('/api/render/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ durationSeconds: 0 }),
+          }).catch(() => {});
+          resetExportState();
+        })
+        .catch((err: unknown) => {
+          setExportError(err instanceof Error ? err.message : String(err));
+          setExportPhase('error');
+          setIsExporting(false);
+        });
+      return;
+    }
+
+    if (status === 'error') {
+      setExportError(errorMessage ?? 'Render failed');
+      setExportPhase('error');
+      setIsExporting(false);
+      return;
+    }
+
+    // queued or rendering — poll again in 2s
+    exportPollTimerRef.current = setTimeout(() => pollRenderStatus(jobId, cfg), 2000);
   }
 
   async function confirmExport() {
     setShowExportConfirm(false);
     const currentClips = clipsRef.current;
     if (currentClips.length === 0) return;
+    if (!config) return;
 
-    const canvas = boardCanvasRef.current;
-    if (!canvas) { alert("Board canvas is not ready. Try again in a moment."); return; }
-
-    const sourceTotalDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
-    const totalDur = Math.min(MAX_EXPORT_DURATION, sourceTotalDur);
-
-    // Rewind to start before recording
-    setPlayheadSec(0);
-    playheadSecRef.current = 0;
-
+    exportAbortRef.current = false;
     setIsExporting(true);
-    isExportingRef.current = true;
-    exportCancelRef.current = false;
-    setExportDurationSec(totalDur);
+    setExportPhase('uploading');
+    setExportError('');
 
-    // ── Audio capture ──────────────────────────────────────────────────────────
-    // spawnClipAudio checks exportAudioDestRef.current and routes audio there too,
-    // so the existing startPlayback/tickAudio path carries audio into the recording.
-    const audioCtx = getAudioCtx();
-    if (audioCtx.state === "suspended") await audioCtx.resume();
-    const exportAudioDest = audioCtx.createMediaStreamDestination();
-    exportAudioDestRef.current = exportAudioDest;
+    try {
+      // ── Upload unique source blobs ────────────────────────────────────────────
+      const clipsWithSource = currentClips.filter((c) => c.blobUrl && c.type !== 'pan');
+      const uniqueBlobUrls = [...new Set(clipsWithSource.map((c) => c.blobUrl))];
+      const sourcePathMap = new Map<string, string>();
 
-    // ── Video capture: live preview canvas ────────────────────────────────────
-    // captureStream on the visible canvas is scheduled by the compositor, which
-    // is why this works while an off-screen setTimeout loop produced 0 bytes.
-    const canvasStream = canvas.captureStream(30);
-    exportCanvasStreamRef.current = canvasStream;
-    console.log('[export] captureStream(30) on visible boardCanvasRef. tracks:',
-      canvasStream.getTracks().map((t) => ({ kind: t.kind, readyState: t.readyState })));
+      for (let i = 0; i < uniqueBlobUrls.length; i++) {
+        if (exportAbortRef.current) { resetExportState(); return; }
+        const blobUrl = uniqueBlobUrls[i];
+        setExportMsg(`Uploading clips... (${i + 1}/${uniqueBlobUrls.length})`);
 
-    const combined = new MediaStream([
-      ...canvasStream.getVideoTracks(),
-      ...exportAudioDest.stream.getAudioTracks(),
-    ]);
+        const fetchResp = await fetch(blobUrl);
+        const blob = await fetchResp.blob();
+        const clipName = currentClips.find((c) => c.blobUrl === blobUrl)?.name ?? 'clip';
+        const ext = blob.type.split('/')[1]?.split(';')[0] || 'bin';
+        const form = new FormData();
+        form.append('file', blob, `${clipName.replace(/[^a-zA-Z0-9._-]/g, '_')}.${ext}`);
 
-    // ── RecordRTC setup ────────────────────────────────────────────────────────
-    // Dynamic import keeps RecordRTC out of the SSR bundle (it accesses window at
-    // module evaluation time, which would fail server-side).
-    const { default: RecordRTCLib } = await import("recordrtc");
-    const recorder = new RecordRTCLib(combined, {
-      type: "video",
-      mimeType: "video/webm",
-      frameRate: 30,
-      bitsPerSecond: 2_500_000,
-      disableLogs: false,
-    });
-    exportRecorderRef.current = recorder;
-    console.log('[export] RecordRTC instantiated. version:', RecordRTCLib.version);
-
-    // Stop callback captured in a ref so the playback tick can trigger it when
-    // playback reaches the end of the timeline.
-    exportOnStopRef.current = () => {
-      exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
-      exportCanvasStreamRef.current = null;
-      exportAudioDestRef.current = null;
-      exportRecorderRef.current = null;
-      exportOnStopRef.current = null;
-      const blob = recorder.getBlob();
-      console.log('[export] RecordRTC blob:', blob.size, 'bytes, type:', blob.type);
-      if (blob.size < 1000) {
-        console.error('[export] FAILURE — blob too small:', blob.size, 'bytes');
-        alert("Recording produced no data. Use Chrome or Firefox, and don't switch tabs during export.");
-        setIsExporting(false); isExportingRef.current = false; setExportDurationSec(0);
-        return;
+        const uploadResp = await fetch(`${config.railwayUrl}/api/render/upload`, {
+          method: 'POST',
+          headers: { 'x-neuralboard-password': config.railwayPassword },
+          body: form,
+        });
+        if (!uploadResp.ok) throw new Error(`Upload failed (${uploadResp.status}): ${await uploadResp.text()}`);
+        const { path } = await uploadResp.json();
+        sourcePathMap.set(blobUrl, path);
       }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "neuralboard-export.webm";
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-      console.log('[export] download triggered. size:', blob.size, 'bytes');
-      setIsExporting(false); isExportingRef.current = false; setExportDurationSec(0);
-      showToast("Webm downloaded · plays in Chrome, Firefox, VLC · convert to mp4 with HandBrake for QuickTime");
-      fetch("/api/render/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ durationSeconds: totalDur }),
-      }).catch(() => {});
-    };
 
-    console.log('[export] about to start recorder. isPlayingRef:', isPlayingRef.current,
-      'playheadSecRef:', playheadSecRef.current, 'clips:', clipsRef.current.length,
-      'totalDur:', totalDur);
-    const canvasRect = canvas.getBoundingClientRect();
-    console.log('[export] canvas bounding rect:', {
-      width: canvasRect.width, height: canvasRect.height,
-      top: canvasRect.top, left: canvasRect.left,
-      visible: canvasRect.width > 0 && canvasRect.height > 0,
-    });
-    console.log('[export] canvas computed style display:', window.getComputedStyle(canvas).display);
-    recorder.startRecording();
-    console.log('[export] recorder started — about to call startPlayback()');
+      if (exportAbortRef.current) { resetExportState(); return; }
+      setExportPhase('submitting');
+      setExportMsg('Submitting to renderer...');
 
-    // Start normal playback from 0 — the tick in startPlayback detects timeline
-    // end and calls exportRecorderRef.stopRecording(exportOnStopRef).
-    startPlayback();
-    console.log('[export] startPlayback() returned. isPlayingRef now:', isPlayingRef.current, 'rafRef:', rafRef.current);
+      // ── Build timeline spec ───────────────────────────────────────────────────
+      const totalDurationSec = currentClips.length > 0
+        ? Math.max(...currentClips.map((c) => c.startTime + c.durationSec))
+        : 0;
+
+      const timelineSpec = {
+        outputFormat: '16:9' as const,
+        totalDurationSec,
+        fps: 30,
+        board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_BG },
+        cameraKeyframes: buildCameraKeyframes(currentClips),
+        clips: currentClips
+          .filter((c) => c.type !== 'pan')
+          .map((c) => ({
+            id: c.id,
+            type: c.type,
+            startTime: c.startTime,
+            duration: c.durationSec,
+            boardX: c.boardX,
+            boardY: c.boardY,
+            boardW: c.boardW,
+            boardH: c.boardH,
+            layer: c.layer,
+            sourceUrl: c.blobUrl ? sourcePathMap.get(c.blobUrl) : undefined,
+            trimStart: c.trimStart,
+            muted: c.muted,
+            text: c.text,
+            fontFamily: c.textFontFamily,
+            fontSize: c.textFontSize,
+            color: c.textColor,
+          })),
+      };
+
+      // ── Submit job ────────────────────────────────────────────────────────────
+      const submitResp = await fetch(`${config.railwayUrl}/api/render/submit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-neuralboard-password': config.railwayPassword,
+        },
+        body: JSON.stringify({ timeline: timelineSpec }),
+      });
+      if (!submitResp.ok) throw new Error(`Submit failed (${submitResp.status}): ${await submitResp.text()}`);
+      const { jobId } = await submitResp.json();
+
+      if (exportAbortRef.current) { resetExportState(); return; }
+      setExportPhase('rendering');
+      setExportMsg('Rendering... this may take a few minutes');
+
+      // ── Poll for completion ───────────────────────────────────────────────────
+      await pollRenderStatus(jobId, config);
+
+    } catch (err: unknown) {
+      if (!exportAbortRef.current) {
+        setExportError(err instanceof Error ? err.message : String(err));
+        setExportPhase('error');
+        setIsExporting(false);
+      }
+    }
   }
 
   // ─── Auth gates ──────────────────────────────────────────────────────────────
@@ -1767,15 +1876,20 @@ export default function BoardPage() {
             <button onClick={fitToTimeline} disabled={isExporting} style={{ ...sketchButton, height: 36, padding: "0 12px", fontSize: 12, opacity: isExporting ? 0.4 : 1 }}>Fit</button>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
               {isExporting && (
-                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a", animation: "nbpulse 1s infinite" }}>
-                  ● REC {formatTime(playheadSec)} / {formatTime(exportDurationSec)}
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", animation: "nbpulse 1.5s infinite" }}>
+                  ● {exportMsg}
+                </span>
+              )}
+              {exportPhase === 'error' && (
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a", maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={exportError}>
+                  ✕ {exportError}
                 </span>
               )}
               <button
-                onClick={isExporting ? cancelExport : startExport}
+                onClick={isExporting ? cancelExport : exportPhase === 'error' ? () => { setExportPhase('idle'); setExportError(''); } : startExport}
                 style={{ ...sketchButton, height: 36, padding: "0 14px", fontSize: 12, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
               >
-                {isExporting ? "✕ Cancel" : "⬇ Export"}
+                {isExporting ? "✕ Cancel" : exportPhase === 'error' ? "↩ Retry" : "⬇ Export"}
               </button>
             </div>
             <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · [cmd/ctrl+z] undo · [⌫] delete</span>
@@ -1925,14 +2039,14 @@ export default function BoardPage() {
       {showExportConfirm && (
         <div onClick={(e) => { if (e.target === e.currentTarget) setShowExportConfirm(false); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 28, maxWidth: 380, width: "90vw", fontFamily: "monospace" }}>
-            <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12 }}>Export — Real-Time Recording</div>
+            <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12 }}>Export — Server-Side Render</div>
             <p style={{ fontSize: 12, color: "#444", lineHeight: 1.7, marginBottom: 20 }}>
-              Recording will run in real-time for <b>{formatTime(Math.min(MAX_EXPORT_DURATION, clips.length > 0 ? Math.max(...clips.map((c) => c.startTime + c.durationSec)) : 0))}</b> while the preview plays back normally.
+              Your clips will be uploaded and rendered server-side. The export will take <b>~{Math.round(clips.length > 0 ? Math.max(...clips.map((c) => c.startTime + c.durationSec)) / 10 : 0)} seconds</b> to complete (you can keep using the app while it runs).
               <br /><br />
-              <b>Don&apos;t switch tabs</b> during recording — the browser may throttle the canvas if the tab is hidden.
+              The rendered <b>.mp4</b> will download automatically when ready.
             </p>
             <div style={{ display: "flex", gap: 10 }}>
-              <button onClick={confirmExport} style={{ ...sketchButton, flex: 1, background: "#c8f135", padding: "10px 0" }}>▶ Start Recording</button>
+              <button onClick={confirmExport} style={{ ...sketchButton, flex: 1, background: "#c8f135", padding: "10px 0" }}>⬆ Upload &amp; Render</button>
               <button onClick={() => setShowExportConfirm(false)} style={{ ...sketchButton, flex: 1, padding: "10px 0" }}>Cancel</button>
             </div>
           </div>
