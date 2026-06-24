@@ -601,7 +601,7 @@ export default function BoardPage() {
   function drawBoardFrame(atSec: number, currentClips: BoardClip[]) {
     const canvas = boardCanvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { willReadFrequently: false });
     if (!ctx) return;
     drawBoardClipsToCanvas(
       ctx, canvas.width, canvas.height,
@@ -903,6 +903,7 @@ export default function BoardPage() {
       tickAudio(newHead, clips2);
       tickBoardVideoPlayback(newHead, clips2);
       applyKeyframeCameraAt(newHead, clips2);
+      drawBoardFrame(newHead, clips2);
       rafRef.current = requestAnimationFrame(tick);
     }
     rafRef.current = requestAnimationFrame(tick);
@@ -1613,6 +1614,13 @@ export default function BoardPage() {
     console.log('[export] about to start recorder. isPlayingRef:', isPlayingRef.current,
       'playheadSecRef:', playheadSecRef.current, 'clips:', clipsRef.current.length,
       'totalDur:', totalDur);
+    const canvasRect = canvas.getBoundingClientRect();
+    console.log('[export] canvas bounding rect:', {
+      width: canvasRect.width, height: canvasRect.height,
+      top: canvasRect.top, left: canvasRect.left,
+      visible: canvasRect.width > 0 && canvasRect.height > 0,
+    });
+    console.log('[export] canvas computed style display:', window.getComputedStyle(canvas).display);
     recorder.startRecording();
     console.log('[export] recorder started — about to call startPlayback()');
 
