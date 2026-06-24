@@ -1555,17 +1555,55 @@ export default function BoardPage() {
       const exportZoom = exportCam ? exportCam.zoom : 1;
       const exportCamX = exportCam ? exportCam.x : BOARD_W / 2;
       const exportCamY = exportCam ? exportCam.y : BOARD_H / 2;
-      // Log camera state at key frames to confirm animation is computing correctly.
       const frameIdx = Math.round(atSec * EXPORT_FPS);
-      if (frameIdx <= 1 || frameIdx % 30 === 0) {
+      const diagFrame = frameIdx <= 1 || frameIdx % 30 === 0;
+
+      // Camera state log (from previous commit)
+      if (diagFrame) {
         console.log(`[export] camera t=${atSec.toFixed(3)}s frame=${frameIdx}: x=${exportCamX.toFixed(1)} y=${exportCamY.toFixed(1)} zoom=${exportZoom.toFixed(3)} label="${exportCam?.label ?? 'null→fallback'}" stops=${currentClips.filter(isPanOrVisual).length}`);
       }
+
+      // LOG 3: transform BEFORE camera
+      if (frameIdx % 30 === 0) {
+        console.log('[export] transform BEFORE camera frame', frameIdx, ':', ctx2d.getTransform());
+      }
+
+      // LOG 2: image ready state per clip, BEFORE draw
+      if (frameIdx % 30 === 0) {
+        for (const clip of currentClips.filter(isVisualClip)) {
+          const imgEl = exportImageEls.get(clip.id) ?? null;
+          const vidEl = exportVideoEls.get(clip.id) ?? null;
+          console.log('[export] drawing clip', clip.id,
+            'type:', clip.type,
+            'imgComplete:', imgEl?.complete,
+            'naturalWidth:', imgEl?.naturalWidth,
+            'naturalHeight:', imgEl?.naturalHeight,
+            'readyState (video):', vidEl?.readyState);
+        }
+      }
+
       drawBoardClipsToCanvas(
         ctx2d, canvasW, canvasH,
         exportCamX, exportCamY, exportZoom,
         atSec, currentClips,
         exportVideoEls, exportImageEls,
       );
+
+      // LOG 3: transform AFTER camera
+      if (frameIdx % 30 === 0) {
+        console.log('[export] transform AFTER camera frame', frameIdx, ':', ctx2d.getTransform());
+      }
+
+      // LOG 1: post-draw pixel samples
+      if (frameIdx % 30 === 0 || frameIdx === 1) {
+        const p1 = ctx2d.getImageData(100, 100, 1, 1).data;
+        const p2 = ctx2d.getImageData(400, 300, 1, 1).data;
+        const p3 = ctx2d.getImageData(700, 500, 1, 1).data;
+        console.log('[export] post-draw pixels frame', frameIdx,
+          '(100,100):', p1[0], p1[1], p1[2],
+          '(400,300):', p2[0], p2[1], p2[2],
+          '(700,500):', p3[0], p3[1], p3[2]);
+      }
     }
 
     for (const [clipId, vid] of exportVideoEls) {
