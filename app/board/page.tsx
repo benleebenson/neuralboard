@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import { useSession, signIn } from "next-auth/react";
+import type RecordRTC from "recordrtc";
 import {
   type Clip, type ClipType, type CurvePoint, type AudioEntry,
   SNAP, MIN_DURATION, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE, MASTER_PLAYBACK_RATE,
@@ -448,7 +449,8 @@ export default function BoardPage() {
   const exportCancelRef = useRef(false);
   const isExportingRef = useRef(false);
   const exportAudioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  const exportRecorderRef = useRef<MediaRecorder | null>(null);
+  const exportRecorderRef = useRef<RecordRTC | null>(null);
+  const exportOnStopRef = useRef<(() => void) | null>(null);
   const exportCanvasStreamRef = useRef<MediaStream | null>(null);
   const undoStackRef = useRef<BoardSnapshot[]>([]);
   const layerCountRef = useRef(INITIAL_LAYER_COUNT);
@@ -884,10 +886,14 @@ export default function BoardPage() {
         if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
         stopAllAudio();
         if (isExportingRef.current) {
+          const wallElapsedMs = performance.now() - playStartWallRef.current;
+          console.log('[export] playback ended. newHead:', newHead.toFixed(3), 'total2:', total2.toFixed(2),
+            'wallElapsedMs:', wallElapsedMs.toFixed(0), 'clips2.length:', clips2.length,
+            'exportRecorderRef:', exportRecorderRef.current ? 'set' : 'null');
           const rec = exportRecorderRef.current;
-          if (rec && rec.state !== "inactive") {
-            try { rec.requestData(); } catch {}
-            rec.stop();
+          const onStop = exportOnStopRef.current;
+          if (rec && onStop) {
+            rec.stopRecording(onStop);
           }
         }
         return;
@@ -1503,20 +1509,15 @@ export default function BoardPage() {
 
   function cancelExport() {
     if (isPlayingRef.current) pausePlayback();
+    exportOnStopRef.current = null; // discard blob on stop
     const rec = exportRecorderRef.current;
     if (rec) {
-      rec.ondataavailable = null;
-      rec.onstop = () => {
-        exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
-        exportCanvasStreamRef.current = null;
-        exportAudioDestRef.current = null;
-        exportRecorderRef.current = null;
-      };
-      if (rec.state !== "inactive") { try { rec.stop(); } catch {} }
+      try { rec.stopRecording(() => { try { rec.destroy(); } catch {} }); } catch {}
     }
-    exportAudioDestRef.current = null;
     exportRecorderRef.current = null;
+    exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
     exportCanvasStreamRef.current = null;
+    exportAudioDestRef.current = null;
     setIsExporting(false);
     isExportingRef.current = false;
     setExportDurationSec(0);
@@ -1563,34 +1564,30 @@ export default function BoardPage() {
       ...exportAudioDest.stream.getAudioTracks(),
     ]);
 
-    // ── Codec selection ────────────────────────────────────────────────────────
-    const candidates = ["video/webm;codecs=vp8,opus", "video/webm", "video/webm;codecs=vp9,opus"];
-    console.log('[export] codec support:', candidates.map((c) => ({ codec: c, supported: MediaRecorder.isTypeSupported(c) })));
-    const recorderMime = candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
-    console.log('[export] chosen mimeType:', recorderMime || "(browser default)");
-
-    const recorder = new MediaRecorder(
-      combined,
-      recorderMime ? { mimeType: recorderMime, videoBitsPerSecond: 6_000_000 } : { videoBitsPerSecond: 6_000_000 },
-    );
+    // ── RecordRTC setup ────────────────────────────────────────────────────────
+    // Dynamic import keeps RecordRTC out of the SSR bundle (it accesses window at
+    // module evaluation time, which would fail server-side).
+    const { default: RecordRTCLib } = await import("recordrtc");
+    const recorder = new RecordRTCLib(combined, {
+      type: "video",
+      mimeType: "video/webm",
+      frameRate: 30,
+      bitsPerSecond: 2_500_000,
+      disableLogs: false,
+    });
     exportRecorderRef.current = recorder;
-    const actualMimeType = recorder.mimeType || recorderMime || "video/webm";
-    console.log('[export] recorder instantiated. actualMimeType:', actualMimeType, 'state:', recorder.state);
+    console.log('[export] RecordRTC instantiated. version:', RecordRTCLib.version);
 
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => {
-      console.log('[export] data chunk:', e.data.size, 'bytes — running total:', chunks.length + (e.data.size > 0 ? 1 : 0));
-      if (e.data.size > 0) chunks.push(e.data);
-    };
-
-    recorder.onstop = () => {
+    // Stop callback captured in a ref so the playback tick can trigger it when
+    // playback reaches the end of the timeline.
+    exportOnStopRef.current = () => {
       exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
       exportCanvasStreamRef.current = null;
       exportAudioDestRef.current = null;
       exportRecorderRef.current = null;
-      const totalBytes = chunks.reduce((s, c) => s + c.size, 0);
-      console.log('[export] recorder stopped. chunks:', chunks.length, 'totalBytes:', totalBytes);
-      const blob = new Blob(chunks, { type: actualMimeType });
+      exportOnStopRef.current = null;
+      const blob = recorder.getBlob();
+      console.log('[export] RecordRTC blob:', blob.size, 'bytes, type:', blob.type);
       if (blob.size < 1000) {
         console.error('[export] FAILURE — blob too small:', blob.size, 'bytes');
         alert("Recording produced no data. Use Chrome or Firefox, and don't switch tabs during export.");
@@ -1613,23 +1610,14 @@ export default function BoardPage() {
       }).catch(() => {});
     };
 
-    recorder.onerror = () => {
-      exportCanvasStreamRef.current?.getTracks().forEach((t) => t.stop());
-      exportCanvasStreamRef.current = null;
-      exportAudioDestRef.current = null;
-      exportRecorderRef.current = null;
-      alert("Recorder error during export. Try Chrome or Firefox.");
-      setIsExporting(false); isExportingRef.current = false; setExportDurationSec(0);
-    };
-
     console.log('[export] about to start recorder. isPlayingRef:', isPlayingRef.current,
       'playheadSecRef:', playheadSecRef.current, 'clips:', clipsRef.current.length,
-      'totalDur:', totalDur, 'recorder.state:', recorder.state);
-    recorder.start(100);
-    console.log('[export] recorder started. state:', recorder.state, '— about to call startPlayback()');
+      'totalDur:', totalDur);
+    recorder.startRecording();
+    console.log('[export] recorder started — about to call startPlayback()');
 
-    // Start normal playback from 0 — the tick function in startPlayback detects
-    // when the timeline ends and calls rec.stop() via exportRecorderRef.
+    // Start normal playback from 0 — the tick in startPlayback detects timeline
+    // end and calls exportRecorderRef.stopRecording(exportOnStopRef).
     startPlayback();
     console.log('[export] startPlayback() returned. isPlayingRef now:', isPlayingRef.current, 'rafRef:', rafRef.current);
   }
