@@ -110,6 +110,23 @@ type ProcessedMediaItem = {
   waveform?: number[];
 };
 
+type EntrySfxOption = {
+  id: string;
+  label: string;
+  blobUrl: string;
+  durationSec: number;
+  custom?: boolean;
+};
+
+type ActiveSfxEntry = {
+  bufNode: AudioBufferSourceNode;
+  gainNode: GainNode;
+  clipId: string;
+  sfxId: string;
+  startTime: number;
+  durationSec: number;
+};
+
 type YtSearchResult = {
   id: string;
   title: string;
@@ -1966,7 +1983,7 @@ export default function BoardPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <a href="/editor" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Editor</a>
-          <a href="/builder" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Builder</a>
+          <a href="/board2" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Board 2.0</a>
           <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
         </div>
       </header>

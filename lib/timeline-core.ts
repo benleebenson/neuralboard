@@ -35,6 +35,7 @@ export type Clip = {
   countdownTitle?: string;
   countdownItems?: Array<{ rank: number; label: string }>;
   revealOffsets?: number[];
+  entrySfxId?: string;
 };
 
 export type AudioEntry =
