@@ -60,6 +60,7 @@ type BoardClip = Clip & {
 type BoardSnapshot = {
   clips: BoardClip[];
   selectedClipId: string | null;
+  selectedClipIds: string[];
   layerCount: number;
   mutedLayers: Record<number, boolean>;
 };
@@ -86,6 +87,13 @@ type DragInfo = {
   validLayer: number;
   validTrimStart: number;
 };
+
+type TimelineMarquee = {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+} | null;
 
 type YtSearchResult = {
   id: string;
@@ -447,6 +455,8 @@ export default function BoardPage() {
   const [ghost, setGhost] = useState<Ghost>(null);
   const [snapGuideSec, setSnapGuideSec] = useState<number | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
   const [layerCount, setLayerCount] = useState(INITIAL_LAYER_COUNT);
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [pxPerSec, setPxPerSec] = useState(DEFAULT_PX_PER_SEC);
@@ -483,8 +493,11 @@ export default function BoardPage() {
   // Refs
   const clipsRef = useRef<BoardClip[]>([]);
   const selectedClipIdRef = useRef<string | null>(null);
+  const selectedClipIdsRef = useRef<string[]>([]);
   const playheadDraggingRef = useRef(false);
   const dragRef = useRef<DragInfo | null>(null);
+  const timelineMarqueeRef = useRef<TimelineMarquee>(null);
+  const marqueeStartRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -552,6 +565,8 @@ export default function BoardPage() {
   // Sync refs
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdRef.current = selectedClipId; }, [selectedClipId]);
+  useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
+  useEffect(() => { timelineMarqueeRef.current = timelineMarquee; }, [timelineMarquee]);
   useEffect(() => { playheadSecRef.current = playheadSec; }, [playheadSec]);
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
   useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
@@ -612,11 +627,15 @@ export default function BoardPage() {
         }
         return;
       }
-      if ((e.code === "Backspace" || e.code === "Delete") && selectedClipIdRef.current) {
+      if ((e.code === "Backspace" || e.code === "Delete") && (selectedClipIdsRef.current.length > 0 || selectedClipIdRef.current)) {
         e.preventDefault();
+        const ids = selectedClipIdsRef.current.length > 0
+          ? selectedClipIdsRef.current
+          : selectedClipIdRef.current ? [selectedClipIdRef.current] : [];
+        const deleteIds = new Set(ids);
         pushUndoSnapshot();
-        setClips((prev) => prev.filter((c) => c.id !== selectedClipIdRef.current));
-        setSelectedClipId(null);
+        setClips((prev) => prev.filter((c) => !deleteIds.has(c.id)));
+        setTimelineSelection([]);
       }
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) {
@@ -724,6 +743,7 @@ export default function BoardPage() {
     undoStackRef.current.push({
       clips: clipsRef.current.map(cloneClip),
       selectedClipId: selectedClipIdRef.current,
+      selectedClipIds: [...selectedClipIdsRef.current],
       layerCount: layerCountRef.current,
       mutedLayers: { ...mutedLayersRef.current },
     });
@@ -735,14 +755,19 @@ export default function BoardPage() {
     if (!snap) return;
     if (isPlayingRef.current) pausePlayback();
     setGhost(null);
+    setTimelineMarquee(null);
     dragRef.current = null;
+    timelineMarqueeRef.current = null;
+    marqueeStartRef.current = null;
     const restored = snap.clips.map(cloneClip);
     clipsRef.current = restored;
     selectedClipIdRef.current = snap.selectedClipId;
+    selectedClipIdsRef.current = snap.selectedClipIds ?? (snap.selectedClipId ? [snap.selectedClipId] : []);
     layerCountRef.current = snap.layerCount;
     mutedLayersRef.current = { ...snap.mutedLayers };
     setClips(restored);
     setSelectedClipId(snap.selectedClipId);
+    setSelectedClipIds(snap.selectedClipIds ?? (snap.selectedClipId ? [snap.selectedClipId] : []));
     setLayerCount(snap.layerCount);
     setMutedLayers({ ...snap.mutedLayers });
   }
@@ -1074,8 +1099,7 @@ export default function BoardPage() {
     e.currentTarget.setPointerCapture(e.pointerId);
     boardDragRef.current = { clipId: hit.id, offsetX: bx - hit.boardX, offsetY: by - hit.boardY };
     setBoardDraggingClipId(hit.id);
-    setSelectedClipId(hit.id);
-    selectedClipIdRef.current = hit.id;
+    selectSingleClip(hit.id);
   }
 
   function onBoardPointerMove(e: React.PointerEvent<HTMLDivElement>) {
@@ -1159,11 +1183,68 @@ export default function BoardPage() {
 
   // ─── Timeline drag ──────────────────────────────────────────────────────────
 
+  function setTimelineSelection(ids: string[]) {
+    const uniqueIds = Array.from(new Set(ids));
+    selectedClipIdsRef.current = uniqueIds;
+    selectedClipIdRef.current = uniqueIds[uniqueIds.length - 1] ?? null;
+    setSelectedClipIds(uniqueIds);
+    setSelectedClipId(uniqueIds[uniqueIds.length - 1] ?? null);
+  }
+
+  function selectSingleClip(id: string | null) {
+    setTimelineSelection(id ? [id] : []);
+  }
+
+  function timelinePointFromEvent(e: React.PointerEvent<HTMLDivElement>) {
+    const scroller = scrollerRef.current;
+    if (!scroller) return { x: 0, y: 0 };
+    const rect = scroller.getBoundingClientRect();
+    return {
+      x: e.clientX - rect.left + scroller.scrollLeft,
+      y: e.clientY - rect.top + scroller.scrollTop,
+    };
+  }
+
+  function selectedIdsInMarquee(marquee: NonNullable<TimelineMarquee>): string[] {
+    const left = Math.min(marquee.startX, marquee.currentX);
+    const right = Math.max(marquee.startX, marquee.currentX);
+    const top = Math.min(marquee.startY, marquee.currentY);
+    const bottom = Math.max(marquee.startY, marquee.currentY);
+    return clipsRef.current
+      .filter((clip) => {
+        const clipLeft = clip.startTime * pxPerSecRef.current;
+        const clipRight = clipLeft + Math.max(HANDLE_W * 2 + 4, clip.durationSec * pxPerSecRef.current - 2);
+        const clipTop = RULER_H + (clip.layer - 1) * LAYER_H + 7;
+        const clipBottom = clipTop + LAYER_H - 14;
+        return clipLeft < right && clipRight > left && clipTop < bottom && clipBottom > top;
+      })
+      .sort((a, b) => a.startTime - b.startTime || a.layer - b.layer)
+      .map((clip) => clip.id);
+  }
+
+  function finishTimelineMarquee() {
+    const marquee = timelineMarqueeRef.current;
+    if (!marquee) return;
+    setTimelineSelection(selectedIdsInMarquee(marquee));
+    timelineMarqueeRef.current = null;
+    marqueeStartRef.current = null;
+    setTimelineMarquee(null);
+  }
+
   function onScrollerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0) return;
     if (dragRef.current) return;
-    playheadDraggingRef.current = true;
-    setSelectedClipId(null);
+    const point = timelinePointFromEvent(e);
     e.currentTarget.setPointerCapture(e.pointerId);
+    if (point.y >= RULER_H) {
+      const marquee = { startX: point.x, startY: point.y, currentX: point.x, currentY: point.y };
+      timelineMarqueeRef.current = marquee;
+      marqueeStartRef.current = { clientX: e.clientX, clientY: e.clientY };
+      setTimelineMarquee(marquee);
+      return;
+    }
+    playheadDraggingRef.current = true;
+    selectSingleClip(null);
     seekFromClientX(e.clientX);
   }
 
@@ -1183,19 +1264,40 @@ export default function BoardPage() {
   function onScrollerPointerMove(e: React.PointerEvent<HTMLDivElement>) {
     if (holdDragRef.current) { updateHoldDrag(e.clientX); return; }
     if (dragRef.current) { updateClipDrag(e.clientX, e.clientY); return; }
+    if (timelineMarqueeRef.current) {
+      const point = timelinePointFromEvent(e);
+      const next = { ...timelineMarqueeRef.current, currentX: point.x, currentY: point.y };
+      timelineMarqueeRef.current = next;
+      setTimelineMarquee(next);
+      setTimelineSelection(selectedIdsInMarquee(next));
+      return;
+    }
     if (playheadDraggingRef.current) seekFromClientX(e.clientX);
   }
 
-  function onScrollerPointerUp() {
+  function onScrollerPointerUp(e: React.PointerEvent<HTMLDivElement>) {
     if (holdDragRef.current) { holdDragRef.current = null; return; }
     if (dragRef.current) { commitClipDrag(); return; }
+    if (timelineMarqueeRef.current) {
+      const start = marqueeStartRef.current;
+      const moved = start ? Math.hypot(e.clientX - start.clientX, e.clientY - start.clientY) : 0;
+      if (moved < 4) {
+        selectSingleClip(null);
+        seekFromClientX(e.clientX);
+        timelineMarqueeRef.current = null;
+        marqueeStartRef.current = null;
+        setTimelineMarquee(null);
+        return;
+      }
+      finishTimelineMarquee();
+      return;
+    }
     playheadDraggingRef.current = false;
   }
 
   function onClipPointerDown(e: React.PointerEvent<HTMLDivElement>, clip: BoardClip) {
     e.stopPropagation();
-    setSelectedClipId(clip.id);
-    selectedClipIdRef.current = clip.id;
+    selectSingleClip(clip.id);
     const rect = e.currentTarget.getBoundingClientRect();
     const offsetX = e.clientX - rect.left;
     const clipW = rect.width;
@@ -1892,7 +1994,7 @@ export default function BoardPage() {
                 {isExporting ? "✕ Cancel" : exportPhase === 'error' ? "↩ Retry" : "⬇ Export"}
               </button>
             </div>
-            <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · [cmd/ctrl+z] undo · [⌫] delete</span>
+            <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>[space] play/pause · drag-select clips · [cmd/ctrl+z] undo · [⌫] delete</span>
           </div>
 
           {/* Timeline */}
@@ -1946,13 +2048,14 @@ export default function BoardPage() {
                     </button>
                     {layerClips.map((clip) => {
                       const isBeingDragged = ghost?.clipId === clip.id;
+                      const isSelected = selectedClipIds.includes(clip.id) || selectedClipId === clip.id;
                       const clipPx = Math.max(HANDLE_W * 2 + 4, clip.durationSec * pxPerSec - 2);
                       const showHandles = clipPx >= HANDLE_W * 3;
                       return (
                         <div
                           key={clip.id}
                           onPointerDown={(e) => onClipPointerDown(e, clip)}
-                          style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: selectedClipId === clip.id ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : selectedClipId === clip.id ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: 2 }}
+                          style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 7, width: clipPx, height: LAYER_H - 14, background: CLIP_COLORS[clip.type], opacity: isBeingDragged ? 0.28 : 1, border: isSelected ? "2px solid #ff5e3a" : "1.5px solid #2a2a2a", boxShadow: isBeingDragged ? "none" : isSelected ? "0 0 0 2px #ff5e3a44, 2px 2px 0 #2a2a2a" : "2px 2px 0 #2a2a2a", cursor: isBeingDragged ? "grabbing" : "grab", display: "flex", alignItems: "center", overflow: "hidden", zIndex: isSelected ? 3 : 2 }}
                         >
                           {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
                           {clip.type === "pan" && clipPx >= 30 && !isBeingDragged && (
@@ -2014,6 +2117,27 @@ export default function BoardPage() {
                   Record or upload to add clips
                 </div>
               )}
+
+              {/* Marquee selection */}
+              {timelineMarquee && (() => {
+                const left = Math.min(timelineMarquee.startX, timelineMarquee.currentX);
+                const top = Math.min(timelineMarquee.startY, timelineMarquee.currentY);
+                const width = Math.abs(timelineMarquee.currentX - timelineMarquee.startX);
+                const height = Math.abs(timelineMarquee.currentY - timelineMarquee.startY);
+                return (
+                  <div
+                    style={{
+                      position: "absolute",
+                      left, top, width, height,
+                      border: "1.5px dashed #ff5e3a",
+                      background: "rgba(255,94,58,0.12)",
+                      boxShadow: "0 0 0 1px rgba(255,253,245,0.7) inset",
+                      pointerEvents: "none",
+                      zIndex: 8,
+                    }}
+                  />
+                );
+              })()}
 
               {/* Snap guide */}
               {snapGuideSec !== null && (
