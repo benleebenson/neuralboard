@@ -23,6 +23,7 @@ type Clip = {
   boardY?: number;
   boardW?: number;
   boardH?: number;
+  holdFraction?: number;
 };
 
 type MediaItem = {
@@ -85,6 +86,13 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return `${m}:${s.toFixed(1).padStart(4, "0")}`;
+}
+
+function shadeColor(hex: string, factor: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `#${clamp(Math.round(r * factor), 0, 255).toString(16).padStart(2, "0")}${clamp(Math.round(g * factor), 0, 255).toString(16).padStart(2, "0")}${clamp(Math.round(b * factor), 0, 255).toString(16).padStart(2, "0")}`;
 }
 
 function getVideoDuration(url: string): Promise<number> {
@@ -233,6 +241,8 @@ export default function Board2Page() {
   const [toast, setToast] = useState<string | null>(null);
   const [cameraKeyframes, setCameraKeyframes] = useState<CameraKeyframe[]>([]);
   const [isSpaceDown, setIsSpaceDown] = useState(false);
+  const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
+  const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -267,6 +277,7 @@ export default function Board2Page() {
   const pendingScrollLeftRef = useRef<number | null>(null);
   const timelineDragRef = useRef<TimelineDrag | null>(null);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
+  const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -835,7 +846,7 @@ export default function Board2Page() {
     const events: CamEvent[] = [];
     for (let i = 0; i < boardClips.length; i++) {
       const c = boardClips[i];
-      const holdEnd = c.startTime + c.duration * HOLD_FRACTION;
+      const holdEnd = c.startTime + c.duration * (c.holdFraction ?? HOLD_FRACTION);
       const transEnd = c.startTime + c.duration;
       events.push({ absTime: c.startTime, stop: clipStops[i] });
       events.push({ absTime: holdEnd, stop: clipStops[i] });
@@ -858,9 +869,47 @@ export default function Board2Page() {
 
     setCameraKeyframes(newCameraKeyframes);
     cameraKeyframesRef.current = newCameraKeyframes;
+    setKeyframesOutOfDate(false);
     drawFrame(playheadRef.current);
     const n = boardClips.length;
     setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all`);
+  }
+
+  // ─ Divider drag (hold/transition split per clip) ──────────────────────────
+
+  function handleDividerPointerDown(e: React.PointerEvent, clip: Clip) {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSecRef.current);
+    const innerW = clipPx - HANDLE_W * 2;
+    const innerStart = clip.startTime * pxPerSecRef.current + HANDLE_W;
+    dividerDragRef.current = { clipId: clip.id, innerStartPx: innerStart, innerWidthPx: innerW };
+
+    const onMove = (ev: PointerEvent) => {
+      const drag = dividerDragRef.current;
+      if (!drag) return;
+      const rect = scrollerRef.current!.getBoundingClientRect();
+      const cursorX = ev.clientX - rect.left + timelineScrollRef.current;
+      let fraction = clamp((cursorX - drag.innerStartPx) / drag.innerWidthPx, 0.1, 0.95);
+      for (const sp of [0.25, 0.5, 0.75]) {
+        if (Math.abs(fraction - sp) < 0.05) { fraction = sp; break; }
+      }
+      const pct = Math.round(fraction * 100);
+      setDividerTooltip({ label: `Hold: ${pct}% / Trans: ${100 - pct}%`, x: ev.clientX, y: ev.clientY });
+      if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+      setClips((prev) => prev.map((c) => c.id !== drag.clipId ? c : { ...c, holdFraction: fraction }));
+    };
+
+    const onUp = () => {
+      dividerDragRef.current = null;
+      setDividerTooltip(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   // ─ Export ─────────────────────────────────────────────────────────────────
@@ -974,22 +1023,29 @@ export default function Board2Page() {
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <button
-            onClick={generateCameraKeyframes}
-            disabled={!clips.some((c) => c.boardX !== undefined)}
-            title={clips.some((c) => c.boardX !== undefined)
-              ? "Generate camera keyframe sequence from board positions and timeline"
-              : "Upload media first"}
-            style={{
-              ...sketchButton,
-              padding: "4px 10px",
-              fontSize: 11,
-              opacity: clips.some((c) => c.boardX !== undefined) ? 1 : 0.45,
-              cursor: clips.some((c) => c.boardX !== undefined) ? "pointer" : "not-allowed",
-            }}
-          >
-            ⬡ Generate camera keyframes
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button
+              onClick={generateCameraKeyframes}
+              disabled={!clips.some((c) => c.boardX !== undefined)}
+              title={clips.some((c) => c.boardX !== undefined)
+                ? "Generate camera keyframe sequence from board positions and timeline"
+                : "Upload media first"}
+              style={{
+                ...sketchButton,
+                padding: "4px 10px",
+                fontSize: 11,
+                opacity: clips.some((c) => c.boardX !== undefined) ? 1 : 0.45,
+                cursor: clips.some((c) => c.boardX !== undefined) ? "pointer" : "not-allowed",
+              }}
+            >
+              ⬡ Generate camera keyframes
+            </button>
+            {keyframesOutOfDate && cameraKeyframes.length > 0 && (
+              <span style={{ fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", border: "1px solid #ff5e3a", padding: "2px 5px", whiteSpace: "nowrap" }}>
+                ↻ keyframes out of date
+              </span>
+            )}
+          </div>
           <a href="/editor" style={navLinkStyle}>Editor</a>
           <a href="/board" style={navLinkStyle}>Board</a>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board 2.0</span>
@@ -1209,6 +1265,28 @@ export default function Board2Page() {
                   />
                 </div>
 
+                <div>
+                  <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={0.95}
+                    step={0.01}
+                    value={selectedClip.holdFraction ?? HOLD_FRACTION}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+                      setClips((prev) =>
+                        prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)
+                      );
+                    }}
+                    style={{ width: "100%", accentColor: "#c8f135" }}
+                  />
+                  <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
+                    Hold: {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans: {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
+                  </div>
+                </div>
+
                 {selectedClip.boardX !== undefined && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Board Position</div>
@@ -1320,6 +1398,13 @@ export default function Board2Page() {
                 const color = CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
+                const hf = clip.holdFraction ?? HOLD_FRACTION;
+                const innerW = clipPx - HANDLE_W * 2;
+                const holdW = Math.max(0, innerW * hf);
+                const transW = Math.max(0, innerW * (1 - hf));
+                const holdColor = shadeColor(color, 0.82);
+                const transColor = shadeColor(color, 1.18);
+                const dividerLeft = HANDLE_W + holdW;
                 return (
                   <div
                     key={clip.id}
@@ -1329,27 +1414,44 @@ export default function Board2Page() {
                       top: 4,
                       width: clipPx,
                       height: TRACK_H - 8,
-                      background: color,
                       border: selected ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.35)",
                       boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
                       cursor: "grab",
                       userSelect: "none",
                       overflow: "hidden",
-                      display: "flex",
-                      alignItems: "center",
                     }}
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
+                    {/* Hold region */}
+                    <div style={{ position: "absolute", left: HANDLE_W, top: 0, width: holdW, bottom: 0, background: holdColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+                      {holdW > 30 && (
+                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>hold</span>
+                      )}
+                    </div>
+                    {/* Transition region */}
+                    <div style={{ position: "absolute", left: HANDLE_W + holdW, top: 0, width: transW, bottom: 0, background: transColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+                      {transW > 36 && (
+                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>trans</span>
+                      )}
+                    </div>
+                    {/* Divider */}
                     <div
-                      style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)", flexShrink: 0 }}
+                      style={{ position: "absolute", left: dividerLeft - 1, top: 0, bottom: 0, width: 3, background: "rgba(42,42,42,0.65)", cursor: "col-resize", zIndex: 5 }}
+                      onPointerDown={(e) => handleDividerPointerDown(e, clip)}
+                    />
+                    {/* Left resize handle */}
+                    <div
+                      style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.25)", zIndex: 6 }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")}
                     />
-                    <span style={{ fontFamily: "monospace", fontSize: 9, paddingLeft: HANDLE_W + 4, paddingRight: HANDLE_W + 4, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
+                    {/* Clip name */}
+                    <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
                       {clip.name}{clip.boardX !== undefined ? " [B]" : ""}
                     </span>
+                    {/* Right resize handle */}
                     <div
-                      style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)" }}
+                      style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.25)", zIndex: 6 }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")}
                     />
                   </div>
@@ -1361,6 +1463,13 @@ export default function Board2Page() {
           </div>
         </div>
       </div>
+
+      {/* Divider drag tooltip */}
+      {dividerTooltip && (
+        <div style={{ position: "fixed", left: dividerTooltip.x + 12, top: dividerTooltip.y - 32, background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 10, padding: "3px 8px", border: "1px solid #c8f135", pointerEvents: "none", zIndex: 9999, whiteSpace: "nowrap" }}>
+          {dividerTooltip.label}
+        </div>
+      )}
 
       {/* Toast */}
       {toast && (
