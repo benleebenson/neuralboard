@@ -120,6 +120,8 @@ export default function Board2Page() {
   const [canvasAspect, setCanvasAspect] = useState<"16:9" | "9:16">("16:9");
   const [pxPerSec, setPxPerSec] = useState(DEFAULT_PX_PER_SEC);
   const [timelineScroll, setTimelineScroll] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
 
   // ─ Derived ────────────────────────────────────────────────────────────────
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
@@ -141,6 +143,9 @@ export default function Board2Page() {
   const timelineRef = useRef<HTMLDivElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const videoCacheRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const exportCancelRef = useRef(false);
+  const exportRafRef = useRef<number | null>(null);
+  const isExportingRef = useRef(false);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -149,19 +154,18 @@ export default function Board2Page() {
 
   // ─ Canvas draw ────────────────────────────────────────────────────────────
 
-  const drawFrame = useCallback((time: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const W = canvasWRef.current;
-    const H = canvasHRef.current;
+  const renderToCtx = useCallback((
+    ctx: CanvasRenderingContext2D,
+    time: number,
+    currentClips: Clip[],
+    W: number,
+    H: number
+  ) => {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#111";
     ctx.fillRect(0, 0, W, H);
 
-    const active = clipsRef.current
+    const active = currentClips
       .filter((c) => time >= c.startTime && time < c.startTime + c.duration)
       .sort((a, b) => a.startTime - b.startTime);
 
@@ -178,8 +182,6 @@ export default function Board2Page() {
           ctx.drawImage(img, x - w / 2, y - h / 2, w, h);
         }
       } else {
-        // Video: draw whatever frame the element is at.
-        // Time-sync is handled by seekVideo() on scrub and play/pause.
         const vid = videoCacheRef.current.get(clip.sourceUrl);
         if (vid && vid.readyState >= 2) {
           const w = (vid.videoWidth || 640) * scale;
@@ -191,6 +193,14 @@ export default function Board2Page() {
       ctx.globalAlpha = 1;
     }
   }, []);
+
+  const drawFrame = useCallback((time: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    renderToCtx(ctx, time, clipsRef.current, canvasWRef.current, canvasHRef.current);
+  }, [renderToCtx]);
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
 
@@ -459,6 +469,115 @@ export default function Board2Page() {
     return ticks;
   }
 
+  // ─ Export ─────────────────────────────────────────────────────────────────
+
+  function cancelExport() {
+    exportCancelRef.current = true;
+  }
+
+  async function startExport() {
+    if (clips.length === 0) {
+      alert("No clips to export");
+      return;
+    }
+    if (isPlayingRef.current) setIsPlaying(false);
+
+    setIsExporting(true);
+    isExportingRef.current = true;
+    exportCancelRef.current = false;
+    setExportProgress(0);
+
+    const currentClips = clipsRef.current;
+    const totalDur = currentClips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+    const W = canvasWRef.current;
+    const H = canvasHRef.current;
+
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = W;
+    exportCanvas.height = H;
+    const exportCtx = exportCanvas.getContext("2d")!;
+
+    // Seed video elements active at t=0
+    for (const clip of currentClips) {
+      if (clip.type !== "video") continue;
+      const vid = videoCacheRef.current.get(clip.sourceUrl);
+      if (!vid) continue;
+      if (clip.startTime === 0) {
+        vid.currentTime = 0;
+        vid.play().catch(() => {});
+      } else {
+        vid.pause();
+        vid.currentTime = 0;
+      }
+    }
+
+    const canvasStream = exportCanvas.captureStream(30);
+    const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
+    const recorder = new MediaRecorder(canvasStream, { mimeType });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = mimeType === "video/mp4" ? "board2-export.mp4" : "board2-export.webm";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      for (const vid of videoCacheRef.current.values()) vid.pause();
+      setIsExporting(false);
+      isExportingRef.current = false;
+      setExportProgress(0);
+    };
+
+    recorder.start(100);
+
+    const exportWallStart = performance.now();
+
+    function exportFrame() {
+      if (exportCancelRef.current) {
+        for (const vid of videoCacheRef.current.values()) vid.pause();
+        recorder.stop();
+        setIsExporting(false);
+        isExportingRef.current = false;
+        setExportProgress(0);
+        return;
+      }
+
+      const elapsed = (performance.now() - exportWallStart) / 1000;
+
+      if (elapsed >= totalDur) {
+        for (const vid of videoCacheRef.current.values()) vid.pause();
+        recorder.stop();
+        return;
+      }
+
+      setExportProgress(elapsed / totalDur);
+
+      // Manage video element lifecycle
+      for (const clip of currentClips) {
+        if (clip.type !== "video") continue;
+        const vid = videoCacheRef.current.get(clip.sourceUrl);
+        if (!vid) continue;
+        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
+        if (isActive && vid.paused) {
+          vid.currentTime = elapsed - clip.startTime;
+          vid.play().catch(() => {});
+        } else if (!isActive && !vid.paused) {
+          vid.pause();
+        }
+      }
+
+      renderToCtx(exportCtx, elapsed, currentClips, W, H);
+
+      exportRafRef.current = requestAnimationFrame(exportFrame);
+    }
+
+    exportRafRef.current = requestAnimationFrame(exportFrame);
+  }
+
   // ─ Keyboard shortcuts ─────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -555,17 +674,31 @@ export default function Board2Page() {
           {/* ── Center: preview canvas ── */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "14px 16px", background: "rgba(20,20,20,0.04)", position: "relative" }}>
 
-            {/* Aspect toggle */}
-            <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 4 }}>
-              {(["16:9", "9:16"] as const).map((a) => (
-                <button
-                  key={a}
-                  onClick={() => setCanvasAspect(a)}
-                  style={{ ...miniButton, background: canvasAspect === a ? "#2a2a2a" : "transparent", color: canvasAspect === a ? "#fff" : "#2a2a2a" }}
-                >
-                  {a}
-                </button>
-              ))}
+            {/* Aspect toggle + Export button */}
+            <div style={{ position: "absolute", top: 10, right: 10, display: "flex", alignItems: "center", gap: 6 }}>
+              {isExporting && (
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>
+                  {Math.round(exportProgress * 100)}%
+                </span>
+              )}
+              <button
+                onClick={isExporting ? cancelExport : startExport}
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
+                title={isExporting ? "Cancel export" : "Export video"}
+              >
+                {isExporting ? `✕ Cancel` : "⬇ Export"}
+              </button>
+              <div style={{ display: "flex", gap: 4 }}>
+                {(["16:9", "9:16"] as const).map((a) => (
+                  <button
+                    key={a}
+                    onClick={() => setCanvasAspect(a)}
+                    style={{ ...miniButton, background: canvasAspect === a ? "#2a2a2a" : "transparent", color: canvasAspect === a ? "#fff" : "#2a2a2a" }}
+                  >
+                    {a}
+                  </button>
+                ))}
+              </div>
             </div>
 
             {/* Canvas */}
