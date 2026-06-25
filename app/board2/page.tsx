@@ -48,6 +48,10 @@ const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 
+const HOLD_FRACTION = 0.6;
+const FRAME_ALL_PADDING = 0.1;
+const CLIP_FOCUS_RATIO = 0.7;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 let _idCounter = 0;
@@ -112,6 +116,7 @@ export default function Board2Page() {
   const [viewMode, setViewMode] = useState<"preview" | "board">("preview");
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
+  const [toast, setToast] = useState<string | null>(null);
 
   // ─ Derived ────────────────────────────────────────────────────────────────
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
@@ -141,6 +146,7 @@ export default function Board2Page() {
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -149,6 +155,13 @@ export default function Board2Page() {
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+
+  useEffect(() => {
+    if (!toast) return;
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+    return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
+  }, [toast]);
 
   // ─ Fit board to container when switching to board view ───────────────────
   useEffect(() => {
@@ -537,6 +550,112 @@ export default function Board2Page() {
     return ticks;
   }
 
+  // ─ Generate camera pan keyframes ──────────────────────────────────────────
+  function generateCameraKeyframes() {
+    const boardClips = clipsRef.current
+      .filter((c) => c.boardX !== undefined)
+      .sort((a, b) => a.startTime - b.startTime);
+
+    if (boardClips.length === 0) {
+      setToast("Place clips on the board first");
+      return;
+    }
+
+    const W = canvasWRef.current;
+    const H = canvasHRef.current;
+
+    function getNatSize(clip: Clip): { w: number; h: number } {
+      if (clip.type === "image") {
+        const img = imgCacheRef.current.get(clip.sourceUrl);
+        if (img && img.naturalWidth > 0) return { w: img.naturalWidth, h: img.naturalHeight };
+      } else {
+        const vid = videoCacheRef.current.get(clip.sourceUrl);
+        if (vid && vid.videoWidth > 0) return { w: vid.videoWidth, h: vid.videoHeight };
+      }
+      return { w: 640, h: 480 };
+    }
+
+    type Stop = { camX: number; camY: number; zoom: number };
+
+    // One camera stop per board-placed clip: camera centers on clip, zoomed to CLIP_FOCUS_RATIO
+    const clipStops: Stop[] = boardClips.map((clip) => {
+      const bw = clip.boardW!, bh = clip.boardH!;
+      // sf = boardZoom * W / BOARD_W  →  clip fills min(bw*sf/W, bh*sf/H) = CLIP_FOCUS_RATIO
+      const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
+      return {
+        camX: clip.boardX! + bw / 2,
+        camY: clip.boardY! + bh / 2,
+        zoom: sf * BOARD_W / W,
+      };
+    });
+
+    // Frame All stop: camera frames the bounding box of all board clips with padding
+    const minX = Math.min(...boardClips.map((c) => c.boardX!));
+    const minY = Math.min(...boardClips.map((c) => c.boardY!));
+    const maxX = Math.max(...boardClips.map((c) => c.boardX! + c.boardW!));
+    const maxY = Math.max(...boardClips.map((c) => c.boardY! + c.boardH!));
+    const bbW = maxX - minX || 1;
+    const bbH = maxY - minY || 1;
+    const faSf = (1 - 2 * FRAME_ALL_PADDING) * Math.min(W / bbW, H / bbH);
+    const frameAllStop: Stop = {
+      camX: (minX + maxX) / 2,
+      camY: (minY + maxY) / 2,
+      zoom: faSf * BOARD_W / W,
+    };
+    const allStops: Stop[] = [...clipStops, frameAllStop];
+
+    // Camera events: for each clip i → hold_start, hold_end, transition_end
+    // At hold_start and hold_end: camera = clipStops[i]  (static during hold)
+    // At transition_end: camera = allStops[i+1]  (arrived at next stop)
+    type CamEvent = { absTime: number; stop: Stop };
+    const events: CamEvent[] = [];
+    for (let i = 0; i < boardClips.length; i++) {
+      const c = boardClips[i];
+      const holdEnd = c.startTime + c.duration * HOLD_FRACTION;
+      const transEnd = c.startTime + c.duration;
+      events.push({ absTime: c.startTime, stop: clipStops[i] });
+      events.push({ absTime: holdEnd, stop: clipStops[i] });
+      events.push({ absTime: transEnd, stop: allStops[i + 1] });
+    }
+
+    // Convert (boardClip, cameraStop) → screen keyframe
+    function boardToScreen(clip: Clip, stop: Stop): { x: number; y: number; scale: number } {
+      const bx = clip.boardX!, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
+      const sf = stop.zoom * W / BOARD_W;
+      const x = (bx + bw / 2 - stop.camX) * sf + W / 2;
+      const y = (by + bh / 2 - stop.camY) * sf + H / 2;
+      const nat = getNatSize(clip);
+      const scale = (bw * sf) / nat.w;
+      return { x, y, scale };
+    }
+
+    // Build new clips: board-placed clips get fresh keyframes; others are unchanged
+    const newClips = clipsRef.current.map((clip) => {
+      if (clip.boardX === undefined) return clip;
+      const seen = new Set<number>();
+      const keyframes: Keyframe[] = events
+        .map((ev) => {
+          const { x, y, scale } = boardToScreen(clip, ev.stop);
+          return {
+            time: parseFloat((ev.absTime - clip.startTime).toFixed(3)),
+            x, y, scale, opacity: 1,
+          };
+        })
+        .sort((a, b) => a.time - b.time)
+        .filter((kf) => {
+          const t = Math.round(kf.time * 1000);
+          if (seen.has(t)) return false;
+          seen.add(t);
+          return true;
+        });
+      return { ...clip, keyframes };
+    });
+
+    setClips(newClips);
+    const n = boardClips.length;
+    setToast(`Camera keyframes generated for ${n} clip${n !== 1 ? "s" : ""}`);
+  }
+
   // ─ Export ─────────────────────────────────────────────────────────────────
   function cancelExport() { exportCancelRef.current = true; }
 
@@ -642,6 +761,20 @@ export default function Board2Page() {
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <button
+            onClick={generateCameraKeyframes}
+            disabled={!clips.some((c) => c.boardX !== undefined)}
+            title={clips.some((c) => c.boardX !== undefined) ? "Generate per-clip x/y/scale keyframes from board positions" : "Place clips on the board first"}
+            style={{
+              ...sketchButton,
+              padding: "4px 10px",
+              fontSize: 11,
+              opacity: clips.some((c) => c.boardX !== undefined) ? 1 : 0.45,
+              cursor: clips.some((c) => c.boardX !== undefined) ? "pointer" : "not-allowed",
+            }}
+          >
+            ⬡ Generate camera keyframes
+          </button>
           <a href="/editor" style={navLinkStyle}>Editor</a>
           <a href="/board" style={navLinkStyle}>Board</a>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board 2.0</span>
@@ -1000,6 +1133,13 @@ export default function Board2Page() {
           </div>
         </div>
       </div>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
