@@ -6,11 +6,11 @@ import { useSession, signIn } from "next-auth/react";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Keyframe = {
-  time: number;     // seconds relative to clip.startTime
-  x: number;        // center X on output canvas
-  y: number;        // center Y on output canvas
-  scale: number;    // 1 = natural size
-  opacity: number;  // 0–1
+  time: number;
+  x: number;
+  y: number;
+  scale: number;
+  opacity: number;
 };
 
 type Clip = {
@@ -18,9 +18,13 @@ type Clip = {
   type: "image" | "video";
   name: string;
   sourceUrl: string;
-  startTime: number;  // seconds on timeline
-  duration: number;   // seconds
+  startTime: number;
+  duration: number;
   keyframes: Keyframe[];
+  boardX?: number;
+  boardY?: number;
+  boardW?: number;
+  boardH?: number;
 };
 
 type MediaItem = {
@@ -35,10 +39,13 @@ type MediaItem = {
 
 const CANVAS_W_LAND = 1920;
 const CANVAS_H_LAND = 1080;
+const BOARD_W = 4000;
+const BOARD_H = 3000;
 const DEFAULT_PX_PER_SEC = 100;
 const RULER_H = 28;
 const TRACK_H = 48;
 const HANDLE_W = 6;
+const BOARD_RESIZE_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -52,39 +59,19 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-/**
- * Returns interpolated {x, y, scale, opacity} at `time` seconds (relative to clip start).
- * Clamps to first/last keyframe outside the range.
- */
 function interpolateKeyframes(
   keyframes: Keyframe[],
   time: number
 ): { x: number; y: number; scale: number; opacity: number } {
   if (keyframes.length === 0) return { x: CANVAS_W_LAND / 2, y: CANVAS_H_LAND / 2, scale: 1, opacity: 1 };
-
   const sorted = [...keyframes].sort((a, b) => a.time - b.time);
-
-  if (time <= sorted[0].time) {
-    const { x, y, scale, opacity } = sorted[0];
-    return { x, y, scale, opacity };
-  }
-  if (time >= sorted[sorted.length - 1].time) {
-    const { x, y, scale, opacity } = sorted[sorted.length - 1];
-    return { x, y, scale, opacity };
-  }
-
+  if (time <= sorted[0].time) { const { x, y, scale, opacity } = sorted[0]; return { x, y, scale, opacity }; }
+  if (time >= sorted[sorted.length - 1].time) { const { x, y, scale, opacity } = sorted[sorted.length - 1]; return { x, y, scale, opacity }; }
   let lo = 0;
   while (lo < sorted.length - 2 && sorted[lo + 1].time <= time) lo++;
-  const a = sorted[lo];
-  const b = sorted[lo + 1];
+  const a = sorted[lo]; const b = sorted[lo + 1];
   const t = (time - a.time) / (b.time - a.time);
-
-  return {
-    x: lerp(a.x, b.x, t),
-    y: lerp(a.y, b.y, t),
-    scale: lerp(a.scale, b.scale, t),
-    opacity: lerp(a.opacity, b.opacity, t),
-  };
+  return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t), scale: lerp(a.scale, b.scale, t), opacity: lerp(a.opacity, b.opacity, t) };
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -122,6 +109,9 @@ export default function Board2Page() {
   const [timelineScroll, setTimelineScroll] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [viewMode, setViewMode] = useState<"preview" | "board">("preview");
+  const [boardZoom, setBoardZoom] = useState(0.18);
+  const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
 
   // ─ Derived ────────────────────────────────────────────────────────────────
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
@@ -130,13 +120,18 @@ export default function Board2Page() {
   const timelineDuration = Math.max(10, ...clips.map((c) => c.startTime + c.duration + 2));
   const timelineWidth = timelineDuration * pxPerSec;
 
-  // ─ Refs (stale-closure safe mirrors) ──────────────────────────────────────
+  // ─ Refs ───────────────────────────────────────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const boardContainerRef = useRef<HTMLDivElement>(null);
   const clipsRef = useRef<Clip[]>(clips);
   const playheadRef = useRef(0);
   const isPlayingRef = useRef(false);
   const canvasWRef = useRef(canvasW);
   const canvasHRef = useRef(canvasH);
+  const viewModeRef = useRef<"preview" | "board">("preview");
+  const boardZoomRef = useRef(0.18);
+  const boardPanRef = useRef({ x: 20, y: 20 });
+  const isSpaceDownRef = useRef(false);
   const lastRafTimeRef = useRef<number | null>(null);
   const rafIdRef = useRef<number | null>(null);
   const mediaUploadRef = useRef<HTMLInputElement>(null);
@@ -151,9 +146,51 @@ export default function Board2Page() {
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
+  useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+  useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
+  useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+
+  // ─ Fit board to container when switching to board view ───────────────────
+  useEffect(() => {
+    if (viewMode !== "board") return;
+    const timeout = setTimeout(() => {
+      const container = boardContainerRef.current;
+      if (!container) return;
+      const { width, height } = container.getBoundingClientRect();
+      if (width === 0 || height === 0) return;
+      const zoom = Math.min((width - 60) / BOARD_W, (height - 60) / BOARD_H);
+      const panX = (width - BOARD_W * zoom) / 2;
+      const panY = (height - BOARD_H * zoom) / 2;
+      setBoardZoom(zoom);
+      setBoardPan({ x: panX, y: panY });
+    }, 30);
+    return () => clearTimeout(timeout);
+  }, [viewMode]);
+
+  // ─ Board wheel zoom (non-passive) ─────────────────────────────────────────
+  useEffect(() => {
+    const container = boardContainerRef.current;
+    if (!container || viewMode !== "board") return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const rect = container.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const pz = boardZoomRef.current;
+      const pp = boardPanRef.current;
+      const nz = Math.max(0.05, Math.min(3, pz * factor));
+      const np = { x: mx - (mx - pp.x) * (nz / pz), y: my - (my - pp.y) * (nz / pz) };
+      boardZoomRef.current = nz;
+      boardPanRef.current = np;
+      setBoardZoom(nz);
+      setBoardPan(np);
+    };
+    container.addEventListener("wheel", onWheel, { passive: false });
+    return () => container.removeEventListener("wheel", onWheel);
+  }, [viewMode]);
 
   // ─ Canvas draw ────────────────────────────────────────────────────────────
-
   const renderToCtx = useCallback((
     ctx: CanvasRenderingContext2D,
     time: number,
@@ -164,32 +201,26 @@ export default function Board2Page() {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#111";
     ctx.fillRect(0, 0, W, H);
-
     const active = currentClips
       .filter((c) => time >= c.startTime && time < c.startTime + c.duration)
       .sort((a, b) => a.startTime - b.startTime);
-
     for (const clip of active) {
       const relTime = time - clip.startTime;
       const { x, y, scale, opacity } = interpolateKeyframes(clip.keyframes, relTime);
       ctx.globalAlpha = clamp(opacity, 0, 1);
-
       if (clip.type === "image") {
         const img = imgCacheRef.current.get(clip.sourceUrl);
         if (img?.complete && img.naturalWidth > 0) {
-          const w = img.naturalWidth * scale;
-          const h = img.naturalHeight * scale;
+          const w = img.naturalWidth * scale; const h = img.naturalHeight * scale;
           ctx.drawImage(img, x - w / 2, y - h / 2, w, h);
         }
       } else {
         const vid = videoCacheRef.current.get(clip.sourceUrl);
         if (vid && vid.readyState >= 2) {
-          const w = (vid.videoWidth || 640) * scale;
-          const h = (vid.videoHeight || 360) * scale;
+          const w = (vid.videoWidth || 640) * scale; const h = (vid.videoHeight || 360) * scale;
           ctx.drawImage(vid, x - w / 2, y - h / 2, w, h);
         }
       }
-
       ctx.globalAlpha = 1;
     }
   }, []);
@@ -203,7 +234,6 @@ export default function Board2Page() {
   }, [renderToCtx]);
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
-
   const rafLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
     const now = performance.now();
@@ -212,15 +242,10 @@ export default function Board2Page() {
       const next = playheadRef.current + dt;
       const maxEnd = clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       if (next >= maxEnd) {
-        playheadRef.current = maxEnd;
-        setPlayhead(maxEnd);
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        drawFrame(maxEnd);
-        return;
+        playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
+        isPlayingRef.current = false; drawFrame(maxEnd); return;
       }
-      playheadRef.current = next;
-      setPlayhead(next);
+      playheadRef.current = next; setPlayhead(next);
     }
     lastRafTimeRef.current = now;
     drawFrame(playheadRef.current);
@@ -228,24 +253,12 @@ export default function Board2Page() {
   }, [drawFrame]);
 
   useEffect(() => {
-    if (isPlaying) {
-      lastRafTimeRef.current = null;
-      rafIdRef.current = requestAnimationFrame(rafLoop);
-    } else {
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    return () => {
-      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
-    };
+    if (isPlaying) { lastRafTimeRef.current = null; rafIdRef.current = requestAnimationFrame(rafLoop); }
+    else { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null; }
+    return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
 
-  // Redraw on scrub / clip change (not during playback — RAF handles that)
-  useEffect(() => {
-    if (!isPlaying) drawFrame(playhead);
-  }, [playhead, clips, canvasAspect, isPlaying, drawFrame]);
-
-  // ─ Seek video elements on scrub ───────────────────────────────────────────
+  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [playhead, clips, canvasAspect, isPlaying, drawFrame]);
 
   useEffect(() => {
     if (isPlaying) return;
@@ -254,14 +267,11 @@ export default function Board2Page() {
       const vid = videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       const relTime = playhead - clip.startTime;
-      if (relTime >= 0 && relTime <= clip.duration) {
-        vid.currentTime = relTime;
-      }
+      if (relTime >= 0 && relTime <= clip.duration) vid.currentTime = relTime;
     }
   }, [playhead, isPlaying]);
 
   // ─ Media loading ──────────────────────────────────────────────────────────
-
   function loadMedia(url: string, type: "image" | "video") {
     if (type === "image") {
       if (!imgCacheRef.current.has(url)) {
@@ -273,16 +283,13 @@ export default function Board2Page() {
     } else {
       if (!videoCacheRef.current.has(url)) {
         const vid = document.createElement("video");
-        vid.muted = true;
-        vid.preload = "auto";
-        vid.src = url;
+        vid.muted = true; vid.preload = "auto"; vid.src = url;
         videoCacheRef.current.set(url, vid);
       }
     }
   }
 
   // ─ Media upload ───────────────────────────────────────────────────────────
-
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     for (const file of files) {
@@ -297,16 +304,11 @@ export default function Board2Page() {
   }
 
   // ─ Add clip ───────────────────────────────────────────────────────────────
-
   function makeClip(item: MediaItem, startTime: number): Clip {
     const duration = item.duration ?? (item.type === "video" ? 5 : 4);
     return {
-      id: generateId(),
-      type: item.type,
-      name: item.name,
-      sourceUrl: item.url,
-      startTime,
-      duration,
+      id: generateId(), type: item.type, name: item.name, sourceUrl: item.url,
+      startTime, duration,
       keyframes: [{ time: 0, x: canvasWRef.current / 2, y: canvasHRef.current / 2, scale: 1, opacity: 1 }],
     };
   }
@@ -318,8 +320,110 @@ export default function Board2Page() {
     setSelectedClipId(clip.id);
   }
 
-  // ─ Keyframe editing ───────────────────────────────────────────────────────
+  // ─ Board placement ────────────────────────────────────────────────────────
+  function placeOnBoard(clipId: string) {
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (!clip) return;
+    let w = 800, h = 600;
+    if (clip.type === "image") {
+      const img = imgCacheRef.current.get(clip.sourceUrl);
+      if (img && img.naturalWidth > 0) { w = img.naturalWidth; h = img.naturalHeight; }
+    } else {
+      const vid = videoCacheRef.current.get(clip.sourceUrl);
+      if (vid && vid.videoWidth > 0) { w = vid.videoWidth; h = vid.videoHeight; }
+      else { w = 1280; h = 720; }
+    }
+    const zoom = boardZoomRef.current;
+    const pan = boardPanRef.current;
+    const container = boardContainerRef.current;
+    let cx = BOARD_W / 2, cy = BOARD_H / 2;
+    if (container) {
+      const { width, height } = container.getBoundingClientRect();
+      cx = clamp((width / 2 - pan.x) / zoom, w / 2, BOARD_W - w / 2);
+      cy = clamp((height / 2 - pan.y) / zoom, h / 2, BOARD_H - h / 2);
+    }
+    const boardX = Math.round(cx - w / 2);
+    const boardY = Math.round(cy - h / 2);
+    setClips((prev) => prev.map((c) => c.id !== clipId ? c : { ...c, boardX, boardY, boardW: w, boardH: h }));
+  }
 
+  function removeFromBoard(clipId: string) {
+    setClips((prev) => prev.map((c) =>
+      c.id !== clipId ? c : { ...c, boardX: undefined, boardY: undefined, boardW: undefined, boardH: undefined }
+    ));
+  }
+
+  // ─ Board clip drag ────────────────────────────────────────────────────────
+  function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
+    if (isSpaceDownRef.current) return;
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setSelectedClipId(clip.id);
+    const startX = e.clientX, startY = e.clientY;
+    const origX = clip.boardX!, origY = clip.boardY!;
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
+        ...c,
+        boardX: Math.round(origX + (ev.clientX - startX) / zoom),
+        boardY: Math.round(origY + (ev.clientY - startY) / zoom),
+      }));
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Board clip resize ──────────────────────────────────────────────────────
+  function handleBoardResizePointerDown(e: React.PointerEvent, clip: Clip, corner: "nw" | "ne" | "sw" | "se") {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const startX = e.clientX;
+    const { boardX: ox, boardY: oy, boardW: ow, boardH: oh } = clip;
+    if (ox === undefined || oy === undefined || ow === undefined || oh === undefined) return;
+    const aspect = ow / oh;
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      const dx = (ev.clientX - startX) / zoom;
+      let nx = ox, ny = oy, nw = ow, nh = oh;
+      if (corner === "se") {
+        nw = Math.max(50, ow + dx); nh = nw / aspect;
+      } else if (corner === "sw") {
+        nw = Math.max(50, ow - dx); nh = nw / aspect; nx = ox + ow - nw;
+      } else if (corner === "ne") {
+        nw = Math.max(50, ow + dx); nh = nw / aspect; ny = oy + oh - nh;
+      } else {
+        nw = Math.max(50, ow - dx); nh = nw / aspect; nx = ox + ow - nw; ny = oy + oh - nh;
+      }
+      setClips((prev) => prev.map((c) => c.id !== clip.id ? c : {
+        ...c, boardX: Math.round(nx), boardY: Math.round(ny), boardW: Math.round(nw), boardH: Math.round(nh),
+      }));
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Board pan (spacebar + drag) ────────────────────────────────────────────
+  function handleBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!isSpaceDownRef.current) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const startX = e.clientX, startY = e.clientY;
+    const origPan = { ...boardPanRef.current };
+    const onMove = (ev: PointerEvent) => {
+      const np = { x: origPan.x + ev.clientX - startX, y: origPan.y + ev.clientY - startY };
+      boardPanRef.current = np;
+      setBoardPan(np);
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Keyframe editing ───────────────────────────────────────────────────────
   function addKeyframe() {
     if (!selectedClip) return;
     const relTime = parseFloat(Math.max(0, playhead - selectedClip.startTime).toFixed(3));
@@ -328,9 +432,7 @@ export default function Board2Page() {
     const newKf: Keyframe = { time: relTime, ...interp };
     setClips((prev) =>
       prev.map((c) =>
-        c.id !== selectedClip.id
-          ? c
-          : { ...c, keyframes: [...c.keyframes, newKf].sort((a, b) => a.time - b.time) }
+        c.id !== selectedClip.id ? c : { ...c, keyframes: [...c.keyframes, newKf].sort((a, b) => a.time - b.time) }
       )
     );
   }
@@ -352,77 +454,53 @@ export default function Board2Page() {
     if (!selectedClip || selectedClip.keyframes.length <= 1) return;
     setClips((prev) =>
       prev.map((c) =>
-        c.id !== selectedClip.id
-          ? c
-          : { ...c, keyframes: c.keyframes.filter((_, i) => i !== kfIndex) }
+        c.id !== selectedClip.id ? c : { ...c, keyframes: c.keyframes.filter((_, i) => i !== kfIndex) }
       )
     );
   }
 
   // ─ Timeline clip dragging ─────────────────────────────────────────────────
-
   function handleClipPointerDown(
     e: React.PointerEvent,
     clip: Clip,
     kind: "move" | "resize-left" | "resize-right"
   ) {
     e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     setSelectedClipId(clip.id);
-
-    const origStart = clip.startTime;
-    const origDuration = clip.duration;
-    const startX = e.clientX;
-
+    const origStart = clip.startTime, origDuration = clip.duration, startX = e.clientX;
     const onMove = (ev: PointerEvent) => {
       const dx = (ev.clientX - startX) / pxPerSec;
       setClips((prev) =>
         prev.map((c) => {
           if (c.id !== clip.id) return c;
-          if (kind === "move") {
-            return { ...c, startTime: Math.max(0, origStart + dx) };
-          }
-          if (kind === "resize-right") {
-            return { ...c, duration: Math.max(0.1, origDuration + dx) };
-          }
-          // resize-left
+          if (kind === "move") return { ...c, startTime: Math.max(0, origStart + dx) };
+          if (kind === "resize-right") return { ...c, duration: Math.max(0.1, origDuration + dx) };
           const newStart = Math.max(0, origStart + dx);
-          const delta = newStart - origStart;
-          return { ...c, startTime: newStart, duration: Math.max(0.1, origDuration - delta) };
+          return { ...c, startTime: newStart, duration: Math.max(0.1, origDuration - (newStart - origStart)) };
         })
       );
     };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
 
   // ─ Ruler scrub ────────────────────────────────────────────────────────────
-
   function handleRulerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     setIsPlaying(false);
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const rect = el.getBoundingClientRect();
-    const scrub = (clientX: number) => {
-      const x = clientX - rect.left + timelineScroll;
-      setPlayhead(Math.max(0, x / pxPerSec));
-    };
+    const scrub = (clientX: number) => { const x = clientX - rect.left + timelineScroll; setPlayhead(Math.max(0, x / pxPerSec)); };
     scrub(e.clientX);
     const onMove = (ev: PointerEvent) => scrub(ev.clientX);
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
 
   // ─ Timeline drop ──────────────────────────────────────────────────────────
-
   function handleTimelineDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
     const itemId = e.dataTransfer.getData("mediaItemId");
@@ -438,31 +516,21 @@ export default function Board2Page() {
   }
 
   // ─ Play / pause ───────────────────────────────────────────────────────────
-
   function togglePlay() {
-    if (isPlaying) {
-      setIsPlaying(false);
-      return;
-    }
+    if (isPlaying) { setIsPlaying(false); return; }
     const maxEnd = clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
     if (playhead >= maxEnd && maxEnd > 0) setPlayhead(0);
     setIsPlaying(true);
   }
 
   // ─ Ruler ticks ────────────────────────────────────────────────────────────
-
   function rulerTicks() {
     const step = pxPerSec >= 100 ? 1 : pxPerSec >= 50 ? 2 : 5;
     const ticks = [];
     for (let t = 0; t <= timelineDuration; t += step) {
       ticks.push(
-        <div
-          key={t}
-          style={{ position: "absolute", left: t * pxPerSec, top: 0, bottom: 0, borderLeft: "1px solid rgba(42,42,42,0.2)", pointerEvents: "none" }}
-        >
-          <span style={{ position: "absolute", top: 3, left: 3, fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", userSelect: "none" }}>
-            {t}s
-          </span>
+        <div key={t} style={{ position: "absolute", left: t * pxPerSec, top: 0, bottom: 0, borderLeft: "1px solid rgba(42,42,42,0.2)", pointerEvents: "none" }}>
+          <span style={{ position: "absolute", top: 3, left: 3, fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", userSelect: "none" }}>{t}s</span>
         </div>
       );
     }
@@ -470,47 +538,25 @@ export default function Board2Page() {
   }
 
   // ─ Export ─────────────────────────────────────────────────────────────────
-
-  function cancelExport() {
-    exportCancelRef.current = true;
-  }
+  function cancelExport() { exportCancelRef.current = true; }
 
   async function startExport() {
-    if (clips.length === 0) {
-      alert("No clips to export");
-      return;
-    }
+    if (clips.length === 0) { alert("No clips to export"); return; }
     if (isPlayingRef.current) setIsPlaying(false);
-
-    setIsExporting(true);
-    isExportingRef.current = true;
-    exportCancelRef.current = false;
-    setExportProgress(0);
-
+    setIsExporting(true); isExportingRef.current = true; exportCancelRef.current = false; setExportProgress(0);
     const currentClips = clipsRef.current;
     const totalDur = currentClips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    const W = canvasWRef.current;
-    const H = canvasHRef.current;
-
+    const W = canvasWRef.current, H = canvasHRef.current;
     const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = W;
-    exportCanvas.height = H;
+    exportCanvas.width = W; exportCanvas.height = H;
     const exportCtx = exportCanvas.getContext("2d")!;
-
-    // Seed video elements active at t=0
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
       const vid = videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
-      if (clip.startTime === 0) {
-        vid.currentTime = 0;
-        vid.play().catch(() => {});
-      } else {
-        vid.pause();
-        vid.currentTime = 0;
-      }
+      if (clip.startTime === 0) { vid.currentTime = 0; vid.play().catch(() => {}); }
+      else { vid.pause(); vid.currentTime = 0; }
     }
-
     const canvasStream = exportCanvas.captureStream(30);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
     const recorder = new MediaRecorder(canvasStream, { mimeType });
@@ -520,81 +566,67 @@ export default function Board2Page() {
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = mimeType === "video/mp4" ? "board2-export.mp4" : "board2-export.webm";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
+      a.href = url; a.download = mimeType === "video/mp4" ? "board2-export.mp4" : "board2-export.webm";
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
       for (const vid of videoCacheRef.current.values()) vid.pause();
-      setIsExporting(false);
-      isExportingRef.current = false;
-      setExportProgress(0);
+      setIsExporting(false); isExportingRef.current = false; setExportProgress(0);
     };
-
     recorder.start(100);
-
     const exportWallStart = performance.now();
-
     function exportFrame() {
       if (exportCancelRef.current) {
         for (const vid of videoCacheRef.current.values()) vid.pause();
-        recorder.stop();
-        setIsExporting(false);
-        isExportingRef.current = false;
-        setExportProgress(0);
-        return;
+        recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
       }
-
       const elapsed = (performance.now() - exportWallStart) / 1000;
-
       if (elapsed >= totalDur) {
         for (const vid of videoCacheRef.current.values()) vid.pause();
-        recorder.stop();
-        return;
+        recorder.stop(); return;
       }
-
       setExportProgress(elapsed / totalDur);
-
-      // Manage video element lifecycle
       for (const clip of currentClips) {
         if (clip.type !== "video") continue;
         const vid = videoCacheRef.current.get(clip.sourceUrl);
         if (!vid) continue;
         const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
-        if (isActive && vid.paused) {
-          vid.currentTime = elapsed - clip.startTime;
-          vid.play().catch(() => {});
-        } else if (!isActive && !vid.paused) {
-          vid.pause();
-        }
+        if (isActive && vid.paused) { vid.currentTime = elapsed - clip.startTime; vid.play().catch(() => {}); }
+        else if (!isActive && !vid.paused) { vid.pause(); }
       }
-
       renderToCtx(exportCtx, elapsed, currentClips, W, H);
-
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
-
     exportRafRef.current = requestAnimationFrame(exportFrame);
   }
 
   // ─ Keyboard shortcuts ─────────────────────────────────────────────────────
-
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+    const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
-      if (e.code === "Space") { e.preventDefault(); togglePlay(); }
-      if (e.code === "KeyK") { addKeyframe(); }
-      if (e.code === "Delete" || e.code === "Backspace") {
-        if (selectedClipId) {
-          setClips((prev) => prev.filter((c) => c.id !== selectedClipId));
-          setSelectedClipId(null);
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (viewModeRef.current === "board") {
+          isSpaceDownRef.current = true;
+          if (boardContainerRef.current) boardContainerRef.current.style.cursor = "grab";
+        } else {
+          togglePlay();
         }
       }
+      if (e.code === "KeyK") addKeyframe();
+      if (e.code === "Delete" || e.code === "Backspace") {
+        if (selectedClipId) { setClips((prev) => prev.filter((c) => c.id !== selectedClipId)); setSelectedClipId(null); }
+      }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space") {
+        isSpaceDownRef.current = false;
+        if (boardContainerRef.current) boardContainerRef.current.style.cursor = "default";
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => { window.removeEventListener("keydown", onKeyDown); window.removeEventListener("keyup", onKeyUp); };
   });
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -616,12 +648,7 @@ export default function Board2Page() {
           {session?.user ? (
             <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
           ) : (
-            <button
-              onClick={() => signIn("google", { callbackUrl: "/board2" })}
-              style={{ fontFamily: "monospace", background: "transparent", border: "1px solid #2a2a2a", padding: "3px 8px", cursor: "pointer", fontSize: 10 }}
-            >
-              sign in →
-            </button>
+            <button onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ fontFamily: "monospace", background: "transparent", border: "1px solid #2a2a2a", padding: "3px 8px", cursor: "pointer", fontSize: 10 }}>sign in →</button>
           )}
         </div>
       </header>
@@ -629,28 +656,19 @@ export default function Board2Page() {
       {/* ── Main workspace ── */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, flexDirection: "column", overflow: "hidden" }}>
 
-        {/* Top row: media | canvas | properties */}
+        {/* Top row: media | canvas/board | properties */}
         <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
-            <input
-              ref={mediaUploadRef}
-              type="file"
-              accept="image/*,video/*"
-              multiple
-              style={{ display: "none" }}
-              onChange={handleMediaUpload}
-            />
-
+            <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
             {mediaLibrary.length === 0 && (
               <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
                 Upload images or videos, then click to add to timeline.
               </p>
             )}
-
             {mediaLibrary.map((item) => (
               <div
                 key={item.id}
@@ -663,78 +681,173 @@ export default function Board2Page() {
                 <span style={{ fontSize: 13, flexShrink: 0 }}>{item.type === "video" ? "▶" : "□"}</span>
                 <div style={{ overflow: "hidden", flex: 1 }}>
                   <div style={{ textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", fontSize: 10 }}>{item.name}</div>
-                  {item.duration !== undefined && (
-                    <div style={{ color: "#9a9a9a", fontSize: 9, marginTop: 1 }}>{item.duration.toFixed(1)}s</div>
-                  )}
+                  {item.duration !== undefined && <div style={{ color: "#9a9a9a", fontSize: 9, marginTop: 1 }}>{item.duration.toFixed(1)}s</div>}
                 </div>
               </div>
             ))}
           </div>
 
-          {/* ── Center: preview canvas ── */}
+          {/* ── Center: preview / board area ── */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "14px 16px", background: "rgba(20,20,20,0.04)", position: "relative" }}>
 
-            {/* Aspect toggle + Export button */}
-            <div style={{ position: "absolute", top: 10, right: 10, display: "flex", alignItems: "center", gap: 6 }}>
-              {isExporting && (
-                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>
-                  {Math.round(exportProgress * 100)}%
-                </span>
-              )}
+            {/* Preview / Board toggle (top-left) */}
+            <div style={{ position: "absolute", top: 10, left: 10, display: "flex", gap: 2, zIndex: 2 }}>
+              {(["preview", "board"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setViewMode(mode)}
+                  style={{ ...miniButton, background: viewMode === mode ? "#2a2a2a" : "transparent", color: viewMode === mode ? "#fff" : "#2a2a2a", padding: "3px 12px", fontSize: 10 }}
+                >
+                  {mode === "preview" ? "Preview" : "Board"}
+                </button>
+              ))}
+            </div>
+
+            {/* Aspect toggle + Export (top-right) */}
+            <div style={{ position: "absolute", top: 10, right: 10, display: "flex", alignItems: "center", gap: 6, zIndex: 2 }}>
+              {isExporting && <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>{Math.round(exportProgress * 100)}%</span>}
               <button
                 onClick={isExporting ? cancelExport : startExport}
                 style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
                 title={isExporting ? "Cancel export" : "Export video"}
               >
-                {isExporting ? `✕ Cancel` : "⬇ Export"}
+                {isExporting ? "✕ Cancel" : "⬇ Export"}
               </button>
               <div style={{ display: "flex", gap: 4 }}>
                 {(["16:9", "9:16"] as const).map((a) => (
-                  <button
-                    key={a}
-                    onClick={() => setCanvasAspect(a)}
-                    style={{ ...miniButton, background: canvasAspect === a ? "#2a2a2a" : "transparent", color: canvasAspect === a ? "#fff" : "#2a2a2a" }}
-                  >
-                    {a}
-                  </button>
+                  <button key={a} onClick={() => setCanvasAspect(a)} style={{ ...miniButton, background: canvasAspect === a ? "#2a2a2a" : "transparent", color: canvasAspect === a ? "#fff" : "#2a2a2a" }}>{a}</button>
                 ))}
               </div>
             </div>
 
-            {/* Canvas */}
-            <div style={{ flex: 1, minHeight: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {/* Preview canvas — always mounted so RAF loop continues; hidden in board mode */}
+            <div style={{ flex: 1, minHeight: 0, width: "100%", display: viewMode === "preview" ? "flex" : "none", alignItems: "center", justifyContent: "center" }}>
               <canvas
                 ref={canvasRef}
                 width={canvasW}
                 height={canvasH}
-                style={{
-                  maxWidth: "100%",
-                  maxHeight: "100%",
-                  border: "1.5px solid #2a2a2a",
-                  boxShadow: "4px 4px 0 #2a2a2a",
-                  background: "#111",
-                  display: "block",
-                }}
+                style={{ maxWidth: "100%", maxHeight: "100%", border: "1.5px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", background: "#111", display: "block" }}
               />
             </div>
 
-            {/* Playback controls */}
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexShrink: 0 }}>
-              <button
-                onClick={togglePlay}
-                style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, background: isPlaying ? "#ff5e3a" : "#c8f135" }}
+            {/* Board view */}
+            {viewMode === "board" && (
+              <div
+                ref={boardContainerRef}
+                style={{ flex: 1, minHeight: 0, width: "100%", position: "relative", overflow: "hidden", cursor: "default", background: "rgba(20,20,20,0.06)" }}
+                onPointerDown={handleBoardPointerDown}
               >
-                {isPlaying ? "■" : "▶"}
-              </button>
-              <span style={{ fontFamily: "monospace", fontSize: 11, color: "#6a6a6a", minWidth: 56 }}>{formatTime(playhead)}</span>
-              <button onClick={() => { setPlayhead(0); setIsPlaying(false); }} style={miniButton}>↩ reset</button>
-              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>zoom</span>
-                <button onClick={() => setPxPerSec((p) => clamp(p / 1.5, 10, 500))} style={miniButton}>−</button>
-                <button onClick={() => setPxPerSec((p) => clamp(p * 1.5, 10, 500))} style={miniButton}>+</button>
+                {/* Board surface (4000×3000 virtual, scaled by boardZoom) */}
+                <div
+                  style={{
+                    position: "absolute",
+                    left: boardPan.x,
+                    top: boardPan.y,
+                    width: BOARD_W * boardZoom,
+                    height: BOARD_H * boardZoom,
+                    background: "#f5ecd8",
+                    border: "1.5px solid #2a2a2a",
+                    boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
+                  }}
+                  onPointerDown={(e) => {
+                    if (!isSpaceDownRef.current && e.target === e.currentTarget) setSelectedClipId(null);
+                  }}
+                >
+                  {clips.filter((c) => c.boardX !== undefined).map((clip) => {
+                    const isSel = clip.id === selectedClipId;
+                    return (
+                      <div
+                        key={clip.id}
+                        style={{
+                          position: "absolute",
+                          left: clip.boardX! * boardZoom,
+                          top: clip.boardY! * boardZoom,
+                          width: clip.boardW! * boardZoom,
+                          height: clip.boardH! * boardZoom,
+                          border: isSel ? "2px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.4)",
+                          boxShadow: isSel ? "0 0 0 1px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : "1px 1px 4px rgba(42,42,42,0.2)",
+                          cursor: "grab",
+                          overflow: "visible",
+                        }}
+                        onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
+                        onPointerDown={(e) => handleBoardClipPointerDown(e, clip)}
+                      >
+                        {/* Clipped content */}
+                        <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+                          {clip.type === "image" ? (
+                            <img
+                              src={clip.sourceUrl}
+                              style={{ width: "100%", height: "100%", objectFit: "fill", display: "block", userSelect: "none", pointerEvents: "none" }}
+                              draggable={false}
+                            />
+                          ) : (
+                            <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                              <span style={{ color: "#7df5b0", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>▶ {clip.name}</span>
+                            </div>
+                          )}
+                          {/* Name label */}
+                          <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 4px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: 9, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none" }}>
+                            {clip.name}
+                          </div>
+                        </div>
+
+                        {/* Corner resize handles — only when selected */}
+                        {isSel && (["nw", "ne", "sw", "se"] as const).map((corner) => (
+                          <div
+                            key={corner}
+                            style={{
+                              position: "absolute",
+                              width: BOARD_RESIZE_PX,
+                              height: BOARD_RESIZE_PX,
+                              background: "#ff5e3a",
+                              border: "1.5px solid #fff",
+                              cursor: (corner === "nw" || corner === "se") ? "nwse-resize" : "nesw-resize",
+                              zIndex: 10,
+                              ...(corner === "nw" ? { left: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
+                                  corner === "ne" ? { right: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
+                                  corner === "sw" ? { left: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 } :
+                                                   { right: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 }),
+                            }}
+                            onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
+                          />
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Empty state hint */}
+                {clips.filter((c) => c.boardX !== undefined).length === 0 && (
+                  <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                    <span style={{ fontFamily: "monospace", fontSize: 11, color: "rgba(42,42,42,0.4)" }}>
+                      Select a clip and click "Place on board" in the Properties panel
+                    </span>
+                  </div>
+                )}
+
+                {/* Info label */}
+                <div style={{ position: "absolute", bottom: 8, right: 8, fontFamily: "monospace", fontSize: 9, color: "rgba(42,42,42,0.4)", pointerEvents: "none" }}>
+                  {BOARD_W}x{BOARD_H} · {Math.round(boardZoom * 100)}% · space+drag=pan · scroll=zoom
+                </div>
               </div>
-              <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>space=play · K=keyframe · Del=delete clip</span>
-            </div>
+            )}
+
+            {/* Playback controls (preview mode only) */}
+            {viewMode === "preview" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexShrink: 0 }}>
+                <button onClick={togglePlay} style={{ ...sketchButton, width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, background: isPlaying ? "#ff5e3a" : "#c8f135" }}>
+                  {isPlaying ? "■" : "▶"}
+                </button>
+                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#6a6a6a", minWidth: 56 }}>{formatTime(playhead)}</span>
+                <button onClick={() => { setPlayhead(0); setIsPlaying(false); }} style={miniButton}>↩ reset</button>
+                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>zoom</span>
+                  <button onClick={() => setPxPerSec((p) => clamp(p / 1.5, 10, 500))} style={miniButton}>−</button>
+                  <button onClick={() => setPxPerSec((p) => clamp(p * 1.5, 10, 500))} style={miniButton}>+</button>
+                </div>
+                <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>space=play · K=keyframe · Del=delete clip</span>
+              </div>
+            )}
           </div>
 
           {/* ── Right: properties panel ── */}
@@ -756,16 +869,11 @@ export default function Board2Page() {
                   {selectedClip.startTime.toFixed(2)}s → {(selectedClip.startTime + selectedClip.duration).toFixed(2)}s &nbsp;({selectedClip.duration.toFixed(2)}s)
                 </div>
 
-                <button
-                  onClick={addKeyframe}
-                  style={{ ...sketchButton, padding: "6px 10px", fontSize: 11, background: "#c8f135" }}
-                >
+                <button onClick={addKeyframe} style={{ ...sketchButton, padding: "6px 10px", fontSize: 11, background: "#c8f135" }}>
                   + Add keyframe at {formatTime(Math.max(0, playhead - selectedClip.startTime))}
                 </button>
 
-                <div style={{ ...panelLabelStyle, marginTop: 4 }}>
-                  Keyframes ({selectedClip.keyframes.length})
-                </div>
+                <div style={{ ...panelLabelStyle, marginTop: 4 }}>Keyframes ({selectedClip.keyframes.length})</div>
 
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {selectedClip.keyframes.map((kf, i) => (
@@ -773,15 +881,9 @@ export default function Board2Page() {
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
                         <span style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 700 }}>t = {kf.time.toFixed(2)}s</span>
                         {selectedClip.keyframes.length > 1 && (
-                          <button
-                            onClick={() => deleteKeyframe(i)}
-                            style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", fontSize: 9 }}
-                          >
-                            ✕
-                          </button>
+                          <button onClick={() => deleteKeyframe(i)} style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", fontSize: 9 }}>✕</button>
                         )}
                       </div>
-
                       {(["x", "y", "scale", "opacity"] as const).map((field) => (
                         <div key={field} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
                           <span style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", width: 44, flexShrink: 0 }}>{field}</span>
@@ -798,6 +900,32 @@ export default function Board2Page() {
                       ))}
                     </div>
                   ))}
+                </div>
+
+                {/* Board position */}
+                <div style={{ borderTop: "1px solid rgba(42,42,42,0.12)", paddingTop: 10, marginTop: 2 }}>
+                  <div style={{ ...panelLabelStyle, marginBottom: 7 }}>Board Position</div>
+                  {selectedClip.boardX === undefined ? (
+                    <button
+                      onClick={() => placeOnBoard(selectedClip.id)}
+                      style={{ ...sketchButton, padding: "6px 10px", fontSize: 11, width: "100%", textAlign: "center" }}
+                    >
+                      + Place on board
+                    </button>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div style={{ fontFamily: "monospace", fontSize: 10, color: "#6a6a6a", lineHeight: 1.8 }}>
+                        <div>X: {Math.round(selectedClip.boardX)} &nbsp; Y: {Math.round(selectedClip.boardY!)}</div>
+                        <div>W: {Math.round(selectedClip.boardW!)} &nbsp; H: {Math.round(selectedClip.boardH!)}</div>
+                      </div>
+                      <button
+                        onClick={() => removeFromBoard(selectedClip.id)}
+                        style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", alignSelf: "flex-start" }}
+                      >
+                        ✕ Remove from board
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 <button
@@ -822,7 +950,6 @@ export default function Board2Page() {
             <div style={{ position: "absolute", left: -timelineScroll, top: 0, width: timelineWidth, height: "100%", pointerEvents: "none" }}>
               {rulerTicks()}
             </div>
-            {/* Playhead needle on ruler */}
             <div style={{ position: "absolute", left: playhead * pxPerSec - timelineScroll, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none" }} />
           </div>
 
@@ -844,73 +971,30 @@ export default function Board2Page() {
             onDrop={handleTimelineDrop}
           >
             <div style={{ position: "relative", width: timelineWidth, minHeight: TRACK_H, height: "100%" }}>
-              {/* Lane stripe */}
               <div style={{ position: "absolute", inset: 0, background: "rgba(100,130,180,0.05)", borderTop: "1px solid rgba(42,42,42,0.08)" }} />
 
-              {/* Clips */}
               {clips.map((clip, ci) => {
                 const color = CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId;
                 return (
                   <div
                     key={clip.id}
-                    style={{
-                      position: "absolute",
-                      left: clip.startTime * pxPerSec,
-                      top: 4,
-                      width: Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec),
-                      height: TRACK_H - 8,
-                      background: color,
-                      border: selected ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.35)",
-                      boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
-                      cursor: "grab",
-                      userSelect: "none",
-                      overflow: "hidden",
-                      display: "flex",
-                      alignItems: "center",
-                    }}
+                    style={{ position: "absolute", left: clip.startTime * pxPerSec, top: 4, width: Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec), height: TRACK_H - 8, background: color, border: selected ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.35)", boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none", cursor: "grab", userSelect: "none", overflow: "hidden", display: "flex", alignItems: "center" }}
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
-                    {/* Left resize */}
-                    <div
-                      style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)", flexShrink: 0 }}
-                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")}
-                    />
-
+                    <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)", flexShrink: 0 }} onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ fontFamily: "monospace", fontSize: 9, paddingLeft: HANDLE_W + 4, paddingRight: HANDLE_W + 4, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.name}
+                      {clip.name}{clip.boardX !== undefined ? " [B]" : ""}
                     </span>
-
-                    {/* Right resize */}
-                    <div
-                      style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)" }}
-                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")}
-                    />
-
-                    {/* Keyframe diamonds */}
+                    <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.18)" }} onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
                     {clip.keyframes.map((kf, ki) => (
-                      <div
-                        key={ki}
-                        style={{
-                          position: "absolute",
-                          left: kf.time * pxPerSec - 4,
-                          top: "50%",
-                          width: 6,
-                          height: 6,
-                          transform: "translateY(-50%) rotate(45deg)",
-                          background: "#2a2a2a",
-                          opacity: 0.65,
-                          pointerEvents: "none",
-                          flexShrink: 0,
-                        }}
-                      />
+                      <div key={ki} style={{ position: "absolute", left: kf.time * pxPerSec - 4, top: "50%", width: 6, height: 6, transform: "translateY(-50%) rotate(45deg)", background: "#2a2a2a", opacity: 0.65, pointerEvents: "none", flexShrink: 0 }} />
                     ))}
                   </div>
                 );
               })}
 
-              {/* Playhead */}
               <div style={{ position: "absolute", left: playhead * pxPerSec, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none", zIndex: 10 }} />
             </div>
           </div>
