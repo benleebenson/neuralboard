@@ -2446,7 +2446,7 @@ export default function BoardPage() {
                           {clip.type === "pan" && clipPx >= 30 && !isBeingDragged && (
                             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 3, fontSize: 16, opacity: 0.55 }}>↔</div>
                           )}
-                          {clip.type === "image" && clipPx >= 86 && !isBeingDragged && (
+                          {clip.type === "image" && clipPx >= 54 && !isBeingDragged && (
                             <select
                               title="Image entry sound"
                               value={clip.entrySfxId ?? ""}
@@ -2455,13 +2455,15 @@ export default function BoardPage() {
                               onChange={(e) => handleEntrySfxSelect(clip.id, e.target.value)}
                               style={{
                                 position: "absolute",
-                                right: showHandles ? HANDLE_W + 3 : 3,
-                                top: 3,
-                                maxWidth: Math.max(54, Math.min(98, clipPx - 18)),
-                                height: 20,
+                                right: showHandles ? HANDLE_W + 2 : 2,
+                                top: 2,
+                                width: clipPx >= 84 ? 46 : 30,
+                                height: 17,
                                 zIndex: 8,
                                 fontFamily: "monospace",
-                                fontSize: 9,
+                                fontSize: 8,
+                                lineHeight: "17px",
+                                padding: "0 1px",
                                 border: "1px solid #2a2a2a",
                                 background: clip.entrySfxId ? "#c8f135" : "rgba(255,253,245,0.92)",
                                 color: "#2a2a2a",
@@ -2469,7 +2471,7 @@ export default function BoardPage() {
                                 cursor: "pointer",
                               }}
                             >
-                              <option value="">SFX</option>
+                              <option value="">♪</option>
                               {entrySfxOptions.map((option) => (
                                 <option key={option.id} value={option.id}>{option.custom ? "+ " : ""}{option.label}</option>
                               ))}

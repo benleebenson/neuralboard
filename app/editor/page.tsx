@@ -143,9 +143,108 @@ type RevealDragState = {
   clipDuration: number;
 } | null;
 
+type EntrySfxOption = {
+  id: string;
+  label: string;
+  blobUrl: string;
+  durationSec: number;
+  custom?: boolean;
+};
+
+type ActiveSfxEntry = {
+  bufNode: AudioBufferSourceNode;
+  gainNode: GainNode;
+  clipId: string;
+  sfxId: string;
+  startTime: number;
+  durationSec: number;
+};
 
 function layerBg(layer: number): string {
   return LAYER_BG[(layer - 1) % LAYER_BG.length] ?? LAYER_BG[0];
+}
+
+function wavBlobFromSamples(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function makeEntrySfxSamples(kind: string, durationSec: number, sampleRate = 44100): Float32Array {
+  const count = Math.max(1, Math.floor(durationSec * sampleRate));
+  const samples = new Float32Array(count);
+  let seed = 13;
+  const noise = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed / 2147483647) * 2 - 1;
+  };
+  for (let i = 0; i < count; i++) {
+    const t = i / sampleRate;
+    const p = i / count;
+    let value = 0;
+    if (kind === "pop") {
+      const env = Math.exp(-14 * p);
+      value = Math.sin(2 * Math.PI * (520 - 280 * p) * t) * env;
+    } else if (kind === "whoosh") {
+      const env = Math.sin(Math.PI * p);
+      value = noise() * env * 0.55 + Math.sin(2 * Math.PI * (180 + 900 * p) * t) * env * 0.18;
+    } else if (kind === "click") {
+      const env = Math.exp(-45 * p);
+      value = (Math.sin(2 * Math.PI * 1900 * t) + noise() * 0.5) * env;
+    } else if (kind === "sparkle") {
+      const env = Math.exp(-5 * p);
+      value = (
+        Math.sin(2 * Math.PI * 980 * t) * 0.35 +
+        Math.sin(2 * Math.PI * 1470 * t) * 0.28 +
+        Math.sin(2 * Math.PI * 1960 * t) * 0.18
+      ) * env * (0.7 + 0.3 * Math.sin(2 * Math.PI * 18 * t));
+    } else {
+      const env = Math.exp(-10 * p);
+      value = Math.sin(2 * Math.PI * (120 - 45 * p) * t) * env + noise() * env * 0.16;
+    }
+    samples[i] = value * 0.85;
+  }
+  return samples;
+}
+
+function createBuiltinEntrySfxOptions(): EntrySfxOption[] {
+  const presets = [
+    { id: "pop", label: "Pop", durationSec: 0.35 },
+    { id: "whoosh", label: "Whoosh", durationSec: 0.65 },
+    { id: "click", label: "Click", durationSec: 0.18 },
+    { id: "sparkle", label: "Sparkle", durationSec: 0.75 },
+    { id: "thud", label: "Thud", durationSec: 0.45 },
+  ];
+  return presets.map((preset) => {
+    const blob = wavBlobFromSamples(makeEntrySfxSamples(preset.id, preset.durationSec), 44100);
+    return { ...preset, blobUrl: URL.createObjectURL(blob) };
+  });
+}
+
+function trackHasRequestFrame(track: MediaStreamTrack | undefined): boolean {
+  return typeof (track as (MediaStreamTrack & { requestFrame?: () => void }) | undefined)?.requestFrame === "function";
 }
 
 function cropMediaStyle(clip: Pick<Clip, "cropZoom" | "cropX" | "cropY">): React.CSSProperties {
@@ -186,6 +285,7 @@ export default function EditorPage() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportDurationSec, setExportDurationSec] = useState(0);
   const [signInPrompt, setSignInPrompt] = useState<string | null>(null);
+  const [entrySfxOptions, setEntrySfxOptions] = useState<EntrySfxOption[]>([]);
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -229,6 +329,8 @@ export default function EditorPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const recSecondsRef = useRef(0);
   const mediaUploadRef = useRef<HTMLInputElement | null>(null);
+  const sfxUploadRef = useRef<HTMLInputElement | null>(null);
+  const pendingSfxClipIdRef = useRef<string | null>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const previewDragRef = useRef<PreviewDragState>(null);
   const cropDraftRef = useRef<CropDraft>(null);
@@ -259,8 +361,12 @@ export default function EditorPage() {
   // Audio
   const audioCtxRef = useRef<AudioContext | null>(null);
   const activeAudioRef = useRef<Map<string, AudioEntry>>(new Map());
+  const activeSfxRef = useRef<Map<string, ActiveSfxEntry>>(new Map());
+  const loadingSfxRef = useRef<Set<string>>(new Set());
+  const entrySfxOptionsRef = useRef<EntrySfxOption[]>([]);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  useEffect(() => { entrySfxOptionsRef.current = entrySfxOptions; }, [entrySfxOptions]);
   useEffect(() => { cropDraftRef.current = cropDraft; }, [cropDraft]);
   useEffect(() => { playheadSecRef.current = playheadSec; }, [playheadSec]);
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
@@ -287,6 +393,17 @@ export default function EditorPage() {
     fetch("/api/config").then((r) => r.json()).then((d) => setConfig(d)).catch(() => {});
     fetch("/api/usage/check").then((r) => r.json()).then((d) => setIsSubscribed(!!d.isSubscribed)).catch(() => {});
   }, [session?.user?.email]);
+
+  useEffect(() => {
+    const builtins = createBuiltinEntrySfxOptions();
+    entrySfxOptionsRef.current = builtins;
+    const timer = window.setTimeout(() => setEntrySfxOptions(builtins), 0);
+    return () => {
+      window.clearTimeout(timer);
+      entrySfxOptionsRef.current.forEach((option) => URL.revokeObjectURL(option.blobUrl));
+      entrySfxOptionsRef.current = [];
+    };
+  }, []);
 
   // Spacebar + Delete
   useEffect(() => {
@@ -396,7 +513,15 @@ export default function EditorPage() {
   }, []);
 
   const totalDuration = clips.length > 0
-    ? Math.max(...clips.map((c) => c.startTime + c.durationSec))
+    ? Math.max(
+      ...clips.map((c) => c.startTime + c.durationSec),
+      ...clips
+        .filter((c) => c.type === "image" && c.entrySfxId)
+        .map((c) => {
+          const option = entrySfxOptions.find((item) => item.id === c.entrySfxId);
+          return c.startTime + (option?.durationSec ?? 0);
+        })
+    )
     : 10;
   const timelineW = totalDuration * pxPerSec + 200;
   const isDraggingClip = ghost !== null;
@@ -684,6 +809,11 @@ export default function EditorPage() {
     return audioCtxRef.current;
   }
 
+  function entrySfxOptionForClip(clip: Clip): EntrySfxOption | null {
+    if (clip.type !== "image" || !clip.entrySfxId) return null;
+    return entrySfxOptionsRef.current.find((option) => option.id === clip.entrySfxId) ?? null;
+  }
+
   function stopAllAudio() {
     activeAudioRef.current.forEach((entry) => {
       if (entry.kind === "element") {
@@ -697,6 +827,58 @@ export default function EditorPage() {
       }
     });
     activeAudioRef.current.clear();
+    activeSfxRef.current.forEach((entry) => {
+      try { entry.bufNode.stop(); } catch {}
+      try { entry.bufNode.disconnect(); } catch {}
+      try { entry.gainNode.disconnect(); } catch {}
+    });
+    activeSfxRef.current.clear();
+    loadingSfxRef.current.clear();
+  }
+
+  function spawnImageEntrySfx(clip: Clip, atSec: number, ctx: AudioContext, extraDest?: AudioNode) {
+    const option = entrySfxOptionForClip(clip);
+    if (!option) return;
+    const sfxOffset = atSec - clip.startTime;
+    if (sfxOffset < 0 || sfxOffset >= option.durationSec) return;
+    const key = `${clip.id}:entry-sfx`;
+    if (activeSfxRef.current.has(key) || loadingSfxRef.current.has(key)) return;
+    loadingSfxRef.current.add(key);
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = isRecordingNarrationRef.current ? 0 : 0.82;
+    gainNode.connect(ctx.destination);
+    if (extraDest) gainNode.connect(extraDest);
+    fetch(option.blobUrl)
+      .then((r) => r.arrayBuffer())
+      .then((ab) => ctx.decodeAudioData(ab))
+      .then((buffer) => {
+        loadingSfxRef.current.delete(key);
+        if (!isPlayingRef.current && !isExportingRef.current) {
+          try { gainNode.disconnect(); } catch {}
+          return;
+        }
+        if (activeSfxRef.current.has(key)) {
+          try { gainNode.disconnect(); } catch {}
+          return;
+        }
+        const bufNode = ctx.createBufferSource();
+        bufNode.buffer = buffer;
+        bufNode.connect(gainNode);
+        const safeOffset = Math.min(Math.max(0, sfxOffset), Math.max(0, buffer.duration - 0.01));
+        bufNode.start(0, safeOffset);
+        activeSfxRef.current.set(key, {
+          bufNode,
+          gainNode,
+          clipId: clip.id,
+          sfxId: option.id,
+          startTime: clip.startTime,
+          durationSec: option.durationSec,
+        });
+      })
+      .catch(() => {
+        loadingSfxRef.current.delete(key);
+        try { gainNode.disconnect(); } catch {}
+      });
   }
 
   function startAudioAt(atSec: number, currentClips: Clip[], extraDest?: AudioNode) {
@@ -709,6 +891,10 @@ export default function EditorPage() {
       if (isLayerMuted(clip.layer)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
+    });
+    currentClips.forEach((clip) => {
+      if (clip.type !== "image" || clip.muted || isLayerMuted(clip.layer)) return;
+      spawnImageEntrySfx(clip, atSec, ctx, extraDest);
     });
   }
 
@@ -778,6 +964,19 @@ export default function EditorPage() {
         else entry.bufNode.playbackRate.value = mediaPlaybackRate(clip);
       }
     });
+    activeSfxRef.current.forEach((entry, key) => {
+      const clip = currentClips.find((c) => c.id === entry.clipId);
+      const option = clip ? entrySfxOptionForClip(clip) : null;
+      if (!clip || !option || option.id !== entry.sfxId || clip.muted || isLayerMuted(clip.layer) ||
+          atSec < entry.startTime || atSec >= entry.startTime + entry.durationSec) {
+        try { entry.bufNode.stop(); } catch {}
+        try { entry.bufNode.disconnect(); } catch {}
+        try { entry.gainNode.disconnect(); } catch {}
+        activeSfxRef.current.delete(key);
+      } else {
+        entry.gainNode.gain.value = isRecordingNarrationRef.current ? 0 : 0.82;
+      }
+    });
     currentClips.forEach((clip) => {
       if (!hasClipAudio(clip)) return;
       if (clip.muted) return;
@@ -785,6 +984,10 @@ export default function EditorPage() {
       if (activeAudioRef.current.has(clip.id)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
+    });
+    currentClips.forEach((clip) => {
+      if (clip.type !== "image" || clip.muted || isLayerMuted(clip.layer)) return;
+      spawnImageEntrySfx(clip, atSec, ctx, extraDest);
     });
   }
 
@@ -1131,6 +1334,71 @@ export default function EditorPage() {
       return [...prev, ...newClips];
     });
     e.target.value = "";
+  }
+
+  function updateImageEntrySfx(clipId: string, sfxId: string | undefined) {
+    pushUndoSnapshot();
+    setClips((prev) => prev.map((clip) => clip.id === clipId ? { ...clip, entrySfxId: sfxId } : clip));
+  }
+
+  function playEntrySfxPreview(option: EntrySfxOption) {
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    fetch(option.blobUrl)
+      .then((r) => r.arrayBuffer())
+      .then((ab) => ctx.decodeAudioData(ab))
+      .then((buffer) => {
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = 0.7;
+        gainNode.connect(ctx.destination);
+        const node = ctx.createBufferSource();
+        node.buffer = buffer;
+        node.connect(gainNode);
+        node.start();
+        node.onended = () => {
+          try { node.disconnect(); } catch {}
+          try { gainNode.disconnect(); } catch {}
+        };
+      })
+      .catch(() => {});
+  }
+
+  function handleEntrySfxSelect(clipId: string, value: string) {
+    if (value === "__upload") {
+      pendingSfxClipIdRef.current = clipId;
+      sfxUploadRef.current?.click();
+      return;
+    }
+    const next = value || undefined;
+    updateImageEntrySfx(clipId, next);
+    const option = next ? entrySfxOptionsRef.current.find((item) => item.id === next) : null;
+    if (option) playEntrySfxPreview(option);
+  }
+
+  async function handleEntrySfxUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const clipId = pendingSfxClipIdRef.current;
+    pendingSfxClipIdRef.current = null;
+    e.target.value = "";
+    if (!file || !clipId) return;
+    if (!file.type.startsWith("audio/") && !/\.(mp3|m4a|wav|aac|ogg|opus|webm)$/i.test(file.name)) {
+      showToast("Choose an audio file for image SFX");
+      return;
+    }
+    const blobUrl = URL.createObjectURL(file);
+    const durationSec = await getMediaDuration(blobUrl, "audio").catch(() => 1);
+    const option: EntrySfxOption = {
+      id: `custom-${crypto.randomUUID()}`,
+      label: file.name.replace(/\.[^.]+$/, "").slice(0, 24) || "Custom SFX",
+      blobUrl,
+      durationSec: Math.max(0.1, Math.min(durationSec || 1, 10)),
+      custom: true,
+    };
+    entrySfxOptionsRef.current = [...entrySfxOptionsRef.current, option];
+    setEntrySfxOptions(entrySfxOptionsRef.current);
+    updateImageEntrySfx(clipId, option.id);
+    playEntrySfxPreview(option);
+    showToast(`Added SFX: ${option.label}`);
   }
 
   // ─── YouTube ────────────────────────────────────────────────────────────────
@@ -1542,7 +1810,12 @@ export default function EditorPage() {
     exportCancelRef.current = false;
     setExportProgress(0);
 
-    const sourceTotalDur = Math.max(...currentClips.map((c) => c.startTime + c.durationSec));
+    const sourceTotalDur = Math.max(
+      ...currentClips.map((c) => c.startTime + c.durationSec),
+      ...currentClips
+        .filter((c) => c.type === "image" && c.entrySfxId)
+        .map((c) => c.startTime + (entrySfxOptionsRef.current.find((item) => item.id === c.entrySfxId)?.durationSec ?? 0))
+    );
     const totalDur = Math.min(MAX_EXPORT_DURATION, sourceTotalDur);
     setExportDurationSec(totalDur);
     const [canvasW, canvasH] = outputFormat === '16:9' ? [1280, 720] : [720, 1280];
@@ -1599,7 +1872,7 @@ export default function EditorPage() {
       readyState: _exportVideoTrack?.readyState,
       enabled: _exportVideoTrack?.enabled,
       muted: _exportVideoTrack?.muted,
-      hasRequestFrame: typeof (_exportVideoTrack as any)?.requestFrame === 'function',
+      hasRequestFrame: trackHasRequestFrame(_exportVideoTrack),
     });
 
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
@@ -1750,7 +2023,7 @@ export default function EditorPage() {
           readyState: _vt?.readyState,
           enabled: _vt?.enabled,
           muted: _vt?.muted,
-          hasRequestFrame: typeof (_vt as any)?.requestFrame === 'function',
+          hasRequestFrame: trackHasRequestFrame(_vt),
         });
       }
 
@@ -2010,6 +2283,7 @@ export default function EditorPage() {
           )}
           <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
           <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+          <input ref={sfxUploadRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={handleEntrySfxUpload} />
           <button onClick={addTextClip} style={sketchButton}>T Add text</button>
           <button onClick={openCountdownCreateModal} style={{ ...sketchButton, background: COUNTDOWN_COLOR }}>↓ Top List</button>
           <button
@@ -2383,6 +2657,38 @@ export default function EditorPage() {
                             );
                           })}
                         </svg>
+                      )}
+                      {clip.type === "image" && clipPx >= 54 && !isBeingDragged && (
+                        <select
+                          title="Image entry sound"
+                          value={clip.entrySfxId ?? ""}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => handleEntrySfxSelect(clip.id, e.target.value)}
+                          style={{
+                            position: "absolute",
+                            right: showHandles ? HANDLE_W + 2 : 2,
+                            top: 2,
+                            width: clipPx >= 84 ? 46 : 30,
+                            height: 17,
+                            zIndex: 8,
+                            fontFamily: "monospace",
+                            fontSize: 8,
+                            lineHeight: "17px",
+                            padding: "0 1px",
+                            border: "1px solid #2a2a2a",
+                            background: clip.entrySfxId ? "#c8f135" : "rgba(255,253,245,0.92)",
+                            color: "#2a2a2a",
+                            boxShadow: "1px 1px 0 #2a2a2a",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <option value="">♪</option>
+                          {entrySfxOptions.map((option) => (
+                            <option key={option.id} value={option.id}>{option.custom ? "+ " : ""}{option.label}</option>
+                          ))}
+                          <option value="__upload">+ Add SFX...</option>
+                        </select>
                       )}
                       <div style={{ position: "relative", zIndex: 2, paddingLeft: showHandles ? HANDLE_W + 4 : 5, paddingRight: showHandles ? HANDLE_W + 4 : 5, paddingBottom: CURVE_H, overflow: "hidden", flexGrow: 1, pointerEvents: "none" }}>
                         <div style={{ fontSize: 10, fontFamily: "'Courier New', monospace", fontWeight: 700, color: "#2a2a2a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{clip.name}</div>
