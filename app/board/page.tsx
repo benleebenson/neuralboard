@@ -95,6 +95,21 @@ type TimelineMarquee = {
   currentY: number;
 } | null;
 
+type TimelineDropTarget = {
+  startTime: number;
+  layer: number;
+  x: number;
+  y: number;
+} | null;
+
+type ProcessedMediaItem = {
+  type: Extract<ClipType, "audio" | "video" | "image">;
+  name: string;
+  blobUrl: string;
+  durationSec: number;
+  waveform?: number[];
+};
+
 type YtSearchResult = {
   id: string;
   title: string;
@@ -457,6 +472,7 @@ export default function BoardPage() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
+  const [timelineDropTarget, setTimelineDropTarget] = useState<TimelineDropTarget>(null);
   const [layerCount, setLayerCount] = useState(INITIAL_LAYER_COUNT);
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [pxPerSec, setPxPerSec] = useState(DEFAULT_PX_PER_SEC);
@@ -1196,13 +1212,62 @@ export default function BoardPage() {
   }
 
   function timelinePointFromEvent(e: React.PointerEvent<HTMLDivElement>) {
+    return timelinePointFromClient(e.clientX, e.clientY);
+  }
+
+  function timelinePointFromClient(clientX: number, clientY: number) {
     const scroller = scrollerRef.current;
     if (!scroller) return { x: 0, y: 0 };
     const rect = scroller.getBoundingClientRect();
     return {
-      x: e.clientX - rect.left + scroller.scrollLeft,
-      y: e.clientY - rect.top + scroller.scrollTop,
+      x: clientX - rect.left + scroller.scrollLeft,
+      y: clientY - rect.top + scroller.scrollTop,
     };
+  }
+
+  function timelineDropTargetFromClient(clientX: number, clientY: number): NonNullable<TimelineDropTarget> {
+    const point = timelinePointFromClient(clientX, clientY);
+    const startTime = snapTo(Math.max(0, point.x / pxPerSecRef.current));
+    const layerAreaY = point.y - RULER_H;
+    const layer = layerAreaY >= layerCountRef.current * LAYER_H
+      ? layerCountRef.current + 1
+      : clamp(Math.floor(layerAreaY / LAYER_H) + 1, 1, layerCountRef.current);
+    return {
+      startTime,
+      layer,
+      x: startTime * pxPerSecRef.current,
+      y: RULER_H + (layer - 1) * LAYER_H,
+    };
+  }
+
+  function hasDroppableFiles(dataTransfer: DataTransfer): boolean {
+    if (dataTransfer.files.length > 0) return true;
+    return Array.from(dataTransfer.items).some((item) => item.kind === "file");
+  }
+
+  function onTimelineDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (!hasDroppableFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+    setTimelineDropTarget(timelineDropTargetFromClient(e.clientX, e.clientY));
+  }
+
+  function onTimelineDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    const nextTarget = e.relatedTarget;
+    if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+    setTimelineDropTarget(null);
+  }
+
+  async function onTimelineDrop(e: React.DragEvent<HTMLDivElement>) {
+    if (!hasDroppableFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const target = timelineDropTargetFromClient(e.clientX, e.clientY);
+    const files = Array.from(e.dataTransfer.files);
+    setTimelineDropTarget(null);
+    if (files.length === 0) return;
+    await importMediaFiles(files, { startTime: target.startTime, layer: target.layer });
   }
 
   function selectedIdsInMarquee(marquee: NonNullable<TimelineMarquee>): string[] {
@@ -1482,15 +1547,25 @@ export default function BoardPage() {
     setRecording(false);
   }
 
-  async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    const processed = await Promise.all(
-      Array.from(files).map(async (file) => {
-        let type: ClipType;
-        if (file.type.startsWith("audio/")) type = "audio";
-        else if (file.type.startsWith("video/")) type = "video";
-        else if (file.type.startsWith("image/")) type = "image";
+  function preferredFreeLayer(existing: BoardClip[], startTime: number, duration: number, preferredLayer: number): number {
+    const maxLayer = Math.max(layerCountRef.current, preferredLayer);
+    for (let layer = preferredLayer; layer <= maxLayer; layer++) {
+      if (!existing.some((clip) => clip.layer === layer && clipsOverlap(startTime, duration, clip.startTime, clip.durationSec))) return layer;
+    }
+    for (let layer = 1; layer < preferredLayer; layer++) {
+      if (!existing.some((clip) => clip.layer === layer && clipsOverlap(startTime, duration, clip.startTime, clip.durationSec))) return layer;
+    }
+    return maxLayer + 1;
+  }
+
+  async function processMediaFiles(files: File[]): Promise<ProcessedMediaItem[]> {
+    const processed: Array<ProcessedMediaItem | null> = await Promise.all(
+      files.map(async (file) => {
+        let type: ProcessedMediaItem["type"];
+        const lowerName = file.name.toLowerCase();
+        if (file.type.startsWith("audio/") || /\.(mp3|m4a|wav|aac|ogg|opus)$/.test(lowerName)) type = "audio";
+        else if (file.type.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi|mkv)$/.test(lowerName)) type = "video";
+        else if (file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|avif)$/.test(lowerName)) type = "image";
         else return null;
         const blobUrl = URL.createObjectURL(file);
         const durationSec = await getMediaDuration(blobUrl, type);
@@ -1498,15 +1573,22 @@ export default function BoardPage() {
         return { type, name: file.name, blobUrl, durationSec, waveform };
       })
     );
-    const valid = processed.filter((x): x is NonNullable<typeof x> => x !== null);
+    return processed.filter((x): x is ProcessedMediaItem => x !== null);
+  }
+
+  async function importMediaFiles(files: File[], drop?: { startTime: number; layer: number }) {
+    if (files.length === 0) return;
+    const valid = await processMediaFiles(files);
     if (!valid.length) return;
     pushUndoSnapshot();
     setClips((prev) => {
-      const startTime = playheadSecRef.current;
+      const startTime = drop ? drop.startTime : playheadSecRef.current;
       const newClips: BoardClip[] = [];
       for (const item of valid) {
         const dur = item.durationSec || (item.type === "image" ? IMAGE_DEFAULT_DURATION : 5);
-        const layer = findFreeLayer([...prev, ...newClips], startTime, dur, layerCountRef.current);
+        const layer = drop
+          ? preferredFreeLayer([...prev, ...newClips], startTime, dur, drop.layer)
+          : findFreeLayer([...prev, ...newClips], startTime, dur, layerCountRef.current);
         ensureLayerCount(layer);
         const pos = findFreeBoardPos([...prev, ...newClips], CLIP_DEFAULT_W, CLIP_DEFAULT_H, cameraXRef.current, cameraYRef.current);
         newClips.push({
@@ -1520,6 +1602,12 @@ export default function BoardPage() {
       }
       return [...prev, ...newClips];
     });
+  }
+
+  async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    await importMediaFiles(Array.from(files));
     e.target.value = "";
   }
 
@@ -2004,6 +2092,9 @@ export default function BoardPage() {
             onPointerMove={onScrollerPointerMove}
             onPointerUp={onScrollerPointerUp}
             onPointerCancel={onScrollerPointerUp}
+            onDragOver={onTimelineDragOver}
+            onDragLeave={onTimelineDragLeave}
+            onDrop={onTimelineDrop}
             style={{ overflowX: "auto", overflowY: "auto", cursor: isDraggingClip ? "grabbing" : "crosshair", userSelect: "none", position: "relative", flex: 1 }}
           >
             <div style={{ position: "relative", width: timelineW, minHeight: RULER_H + layerCount * LAYER_H }}>
@@ -2138,6 +2229,27 @@ export default function BoardPage() {
                   />
                 );
               })()}
+
+              {/* Finder drop target */}
+              {timelineDropTarget && (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: timelineDropTarget.x,
+                    top: Math.max(RULER_H, timelineDropTarget.y),
+                    height: LAYER_H,
+                    width: 2,
+                    background: "#c8f135",
+                    boxShadow: "0 0 0 2px rgba(42,42,42,0.85), 0 0 12px rgba(200,241,53,0.7)",
+                    pointerEvents: "none",
+                    zIndex: 11,
+                  }}
+                >
+                  <div style={{ position: "absolute", left: 6, top: 4, fontSize: 9, fontFamily: "monospace", fontWeight: 700, color: "#2a2a2a", background: "#c8f135", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", padding: "2px 5px", whiteSpace: "nowrap" }}>
+                    Drop L{timelineDropTarget.layer} @ {formatTime(timelineDropTarget.startTime)}
+                  </div>
+                </div>
+              )}
 
               {/* Snap guide */}
               {snapGuideSec !== null && (
