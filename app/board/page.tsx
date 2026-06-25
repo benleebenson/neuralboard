@@ -1788,7 +1788,10 @@ export default function BoardPage() {
     const { status, downloadUrl, errorMessage } = statusData;
 
     if (status === 'done') {
-      const resolvedUrl = downloadUrl ?? `${cfg.railwayUrl}/api/render/download?jobId=${encodeURIComponent(jobId)}`;
+      // If downloadUrl is absolute (e.g. signed S3 URL) use it directly; otherwise route through Railway.
+      const resolvedUrl = (downloadUrl && downloadUrl.startsWith('http'))
+        ? downloadUrl
+        : `${cfg.railwayUrl}/api/render/download?jobId=${encodeURIComponent(jobId)}`;
       // Fetch through Railway auth, then trigger browser download as blob
       fetch(resolvedUrl, { headers: { 'x-neuralboard-password': cfg.railwayPassword } })
         .then((r) => r.blob())
