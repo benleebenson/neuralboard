@@ -14,7 +14,7 @@ type CameraKeyframe = {
 
 type Clip = {
   id: string;
-  type: "image" | "video";
+  type: "image" | "video" | "pan";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -61,6 +61,8 @@ const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
 const MAGNETIC_SNAP_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
+const PAN_CLIP_COLOR = "#f0e6a8";
+const PAN_KF_INTERVAL = 0.25;
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -243,6 +245,7 @@ export default function Board2Page() {
   const [isSpaceDown, setIsSpaceDown] = useState(false);
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number } | null>(null);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -526,6 +529,15 @@ export default function Board2Page() {
     setSelectedClipId(clipId);
   }
 
+  function addPanClip(atTime?: number) {
+    const id = generateId();
+    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+    const clip: Clip = { id, type: "pan", name: "Pan", sourceUrl: "", startTime, duration: 5, holdFraction: 0.5 };
+    setClips((prev) => [...prev, clip]);
+    setSelectedClipId(id);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
   // ─ Media upload ───────────────────────────────────────────────────────────
 
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -804,53 +816,96 @@ export default function Board2Page() {
   // ─ Generate camera keyframes ──────────────────────────────────────────────
 
   function generateCameraKeyframes() {
-    const boardClips = clipsRef.current
-      .filter((c) => c.boardX !== undefined)
+    const allClipsSorted = clipsRef.current
+      .filter((c) => c.boardX !== undefined || c.type === "pan")
       .sort((a, b) => a.startTime - b.startTime);
 
-    if (boardClips.length === 0) {
+    if (allClipsSorted.length === 0) {
       setToast("Place clips on the board first");
       return;
     }
 
+    const boardPlacedClips = clipsRef.current.filter((c) => c.boardX !== undefined);
+    const hasBoardClips = boardPlacedClips.length > 0;
     const W = canvasWRef.current;
     const H = canvasHRef.current;
 
     type Stop = { camX: number; camY: number; zoom: number };
 
-    const clipStops: Stop[] = boardClips.map((clip) => {
-      const bw = clip.boardW!, bh = clip.boardH!;
-      const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
-      return {
-        camX: clip.boardX! + bw / 2,
-        camY: clip.boardY! + bh / 2,
-        zoom: sf * BOARD_W / W,
-      };
-    });
+    // Bounding box of all board-placed clips
+    const bboxMinX = hasBoardClips ? Math.min(...boardPlacedClips.map((c) => c.boardX!)) : 0;
+    const bboxMaxX = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardX! + c.boardW!)) : BOARD_W;
+    const bboxMinY = hasBoardClips ? Math.min(...boardPlacedClips.map((c) => c.boardY!)) : 0;
+    const bboxMaxY = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardY! + c.boardH!)) : BOARD_H;
+    const bboxH = bboxMaxY - bboxMinY || 1;
+    const bbW = bboxMaxX - bboxMinX || 1;
+    const bbH = bboxMaxY - bboxMinY || 1;
 
-    const minX = Math.min(...boardClips.map((c) => c.boardX!));
-    const minY = Math.min(...boardClips.map((c) => c.boardY!));
-    const maxX = Math.max(...boardClips.map((c) => c.boardX! + c.boardW!));
-    const maxY = Math.max(...boardClips.map((c) => c.boardY! + c.boardH!));
-    const bbW = maxX - minX || 1;
-    const bbH = maxY - minY || 1;
+    // Frame-all stop
     const faSf = (1 - 2 * FRAME_ALL_PADDING) * Math.min(W / bbW, H / bbH);
     const frameAllStop: Stop = {
-      camX: (minX + maxX) / 2,
-      camY: (minY + maxY) / 2,
+      camX: (bboxMinX + bboxMaxX) / 2,
+      camY: (bboxMinY + bboxMaxY) / 2,
       zoom: faSf * BOARD_W / W,
     };
-    const allStops: Stop[] = [...clipStops, frameAllStop];
+
+    // Pan sweep parameters
+    const panZoomSf = (H * 0.8) / bboxH;  // pixels per board unit
+    const panZoom = panZoomSf * BOARD_W / W;
+    const viewportHalfWidth = W / (2 * panZoomSf);
+    const panCamY = (bboxMinY + bboxMaxY) / 2;
+    const panStartX = bboxMinX + viewportHalfWidth;
+    const panEndX = Math.max(panStartX, bboxMaxX - viewportHalfWidth);
+
+    // Hold-start stop for each clip (where camera is at the start of the hold phase)
+    const holdStartStops: Stop[] = allClipsSorted.map((c) => {
+      if (c.type === "pan") {
+        return hasBoardClips
+          ? { camX: panStartX, camY: panCamY, zoom: panZoom }
+          : frameAllStop;
+      }
+      const bw = c.boardW!, bh = c.boardH!;
+      const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
+      return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * BOARD_W / W };
+    });
+    const allStartStops: Stop[] = [...holdStartStops, frameAllStop];
 
     type CamEvent = { absTime: number; stop: Stop };
     const events: CamEvent[] = [];
-    for (let i = 0; i < boardClips.length; i++) {
-      const c = boardClips[i];
-      const holdEnd = c.startTime + c.duration * (c.holdFraction ?? HOLD_FRACTION);
+
+    for (let i = 0; i < allClipsSorted.length; i++) {
+      const c = allClipsSorted[i];
+      const hf = c.holdFraction ?? HOLD_FRACTION;
+      const holdStart = c.startTime;
+      const holdEnd = c.startTime + c.duration * hf;
       const transEnd = c.startTime + c.duration;
-      events.push({ absTime: c.startTime, stop: clipStops[i] });
-      events.push({ absTime: holdEnd, stop: clipStops[i] });
-      events.push({ absTime: transEnd, stop: allStops[i + 1] });
+      const nextStop = allStartStops[i + 1];
+
+      if (c.type === "pan") {
+        if (!hasBoardClips) {
+          console.warn(`Pan clip skipped: no board-placed clips`);
+          continue;
+        }
+        const holdDuration = Math.max(0.001, holdEnd - holdStart);
+        const numKF = Math.max(4, Math.ceil(holdDuration / PAN_KF_INTERVAL) + 1);
+        for (let k = 0; k < numKF; k++) {
+          const t = k / (numKF - 1);
+          events.push({
+            absTime: holdStart + t * holdDuration,
+            stop: { camX: lerp(panStartX, panEndX, t), camY: panCamY, zoom: panZoom },
+          });
+        }
+        events.push({ absTime: transEnd, stop: nextStop });
+      } else {
+        events.push({ absTime: holdStart, stop: holdStartStops[i] });
+        events.push({ absTime: holdEnd, stop: holdStartStops[i] });
+        events.push({ absTime: transEnd, stop: nextStop });
+      }
+    }
+
+    if (events.length === 0) {
+      setToast("No keyframes generated — add board clips or remove pan-only clips");
+      return;
     }
 
     const seen = new Set<number>();
@@ -871,7 +926,7 @@ export default function Board2Page() {
     cameraKeyframesRef.current = newCameraKeyframes;
     setKeyframesOutOfDate(false);
     drawFrame(playheadRef.current);
-    const n = boardClips.length;
+    const n = allClipsSorted.length;
     setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all`);
   }
 
@@ -1010,6 +1065,19 @@ export default function Board2Page() {
     };
   });
 
+  // ─ Context menu dismiss ───────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = () => setContextMenu(null);
+    window.addEventListener("click", dismiss, { once: true });
+    window.addEventListener("keydown", dismiss, { once: true });
+    return () => {
+      window.removeEventListener("click", dismiss);
+      window.removeEventListener("keydown", dismiss);
+    };
+  }, [contextMenu]);
+
   // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
@@ -1026,16 +1094,16 @@ export default function Board2Page() {
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               onClick={generateCameraKeyframes}
-              disabled={!clips.some((c) => c.boardX !== undefined)}
-              title={clips.some((c) => c.boardX !== undefined)
+              disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan")}
+              title={clips.some((c) => c.boardX !== undefined || c.type === "pan")
                 ? "Generate camera keyframe sequence from board positions and timeline"
                 : "Upload media first"}
               style={{
                 ...sketchButton,
                 padding: "4px 10px",
                 fontSize: 11,
-                opacity: clips.some((c) => c.boardX !== undefined) ? 1 : 0.45,
-                cursor: clips.some((c) => c.boardX !== undefined) ? "pointer" : "not-allowed",
+                opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? 1 : 0.45,
+                cursor: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? "pointer" : "not-allowed",
               }}
             >
               ⬡ Generate camera keyframes
@@ -1072,6 +1140,13 @@ export default function Board2Page() {
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
+            <button
+              onClick={() => addPanClip()}
+              style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
+              title="Add a pan clip that sweeps across all board images"
+            >
+              ⟷ Add pan clip
+            </button>
             <input
               ref={mediaUploadRef}
               type="file"
@@ -1239,8 +1314,13 @@ export default function Board2Page() {
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.name}
+                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.name}
                 </div>
+                {selectedClip.type === "pan" && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+                    Sweeps across all board images
+                  </div>
+                )}
 
                 <div style={{ fontSize: 10, fontFamily: "monospace", color: "#6a6a6a" }}>
                   Start: {selectedClip.startTime.toFixed(2)}s
@@ -1390,12 +1470,19 @@ export default function Board2Page() {
             }}
             onDragOver={(e) => e.preventDefault()}
             onDrop={handleTimelineDrop}
+            onContextMenu={(e) => {
+              if ((e.target as HTMLElement).closest("[data-clipblock]")) return;
+              e.preventDefault();
+              const rect = scrollerRef.current!.getBoundingClientRect();
+              const timeSec = Math.max(0, (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current);
+              setContextMenu({ x: e.clientX, y: e.clientY, timeSec });
+            }}
           >
             <div style={{ position: "relative", width: timelineWidth, minHeight: TRACK_H, height: "100%" }}>
               <div style={{ position: "absolute", inset: 0, background: "rgba(100,130,180,0.05)", borderTop: "1px solid rgba(42,42,42,0.08)" }} />
 
               {clips.map((clip, ci) => {
-                const color = CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const hf = clip.holdFraction ?? HOLD_FRACTION;
@@ -1408,6 +1495,7 @@ export default function Board2Page() {
                 return (
                   <div
                     key={clip.id}
+                    data-clipblock
                     style={{
                       position: "absolute",
                       left: clip.startTime * pxPerSec,
@@ -1447,7 +1535,7 @@ export default function Board2Page() {
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.name}{clip.boardX !== undefined ? " [B]" : ""}
+                      {clip.type === "pan" ? "⟷ Pan" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
@@ -1463,6 +1551,23 @@ export default function Board2Page() {
           </div>
         </div>
       </div>
+
+      {/* Timeline context menu */}
+      {contextMenu && (
+        <div
+          style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 9998, background: "#fffdf5", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", minWidth: 130 }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div
+            onClick={() => { addPanClip(contextMenu.timeSec); setContextMenu(null); }}
+            style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = PAN_CLIP_COLOR)}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            ⟷ Add pan here
+          </div>
+        </div>
+      )}
 
       {/* Divider drag tooltip */}
       {dividerTooltip && (
