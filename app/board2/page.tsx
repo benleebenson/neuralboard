@@ -56,7 +56,8 @@ const DEFAULT_PX_PER_SEC = 100;
 const MIN_PX_PER_SEC = 10;
 const MAX_PX_PER_SEC = 500;
 const RULER_H = 28;
-const TRACK_H = 48;
+const TRACK_H = 64;
+const TIMELINE_H = 280;
 const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
 const MAGNETIC_SNAP_PX = 10;
@@ -516,12 +517,13 @@ export default function Board2Page() {
     const clipId = generateId();
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
     setClips((prev) => {
+      const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       const pos = findFreeBoardPos(prev, w, h, camX, camY);
       return [
         ...prev,
         {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
-          startTime: playheadRef.current, duration: clipDuration,
+          startTime: endTime, duration: clipDuration,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
         },
       ];
@@ -837,9 +839,10 @@ export default function Board2Page() {
     const bboxMaxX = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardX! + c.boardW!)) : BOARD_W;
     const bboxMinY = hasBoardClips ? Math.min(...boardPlacedClips.map((c) => c.boardY!)) : 0;
     const bboxMaxY = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardY! + c.boardH!)) : BOARD_H;
-    const bboxH = bboxMaxY - bboxMinY || 1;
-    const bbW = bboxMaxX - bboxMinX || 1;
-    const bbH = bboxMaxY - bboxMinY || 1;
+    const bboxWidth = bboxMaxX - bboxMinX || 1;
+    const bboxHeight = bboxMaxY - bboxMinY || 1;
+    const bbW = bboxWidth;
+    const bbH = bboxHeight;
 
     // Frame-all stop
     const faSf = (1 - 2 * FRAME_ALL_PADDING) * Math.min(W / bbW, H / bbH);
@@ -849,13 +852,22 @@ export default function Board2Page() {
       zoom: faSf * BOARD_W / W,
     };
 
-    // Pan sweep parameters
-    const panZoomSf = (H * 0.8) / bboxH;  // pixels per board unit
-    const panZoom = panZoomSf * BOARD_W / W;
-    const viewportHalfWidth = W / (2 * panZoomSf);
+    // Pan sweep parameters — horizontal left-to-right sweep across bbox
+    // 5% horizontal padding so edge images aren't cropped at sweep start/end
+    const paddingX = bboxWidth * 0.05;
+    const sweepStartX = bboxMinX - paddingX;
+    const sweepEndX = bboxMaxX + paddingX;
+    // Fit bbox height + 20% padding into output frame, clamped to reasonable range
+    const paddingY = bboxHeight * 0.2;
+    const visibleBoardHeight = bboxHeight + paddingY;
+    const panZoom = clamp((H / visibleBoardHeight) * BOARD_W / W, 0.3, 2.0);
+    const panZoomSf = panZoom * W / BOARD_W;
+    const viewportHalfWidth = (W / 2) / panZoomSf;
     const panCamY = (bboxMinY + bboxMaxY) / 2;
-    const panStartX = bboxMinX + viewportHalfWidth;
-    const panEndX = Math.max(panStartX, bboxMaxX - viewportHalfWidth);
+    // cameraX at start: left edge of bbox+padding is at viewport left
+    const panStartX = sweepStartX + viewportHalfWidth;
+    // cameraX at end: right edge of bbox+padding is at viewport right (no reverse sweep)
+    const panEndX = Math.max(panStartX, sweepEndX - viewportHalfWidth);
 
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const holdStartStops: Stop[] = allClipsSorted.map((c) => {
@@ -1155,29 +1167,9 @@ export default function Board2Page() {
               style={{ display: "none" }}
               onChange={handleMediaUpload}
             />
-            {mediaLibrary.length === 0 && (
-              <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
-                Upload images or videos — they auto-place on the board and timeline.
-              </p>
-            )}
-            {mediaLibrary.map((item) => (
-              <div
-                key={item.id}
-                draggable
-                onDragStart={(e) => e.dataTransfer.setData("mediaItemId", item.id)}
-                onClick={() => { loadMedia(item.url, item.type); addClipAndPlaceOnBoard(item); }}
-                title="Click to add at playhead · Drag to timeline"
-                style={mediaItemStyle}
-              >
-                <span style={{ fontSize: 13, flexShrink: 0 }}>{item.type === "video" ? "▶" : "□"}</span>
-                <div style={{ overflow: "hidden", flex: 1 }}>
-                  <div style={{ textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", fontSize: 10 }}>{item.name}</div>
-                  {item.duration !== undefined && (
-                    <div style={{ color: "#9a9a9a", fontSize: 9, marginTop: 1 }}>{item.duration.toFixed(1)}s</div>
-                  )}
-                </div>
-              </div>
-            ))}
+            <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
+              Upload images or videos — they auto-place on the board and timeline.
+            </p>
           </div>
 
           {/* ── Center: board (primary) + preview overlay ── */}
@@ -1394,10 +1386,10 @@ export default function Board2Page() {
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ flexShrink: 0, background: "rgba(255,253,245,0.85)", display: "flex", flexDirection: "column" }}>
+        <div style={{ height: TIMELINE_H, flexShrink: 0, background: "rgba(255,253,245,0.85)", display: "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap" }}>
             <button
               onClick={togglePlay}
               style={{ ...sketchButton, width: 34, height: 34, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isPlaying ? "#ff5e3a" : "#c8f135", color: isPlaying ? "#fff" : "#2a2a2a" }}
@@ -1441,7 +1433,7 @@ export default function Board2Page() {
 
           {/* Ruler */}
           <div
-            style={{ height: RULER_H, position: "relative", overflow: "hidden", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(42,42,42,0.04)", cursor: "col-resize", flexShrink: 0 }}
+            style={{ height: RULER_H, flexShrink: 0, position: "relative", overflow: "hidden", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(42,42,42,0.04)", cursor: "col-resize" }}
             onPointerDown={handleRulerPointerDown}
           >
             <div style={{ position: "absolute", left: -timelineScroll, top: 0, width: timelineWidth + 200, height: "100%", pointerEvents: "none" }}>
@@ -1453,7 +1445,7 @@ export default function Board2Page() {
           {/* Track */}
           <div
             ref={scrollerRef}
-            style={{ height: TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
+            style={{ flex: 1, minHeight: TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
             onScroll={(e) => {
               const sl = (e.target as HTMLDivElement).scrollLeft;
               timelineScrollRef.current = sl;
@@ -1648,16 +1640,3 @@ const miniButton: React.CSSProperties = {
   fontSize: 10,
 };
 
-const mediaItemStyle: React.CSSProperties = {
-  padding: "6px 8px",
-  background: "#fffdf5",
-  border: "1.5px solid #2a2a2a",
-  cursor: "pointer",
-  fontSize: 10,
-  fontFamily: "monospace",
-  display: "flex",
-  alignItems: "center",
-  gap: 6,
-  boxShadow: "1px 1px 0 #2a2a2a",
-  userSelect: "none",
-};
