@@ -13,6 +13,13 @@ type Keyframe = {
   opacity: number;
 };
 
+type CameraKeyframe = {
+  time: number;
+  cameraX: number;
+  cameraY: number;
+  boardZoom: number;
+};
+
 type Clip = {
   id: string;
   type: "image" | "video";
@@ -78,6 +85,35 @@ function interpolateKeyframes(
   return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t), scale: lerp(a.scale, b.scale, t), opacity: lerp(a.opacity, b.opacity, t) };
 }
 
+function easeInOutCubic(t: number): number {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function interpolateCameraKeyframes(
+  kfs: CameraKeyframe[],
+  time: number
+): { cameraX: number; cameraY: number; boardZoom: number } {
+  if (kfs.length === 0) return { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
+  const sorted = [...kfs].sort((a, b) => a.time - b.time);
+  if (time <= sorted[0].time) {
+    const { cameraX, cameraY, boardZoom } = sorted[0];
+    return { cameraX, cameraY, boardZoom };
+  }
+  if (time >= sorted[sorted.length - 1].time) {
+    const last = sorted[sorted.length - 1];
+    return { cameraX: last.cameraX, cameraY: last.cameraY, boardZoom: last.boardZoom };
+  }
+  let lo = 0;
+  while (lo < sorted.length - 2 && sorted[lo + 1].time <= time) lo++;
+  const a = sorted[lo], b = sorted[lo + 1];
+  const t = easeInOutCubic((time - a.time) / (b.time - a.time));
+  return {
+    cameraX: lerp(a.cameraX, b.cameraX, t),
+    cameraY: lerp(a.cameraY, b.cameraY, t),
+    boardZoom: lerp(a.boardZoom, b.boardZoom, t),
+  };
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
@@ -117,6 +153,7 @@ export default function Board2Page() {
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
+  const [cameraKeyframes, setCameraKeyframes] = useState<CameraKeyframe[]>([]);
 
   // ─ Derived ────────────────────────────────────────────────────────────────
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
@@ -147,6 +184,7 @@ export default function Board2Page() {
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cameraKeyframesRef = useRef<CameraKeyframe[]>([]);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -155,6 +193,7 @@ export default function Board2Page() {
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
 
   useEffect(() => {
     if (!toast) return;
@@ -208,34 +247,34 @@ export default function Board2Page() {
     ctx: CanvasRenderingContext2D,
     time: number,
     currentClips: Clip[],
+    currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number
   ) => {
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = "#111";
+    ctx.fillStyle = "#f5ecd8";
     ctx.fillRect(0, 0, W, H);
-    const active = currentClips
-      .filter((c) => time >= c.startTime && time < c.startTime + c.duration)
-      .sort((a, b) => a.startTime - b.startTime);
-    for (const clip of active) {
-      const relTime = time - clip.startTime;
-      const { x, y, scale, opacity } = interpolateKeyframes(clip.keyframes, relTime);
-      ctx.globalAlpha = clamp(opacity, 0, 1);
+    const cam = interpolateCameraKeyframes(currentCameraKeyframes, time);
+    const sf = cam.boardZoom * W / BOARD_W;
+    for (const clip of currentClips) {
+      if (clip.boardX === undefined) continue;
+      const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
+      const sx = (bx + bw / 2 - cam.cameraX) * sf + W / 2;
+      const sy = (by + bh / 2 - cam.cameraY) * sf + H / 2;
+      const sw = bw * sf, sh = bh * sf;
+      ctx.globalAlpha = 1;
       if (clip.type === "image") {
         const img = imgCacheRef.current.get(clip.sourceUrl);
         if (img?.complete && img.naturalWidth > 0) {
-          const w = img.naturalWidth * scale; const h = img.naturalHeight * scale;
-          ctx.drawImage(img, x - w / 2, y - h / 2, w, h);
+          ctx.drawImage(img, sx - sw / 2, sy - sh / 2, sw, sh);
         }
       } else {
         const vid = videoCacheRef.current.get(clip.sourceUrl);
         if (vid && vid.readyState >= 2) {
-          const w = (vid.videoWidth || 640) * scale; const h = (vid.videoHeight || 360) * scale;
-          ctx.drawImage(vid, x - w / 2, y - h / 2, w, h);
+          ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh);
         }
       }
-      ctx.globalAlpha = 1;
     }
+    ctx.globalAlpha = 1;
   }, []);
 
   const drawFrame = useCallback((time: number) => {
@@ -243,7 +282,7 @@ export default function Board2Page() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    renderToCtx(ctx, time, clipsRef.current, canvasWRef.current, canvasHRef.current);
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
   }, [renderToCtx]);
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
@@ -550,7 +589,7 @@ export default function Board2Page() {
     return ticks;
   }
 
-  // ─ Generate camera pan keyframes ──────────────────────────────────────────
+  // ─ Generate camera keyframes ──────────────────────────────────────────────
   function generateCameraKeyframes() {
     const boardClips = clipsRef.current
       .filter((c) => c.boardX !== undefined)
@@ -564,23 +603,10 @@ export default function Board2Page() {
     const W = canvasWRef.current;
     const H = canvasHRef.current;
 
-    function getNatSize(clip: Clip): { w: number; h: number } {
-      if (clip.type === "image") {
-        const img = imgCacheRef.current.get(clip.sourceUrl);
-        if (img && img.naturalWidth > 0) return { w: img.naturalWidth, h: img.naturalHeight };
-      } else {
-        const vid = videoCacheRef.current.get(clip.sourceUrl);
-        if (vid && vid.videoWidth > 0) return { w: vid.videoWidth, h: vid.videoHeight };
-      }
-      return { w: 640, h: 480 };
-    }
-
     type Stop = { camX: number; camY: number; zoom: number };
 
-    // One camera stop per board-placed clip: camera centers on clip, zoomed to CLIP_FOCUS_RATIO
     const clipStops: Stop[] = boardClips.map((clip) => {
       const bw = clip.boardW!, bh = clip.boardH!;
-      // sf = boardZoom * W / BOARD_W  →  clip fills min(bw*sf/W, bh*sf/H) = CLIP_FOCUS_RATIO
       const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
       return {
         camX: clip.boardX! + bw / 2,
@@ -589,7 +615,6 @@ export default function Board2Page() {
       };
     });
 
-    // Frame All stop: camera frames the bounding box of all board clips with padding
     const minX = Math.min(...boardClips.map((c) => c.boardX!));
     const minY = Math.min(...boardClips.map((c) => c.boardY!));
     const maxX = Math.max(...boardClips.map((c) => c.boardX! + c.boardW!));
@@ -604,9 +629,6 @@ export default function Board2Page() {
     };
     const allStops: Stop[] = [...clipStops, frameAllStop];
 
-    // Camera events: for each clip i → hold_start, hold_end, transition_end
-    // At hold_start and hold_end: camera = clipStops[i]  (static during hold)
-    // At transition_end: camera = allStops[i+1]  (arrived at next stop)
     type CamEvent = { absTime: number; stop: Stop };
     const events: CamEvent[] = [];
     for (let i = 0; i < boardClips.length; i++) {
@@ -618,42 +640,25 @@ export default function Board2Page() {
       events.push({ absTime: transEnd, stop: allStops[i + 1] });
     }
 
-    // Convert (boardClip, cameraStop) → screen keyframe
-    function boardToScreen(clip: Clip, stop: Stop): { x: number; y: number; scale: number } {
-      const bx = clip.boardX!, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
-      const sf = stop.zoom * W / BOARD_W;
-      const x = (bx + bw / 2 - stop.camX) * sf + W / 2;
-      const y = (by + bh / 2 - stop.camY) * sf + H / 2;
-      const nat = getNatSize(clip);
-      const scale = (bw * sf) / nat.w;
-      return { x, y, scale };
+    const seen = new Set<number>();
+    const newCameraKeyframes: CameraKeyframe[] = [];
+    for (const ev of events.sort((a, b) => a.absTime - b.absTime)) {
+      const t = Math.round(ev.absTime * 1000);
+      if (seen.has(t)) continue;
+      seen.add(t);
+      newCameraKeyframes.push({
+        time: parseFloat(ev.absTime.toFixed(3)),
+        cameraX: ev.stop.camX,
+        cameraY: ev.stop.camY,
+        boardZoom: ev.stop.zoom,
+      });
     }
 
-    // Build new clips: board-placed clips get fresh keyframes; others are unchanged
-    const newClips = clipsRef.current.map((clip) => {
-      if (clip.boardX === undefined) return clip;
-      const seen = new Set<number>();
-      const keyframes: Keyframe[] = events
-        .map((ev) => {
-          const { x, y, scale } = boardToScreen(clip, ev.stop);
-          return {
-            time: parseFloat((ev.absTime - clip.startTime).toFixed(3)),
-            x, y, scale, opacity: 1,
-          };
-        })
-        .sort((a, b) => a.time - b.time)
-        .filter((kf) => {
-          const t = Math.round(kf.time * 1000);
-          if (seen.has(t)) return false;
-          seen.add(t);
-          return true;
-        });
-      return { ...clip, keyframes };
-    });
-
-    setClips(newClips);
+    setCameraKeyframes(newCameraKeyframes);
+    cameraKeyframesRef.current = newCameraKeyframes;
+    drawFrame(playheadRef.current);
     const n = boardClips.length;
-    setToast(`Camera keyframes generated for ${n} clip${n !== 1 ? "s" : ""}`);
+    setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all`);
   }
 
   // ─ Export ─────────────────────────────────────────────────────────────────
@@ -664,6 +669,7 @@ export default function Board2Page() {
     if (isPlayingRef.current) setIsPlaying(false);
     setIsExporting(true); isExportingRef.current = true; exportCancelRef.current = false; setExportProgress(0);
     const currentClips = clipsRef.current;
+    const currentCameraKeyframes = cameraKeyframesRef.current;
     const totalDur = currentClips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
     const W = canvasWRef.current, H = canvasHRef.current;
     const exportCanvas = document.createElement("canvas");
@@ -712,7 +718,7 @@ export default function Board2Page() {
         if (isActive && vid.paused) { vid.currentTime = elapsed - clip.startTime; vid.play().catch(() => {}); }
         else if (!isActive && !vid.paused) { vid.pause(); }
       }
-      renderToCtx(exportCtx, elapsed, currentClips, W, H);
+      renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H);
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
     exportRafRef.current = requestAnimationFrame(exportFrame);
@@ -764,7 +770,7 @@ export default function Board2Page() {
           <button
             onClick={generateCameraKeyframes}
             disabled={!clips.some((c) => c.boardX !== undefined)}
-            title={clips.some((c) => c.boardX !== undefined) ? "Generate per-clip x/y/scale keyframes from board positions" : "Place clips on the board first"}
+            title={clips.some((c) => c.boardX !== undefined) ? "Generate camera keyframe sequence from board positions and timeline" : "Place clips on the board first"}
             style={{
               ...sketchButton,
               padding: "4px 10px",
