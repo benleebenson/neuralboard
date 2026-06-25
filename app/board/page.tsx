@@ -471,6 +471,85 @@ function findFreeBoardPos(
   return { boardX: clamp(camX - clipW / 2, 0, BOARD_W - clipW), boardY: clamp(camY - clipH / 2, 0, BOARD_H - clipH) };
 }
 
+function wavBlobFromSamples(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function makeEntrySfxSamples(kind: string, durationSec: number, sampleRate = 44100): Float32Array {
+  const count = Math.max(1, Math.floor(durationSec * sampleRate));
+  const samples = new Float32Array(count);
+  let seed = 13;
+  const noise = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed / 2147483647) * 2 - 1;
+  };
+  for (let i = 0; i < count; i++) {
+    const t = i / sampleRate;
+    const p = i / count;
+    let value = 0;
+    if (kind === "pop") {
+      const env = Math.exp(-14 * p);
+      value = Math.sin(2 * Math.PI * (520 - 280 * p) * t) * env;
+    } else if (kind === "whoosh") {
+      const env = Math.sin(Math.PI * p);
+      value = noise() * env * 0.55 + Math.sin(2 * Math.PI * (180 + 900 * p) * t) * env * 0.18;
+    } else if (kind === "click") {
+      const env = Math.exp(-45 * p);
+      value = (Math.sin(2 * Math.PI * 1900 * t) + noise() * 0.5) * env;
+    } else if (kind === "sparkle") {
+      const env = Math.exp(-5 * p);
+      value = (
+        Math.sin(2 * Math.PI * 980 * t) * 0.35 +
+        Math.sin(2 * Math.PI * 1470 * t) * 0.28 +
+        Math.sin(2 * Math.PI * 1960 * t) * 0.18
+      ) * env * (0.7 + 0.3 * Math.sin(2 * Math.PI * 18 * t));
+    } else {
+      const env = Math.exp(-10 * p);
+      value = Math.sin(2 * Math.PI * (120 - 45 * p) * t) * env + noise() * env * 0.16;
+    }
+    samples[i] = value * 0.85;
+  }
+  return samples;
+}
+
+function createBuiltinEntrySfxOptions(): EntrySfxOption[] {
+  const presets = [
+    { id: "pop", label: "Pop", durationSec: 0.35 },
+    { id: "whoosh", label: "Whoosh", durationSec: 0.65 },
+    { id: "click", label: "Click", durationSec: 0.18 },
+    { id: "sparkle", label: "Sparkle", durationSec: 0.75 },
+    { id: "thud", label: "Thud", durationSec: 0.45 },
+  ];
+  return presets.map((preset) => {
+    const blob = wavBlobFromSamples(makeEntrySfxSamples(preset.id, preset.durationSec), 44100);
+    return { ...preset, blobUrl: URL.createObjectURL(blob) };
+  });
+}
+
 // ─── Page component ───────────────────────────────────────────────────────────
 
 export default function BoardPage() {
@@ -499,6 +578,7 @@ export default function BoardPage() {
   const [exportPhase, setExportPhase] = useState<ExportPhase>('idle');
   const [exportMsg, setExportMsg] = useState('');
   const [exportError, setExportError] = useState('');
+  const [entrySfxOptions, setEntrySfxOptions] = useState<EntrySfxOption[]>([]);
 
   // YouTube modal
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -537,6 +617,8 @@ export default function BoardPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const recSecondsRef = useRef(0);
   const mediaUploadRef = useRef<HTMLInputElement | null>(null);
+  const sfxUploadRef = useRef<HTMLInputElement | null>(null);
+  const pendingSfxClipIdRef = useRef<string | null>(null);
   const pxPerSecRef = useRef(DEFAULT_PX_PER_SEC);
   const pendingScrollLeftRef = useRef<number | null>(null);
   const exportCancelRef = useRef(false);
@@ -587,6 +669,9 @@ export default function BoardPage() {
   // Audio
   const audioCtxRef = useRef<AudioContext | null>(null);
   const activeAudioRef = useRef<Map<string, AudioEntry>>(new Map());
+  const activeSfxRef = useRef<Map<string, ActiveSfxEntry>>(new Map());
+  const loadingSfxRef = useRef<Set<string>>(new Set());
+  const entrySfxOptionsRef = useRef<EntrySfxOption[]>([]);
 
   // Board canvas
   const boardCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -600,6 +685,7 @@ export default function BoardPage() {
   useEffect(() => { selectedClipIdRef.current = selectedClipId; }, [selectedClipId]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { timelineMarqueeRef.current = timelineMarquee; }, [timelineMarquee]);
+  useEffect(() => { entrySfxOptionsRef.current = entrySfxOptions; }, [entrySfxOptions]);
   useEffect(() => { playheadSecRef.current = playheadSec; }, [playheadSec]);
   useEffect(() => { recSecondsRef.current = recSeconds; }, [recSeconds]);
   useEffect(() => { layerCountRef.current = layerCount; }, [layerCount]);
@@ -626,6 +712,17 @@ export default function BoardPage() {
     if (!session?.user?.email) return;
     fetch("/api/config").then((r) => r.json()).then((d) => setConfig(d)).catch(() => {});
   }, [session?.user?.email]);
+
+  useEffect(() => {
+    const builtins = createBuiltinEntrySfxOptions();
+    entrySfxOptionsRef.current = builtins;
+    const timer = window.setTimeout(() => setEntrySfxOptions(builtins), 0);
+    return () => {
+      window.clearTimeout(timer);
+      entrySfxOptionsRef.current.forEach((option) => URL.revokeObjectURL(option.blobUrl));
+      entrySfxOptionsRef.current = [];
+    };
+  }, []);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -839,6 +936,11 @@ export default function BoardPage() {
     return audioCtxRef.current;
   }
 
+  function entrySfxOptionForClip(clip: BoardClip): EntrySfxOption | null {
+    if (clip.type !== "image" || !clip.entrySfxId) return null;
+    return entrySfxOptionsRef.current.find((option) => option.id === clip.entrySfxId) ?? null;
+  }
+
   function stopAllAudio() {
     activeAudioRef.current.forEach((entry) => {
       if (entry.kind === "element") {
@@ -852,6 +954,59 @@ export default function BoardPage() {
       }
     });
     activeAudioRef.current.clear();
+    activeSfxRef.current.forEach((entry) => {
+      try { entry.bufNode.stop(); } catch {}
+      try { entry.bufNode.disconnect(); } catch {}
+      try { entry.gainNode.disconnect(); } catch {}
+    });
+    activeSfxRef.current.clear();
+    loadingSfxRef.current.clear();
+  }
+
+  function spawnImageEntrySfx(clip: BoardClip, atSec: number, ctx: AudioContext, extraDest?: AudioNode) {
+    const option = entrySfxOptionForClip(clip);
+    if (!option) return;
+    const sfxOffset = atSec - clip.startTime;
+    if (sfxOffset < 0 || sfxOffset >= option.durationSec) return;
+    const key = `${clip.id}:entry-sfx`;
+    if (activeSfxRef.current.has(key) || loadingSfxRef.current.has(key)) return;
+    loadingSfxRef.current.add(key);
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = isRecordingNarrationRef.current ? 0 : 0.82;
+    gainNode.connect(ctx.destination);
+    if (exportAudioDestRef.current) gainNode.connect(exportAudioDestRef.current);
+    if (extraDest) gainNode.connect(extraDest);
+    fetch(option.blobUrl)
+      .then((r) => r.arrayBuffer())
+      .then((ab) => ctx.decodeAudioData(ab))
+      .then((buffer) => {
+        loadingSfxRef.current.delete(key);
+        if (!isPlayingRef.current && !isExportingRef.current) {
+          try { gainNode.disconnect(); } catch {}
+          return;
+        }
+        if (activeSfxRef.current.has(key)) {
+          try { gainNode.disconnect(); } catch {}
+          return;
+        }
+        const bufNode = ctx.createBufferSource();
+        bufNode.buffer = buffer;
+        bufNode.connect(gainNode);
+        const safeOffset = Math.min(Math.max(0, sfxOffset), Math.max(0, buffer.duration - 0.01));
+        bufNode.start(0, safeOffset);
+        activeSfxRef.current.set(key, {
+          bufNode,
+          gainNode,
+          clipId: clip.id,
+          sfxId: option.id,
+          startTime: clip.startTime,
+          durationSec: option.durationSec,
+        });
+      })
+      .catch(() => {
+        loadingSfxRef.current.delete(key);
+        try { gainNode.disconnect(); } catch {}
+      });
   }
 
   function spawnClipAudio(clip: BoardClip, clipOffset: number, ctx: AudioContext, extraDest?: AudioNode) {
@@ -908,6 +1063,10 @@ export default function BoardPage() {
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
     });
+    currentClips.forEach((clip) => {
+      if (clip.type !== "image" || clip.muted || isLayerMuted(clip.layer)) return;
+      spawnImageEntrySfx(clip, atSec, ctx, extraDest);
+    });
   }
 
   function tickAudio(atSec: number, currentClips: BoardClip[], extraDest?: AudioNode) {
@@ -932,11 +1091,28 @@ export default function BoardPage() {
         else entry.bufNode.playbackRate.value = mediaPlaybackRate(clip);
       }
     });
+    activeSfxRef.current.forEach((entry, key) => {
+      const clip = currentClips.find((c) => c.id === entry.clipId);
+      const option = clip ? entrySfxOptionForClip(clip) : null;
+      if (!clip || !option || option.id !== entry.sfxId || clip.muted || isLayerMuted(clip.layer) ||
+          atSec < entry.startTime || atSec >= entry.startTime + entry.durationSec) {
+        try { entry.bufNode.stop(); } catch {}
+        try { entry.bufNode.disconnect(); } catch {}
+        try { entry.gainNode.disconnect(); } catch {}
+        activeSfxRef.current.delete(key);
+      } else {
+        entry.gainNode.gain.value = isRecordingNarrationRef.current ? 0 : 0.82;
+      }
+    });
     currentClips.forEach((clip) => {
       if (!hasClipAudio(clip) || clip.muted || isLayerMuted(clip.layer)) return;
       if (activeAudioRef.current.has(clip.id)) return;
       if (atSec < clip.startTime || atSec >= clip.startTime + clip.durationSec) return;
       spawnClipAudio(clip, atSec - clip.startTime, ctx, extraDest);
+    });
+    currentClips.forEach((clip) => {
+      if (clip.type !== "image" || clip.muted || isLayerMuted(clip.layer)) return;
+      spawnImageEntrySfx(clip, atSec, ctx, extraDest);
     });
   }
 
@@ -1628,6 +1804,71 @@ export default function BoardPage() {
     e.target.value = "";
   }
 
+  function updateImageEntrySfx(clipId: string, sfxId: string | undefined) {
+    pushUndoSnapshot();
+    setClips((prev) => prev.map((clip) => clip.id === clipId ? { ...clip, entrySfxId: sfxId } : clip));
+  }
+
+  function playEntrySfxPreview(option: EntrySfxOption) {
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    fetch(option.blobUrl)
+      .then((r) => r.arrayBuffer())
+      .then((ab) => ctx.decodeAudioData(ab))
+      .then((buffer) => {
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = 0.7;
+        gainNode.connect(ctx.destination);
+        const node = ctx.createBufferSource();
+        node.buffer = buffer;
+        node.connect(gainNode);
+        node.start();
+        node.onended = () => {
+          try { node.disconnect(); } catch {}
+          try { gainNode.disconnect(); } catch {}
+        };
+      })
+      .catch(() => {});
+  }
+
+  function handleEntrySfxSelect(clipId: string, value: string) {
+    if (value === "__upload") {
+      pendingSfxClipIdRef.current = clipId;
+      sfxUploadRef.current?.click();
+      return;
+    }
+    const next = value || undefined;
+    updateImageEntrySfx(clipId, next);
+    const option = next ? entrySfxOptionsRef.current.find((item) => item.id === next) : null;
+    if (option) playEntrySfxPreview(option);
+  }
+
+  async function handleEntrySfxUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    const clipId = pendingSfxClipIdRef.current;
+    pendingSfxClipIdRef.current = null;
+    e.target.value = "";
+    if (!file || !clipId) return;
+    if (!file.type.startsWith("audio/") && !/\.(mp3|m4a|wav|aac|ogg|opus|webm)$/i.test(file.name)) {
+      showToast("Choose an audio file for image SFX");
+      return;
+    }
+    const blobUrl = URL.createObjectURL(file);
+    const durationSec = await getMediaDuration(blobUrl, "audio").catch(() => 1);
+    const option: EntrySfxOption = {
+      id: `custom-${crypto.randomUUID()}`,
+      label: file.name.replace(/\.[^.]+$/, "").slice(0, 24) || "Custom SFX",
+      blobUrl,
+      durationSec: Math.max(0.1, Math.min(durationSec || 1, 10)),
+      custom: true,
+    };
+    entrySfxOptionsRef.current = [...entrySfxOptionsRef.current, option];
+    setEntrySfxOptions(entrySfxOptionsRef.current);
+    updateImageEntrySfx(clipId, option.id);
+    playEntrySfxPreview(option);
+    showToast(`Added SFX: ${option.label}`);
+  }
+
   function addPanClip() {
     pushUndoSnapshot();
     const startTime = playheadSecRef.current;
@@ -1857,22 +2098,34 @@ export default function BoardPage() {
     setExportError('');
 
     try {
+      const imageEntrySfxClips = currentClips
+        .filter((clip) => clip.type === "image" && clip.entrySfxId && !clip.muted)
+        .map((clip) => {
+          const option = entrySfxOptionsRef.current.find((item) => item.id === clip.entrySfxId);
+          return option ? { clip, option } : null;
+        })
+        .filter((item): item is { clip: BoardClip; option: EntrySfxOption } => item !== null);
+
       // ── Upload unique source blobs ────────────────────────────────────────────
-      const clipsWithSource = currentClips.filter((c) => c.blobUrl && c.type !== 'pan');
-      const uniqueBlobUrls = [...new Set(clipsWithSource.map((c) => c.blobUrl))];
+      const sourceItems = [
+        ...currentClips
+          .filter((c) => c.blobUrl && c.type !== 'pan')
+          .map((c) => ({ blobUrl: c.blobUrl, name: c.name })),
+        ...imageEntrySfxClips.map(({ option }) => ({ blobUrl: option.blobUrl, name: `entry-sfx-${option.label}` })),
+      ];
+      const uniqueSourceItems = Array.from(new Map(sourceItems.map((item) => [item.blobUrl, item])).values());
       const sourcePathMap = new Map<string, string>();
 
-      for (let i = 0; i < uniqueBlobUrls.length; i++) {
+      for (let i = 0; i < uniqueSourceItems.length; i++) {
         if (exportAbortRef.current) { resetExportState(); return; }
-        const blobUrl = uniqueBlobUrls[i];
-        setExportMsg(`Uploading clips... (${i + 1}/${uniqueBlobUrls.length})`);
+        const { blobUrl, name } = uniqueSourceItems[i];
+        setExportMsg(`Uploading clips... (${i + 1}/${uniqueSourceItems.length})`);
 
         const fetchResp = await fetch(blobUrl);
         const blob = await fetchResp.blob();
-        const clipName = currentClips.find((c) => c.blobUrl === blobUrl)?.name ?? 'clip';
         const ext = blob.type.split('/')[1]?.split(';')[0] || 'bin';
         const form = new FormData();
-        form.append('file', blob, `${clipName.replace(/[^a-zA-Z0-9._-]/g, '_')}.${ext}`);
+        form.append('file', blob, `${name.replace(/[^a-zA-Z0-9._-]/g, '_')}.${ext}`);
 
         const uploadResp = await fetch(`${config.railwayUrl}/api/render/upload`, {
           method: 'POST',
@@ -1889,17 +2142,14 @@ export default function BoardPage() {
       setExportMsg('Submitting to renderer...');
 
       // ── Build timeline spec ───────────────────────────────────────────────────
-      const totalDurationSec = currentClips.length > 0
-        ? Math.max(...currentClips.map((c) => c.startTime + c.durationSec))
+      const normalEndTimes = currentClips.map((c) => c.startTime + c.durationSec);
+      const sfxEndTimes = imageEntrySfxClips.map(({ clip, option }) => clip.startTime + option.durationSec);
+      const totalDurationSec = normalEndTimes.length + sfxEndTimes.length > 0
+        ? Math.max(...normalEndTimes, ...sfxEndTimes)
         : 0;
 
-      const timelineSpec = {
-        outputFormat: '16:9' as const,
-        totalDurationSec,
-        fps: 30,
-        board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_BG },
-        cameraKeyframes: buildCameraKeyframes(currentClips),
-        clips: currentClips
+      const renderClips = [
+        ...currentClips
           .filter((c) => c.type !== 'pan')
           .map((c) => ({
             id: c.id,
@@ -1919,6 +2169,29 @@ export default function BoardPage() {
             fontSize: c.textFontSize,
             color: c.textColor,
           })),
+        ...imageEntrySfxClips.map(({ clip, option }) => ({
+          id: `${clip.id}-entry-sfx`,
+          type: "audio" as ClipType,
+          startTime: clip.startTime,
+          duration: option.durationSec,
+          boardX: 0,
+          boardY: 0,
+          boardW: 1,
+          boardH: 1,
+          layer: clip.layer,
+          sourceUrl: sourcePathMap.get(option.blobUrl),
+          trimStart: 0,
+          muted: false,
+        })),
+      ];
+
+      const timelineSpec = {
+        outputFormat: '16:9' as const,
+        totalDurationSec,
+        fps: 30,
+        board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_BG },
+        cameraKeyframes: buildCameraKeyframes(currentClips),
+        clips: renderClips,
       };
 
       // ── Submit job ────────────────────────────────────────────────────────────
@@ -2008,6 +2281,7 @@ export default function BoardPage() {
               )}
               <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
               <input ref={mediaUploadRef} type="file" accept="audio/*,video/*,image/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+              <input ref={sfxUploadRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={handleEntrySfxUpload} />
               {config?.railwayUrl && (
                 <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtQuery(""); setYtResults([]); setYtError(""); }} style={sketchButton}>
                   ▶ Add YouTube clip
@@ -2171,6 +2445,36 @@ export default function BoardPage() {
                           {showHandles && <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.18)", cursor: "ew-resize" }} />}
                           {clip.type === "pan" && clipPx >= 30 && !isBeingDragged && (
                             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 3, fontSize: 16, opacity: 0.55 }}>↔</div>
+                          )}
+                          {clip.type === "image" && clipPx >= 86 && !isBeingDragged && (
+                            <select
+                              title="Image entry sound"
+                              value={clip.entrySfxId ?? ""}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => handleEntrySfxSelect(clip.id, e.target.value)}
+                              style={{
+                                position: "absolute",
+                                right: showHandles ? HANDLE_W + 3 : 3,
+                                top: 3,
+                                maxWidth: Math.max(54, Math.min(98, clipPx - 18)),
+                                height: 20,
+                                zIndex: 8,
+                                fontFamily: "monospace",
+                                fontSize: 9,
+                                border: "1px solid #2a2a2a",
+                                background: clip.entrySfxId ? "#c8f135" : "rgba(255,253,245,0.92)",
+                                color: "#2a2a2a",
+                                boxShadow: "1px 1px 0 #2a2a2a",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <option value="">SFX</option>
+                              {entrySfxOptions.map((option) => (
+                                <option key={option.id} value={option.id}>{option.custom ? "+ " : ""}{option.label}</option>
+                              ))}
+                              <option value="__upload">+ Add SFX...</option>
+                            </select>
                           )}
                           {(isVisualClip(clip) || clip.type === "pan") && clipPx >= 30 && !isBeingDragged && (() => {
                             const dividerLeft = clip.holdFraction * clipPx;
