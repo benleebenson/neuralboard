@@ -852,22 +852,16 @@ export default function Board2Page() {
       zoom: faSf * BOARD_W / W,
     };
 
-    // Pan sweep parameters — horizontal left-to-right sweep across bbox
-    // 5% horizontal padding so edge images aren't cropped at sweep start/end
-    const paddingX = bboxWidth * 0.05;
-    const sweepStartX = bboxMinX - paddingX;
-    const sweepEndX = bboxMaxX + paddingX;
-    // Fit bbox height + 20% padding into output frame, clamped to reasonable range
-    const paddingY = bboxHeight * 0.2;
-    const visibleBoardHeight = bboxHeight + paddingY;
-    const panZoom = clamp((H / visibleBoardHeight) * BOARD_W / W, 0.3, 2.0);
-    const panZoomSf = panZoom * W / BOARD_W;
-    const viewportHalfWidth = (W / 2) / panZoomSf;
+    // Pan sweep — ported directly from /board's getPanSweepInfo
+    // /board uses VIEWPORT_W=800, VIEWPORT_H=600; boardZoom = zoom * BOARD_W/VIEWPORT_W
+    const margin = 100;
+    const bboxH = bboxMaxY - bboxMinY;
+    const zoom = clamp(bboxH > 0 ? (600 * 0.8) / bboxH : 1.0, 0.2, 4);
+    const panZoom = zoom * BOARD_W / 800;
+    const halfVW = 800 / (2 * zoom); // board units; same as BOARD_W / (2 * panZoom)
     const panCamY = (bboxMinY + bboxMaxY) / 2;
-    // cameraX at start: left edge of bbox+padding is at viewport left
-    const panStartX = sweepStartX + viewportHalfWidth;
-    // cameraX at end: right edge of bbox+padding is at viewport right (no reverse sweep)
-    const panEndX = Math.max(panStartX, sweepEndX - viewportHalfWidth);
+    const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
+    const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
 
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const holdStartStops: Stop[] = allClipsSorted.map((c) => {
