@@ -10,6 +10,7 @@ type CameraKeyframe = {
   cameraX: number;
   cameraY: number;
   boardZoom: number;
+  easing?: 'linear' | 'ease-in-out'; // applied when interpolating TO this keyframe
 };
 
 type Clip = {
@@ -63,7 +64,6 @@ const BOARD_RESIZE_PX = 10;
 const MAGNETIC_SNAP_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
-const PAN_KF_INTERVAL = 0.25;
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -129,7 +129,8 @@ function interpolateCameraKeyframes(
   while (lo < sorted.length - 2 && sorted[lo + 1].time <= time) lo++;
   const a = sorted[lo];
   const b = sorted[lo + 1];
-  const t = easeInOutCubic((time - a.time) / (b.time - a.time));
+  const rawT = (time - a.time) / (b.time - a.time);
+  const t = b.easing === 'linear' ? rawT : easeInOutCubic(rawT);
   return {
     cameraX: lerp(a.cameraX, b.cameraX, t),
     cameraY: lerp(a.cameraY, b.cameraY, t),
@@ -852,13 +853,12 @@ export default function Board2Page() {
       zoom: faSf * BOARD_W / W,
     };
 
-    // Pan sweep — ported directly from /board's getPanSweepInfo
-    // /board uses VIEWPORT_W=800, VIEWPORT_H=600; boardZoom = zoom * BOARD_W/VIEWPORT_W
+    // Pan sweep — horizontal math ported from /board's getPanSweepInfo;
+    // zoom uses actual canvas dims for correct 90% vertical fill
     const margin = 100;
     const bboxH = bboxMaxY - bboxMinY;
-    const zoom = clamp(bboxH > 0 ? (600 * 0.8) / bboxH : 1.0, 0.2, 4);
-    const panZoom = zoom * BOARD_W / 800;
-    const halfVW = 800 / (2 * zoom); // board units; same as BOARD_W / (2 * panZoom)
+    const panZoom = clamp(bboxH > 0 ? 0.9 * H * BOARD_W / (bboxH * W) : H * BOARD_W / (W * BOARD_H), 0.5, 5.0);
+    const halfVW = BOARD_W / (2 * panZoom);
     const panCamY = (bboxMinY + bboxMaxY) / 2;
     const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
     const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
@@ -876,7 +876,7 @@ export default function Board2Page() {
     });
     const allStartStops: Stop[] = [...holdStartStops, frameAllStop];
 
-    type CamEvent = { absTime: number; stop: Stop };
+    type CamEvent = { absTime: number; stop: Stop; easing: 'linear' | 'ease-in-out' };
     const events: CamEvent[] = [];
 
     for (let i = 0; i < allClipsSorted.length; i++) {
@@ -892,20 +892,14 @@ export default function Board2Page() {
           console.warn(`Pan clip skipped: no board-placed clips`);
           continue;
         }
-        const holdDuration = Math.max(0.001, holdEnd - holdStart);
-        const numKF = Math.max(4, Math.ceil(holdDuration / PAN_KF_INTERVAL) + 1);
-        for (let k = 0; k < numKF; k++) {
-          const t = k / (numKF - 1);
-          events.push({
-            absTime: holdStart + t * holdDuration,
-            stop: { camX: lerp(panStartX, panEndX, t), camY: panCamY, zoom: panZoom },
-          });
-        }
-        events.push({ absTime: transEnd, stop: nextStop });
+        // Two keyframes only — linear between them for constant-velocity sweep
+        events.push({ absTime: holdStart, stop: { camX: panStartX, camY: panCamY, zoom: panZoom }, easing: 'ease-in-out' });
+        events.push({ absTime: holdEnd,   stop: { camX: panEndX,   camY: panCamY, zoom: panZoom }, easing: 'linear' });
+        events.push({ absTime: transEnd,  stop: nextStop,                                           easing: 'ease-in-out' });
       } else {
-        events.push({ absTime: holdStart, stop: holdStartStops[i] });
-        events.push({ absTime: holdEnd, stop: holdStartStops[i] });
-        events.push({ absTime: transEnd, stop: nextStop });
+        events.push({ absTime: holdStart, stop: holdStartStops[i], easing: 'ease-in-out' });
+        events.push({ absTime: holdEnd,   stop: holdStartStops[i], easing: 'ease-in-out' });
+        events.push({ absTime: transEnd,  stop: nextStop,           easing: 'ease-in-out' });
       }
     }
 
@@ -925,6 +919,7 @@ export default function Board2Page() {
         cameraX: ev.stop.camX,
         cameraY: ev.stop.camY,
         boardZoom: ev.stop.zoom,
+        easing: ev.easing,
       });
     }
 
