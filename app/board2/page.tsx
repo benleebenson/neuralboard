@@ -1179,13 +1179,18 @@ export default function Board2Page() {
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = W; exportCanvas.height = H;
     const exportCtx = exportCanvas.getContext("2d")!;
-    // Position all video elements at t=0 (export drives time via currentTime each frame)
+    // Seed videos: clips starting at t=0 begin playing immediately; others wait at t=0
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
       const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
-      vid.pause();
-      vid.currentTime = 0;
+      if (clip.startTime === 0) {
+        vid.currentTime = 0;
+        vid.play().catch(() => {});
+      } else {
+        vid.pause();
+        vid.currentTime = 0;
+      }
     }
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
@@ -1205,20 +1210,28 @@ export default function Board2Page() {
     const exportWallStart = performance.now();
     function exportFrame() {
       if (exportCancelRef.current) {
+        for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        for (const vid of videoCacheRef.current.values()) vid.pause();
         recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
       }
       const elapsed = (performance.now() - exportWallStart) / 1000;
       if (elapsed >= totalDur) {
+        for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        for (const vid of videoCacheRef.current.values()) vid.pause();
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
-      // Seek each active video to the exact virtual time then draw (no .play() during export)
+      // Manage video lifecycle: seek+play once on activation, pause when inactive, let it run
       for (const clip of currentClips) {
         if (clip.type !== "video") continue;
         const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (!vid) continue;
-        if (elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration) {
+        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
+        if (isActive && vid.paused) {
           vid.currentTime = elapsed - clip.startTime;
+          vid.play().catch(() => {});
+        } else if (!isActive && !vid.paused) {
+          vid.pause();
         }
       }
       renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H);
