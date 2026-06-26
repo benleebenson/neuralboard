@@ -43,6 +43,16 @@ type TimelineDrag = {
   cursorOffsetSec: number;
 };
 
+type YtSearchResult = {
+  id: string;
+  title: string;
+  channel: string;
+  duration: string | number;
+  thumbnail: string;
+};
+type YtModalView = "search" | "trim";
+type YtTab = "paste" | "search";
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const CANVAS_W_LAND = 1920;
@@ -225,6 +235,33 @@ function findFreeBoardPos(
   };
 }
 
+function parseDurationSec(d: string | number | undefined): number {
+  if (typeof d === "number") return isFinite(d) ? d : 0;
+  if (!d) return 0;
+  const parts = d.split(":").map(Number);
+  if (parts.length === 3) return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  if (parts.length === 2) return (parts[0] || 0) * 60 + (parts[1] || 0);
+  return parseFloat(d) || 0;
+}
+
+function formatTimestamp(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function parseTimestampSec(s: string): number | null {
+  const parts = s.split(":").map((p) => parseFloat(p.trim()));
+  if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) return parts[0] * 60 + parts[1];
+  if (parts.length === 1 && !isNaN(parts[0]) && parts[0] >= 0) return parts[0];
+  return null;
+}
+
+function extractYouTubeId(url: string): string | null {
+  const m = url.match(/(?:v=|youtu\.be\/|\/shorts\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Board2Page() {
@@ -248,6 +285,22 @@ export default function Board2Page() {
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number } | null>(null);
+
+  // ── YouTube modal ──
+  const [ytModalOpen, setYtModalOpen] = useState(false);
+  const [ytTab, setYtTab] = useState<YtTab>("paste");
+  const [ytView, setYtView] = useState<YtModalView>("search");
+  const [ytUrlInput, setYtUrlInput] = useState("");
+  const [ytQuery, setYtQuery] = useState("");
+  const [ytResults, setYtResults] = useState<YtSearchResult[]>([]);
+  const [ytSelected, setYtSelected] = useState<YtSearchResult | null>(null);
+  const [ytStart, setYtStart] = useState(0);
+  const [ytStartInput, setYtStartInput] = useState("0:00");
+  const [ytEnd, setYtEnd] = useState(30);
+  const [ytEndInput, setYtEndInput] = useState("0:30");
+  const [ytError, setYtError] = useState("");
+  const [ytLoading, setYtLoading] = useState(false);
+  const [ytShortsOnly, setYtShortsOnly] = useState(false);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -283,6 +336,11 @@ export default function Board2Page() {
   const timelineDragRef = useRef<TimelineDrag | null>(null);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
   const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
+  const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
+  const ytVideoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement
+  const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
+  const ytSliderTrackRef = useRef<HTMLDivElement>(null);
+  const ytRangeRef = useRef({ start: 0, end: 30 });
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -395,7 +453,7 @@ export default function Board2Page() {
           ctx.drawImage(img, sx - sw / 2, sy - sh / 2, sw, sh);
         }
       } else {
-        const vid = videoCacheRef.current.get(clip.sourceUrl);
+        const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (vid && vid.readyState >= 2) {
           ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh);
         }
@@ -423,12 +481,27 @@ export default function Board2Page() {
       const maxEnd = clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       if (next >= maxEnd) {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
-        isPlayingRef.current = false; drawFrame(maxEnd); return;
+        isPlayingRef.current = false;
+        for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        drawFrame(maxEnd); return;
       }
       playheadRef.current = next; setPlayhead(next);
     }
     lastRafTimeRef.current = now;
-    drawFrame(playheadRef.current);
+    const t = playheadRef.current;
+    // Manage YouTube video playback per frame
+    for (const clip of clipsRef.current) {
+      if (clip.type !== "video") continue;
+      const vid = ytVideoElsRef.current.get(clip.id);
+      if (!vid) continue;
+      const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
+      if (isActive) {
+        if (vid.paused) { vid.currentTime = t - clip.startTime; vid.play().catch(() => {}); }
+      } else {
+        if (!vid.paused) vid.pause();
+      }
+    }
+    drawFrame(t);
     rafIdRef.current = requestAnimationFrame(rafCallbackRef.current);
   }, [drawFrame]);
 
@@ -436,7 +509,10 @@ export default function Board2Page() {
 
   useEffect(() => {
     if (isPlaying) { lastRafTimeRef.current = null; rafIdRef.current = requestAnimationFrame(rafLoop); }
-    else { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null; }
+    else {
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
+      for (const vid of ytVideoElsRef.current.values()) vid.pause();
+    }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
 
@@ -446,7 +522,7 @@ export default function Board2Page() {
     if (isPlaying) return;
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       const relTime = playhead - clip.startTime;
       if (relTime >= 0 && relTime <= clip.duration) vid.currentTime = relTime;
@@ -532,6 +608,20 @@ export default function Board2Page() {
     setSelectedClipId(clipId);
   }
 
+  function deleteClip(clipId: string) {
+    const vid = ytVideoElsRef.current.get(clipId);
+    if (vid) {
+      vid.pause();
+      vid.src = "";
+      if (videoHiddenContainerRef.current?.contains(vid)) videoHiddenContainerRef.current.removeChild(vid);
+      ytVideoElsRef.current.delete(clipId);
+    }
+    const blobUrl = ytBlobUrlsRef.current.get(clipId);
+    if (blobUrl) { URL.revokeObjectURL(blobUrl); ytBlobUrlsRef.current.delete(clipId); }
+    setClips((prev) => prev.filter((c) => c.id !== clipId));
+    setSelectedClipId((prev) => (prev === clipId ? null : prev));
+  }
+
   function addPanClip(atTime?: number) {
     const id = generateId();
     const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
@@ -554,6 +644,103 @@ export default function Board2Page() {
       const item: MediaItem = { id: generateId(), name: file.name, type, url, duration };
       setMediaLibrary((prev) => [...prev, item]);
       await addClipAndPlaceOnBoard(item);
+    }
+  }
+
+  // ─ YouTube ────────────────────────────────────────────────────────────────
+
+  async function handleYtSearch(shortsOnlyOverride?: boolean) {
+    if (!ytQuery.trim()) return;
+    setYtLoading(true); setYtError(""); setYtResults([]);
+    try {
+      const res = await fetch("/api/yt-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: shortsOnlyOverride !== undefined ? shortsOnlyOverride : ytShortsOnly }),
+      });
+      if (!res.ok) throw new Error(`Search failed (${res.status})`);
+      const data = await res.json();
+      setYtResults(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setYtError(e instanceof Error ? e.message : "Search failed");
+    } finally {
+      setYtLoading(false);
+    }
+  }
+
+  function handleYtPasteUrl() {
+    const videoId = extractYouTubeId(ytUrlInput.trim());
+    if (!videoId) { setYtError("Couldn't find a YouTube video ID in that URL"); return; }
+    setYtError("");
+    setYtSelected({ id: videoId, title: "YouTube clip", channel: "", duration: 600, thumbnail: "" });
+    setYtStart(0); setYtStartInput("0:00");
+    setYtEnd(30); setYtEndInput("0:30");
+    ytRangeRef.current = { start: 0, end: 30 };
+    setYtView("trim");
+  }
+
+  async function handleYtConfirm() {
+    if (!ytSelected) return;
+    setYtLoading(true); setYtError("");
+    try {
+      const url = `https://www.youtube.com/watch?v=${ytSelected.id}`;
+      const dlRes = await fetch("/api/ytdl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, start: ytStart, end: ytEnd }),
+      });
+      if (!dlRes.ok) {
+        const err = await dlRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Download failed (${dlRes.status})`);
+      }
+      const blob = await dlRes.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const title = (ytSelected.title ?? "YouTube clip").slice(0, 40);
+      const clipDuration = ytEnd - ytStart;
+      const clipId = generateId();
+
+      // Create video element keyed by clip ID, attach to hidden container
+      const vid = document.createElement("video");
+      vid.src = blobUrl;
+      vid.muted = true;
+      vid.preload = "auto";
+      vid.playsInline = true;
+      if (videoHiddenContainerRef.current) videoHiddenContainerRef.current.appendChild(vid);
+      ytVideoElsRef.current.set(clipId, vid);
+      ytBlobUrlsRef.current.set(clipId, blobUrl);
+
+      // Wait for metadata to get natural dimensions
+      const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+        const timer = setTimeout(() => resolve({ w: 800, h: 450 }), 3000);
+        vid.addEventListener("loadedmetadata", () => {
+          clearTimeout(timer);
+          if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+            const scale = Math.min(1, 800 / vid.videoWidth, 600 / vid.videoHeight);
+            resolve({ w: Math.round(vid.videoWidth * scale), h: Math.round(vid.videoHeight * scale) });
+          } else {
+            resolve({ w: 800, h: 450 });
+          }
+        }, { once: true });
+      });
+
+      const { camX, camY } = getVisibleBoardCenter();
+      setClips((prev) => {
+        const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+        const pos = findFreeBoardPos(prev, dims.w, dims.h, camX, camY);
+        return [...prev, {
+          id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
+          startTime: endTime, duration: clipDuration,
+          boardX: pos.boardX, boardY: pos.boardY, boardW: dims.w, boardH: dims.h,
+        }];
+      });
+      setSelectedClipId(clipId);
+      setYtModalOpen(false);
+      setYtView("search"); setYtTab("paste"); setYtSelected(null);
+      setYtResults([]); setYtQuery(""); setYtUrlInput("");
+    } catch (e) {
+      setYtError(e instanceof Error ? e.message : "Download failed");
+    } finally {
+      setYtLoading(false);
     }
   }
 
@@ -749,7 +936,16 @@ export default function Board2Page() {
   function togglePlay() {
     if (isPlaying) { setIsPlaying(false); return; }
     const maxEnd = clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    if (playhead >= maxEnd && maxEnd > 0) setPlayhead(0);
+    const ph = playheadRef.current;
+    if (ph >= maxEnd && maxEnd > 0) setPlayhead(0);
+    // Pre-warm YouTube videos during this user gesture to unlock programmatic .play() later
+    for (const clip of clipsRef.current) {
+      if (clip.type !== "video") continue;
+      const vid = ytVideoElsRef.current.get(clip.id);
+      if (!vid || clip.startTime + clip.duration <= ph) continue;
+      vid.currentTime = Math.max(0, ph - clip.startTime);
+      vid.play().then(() => vid.pause()).catch(() => {});
+    }
     setIsPlaying(true);
   }
 
@@ -983,12 +1179,13 @@ export default function Board2Page() {
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = W; exportCanvas.height = H;
     const exportCtx = exportCanvas.getContext("2d")!;
+    // Position all video elements at t=0 (export drives time via currentTime each frame)
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
-      const vid = videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
-      if (clip.startTime === 0) { vid.currentTime = 0; vid.play().catch(() => {}); }
-      else { vid.pause(); vid.currentTime = 0; }
+      vid.pause();
+      vid.currentTime = 0;
     }
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
@@ -1002,29 +1199,27 @@ export default function Board2Page() {
       a.href = url; a.download = mimeType === "video/mp4" ? "board2-export.mp4" : "board2-export.webm";
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
-      for (const vid of videoCacheRef.current.values()) vid.pause();
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0);
     };
     recorder.start(100);
     const exportWallStart = performance.now();
     function exportFrame() {
       if (exportCancelRef.current) {
-        for (const vid of videoCacheRef.current.values()) vid.pause();
         recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
       }
       const elapsed = (performance.now() - exportWallStart) / 1000;
       if (elapsed >= totalDur) {
-        for (const vid of videoCacheRef.current.values()) vid.pause();
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
+      // Seek each active video to the exact virtual time then draw (no .play() during export)
       for (const clip of currentClips) {
         if (clip.type !== "video") continue;
-        const vid = videoCacheRef.current.get(clip.sourceUrl);
+        const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (!vid) continue;
-        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
-        if (isActive && vid.paused) { vid.currentTime = elapsed - clip.startTime; vid.play().catch(() => {}); }
-        else if (!isActive && !vid.paused) { vid.pause(); }
+        if (elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration) {
+          vid.currentTime = elapsed - clip.startTime;
+        }
       }
       renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H);
       exportRafRef.current = requestAnimationFrame(exportFrame);
@@ -1045,10 +1240,7 @@ export default function Board2Page() {
         if (boardContainerRef.current) boardContainerRef.current.style.cursor = "grab";
       }
       if (e.code === "Delete" || e.code === "Backspace") {
-        if (selectedClipId) {
-          setClips((prev) => prev.filter((c) => c.id !== selectedClipId));
-          setSelectedClipId(null);
-        }
+        if (selectedClipId) deleteClip(selectedClipId);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1083,6 +1275,7 @@ export default function Board2Page() {
 
   return (
     <div style={pageStyle}>
+      <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
       {/* ── Header ── */}
@@ -1148,6 +1341,12 @@ export default function Board2Page() {
             >
               ⟷ Add pan clip
             </button>
+            <button
+              onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("paste"); setYtError(""); }}
+              style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
+            >
+              ▶ Add YouTube
+            </button>
             <input
               ref={mediaUploadRef}
               type="file"
@@ -1212,6 +1411,7 @@ export default function Board2Page() {
                         {clip.type === "image" ? (
                           <img
                             src={clip.sourceUrl}
+                            alt={clip.name}
                             style={{ width: "100%", height: "100%", objectFit: "fill", display: "block", userSelect: "none", pointerEvents: "none" }}
                             draggable={false}
                           />
@@ -1360,10 +1560,7 @@ export default function Board2Page() {
 
                 <div style={{ marginTop: "auto" }}>
                   <button
-                    onClick={() => {
-                      setClips((prev) => prev.filter((c) => c.id !== selectedClip.id));
-                      setSelectedClipId(null);
-                    }}
+                    onClick={() => deleteClip(selectedClip.id)}
                     style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
                   >
                     ✕ Delete clip
@@ -1554,6 +1751,223 @@ export default function Board2Page() {
       {dividerTooltip && (
         <div style={{ position: "fixed", left: dividerTooltip.x + 12, top: dividerTooltip.y - 32, background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 10, padding: "3px 8px", border: "1px solid #c8f135", pointerEvents: "none", zIndex: 9999, whiteSpace: "nowrap" }}>
           {dividerTooltip.label}
+        </div>
+      )}
+
+      {/* YouTube Modal */}
+      {ytModalOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setYtModalOpen(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 640, maxWidth: "95vw", maxHeight: "90vh", display: "flex", flexDirection: "column", fontFamily: "monospace", overflow: "hidden" }}>
+
+            <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>
+                {ytView === "search" ? "▶ ADD YOUTUBE CLIP" : `▶ TRIM  —  ${(ytSelected?.title ?? "").slice(0, 45)}${(ytSelected?.title?.length ?? 0) > 45 ? "…" : ""}`}
+              </span>
+              <button onClick={() => setYtModalOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+            </div>
+
+            <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+              {ytView === "search" ? (
+                <>
+                  {/* Tabs */}
+                  <div style={{ display: "flex", marginBottom: 14, borderBottom: "1.5px solid #2a2a2a" }}>
+                    {(["paste", "search"] as const).map((tab) => (
+                      <button key={tab} onClick={() => { setYtTab(tab); setYtError(""); }}
+                        style={{ fontFamily: "monospace", padding: "6px 14px", fontSize: 11, fontWeight: ytTab === tab ? 700 : 400, background: ytTab === tab ? "#2a2a2a" : "transparent", color: ytTab === tab ? "#fffdf5" : "#2a2a2a", border: "none", borderBottom: ytTab === tab ? "2px solid #c8f135" : "none", cursor: "pointer" }}>
+                        {tab === "paste" ? "Paste URL" : "Search"}
+                      </button>
+                    ))}
+                  </div>
+
+                  {ytTab === "paste" ? (
+                    <div>
+                      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                        <input autoFocus type="text" value={ytUrlInput}
+                          onChange={(e) => setYtUrlInput(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") handleYtPasteUrl(); }}
+                          placeholder="https://www.youtube.com/watch?v=..."
+                          style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                        />
+                        <button onClick={handleYtPasteUrl} style={{ ...miniButton, padding: "8px 16px", fontSize: 12, fontWeight: 700 }}>
+                          Next →
+                        </button>
+                      </div>
+                      {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, margin: 0 }}>{ytError}</p>}
+                      <p style={{ fontSize: 10, color: "#9a9a9a", lineHeight: 1.6, marginTop: 10 }}>
+                        Paste a YouTube URL — you&apos;ll trim it in the next step.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                        <div style={{ display: "flex", flexShrink: 0 }}>
+                          {(["Shorts", "Normal"] as const).map((label) => {
+                            const active = label === "Shorts" ? ytShortsOnly : !ytShortsOnly;
+                            return (
+                              <button key={label}
+                                onClick={() => { const v = label === "Shorts"; setYtShortsOnly(v); handleYtSearch(v); }}
+                                style={{ ...miniButton, fontSize: 11, padding: "4px 8px", background: active ? "#2a2a2a" : "transparent", color: active ? "#fffdf5" : "#2a2a2a", marginRight: label === "Shorts" ? -1 : 0, position: "relative", zIndex: active ? 1 : 0 }}>
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <input autoFocus type="text" value={ytQuery}
+                          onChange={(e) => setYtQuery(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") handleYtSearch(); }}
+                          placeholder="search youtube..."
+                          style={{ flex: 1, fontFamily: "monospace", fontSize: 13, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                        />
+                        <button onClick={() => handleYtSearch()} disabled={ytLoading}
+                          style={{ ...miniButton, padding: "8px 16px", fontSize: 12, fontWeight: 700, opacity: ytLoading ? 0.5 : 1 }}>
+                          {ytLoading ? "..." : "search"}
+                        </button>
+                      </div>
+                      {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, marginBottom: 8 }}>{ytError}</p>}
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                        {ytResults.map((r) => (
+                          <div key={r.id}
+                            onClick={() => {
+                              const maxSec = parseDurationSec(r.duration);
+                              const initEnd = Math.min(30, maxSec || 30);
+                              setYtSelected(r);
+                              setYtStart(0); setYtStartInput("0:00");
+                              setYtEnd(initEnd); setYtEndInput(formatTimestamp(initEnd));
+                              ytRangeRef.current = { start: 0, end: initEnd };
+                              setYtView("trim");
+                            }}
+                            style={{ border: "1.5px solid #2a2a2a", cursor: "pointer", background: "rgba(255,253,245,0.9)", boxShadow: "2px 2px 0 #2a2a2a", overflow: "hidden" }}
+                          >
+                            {r.thumbnail && <img src={r.thumbnail} alt="" style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover" }} />}
+                            <div style={{ padding: "5px 7px" }}>
+                              <div style={{ fontSize: 10, fontWeight: 700, lineHeight: 1.3, marginBottom: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } as React.CSSProperties}>
+                                {r.title ?? "(no title)"}
+                              </div>
+                              <div style={{ fontSize: 9, color: "#6a6a6a" }}>
+                                {r.channel ?? ""}{r.channel && r.duration != null ? " · " : ""}
+                                {r.duration != null ? (typeof r.duration === "number" ? formatTimestamp(r.duration) : r.duration) : ""}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  {ytSelected && (() => {
+                    const maxSec = parseDurationSec(ytSelected.duration) || 600;
+                    const pctOf = (v: number) => Math.max(0, Math.min(100, (v / Math.max(0.1, maxSec)) * 100));
+                    const clipLen = Math.max(0, ytEnd - ytStart);
+                    const handleSliderMouseDown = (which: "start" | "end") => (e: React.MouseEvent) => {
+                      e.preventDefault();
+                      const track = ytSliderTrackRef.current;
+                      if (!track) return;
+                      const onMove = (ev: MouseEvent) => {
+                        const rect = track.getBoundingClientRect();
+                        const raw = ((ev.clientX - rect.left) / rect.width) * maxSec;
+                        const clamped = Math.max(0, Math.min(maxSec, raw));
+                        if (which === "start") {
+                          const curEnd = ytRangeRef.current.end;
+                          const newStart = Math.max(0, Math.min(clamped, curEnd - 0.5));
+                          ytRangeRef.current.start = newStart;
+                          setYtStart(newStart); setYtStartInput(formatTimestamp(newStart));
+                          if (curEnd - newStart > 30) {
+                            const newEnd = newStart + 30;
+                            ytRangeRef.current.end = newEnd; setYtEnd(newEnd); setYtEndInput(formatTimestamp(newEnd));
+                          }
+                        } else {
+                          const curStart = ytRangeRef.current.start;
+                          const newEnd = Math.max(curStart + 0.5, Math.min(maxSec, Math.min(clamped, curStart + 30)));
+                          ytRangeRef.current.end = newEnd; setYtEnd(newEnd); setYtEndInput(formatTimestamp(newEnd));
+                        }
+                      };
+                      const onUp = () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+                      window.addEventListener("mousemove", onMove);
+                      window.addEventListener("mouseup", onUp);
+                    };
+                    return (
+                      <div>
+                        <div style={{ marginBottom: 14, background: "#000", lineHeight: 0 }}>
+                          <iframe
+                            src={`https://www.youtube.com/embed/${ytSelected.id}?start=${Math.floor(ytStart)}&autoplay=0`}
+                            style={{ width: "100%", aspectRatio: "16/9", border: "none" }}
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                            allowFullScreen
+                          />
+                        </div>
+                        <div ref={ytSliderTrackRef} style={{ position: "relative", height: 36, margin: "0 4px 14px", userSelect: "none" }}>
+                          <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: 0, right: 0, height: 8, background: "#d8d5c9", border: "1.5px solid #2a2a2a" }} />
+                          <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: `${pctOf(ytStart)}%`, width: `${Math.max(0, pctOf(ytEnd) - pctOf(ytStart))}%`, height: 8, background: "#c8f135", borderTop: "1.5px solid #2a2a2a", borderBottom: "1.5px solid #2a2a2a" }} />
+                          <div onMouseDown={handleSliderMouseDown("start")} style={{ position: "absolute", top: "50%", left: `${pctOf(ytStart)}%`, transform: "translate(-50%, -50%)", width: 12, height: 24, background: "#2a2a2a", cursor: "ew-resize", zIndex: 3 }} />
+                          <div onMouseDown={handleSliderMouseDown("end")} style={{ position: "absolute", top: "50%", left: `${pctOf(ytEnd)}%`, transform: "translate(-50%, -50%)", width: 12, height: 24, background: "#2a2a2a", cursor: "ew-resize", zIndex: 3 }} />
+                        </div>
+                        <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>Start</div>
+                            <input type="text" value={ytStartInput} placeholder="0:00"
+                              onChange={(e) => {
+                                setYtStartInput(e.target.value);
+                                const p = parseTimestampSec(e.target.value);
+                                if (p !== null) {
+                                  const newStart = Math.max(0, Math.min(maxSec - 0.5, p));
+                                  const curEnd = ytRangeRef.current.end;
+                                  ytRangeRef.current.start = newStart; setYtStart(newStart);
+                                  if (curEnd <= newStart + 0.5) {
+                                    const newEnd = Math.min(newStart + 30, maxSec);
+                                    ytRangeRef.current.end = newEnd; setYtEnd(newEnd); setYtEndInput(formatTimestamp(newEnd));
+                                  } else if (curEnd - newStart > 30) {
+                                    const newEnd = newStart + 30;
+                                    ytRangeRef.current.end = newEnd; setYtEnd(newEnd); setYtEndInput(formatTimestamp(newEnd));
+                                  }
+                                }
+                              }}
+                              onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                            />
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>End</div>
+                            <input type="text" value={ytEndInput} placeholder="0:30"
+                              onChange={(e) => {
+                                setYtEndInput(e.target.value);
+                                const p = parseTimestampSec(e.target.value);
+                                if (p !== null) {
+                                  const newEnd = Math.max(ytRangeRef.current.start + 0.5, Math.min(maxSec, Math.min(p, ytRangeRef.current.start + 30)));
+                                  ytRangeRef.current.end = newEnd; setYtEnd(newEnd);
+                                }
+                              }}
+                              onBlur={() => setYtEndInput(formatTimestamp(ytEnd))}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                            />
+                          </div>
+                        </div>
+                        <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>
+                          Clip length: {formatTimestamp(clipLen)}
+                          <span style={{ marginLeft: 8 }}>· {formatTimestamp(maxSec)} total</span>
+                        </div>
+                        {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, fontFamily: "monospace", marginTop: 6, marginBottom: 0 }}>{ytError}</p>}
+                      </div>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
+
+            {ytView === "trim" && (
+              <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, alignItems: "center" }}>
+                <button onClick={() => { setYtView("search"); setYtSelected(null); setYtError(""); }} style={{ ...miniButton, padding: "6px 12px", fontSize: 11 }}>← back</button>
+                <button onClick={handleYtConfirm} disabled={ytLoading}
+                  style={{ ...miniButton, marginLeft: "auto", padding: "6px 18px", fontSize: 12, fontWeight: 700, background: "#c8f135", borderColor: "#2a2a2a", opacity: ytLoading ? 0.5 : 1 }}>
+                  {ytLoading ? "downloading…" : "Add to board"}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
