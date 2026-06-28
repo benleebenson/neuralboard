@@ -17,7 +17,7 @@ type CameraKeyframe = {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan";
+  type: "image" | "video" | "pan" | "narration";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -28,6 +28,9 @@ type Clip = {
   boardH?: number;
   holdFraction?: number;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
+  // narration-only:
+  audioBlob?: Blob;
+  waveform?: number[];
 };
 
 type Annotation = {
@@ -93,7 +96,9 @@ const MIN_PX_PER_SEC = 10;
 const MAX_PX_PER_SEC = 500;
 const RULER_H = 28;
 const TRACK_H = 64;
-const TIMELINE_H = 280;
+const TIMELINE_H = 334;
+const NARRATION_TRACK_H = 44;
+const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
 const MAGNETIC_SNAP_PX = 10;
@@ -390,6 +395,8 @@ export default function Board2Page() {
   const [timelineScroll, setTimelineScroll] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recElapsed, setRecElapsed] = useState(0);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
@@ -479,6 +486,15 @@ export default function Board2Page() {
   const annotationFontRef = useRef("Caveat");
   const annotationHighlightStyleRef = useRef<"rect" | "underline" | "curlyBrace">("rect");
   const editingAnnotationTextRef = useRef("");
+  const micRecorderRef = useRef<MediaRecorder | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micChunksRef = useRef<Blob[]>([]);
+  const micStartSecRef = useRef(0);
+  const micRafRef = useRef<number | null>(null);
+  const micStartWallRef = useRef(0);
+  const isRecordingRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -494,6 +510,7 @@ export default function Board2Page() {
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
   useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
   useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
 
   useEffect(() => {
     if (!toast) return;
@@ -501,6 +518,15 @@ export default function Board2Page() {
     toastTimerRef.current = setTimeout(() => setToast(null), 3000);
     return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
   }, [toast]);
+
+  useEffect(() => {
+    return () => {
+      if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      if (micRafRef.current !== null) cancelAnimationFrame(micRafRef.current);
+      audioCtxRef.current?.close().catch(() => {});
+    };
+  }, []);
 
   // Apply pending scroll after pxPerSec changes
   useEffect(() => {
@@ -633,6 +659,11 @@ export default function Board2Page() {
         isPlayingRef.current = false;
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
         for (const vid of videoCacheRef.current.values()) vid.pause();
+        for (const clipId of [...activeNarrationRef.current.keys()]) {
+          const entry = activeNarrationRef.current.get(clipId);
+          if (entry) { try { entry.bufNode.stop(); } catch {} try { entry.bufNode.disconnect(); } catch {} try { entry.gainNode.disconnect(); } catch {} }
+        }
+        activeNarrationRef.current.clear();
         prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
@@ -659,6 +690,44 @@ export default function Board2Page() {
       }
       // ambient (outside range): no currentTime override — plays and loops naturally
     }
+    // Narration audio: spawn on entry, stop on exit
+    for (const clip of clipsRef.current) {
+      if (clip.type !== "narration") continue;
+      const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
+      const wasActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
+      if (isActive && !wasActive && !activeNarrationRef.current.has(clip.id)) {
+        const clipId = clip.id;
+        const blobUrl = clip.sourceUrl;
+        const clipOffset = t - clip.startTime;
+        let ctx = audioCtxRef.current;
+        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
+        const audioCtxCapture = ctx;
+        fetch(blobUrl)
+          .then((r) => r.arrayBuffer())
+          .then((ab) => audioCtxCapture.decodeAudioData(ab))
+          .then((buffer) => {
+            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
+            const gainNode = audioCtxCapture.createGain();
+            gainNode.gain.value = 1;
+            gainNode.connect(audioCtxCapture.destination);
+            const bufNode = audioCtxCapture.createBufferSource();
+            bufNode.buffer = buffer;
+            bufNode.connect(gainNode);
+            bufNode.start(0, Math.min(Math.max(0, clipOffset), Math.max(0, buffer.duration - 0.01)));
+            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
+            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
+          })
+          .catch(() => {});
+      } else if (!isActive && wasActive) {
+        const entry = activeNarrationRef.current.get(clip.id);
+        if (entry) {
+          try { entry.bufNode.stop(); } catch {}
+          try { entry.bufNode.disconnect(); } catch {}
+          try { entry.gainNode.disconnect(); } catch {}
+          activeNarrationRef.current.delete(clip.id);
+        }
+      }
+    }
     drawFrame(t);
     rafIdRef.current = requestAnimationFrame(rafCallbackRef.current);
   }, [drawFrame]);
@@ -666,11 +735,52 @@ export default function Board2Page() {
   useEffect(() => { rafCallbackRef.current = rafLoop; }, [rafLoop]);
 
   useEffect(() => {
-    if (isPlaying) { lastRafTimeRef.current = null; rafIdRef.current = requestAnimationFrame(rafLoop); }
-    else {
+    if (isPlaying) {
+      lastRafTimeRef.current = null;
+      rafIdRef.current = requestAnimationFrame(rafLoop);
+      // Spawn narration audio for any clips already active at the current playhead
+      const t = playheadRef.current;
+      for (const clip of clipsRef.current) {
+        if (clip.type !== "narration") continue;
+        if (t < clip.startTime || t >= clip.startTime + clip.duration) continue;
+        if (activeNarrationRef.current.has(clip.id)) continue;
+        const clipId = clip.id;
+        const blobUrl = clip.sourceUrl;
+        const clipOffset = t - clip.startTime;
+        let ctx = audioCtxRef.current;
+        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
+        const audioCtxCapture = ctx;
+        fetch(blobUrl)
+          .then((r) => r.arrayBuffer())
+          .then((ab) => audioCtxCapture.decodeAudioData(ab))
+          .then((buffer) => {
+            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
+            const gainNode = audioCtxCapture.createGain();
+            gainNode.gain.value = 1;
+            gainNode.connect(audioCtxCapture.destination);
+            const bufNode = audioCtxCapture.createBufferSource();
+            bufNode.buffer = buffer;
+            bufNode.connect(gainNode);
+            bufNode.start(0, Math.min(Math.max(0, clipOffset), Math.max(0, buffer.duration - 0.01)));
+            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
+            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
+          })
+          .catch(() => {});
+      }
+    } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
       for (const vid of ytVideoElsRef.current.values()) vid.pause();
       for (const vid of videoCacheRef.current.values()) vid.pause();
+      // Stop all active narration audio
+      for (const clipId of [...activeNarrationRef.current.keys()]) {
+        const entry = activeNarrationRef.current.get(clipId);
+        if (entry) {
+          try { entry.bufNode.stop(); } catch {}
+          try { entry.bufNode.disconnect(); } catch {}
+          try { entry.gainNode.disconnect(); } catch {}
+        }
+      }
+      activeNarrationRef.current.clear();
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
@@ -778,6 +888,11 @@ export default function Board2Page() {
     }
     const blobUrl = ytBlobUrlsRef.current.get(clipId);
     if (blobUrl) { URL.revokeObjectURL(blobUrl); ytBlobUrlsRef.current.delete(clipId); }
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (clip?.type === "narration") {
+      stopNarrationAudio(clipId);
+      URL.revokeObjectURL(clip.sourceUrl);
+    }
     setClips((prev) => prev.filter((c) => c.id !== clipId));
     setSelectedClipId((prev) => (prev === clipId ? null : prev));
   }
@@ -789,6 +904,102 @@ export default function Board2Page() {
     setClips((prev) => [...prev, clip]);
     setSelectedClipId(id);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  // ─ Narration audio helpers ────────────────────────────────────────────────
+
+  function stopNarrationAudio(clipId: string) {
+    const entry = activeNarrationRef.current.get(clipId);
+    if (!entry) return;
+    try { entry.bufNode.stop(); } catch {}
+    try { entry.bufNode.disconnect(); } catch {}
+    try { entry.gainNode.disconnect(); } catch {}
+    activeNarrationRef.current.delete(clipId);
+  }
+
+  function stopAllNarrationAudio() {
+    for (const clipId of [...activeNarrationRef.current.keys()]) stopNarrationAudio(clipId);
+  }
+
+  async function generateNarrationWaveform(blobUrl: string): Promise<number[]> {
+    const ctx = new AudioContext();
+    try {
+      const ab = await fetch(blobUrl).then((r) => r.arrayBuffer());
+      const buffer = await ctx.decodeAudioData(ab);
+      const data = buffer.getChannelData(0);
+      const SAMPLES = 80;
+      const blockSize = Math.max(1, Math.floor(data.length / SAMPLES));
+      const peaks: number[] = [];
+      for (let i = 0; i < SAMPLES; i++) {
+        let max = 0;
+        for (let j = 0; j < blockSize; j++) {
+          const v = Math.abs(data[i * blockSize + j] ?? 0);
+          if (v > max) max = v;
+        }
+        peaks.push(max);
+      }
+      return peaks;
+    } finally {
+      await ctx.close().catch(() => {});
+    }
+  }
+
+  // ─ Narration recording ────────────────────────────────────────────────────
+
+  async function startNarrationRecording() {
+    if (isRecordingRef.current) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = stream;
+      micChunksRef.current = [];
+      micStartSecRef.current = playheadRef.current;
+      micStartWallRef.current = performance.now();
+      setRecElapsed(0);
+      function elapsedTick() {
+        setRecElapsed((performance.now() - micStartWallRef.current) / 1000);
+        micRafRef.current = requestAnimationFrame(elapsedTick);
+      }
+      micRafRef.current = requestAnimationFrame(elapsedTick);
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm"
+        : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      micRecorderRef.current = recorder;
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) micChunksRef.current.push(e.data); };
+      recorder.onstop = async () => {
+        micStreamRef.current?.getTracks().forEach((t) => t.stop());
+        if (micRafRef.current !== null) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+        const blob = new Blob(micChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+        const blobUrl = URL.createObjectURL(blob);
+        const dur: number = await new Promise((resolve) => {
+          const audio = new Audio(blobUrl);
+          audio.onloadedmetadata = () => resolve(isFinite(audio.duration) ? audio.duration : 1);
+          audio.onerror = () => resolve(1);
+        });
+        if (dur < 0.1) { URL.revokeObjectURL(blobUrl); return; }
+        const waveform = await generateNarrationWaveform(blobUrl).catch(() => undefined);
+        setClips((prev) => [...prev, {
+          id: generateId(),
+          type: "narration" as const,
+          name: "Narration",
+          sourceUrl: blobUrl,
+          audioBlob: blob,
+          startTime: micStartSecRef.current,
+          duration: dur,
+          waveform,
+        }]);
+      };
+      recorder.start();
+      setIsRecording(true);
+    } catch (e) {
+      if (micRafRef.current !== null) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+      setToast(e instanceof Error ? e.message : "Microphone access denied");
+    }
+  }
+
+  function stopNarrationRecording() {
+    if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
+    if (micRafRef.current !== null) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
+    setIsRecording(false);
   }
 
   // ─ Media upload ───────────────────────────────────────────────────────────
@@ -1525,6 +1736,7 @@ export default function Board2Page() {
   function cancelExport() { exportCancelRef.current = true; }
 
   async function startExport() {
+    if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
     if (isPlayingRef.current) setIsPlaying(false);
     setIsExporting(true); isExportingRef.current = true; exportCancelRef.current = false; setExportProgress(0);
@@ -1547,10 +1759,35 @@ export default function Board2Page() {
     }
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
-    const recorder = new MediaRecorder(canvasStream, { mimeType });
+
+    // ── Narration audio setup ─────────────────────────────────────────────────
+    const narrationClips = currentClips.filter((c) => c.type === "narration");
+    let exportAudioCtx: AudioContext | null = null;
+    let exportAudioDest: MediaStreamAudioDestinationNode | null = null;
+    type AudioItem = { clip: Clip; buffer: AudioBuffer };
+    let audioBuffers: AudioItem[] = [];
+
+    if (narrationClips.length > 0) {
+      exportAudioCtx = new AudioContext();
+      exportAudioDest = exportAudioCtx.createMediaStreamDestination();
+      audioBuffers = await Promise.all(
+        narrationClips.map(async (clip) => {
+          const ab = await fetch(clip.sourceUrl).then((r) => r.arrayBuffer());
+          const buffer = await exportAudioCtx!.decodeAudioData(ab);
+          return { clip, buffer } as AudioItem;
+        })
+      );
+    }
+
+    const exportStream = exportAudioDest
+      ? new MediaStream([...canvasStream.getVideoTracks(), ...exportAudioDest.stream.getAudioTracks()])
+      : canvasStream;
+
+    const recorder = new MediaRecorder(exportStream, { mimeType });
     const chunks: Blob[] = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
+      exportAudioCtx?.close().catch(() => {});
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -1560,12 +1797,25 @@ export default function Board2Page() {
       setIsExporting(false); isExportingRef.current = false; setExportProgress(0);
     };
     recorder.start(100);
+
+    // Schedule narration audio relative to export start (export runs at real-time 1x speed)
+    if (exportAudioCtx && exportAudioDest && audioBuffers.length > 0) {
+      const exportStartAcTime = exportAudioCtx.currentTime;
+      for (const { clip, buffer } of audioBuffers) {
+        const bufNode = exportAudioCtx.createBufferSource();
+        bufNode.buffer = buffer;
+        bufNode.connect(exportAudioDest);
+        bufNode.start(exportStartAcTime + clip.startTime);
+      }
+    }
+
     const exportWallStart = performance.now();
     let prevExportElapsed = -1; // tracks previous frame for entry detection
     function exportFrame() {
       if (exportCancelRef.current) {
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
         for (const vid of videoCacheRef.current.values()) vid.pause();
+        exportAudioCtx?.close().catch(() => {});
         recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
       }
       const elapsed = (performance.now() - exportWallStart) / 1000;
@@ -1722,6 +1972,28 @@ export default function Board2Page() {
             >
               ▶ Add YouTube
             </button>
+
+            <ProGated featureName="Narration Recording">
+              <button
+                onClick={isRecording ? stopNarrationRecording : startNarrationRecording}
+                style={{
+                  ...sketchButton,
+                  fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%",
+                  background: isRecording ? "#ff5e3a" : "#2a2a2a",
+                  color: "#fff",
+                }}
+              >
+                {isRecording ? (
+                  <>⏹ Stop ({Math.floor(recElapsed / 60)}:{String(Math.floor(recElapsed % 60)).padStart(2, "0")})</>
+                ) : "🎙 Record Narration"}
+              </button>
+            </ProGated>
+            {isRecording && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>
+                <span style={{ display: "inline-block", width: 6, height: 6, borderRadius: "50%", background: "#ff5e3a", animation: "nbpulse 1s infinite" }} />
+                recording...
+              </div>
+            )}
 
             <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
 
@@ -2123,11 +2395,16 @@ export default function Board2Page() {
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.name}
+                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Sweeps across all board images
+                  </div>
+                )}
+                {selectedClip.type === "narration" && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#5a1530", background: NARRATION_COLOR, padding: "3px 6px", border: "1px solid rgba(180,80,130,0.35)" }}>
+                    Audio-only clip — plays during export
                   </div>
                 )}
 
@@ -2154,27 +2431,29 @@ export default function Board2Page() {
                   />
                 </div>
 
-                <div>
-                  <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={0.95}
-                    step={0.01}
-                    value={selectedClip.holdFraction ?? HOLD_FRACTION}
-                    onChange={(e) => {
-                      const v = parseFloat(e.target.value);
-                      if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
-                      setClips((prev) =>
-                        prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)
-                      );
-                    }}
-                    style={{ width: "100%", accentColor: "#c8f135" }}
-                  />
-                  <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
-                    Hold: {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans: {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
+                {selectedClip.type !== "narration" && (
+                  <div>
+                    <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={0.95}
+                      step={0.01}
+                      value={selectedClip.holdFraction ?? HOLD_FRACTION}
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+                        setClips((prev) =>
+                          prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)
+                        );
+                      }}
+                      style={{ width: "100%", accentColor: "#c8f135" }}
+                    />
+                    <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
+                      Hold: {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans: {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {selectedClip.boardX !== undefined && (
                   <div>
@@ -2256,10 +2535,10 @@ export default function Board2Page() {
             <div style={{ position: "absolute", left: playhead * pxPerSec - timelineScroll, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none" }} />
           </div>
 
-          {/* Track */}
+          {/* Track — two rows: visual clips above, narration audio below */}
           <div
             ref={scrollerRef}
-            style={{ flex: 1, minHeight: TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
+            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
             onScroll={(e) => {
               const sl = (e.target as HTMLDivElement).scrollLeft;
               timelineScrollRef.current = sl;
@@ -2284,10 +2563,19 @@ export default function Board2Page() {
               setContextMenu({ x: e.clientX, y: e.clientY, timeSec });
             }}
           >
-            <div style={{ position: "relative", width: timelineWidth, minHeight: TRACK_H, height: "100%" }}>
-              <div style={{ position: "absolute", inset: 0, background: "rgba(100,130,180,0.05)", borderTop: "1px solid rgba(42,42,42,0.08)" }} />
+            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + 8 }}>
+              {/* Visual row background */}
+              <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: TRACK_H, background: "rgba(100,130,180,0.05)", borderTop: "1px solid rgba(42,42,42,0.08)" }} />
+              {/* Narration row background */}
+              <div style={{ position: "absolute", left: 0, right: 0, top: TRACK_H + 4, height: NARRATION_TRACK_H, background: "rgba(255,150,200,0.05)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
-              {clips.map((clip, ci) => {
+              {/* Row label for narration row (tracks scroll position) */}
+              <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + 6, pointerEvents: "none", zIndex: 15 }}>
+                <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(180,80,130,0.5)", letterSpacing: 0.5, textTransform: "uppercase" }}>audio</span>
+              </div>
+
+              {/* Visual clips (image / video / pan) */}
+              {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
                 const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
@@ -2346,6 +2634,60 @@ export default function Board2Page() {
                     {/* Right resize handle */}
                     <div
                       style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.25)", zIndex: 6 }}
+                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")}
+                    />
+                  </div>
+                );
+              })}
+
+              {/* Narration clips row */}
+              {clips.filter((c) => c.type === "narration").map((clip) => {
+                const selected = clip.id === selectedClipId;
+                const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
+                return (
+                  <div
+                    key={clip.id}
+                    data-clipblock
+                    style={{
+                      position: "absolute",
+                      left: clip.startTime * pxPerSec,
+                      top: TRACK_H + 4 + 2,
+                      width: clipPx,
+                      height: NARRATION_TRACK_H - 4,
+                      background: NARRATION_COLOR,
+                      border: selected ? "2px solid #2a2a2a" : "1.5px solid rgba(180,80,130,0.5)",
+                      boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
+                      cursor: "grab",
+                      userSelect: "none",
+                      overflow: "hidden",
+                    }}
+                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
+                    onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
+                  >
+                    {/* Left resize handle */}
+                    <div
+                      style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")}
+                    />
+                    {/* Waveform */}
+                    {clip.waveform && clip.waveform.length > 0 && (
+                      <svg
+                        viewBox={`0 0 ${clip.waveform.length} 1`}
+                        preserveAspectRatio="none"
+                        style={{ position: "absolute", left: HANDLE_W, right: HANDLE_W, top: 0, bottom: 0, width: `calc(100% - ${HANDLE_W * 2}px)`, height: "100%", pointerEvents: "none" }}
+                      >
+                        {clip.waveform.map((v, i) => (
+                          <rect key={i} x={i} y={(1 - v) / 2} width={0.85} height={Math.max(0.02, v)} fill="rgba(120,40,80,0.4)" />
+                        ))}
+                      </svg>
+                    )}
+                    {/* Label */}
+                    <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#5a1530", pointerEvents: "none", zIndex: 4 }}>
+                      🎙 {clip.name} {clip.duration.toFixed(1)}s
+                    </span>
+                    {/* Right resize handle */}
+                    <div
+                      style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")}
                     />
                   </div>
