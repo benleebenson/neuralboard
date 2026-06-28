@@ -1654,28 +1654,9 @@ export default function Board2Page() {
 
   // ─ AI annotation generation ────────────────────────────────────────────────
 
-  async function handleGenerateAnnotations() {
-    const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
-    if (boardClips.length === 0) return;
-    setAiError(null);
-
-    let transcript = aiScriptText.trim();
-
-    if (aiTab === "audio") {
-      if (!aiAudioFile) return;
-      setAiPhase("Transcribing audio...");
-      const fd = new FormData();
-      fd.append("audio", aiAudioFile);
-      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
-      if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
-      const d = await r.json();
-      if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
-      if (!d.transcript?.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
-      transcript = d.transcript;
-    }
-
+  async function applyAnnotationsFromTranscript(transcript: string): Promise<boolean> {
     setAiPhase("Generating annotations...");
-
+    const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
     const sendClips = boardClips.map((c) => ({
       id: c.id,
       type: c.type,
@@ -1685,7 +1666,6 @@ export default function Board2Page() {
       boardH: c.boardH!,
       ...(c.sourceUrl?.startsWith("http") ? { sourceUrl: c.sourceUrl } : {}),
     }));
-
     const r = await fetch("/api/board2/generate-annotations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1695,11 +1675,9 @@ export default function Board2Page() {
         clips: sendClips,
       }),
     }).catch(() => null);
-
-    if (!r) { setAiError("Network error. Try again."); setAiPhase(null); return; }
+    if (!r) { setAiError("Network error. Try again."); setAiPhase(null); return false; }
     const d = await r.json();
-    if (!r.ok) { setAiError(d.error || "Failed to generate annotations"); setAiPhase(null); return; }
-
+    if (!r.ok) { setAiError(d.error || "Failed to generate annotations"); setAiPhase(null); return false; }
     const raw: Partial<Annotation>[] = Array.isArray(d.annotations) ? d.annotations : [];
     const validTypes = new Set(["text", "arrow", "circle", "highlight"]);
     const newAnnotations: Annotation[] = raw
@@ -1722,13 +1700,72 @@ export default function Board2Page() {
         ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, BOARD_H) } : {}),
         ...(a.highlightStyle != null ? { highlightStyle: a.highlightStyle } : {}),
       }));
-
     setAnnotations((prev) => [...prev, ...newAnnotations]);
     setToast(`Generated ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`);
-    setAiModalOpen(false);
     setAiPhase(null);
-    setAiAudioFile(null);
-    setAiScriptText("");
+    return true;
+  }
+
+  async function handleGenerateAnnotations() {
+    const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
+    if (boardClips.length === 0) return;
+    setAiError(null);
+
+    let transcript = aiScriptText.trim();
+
+    if (aiTab === "audio") {
+      if (!aiAudioFile) return;
+      setAiPhase("Transcribing audio...");
+      const fd = new FormData();
+      fd.append("audio", aiAudioFile);
+      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
+      if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
+      const d = await r.json();
+      if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
+      if (!d.transcript?.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
+      transcript = d.transcript;
+    }
+
+    const ok = await applyAnnotationsFromTranscript(transcript);
+    if (ok) {
+      setAiModalOpen(false);
+      setAiAudioFile(null);
+      setAiScriptText("");
+    }
+  }
+
+  async function generateAnnotationsFromNarration() {
+    const narrationClips = clipsRef.current.filter((c) => c.type === "narration");
+    if (narrationClips.length === 0) return;
+    if (clipsRef.current.filter((c) => c.boardX !== undefined).length === 0) return;
+    setAiError(null);
+
+    let blob: Blob;
+    try {
+      setAiPhase("Preparing audio...");
+      blob = await compileNarrationToBlob(narrationClips);
+    } catch (e) {
+      setAiError(e instanceof Error ? e.message : "Failed to compile narration audio");
+      setAiPhase(null);
+      return;
+    }
+
+    if (blob.size > 25 * 1024 * 1024) {
+      setAiError("Narration too long — exceeds 25MB. Please split into shorter recordings.");
+      setAiPhase(null);
+      return;
+    }
+
+    setAiPhase("Transcribing...");
+    const fd = new FormData();
+    fd.append("audio", blob, "narration.wav");
+    const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
+    if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
+    const d = await r.json();
+    if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
+    if (!d.transcript?.trim()) { setAiError("Couldn't understand the narration. Try pasting the script instead."); setAiPhase(null); return; }
+
+    await applyAnnotationsFromTranscript(d.transcript);
   }
 
   // ─ Export ─────────────────────────────────────────────────────────────────
@@ -1998,30 +2035,54 @@ export default function Board2Page() {
             <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
 
             <ProGated featureName="AI Annotation Generation">
-              <button
-                onClick={() => {
-                  if (clips.filter((c) => c.boardX !== undefined).length === 0) return;
-                  setAiModalOpen(true);
-                  setAiError(null);
-                  setAiPhase(null);
-                  setAiAudioFile(null);
-                  setAiScriptText("");
-                  setAiTab("audio");
-                }}
-                disabled={clips.filter((c) => c.boardX !== undefined).length === 0}
-                title={clips.filter((c) => c.boardX !== undefined).length === 0 ? "Place images on the board first" : "Generate annotations from narration audio or script"}
-                style={{
-                  ...sketchButton,
-                  fontSize: 11,
-                  padding: "6px 10px",
-                  fontWeight: 700,
-                  width: "100%",
-                  opacity: clips.filter((c) => c.boardX !== undefined).length === 0 ? 0.45 : 1,
-                  cursor: clips.filter((c) => c.boardX !== undefined).length === 0 ? "not-allowed" : "pointer",
-                }}
-              >
-                ✨ Generate Annotations
-              </button>
+              {(() => {
+                const hasBoardClips = clips.filter((c) => c.boardX !== undefined).length > 0;
+                const hasNarration = clips.some((c) => c.type === "narration");
+                const busy = !!aiPhase;
+                const disabled = !hasBoardClips || busy;
+                return (
+                  <>
+                    <button
+                      onClick={() => {
+                        if (disabled) return;
+                        if (hasNarration) {
+                          setAiError(null);
+                          generateAnnotationsFromNarration();
+                        } else {
+                          setAiModalOpen(true);
+                          setAiError(null);
+                          setAiPhase(null);
+                          setAiAudioFile(null);
+                          setAiScriptText("");
+                          setAiTab("audio");
+                        }
+                      }}
+                      disabled={disabled}
+                      title={
+                        !hasBoardClips ? "Place images on the board first"
+                        : hasNarration ? "Generate annotations from your timeline narration"
+                        : "Generate annotations from narration audio or script"
+                      }
+                      style={{
+                        ...sketchButton,
+                        fontSize: 11,
+                        padding: "6px 10px",
+                        fontWeight: 700,
+                        width: "100%",
+                        opacity: disabled ? 0.45 : 1,
+                        cursor: disabled ? "not-allowed" : "pointer",
+                      }}
+                    >
+                      {busy ? `⟳ ${aiPhase}` : hasNarration ? "✨ Generate Annotations (from narration)" : "✨ Generate Annotations"}
+                    </button>
+                    {!aiModalOpen && aiError && (
+                      <div style={{ fontSize: 10, color: "#cc2200", marginTop: 4, fontFamily: "monospace", lineHeight: 1.4 }}>
+                        ✗ {aiError}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </ProGated>
 
             <input
@@ -3070,6 +3131,72 @@ export default function Board2Page() {
       )}
     </div>
   );
+}
+
+// ─── Narration compilation utilities ─────────────────────────────────────────
+
+function writeWavStr(view: DataView, offset: number, s: string) {
+  for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+}
+
+function audioBufferToWav(buf: AudioBuffer): Blob {
+  const ch = buf.numberOfChannels;
+  const sr = buf.sampleRate;
+  const n = buf.length;
+  const dataLen = n * ch * 2;
+  const ab = new ArrayBuffer(44 + dataLen);
+  const v = new DataView(ab);
+  writeWavStr(v, 0, "RIFF"); v.setUint32(4, 36 + dataLen, true); writeWavStr(v, 8, "WAVE");
+  writeWavStr(v, 12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, ch, true); v.setUint32(24, sr, true); v.setUint32(28, sr * ch * 2, true);
+  v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
+  writeWavStr(v, 36, "data"); v.setUint32(40, dataLen, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < ch; c++) {
+      const s = Math.max(-1, Math.min(1, buf.getChannelData(c)[i]));
+      v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      off += 2;
+    }
+  }
+  return new Blob([ab], { type: "audio/wav" });
+}
+
+async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {
+  const sorted = [...narrationClips].sort((a, b) => a.startTime - b.startTime);
+  if (sorted.length === 1) {
+    const clip = sorted[0];
+    if (clip.audioBlob) return clip.audioBlob;
+    return fetch(clip.sourceUrl).then((r) => r.blob());
+  }
+  const tmpCtx = new AudioContext();
+  const decoded: { clip: Clip; buffer: AudioBuffer }[] = [];
+  try {
+    for (const clip of sorted) {
+      const ab = clip.audioBlob
+        ? await clip.audioBlob.arrayBuffer()
+        : await fetch(clip.sourceUrl).then((r) => r.arrayBuffer());
+      const buffer = await tmpCtx.decodeAudioData(ab);
+      decoded.push({ clip, buffer });
+    }
+  } finally {
+    await tmpCtx.close().catch(() => {});
+  }
+  const sampleRate = decoded[0].buffer.sampleRate;
+  const firstStart = sorted[0].startTime;
+  const lastClip = sorted[sorted.length - 1];
+  const totalDur = lastClip.startTime + lastClip.duration - firstStart;
+  const totalSamples = Math.ceil(totalDur * sampleRate);
+  const numChannels = Math.max(...decoded.map((d) => d.buffer.numberOfChannels));
+  const offCtx = new OfflineAudioContext(numChannels, totalSamples, sampleRate);
+  for (const { clip, buffer } of decoded) {
+    const node = offCtx.createBufferSource();
+    node.buffer = buffer;
+    node.connect(offCtx.destination);
+    node.start(clip.startTime - firstStart);
+  }
+  const rendered = await offCtx.startRendering();
+  return audioBufferToWav(rendered);
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
