@@ -409,6 +409,14 @@ export default function Board2Page() {
   const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
   const [editingAnnotationText, setEditingAnnotationText] = useState("");
 
+  // ── AI annotation generation ──
+  const [aiModalOpen, setAiModalOpen] = useState(false);
+  const [aiTab, setAiTab] = useState<"audio" | "script">("audio");
+  const [aiAudioFile, setAiAudioFile] = useState<File | null>(null);
+  const [aiScriptText, setAiScriptText] = useState("");
+  const [aiPhase, setAiPhase] = useState<string | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+
   // ── YouTube modal ──
   const [ytModalOpen, setYtModalOpen] = useState(false);
   const [ytTab, setYtTab] = useState<YtTab>("paste");
@@ -1433,6 +1441,85 @@ export default function Board2Page() {
     window.addEventListener("pointerup", onUp);
   }
 
+  // ─ AI annotation generation ────────────────────────────────────────────────
+
+  async function handleGenerateAnnotations() {
+    const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
+    if (boardClips.length === 0) return;
+    setAiError(null);
+
+    let transcript = aiScriptText.trim();
+
+    if (aiTab === "audio") {
+      if (!aiAudioFile) return;
+      setAiPhase("Transcribing audio...");
+      const fd = new FormData();
+      fd.append("audio", aiAudioFile);
+      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
+      if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
+      const d = await r.json();
+      if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
+      if (!d.transcript?.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
+      transcript = d.transcript;
+    }
+
+    setAiPhase("Generating annotations...");
+
+    const sendClips = boardClips.map((c) => ({
+      id: c.id,
+      type: c.type,
+      boardX: c.boardX!,
+      boardY: c.boardY!,
+      boardW: c.boardW!,
+      boardH: c.boardH!,
+      ...(c.sourceUrl?.startsWith("http") ? { sourceUrl: c.sourceUrl } : {}),
+    }));
+
+    const r = await fetch("/api/board2/generate-annotations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transcript,
+        board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
+        clips: sendClips,
+      }),
+    }).catch(() => null);
+
+    if (!r) { setAiError("Network error. Try again."); setAiPhase(null); return; }
+    const d = await r.json();
+    if (!r.ok) { setAiError(d.error || "Failed to generate annotations"); setAiPhase(null); return; }
+
+    const raw: Partial<Annotation>[] = Array.isArray(d.annotations) ? d.annotations : [];
+    const validTypes = new Set(["text", "arrow", "circle", "highlight"]);
+    const newAnnotations: Annotation[] = raw
+      .filter((a) => a.type && validTypes.has(a.type))
+      .map((a) => ({
+        id: generateId(),
+        type: a.type as Annotation["type"],
+        boardX: clamp(Number(a.boardX) || 0, 0, BOARD_W - 1),
+        boardY: clamp(Number(a.boardY) || 0, 0, BOARD_H - 1),
+        boardW: clamp(Number(a.boardW) || 200, 10, BOARD_W),
+        boardH: clamp(Number(a.boardH) || 100, 10, BOARD_H),
+        color: typeof a.color === "string" && /^#[0-9a-fA-F]{6}$/.test(a.color) ? a.color : "#cc2200",
+        ...(a.text != null ? { text: String(a.text).slice(0, 300) } : {}),
+        ...(a.fontFamily != null ? { fontFamily: String(a.fontFamily) } : {}),
+        ...(a.fontSize != null ? { fontSize: Number(a.fontSize) } : {}),
+        ...(a.fontWeight === "bold" || a.fontWeight === "normal" ? { fontWeight: a.fontWeight } : {}),
+        ...(a.arrowStartX != null ? { arrowStartX: clamp(Number(a.arrowStartX), 0, BOARD_W) } : {}),
+        ...(a.arrowStartY != null ? { arrowStartY: clamp(Number(a.arrowStartY), 0, BOARD_H) } : {}),
+        ...(a.arrowEndX != null ? { arrowEndX: clamp(Number(a.arrowEndX), 0, BOARD_W) } : {}),
+        ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, BOARD_H) } : {}),
+        ...(a.highlightStyle != null ? { highlightStyle: a.highlightStyle } : {}),
+      }));
+
+    setAnnotations((prev) => [...prev, ...newAnnotations]);
+    setToast(`Generated ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`);
+    setAiModalOpen(false);
+    setAiPhase(null);
+    setAiAudioFile(null);
+    setAiScriptText("");
+  }
+
   // ─ Export ─────────────────────────────────────────────────────────────────
 
   function cancelExport() { exportCancelRef.current = true; }
@@ -1635,6 +1722,36 @@ export default function Board2Page() {
             >
               ▶ Add YouTube
             </button>
+
+            <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
+
+            <ProGated featureName="AI Annotation Generation">
+              <button
+                onClick={() => {
+                  if (clips.filter((c) => c.boardX !== undefined).length === 0) return;
+                  setAiModalOpen(true);
+                  setAiError(null);
+                  setAiPhase(null);
+                  setAiAudioFile(null);
+                  setAiScriptText("");
+                  setAiTab("audio");
+                }}
+                disabled={clips.filter((c) => c.boardX !== undefined).length === 0}
+                title={clips.filter((c) => c.boardX !== undefined).length === 0 ? "Place images on the board first" : "Generate annotations from narration audio or script"}
+                style={{
+                  ...sketchButton,
+                  fontSize: 11,
+                  padding: "6px 10px",
+                  fontWeight: 700,
+                  width: "100%",
+                  opacity: clips.filter((c) => c.boardX !== undefined).length === 0 ? 0.45 : 1,
+                  cursor: clips.filter((c) => c.boardX !== undefined).length === 0 ? "not-allowed" : "pointer",
+                }}
+              >
+                ✨ Generate Annotations
+              </button>
+            </ProGated>
+
             <input
               ref={mediaUploadRef}
               type="file"
@@ -2478,6 +2595,127 @@ export default function Board2Page() {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* AI Annotation Modal */}
+      {aiModalOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget && !aiPhase) setAiModalOpen(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 480, maxWidth: "95vw", fontFamily: "monospace", overflow: "hidden" }}>
+
+            {/* Header */}
+            <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>✨ AUTO-GENERATE ANNOTATIONS</span>
+              <button
+                onClick={() => { if (!aiPhase) setAiModalOpen(false); }}
+                style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15, opacity: aiPhase ? 0.4 : 1 }}
+              >×</button>
+            </div>
+
+            <div style={{ padding: 16 }}>
+              {/* Tabs */}
+              <div style={{ display: "flex", marginBottom: 14, borderBottom: "1.5px solid #2a2a2a" }}>
+                {(["audio", "script"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    onClick={() => { if (!aiPhase) setAiTab(tab); }}
+                    style={{
+                      fontFamily: "monospace", fontSize: 11, fontWeight: 700,
+                      padding: "5px 14px", border: "none", cursor: aiPhase ? "default" : "pointer",
+                      background: aiTab === tab ? "#2a2a2a" : "transparent",
+                      color: aiTab === tab ? "#fff" : "#6a6a6a",
+                      borderBottom: aiTab === tab ? "2px solid #2a2a2a" : "2px solid transparent",
+                      marginBottom: -2,
+                    }}
+                  >
+                    {tab === "audio" ? "↑ Upload audio" : "✎ Paste script"}
+                  </button>
+                ))}
+              </div>
+
+              {aiTab === "audio" ? (
+                <div>
+                  <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
+                    Upload a narration recording (.mp3, .wav, .m4a, .webm) — max 25MB. Whisper will transcribe it, then GPT-4o will generate annotations.
+                  </p>
+                  <input
+                    type="file"
+                    accept=".mp3,.wav,.m4a,.webm,audio/*"
+                    disabled={!!aiPhase}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0] ?? null;
+                      if (!f) return;
+                      if (f.size > 25 * 1024 * 1024) { setAiError("File too large (max 25MB)"); return; }
+                      setAiAudioFile(f);
+                      setAiError(null);
+                    }}
+                    style={{ display: "block", marginBottom: 8, fontFamily: "monospace", fontSize: 11 }}
+                  />
+                  {aiAudioFile && (
+                    <div style={{ fontSize: 10, color: "#228b22", marginBottom: 4 }}>
+                      ✓ {aiAudioFile.name} ({(aiAudioFile.size / 1024 / 1024).toFixed(1)} MB)
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
+                    Paste your narration script. GPT-4o will read it and generate annotations that emphasize key ideas on the board.
+                  </p>
+                  <textarea
+                    value={aiScriptText}
+                    onChange={(e) => setAiScriptText(e.target.value)}
+                    disabled={!!aiPhase}
+                    placeholder="Paste your narration script here…"
+                    rows={8}
+                    style={{
+                      width: "100%", fontFamily: "monospace", fontSize: 11,
+                      border: "1.5px solid #2a2a2a", padding: "8px",
+                      resize: "vertical", boxSizing: "border-box",
+                      background: aiPhase ? "#f5f5f0" : "#fff",
+                    } as React.CSSProperties}
+                  />
+                </div>
+              )}
+
+              {aiPhase && (
+                <div style={{ marginTop: 10, fontSize: 11, color: "#1a6fd4" }}>
+                  ⟳ {aiPhase}
+                </div>
+              )}
+              {aiError && (
+                <div style={{ marginTop: 10, fontSize: 11, color: "#cc2200" }}>
+                  ✗ {aiError}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => { if (!aiPhase) setAiModalOpen(false); }}
+                disabled={!!aiPhase}
+                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: aiPhase ? 0.4 : 1 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleGenerateAnnotations}
+                disabled={!!aiPhase || (aiTab === "audio" ? !aiAudioFile : !aiScriptText.trim())}
+                style={{
+                  ...miniButton, padding: "6px 18px", fontSize: 12, fontWeight: 700,
+                  background: "#c8f135", borderColor: "#2a2a2a",
+                  opacity: (!!aiPhase || (aiTab === "audio" ? !aiAudioFile : !aiScriptText.trim())) ? 0.5 : 1,
+                  cursor: (!!aiPhase || (aiTab === "audio" ? !aiAudioFile : !aiScriptText.trim())) ? "not-allowed" : "pointer",
+                }}
+              >
+                {aiPhase ? "Working…" : "Generate →"}
+              </button>
+            </div>
           </div>
         </div>
       )}
