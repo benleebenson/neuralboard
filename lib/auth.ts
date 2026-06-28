@@ -1,6 +1,6 @@
-import { NextAuthOptions } from "next-auth";
+import { NextAuthOptions, Session } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
-import { upsertUser } from "./supabase";
+import { upsertUser, getSubscriptionStatus } from "./supabase";
 
 export const ADMIN_EMAIL = "bbtvhq@gmail.com";
 
@@ -36,4 +36,12 @@ export const authOptions: NextAuthOptions = {
 
 export function isAdmin(email: string | null | undefined): boolean {
   return email === ADMIN_EMAIL;
+}
+
+export async function isUserPro(session: Session | null): Promise<boolean> {
+  if (!session?.user?.email) return false;
+  const email = session.user.email;
+  if (isAdmin(email)) return true;
+  const { isSubscribed } = await getSubscriptionStatus(email);
+  return isSubscribed;
 }
