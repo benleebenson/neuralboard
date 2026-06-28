@@ -22,6 +22,9 @@ type Clip = {
   sourceUrl: string;
   startTime: number;
   duration: number;
+  layer?: number;    // 0-4 for visual clips, undefined for narration. Default: 1
+  volume?: number;   // 0-1, default 1. Applies to video and narration clips
+  muted?: boolean;   // explicit mute (overrides volume). Default: false
   boardX?: number;
   boardY?: number;
   boardW?: number;
@@ -70,6 +73,7 @@ type TimelineDrag = {
   clipId: string;
   origStartTime: number;
   origDuration: number;
+  origLayer: number;
   cursorOffsetSec: number;
 };
 
@@ -97,8 +101,10 @@ const DEFAULT_PX_PER_SEC = 100;
 const MIN_PX_PER_SEC = 10;
 const MAX_PX_PER_SEC = 500;
 const RULER_H = 28;
-const TRACK_H = 64;
-const TIMELINE_H = 334;
+const N_LAYERS = 5;
+const LAYER_H = 22;
+const TRACK_H = N_LAYERS * LAYER_H; // 110
+const TIMELINE_H = 370;
 const NARRATION_TRACK_H = 44;
 const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
@@ -202,6 +208,29 @@ function allClipEdges(clips: Clip[], excludeId: string): number[] {
     edges.push(c.startTime, c.startTime + c.duration);
   }
   return edges;
+}
+
+function layerOverlap(clips: Clip[], start: number, duration: number, excludeId: string, layer: number): boolean {
+  return clips.some(
+    (c) => c.id !== excludeId && (c.layer ?? 1) === layer && c.type !== "narration" &&
+      start < c.startTime + c.duration && start + duration > c.startTime
+  );
+}
+
+function freeLayerAtTime(clips: Clip[], start: number, duration: number, excludeId: string, preferLayer: number): number {
+  for (let l = preferLayer; l < N_LAYERS; l++) {
+    if (!layerOverlap(clips, start, duration, excludeId, l)) return l;
+  }
+  for (let l = 0; l < preferLayer; l++) {
+    if (!layerOverlap(clips, start, duration, excludeId, l)) return l;
+  }
+  return preferLayer;
+}
+
+function endOfLayer(clips: Clip[], layer: number, excludeId: string): number {
+  return clips
+    .filter((c) => c.id !== excludeId && (c.layer ?? 1) === layer && c.type !== "narration")
+    .reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
 }
 
 function findFreeBoardPos(
@@ -428,7 +457,8 @@ export default function Board2Page() {
   const [isSpaceDown, setIsSpaceDown] = useState(false);
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number; clipId?: string } | null>(null);
+  const [clipboardReady, setClipboardReady] = useState(false);
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -516,6 +546,7 @@ export default function Board2Page() {
   const editingAnnotationTextRef = useRef("");
   const editingTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const annotationEmojiRef = useRef("🎯");
+  const clipboardRef = useRef<Clip | null>(null);
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micChunksRef = useRef<Blob[]>([]);
@@ -647,7 +678,8 @@ export default function Board2Page() {
     ctx.fillRect(0, 0, W, H);
     const cam = interpolateCameraKeyframes(currentCameraKeyframes, time);
     const sf = cam.boardZoom * W / BOARD_W;
-    for (const clip of currentClips) {
+    const sortedClips = [...currentClips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
+    for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
       const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
       const sx = (bx + bw / 2 - cam.cameraX) * sf + W / 2;
@@ -744,7 +776,7 @@ export default function Board2Page() {
           .then((buffer) => {
             if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
             const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = 1;
+            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
             gainNode.connect(audioCtxCapture.destination);
             const bufNode = audioCtxCapture.createBufferSource();
             bufNode.buffer = buffer;
@@ -792,7 +824,7 @@ export default function Board2Page() {
           .then((buffer) => {
             if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
             const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = 1;
+            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
             gainNode.connect(audioCtxCapture.destination);
             const bufNode = audioCtxCapture.createBufferSource();
             bufNode.buffer = buffer;
@@ -900,12 +932,13 @@ export default function Board2Page() {
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
     setClips((prev) => {
       const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+      const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
       const pos = findFreeBoardPos(prev, w, h, camX, camY);
       return [
         ...prev,
         {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
-          startTime: endTime, duration: clipDuration,
+          startTime: endTime, duration: clipDuration, layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
         },
@@ -936,10 +969,37 @@ export default function Board2Page() {
   function addPanClip(atTime?: number) {
     const id = generateId();
     const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    const clip: Clip = { id, type: "pan", name: "Pan", sourceUrl: "", startTime, duration: 5, holdFraction: 0.5 };
+    const clip: Clip = { id, type: "pan", name: "Pan", sourceUrl: "", startTime, duration: 5, holdFraction: 0.5, layer: 1 };
     setClips((prev) => [...prev, clip]);
     setSelectedClipId(id);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function copyClip(clipId: string) {
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (!clip) return;
+    clipboardRef.current = { ...clip };
+    setClipboardReady(true);
+  }
+
+  function pasteClip() {
+    const src = clipboardRef.current;
+    if (!src) return;
+    const startTime = playheadRef.current;
+    const layer = freeLayerAtTime(clipsRef.current, startTime, src.duration, "", src.layer ?? 1);
+    const newClip: Clip = { ...src, id: generateId(), startTime, layer };
+    setClips((prev) => [...prev, newClip]);
+    setSelectedClipId(newClip.id);
+  }
+
+  function duplicateClip(clipId: string) {
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (!clip) return;
+    const startTime = clip.startTime + clip.duration;
+    const layer = freeLayerAtTime(clipsRef.current, startTime, clip.duration, "", clip.layer ?? 1);
+    const newClip: Clip = { ...clip, id: generateId(), startTime, layer };
+    setClips((prev) => [...prev, newClip]);
+    setSelectedClipId(newClip.id);
   }
 
   // ─ Narration audio helpers ────────────────────────────────────────────────
@@ -1135,10 +1195,11 @@ export default function Board2Page() {
       const { camX, camY } = getVisibleBoardCenter();
       setClips((prev) => {
         const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+        const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
         const pos = findFreeBoardPos(prev, meta.w, meta.h, camX, camY);
         return [...prev, {
           id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
-          startTime: endTime, duration: clipDuration,
+          startTime: endTime, duration: clipDuration, layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
           sourceDurationSec: meta.sourceDurationSec,
         }];
@@ -1472,9 +1533,11 @@ export default function Board2Page() {
     const rect = scrollerRef.current!.getBoundingClientRect();
     const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
     const cursorOffsetSec = kind === "move" ? clickTimeSec - clip.startTime : 0;
+    const origLayer = clip.layer ?? 1;
     timelineDragRef.current = {
       kind, clipId: clip.id,
       origStartTime: clip.startTime, origDuration: clip.duration,
+      origLayer,
       cursorOffsetSec,
     };
     const onMove = (ev: PointerEvent) => {
@@ -1491,20 +1554,49 @@ export default function Board2Page() {
             const { snapped: snL, target: tL } = magneticSnap(rawStart, snapTargets, threshold);
             const { snapped: snR, target: tR } = magneticSnap(rawStart + drag.origDuration, snapTargets, threshold);
             const newStart = tL !== null ? Math.max(0, snL) : tR !== null ? Math.max(0, snR - drag.origDuration) : rawStart;
+            // For non-narration clips: compute target layer from vertical cursor position
+            if (c.type !== "narration") {
+              const newLayer = clamp(Math.floor((ev.clientY - rect.top) / LAYER_H), 0, N_LAYERS - 1);
+              if (!layerOverlap(prev, newStart, drag.origDuration, drag.clipId, newLayer)) {
+                return { ...c, startTime: newStart, layer: newLayer };
+              }
+              // Try same layer if target layer is blocked
+              const curLayer = c.layer ?? 1;
+              if (!layerOverlap(prev, newStart, drag.origDuration, drag.clipId, curLayer)) {
+                return { ...c, startTime: newStart };
+              }
+              return c; // reject — both positions overlap
+            }
             return { ...c, startTime: newStart };
           }
           if (drag.kind === "resize-right") {
             const rawEnd = Math.max(drag.origStartTime + 0.1, cursorSec);
             const { snapped, target } = magneticSnap(rawEnd, snapTargets, threshold);
-            const newEnd = target !== null ? Math.max(drag.origStartTime + 0.1, snapped) : rawEnd;
-            return { ...c, duration: newEnd - drag.origStartTime };
+            let newEnd = target !== null ? Math.max(drag.origStartTime + 0.1, snapped) : rawEnd;
+            // Clamp to not overlap next clip in same layer
+            if (c.type !== "narration") {
+              const layer = c.layer ?? 1;
+              const nextInLayer = clipsRef.current
+                .filter((cc) => cc.id !== drag.clipId && (cc.layer ?? 1) === layer && cc.type !== "narration" && cc.startTime >= drag.origStartTime)
+                .sort((a, b) => a.startTime - b.startTime)[0];
+              if (nextInLayer) newEnd = Math.min(newEnd, nextInLayer.startTime);
+            }
+            return { ...c, duration: Math.max(0.1, newEnd - drag.origStartTime) };
           }
           // resize-left
           const rawStart = clamp(cursorSec, 0, drag.origStartTime + drag.origDuration - 0.1);
           const { snapped, target } = magneticSnap(rawStart, snapTargets, threshold);
-          const newStart = target !== null
+          let newStart = target !== null
             ? clamp(snapped, 0, drag.origStartTime + drag.origDuration - 0.1)
             : rawStart;
+          // Clamp to not overlap previous clip in same layer
+          if (c.type !== "narration") {
+            const layer = c.layer ?? 1;
+            const prevInLayer = clipsRef.current
+              .filter((cc) => cc.id !== drag.clipId && (cc.layer ?? 1) === layer && cc.type !== "narration" && cc.startTime < drag.origStartTime + drag.origDuration)
+              .sort((a, b) => b.startTime - a.startTime)[0];
+            if (prevInLayer) newStart = Math.max(newStart, prevInLayer.startTime + prevInLayer.duration);
+          }
           return {
             ...c,
             startTime: newStart,
@@ -1548,18 +1640,24 @@ export default function Board2Page() {
     const item = mediaLibrary.find((m) => m.id === itemId);
     if (!item) return;
     const rect = e.currentTarget.getBoundingClientRect();
-    const startTime = Math.max(0, (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current);
+    const rawStart = Math.max(0, (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current);
+    const dropLayer = clamp(Math.floor((e.clientY - rect.top) / LAYER_H), 0, N_LAYERS - 1);
+    const duration = item.duration ?? (item.type === "video" ? 5 : 4);
+    const clipId = generateId();
     loadMedia(item.url, item.type);
     const { w, h } = getMediaDimensions(item.url, item.type);
     const { camX, camY } = getVisibleBoardCenter();
-    const clipId = generateId();
     setClips((prev) => {
       const pos = findFreeBoardPos(prev, w, h, camX, camY);
+      // Place in drop layer if no overlap; otherwise at end of that layer
+      const startTime = layerOverlap(prev, rawStart, duration, clipId, dropLayer)
+        ? endOfLayer(prev, dropLayer, clipId)
+        : rawStart;
       return [
         ...prev,
         {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
-          startTime, duration: item.duration ?? (item.type === "video" ? 5 : 4),
+          startTime, duration, layer: dropLayer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
         },
@@ -1989,9 +2087,12 @@ export default function Board2Page() {
     if (exportAudioCtx && exportAudioDest && audioBuffers.length > 0) {
       const exportStartAcTime = exportAudioCtx.currentTime;
       for (const { clip, buffer } of audioBuffers) {
+        const gainNode = exportAudioCtx.createGain();
+        gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
+        gainNode.connect(exportAudioDest);
         const bufNode = exportAudioCtx.createBufferSource();
         bufNode.buffer = buffer;
-        bufNode.connect(exportAudioDest);
+        bufNode.connect(gainNode);
         bufNode.start(exportStartAcTime + clip.startTime);
       }
     }
@@ -2043,16 +2144,34 @@ export default function Board2Page() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement).tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA";
       if (e.code === "Space") {
-        e.preventDefault();
         isSpaceDownRef.current = true;
         setIsSpaceDown(true);
         if (boardContainerRef.current) boardContainerRef.current.style.cursor = "grab";
+        if (!inInput) {
+          e.preventDefault();
+          if (!e.repeat) togglePlay();
+        }
+        return;
       }
+      if (inInput) return;
       if (e.code === "Delete" || e.code === "Backspace") {
         if (selectedClipId) deleteClip(selectedClipId);
         else if (selectedAnnotationId) deleteAnnotation(selectedAnnotationId);
+      }
+      const meta = e.metaKey || e.ctrlKey;
+      if (meta && e.code === "KeyC" && selectedClipId) {
+        e.preventDefault();
+        copyClip(selectedClipId);
+      }
+      if (meta && e.code === "KeyV" && clipboardRef.current) {
+        e.preventDefault();
+        pasteClip();
+      }
+      if (meta && e.code === "KeyD" && selectedClipId) {
+        e.preventDefault();
+        duplicateClip(selectedClipId);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -2838,6 +2957,33 @@ export default function Board2Page() {
                   </div>
                 )}
 
+                {(selectedClip.type === "video" || selectedClip.type === "narration") && (
+                  <div>
+                    <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Volume</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        type="range"
+                        min={0} max={1} step={0.01}
+                        value={selectedClip.muted ? 0 : (selectedClip.volume ?? 1)}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, volume: v, muted: false } : c));
+                        }}
+                        style={{ flex: 1, accentColor: "#c8f135" }}
+                      />
+                      <button
+                        onClick={() => setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, muted: !c.muted } : c))}
+                        style={{ ...miniButton, background: selectedClip.muted ? "#ff5e3a" : "transparent", color: selectedClip.muted ? "#fff" : "#2a2a2a", padding: "2px 6px" }}
+                      >
+                        {selectedClip.muted ? "🔇" : "🔊"}
+                      </button>
+                    </div>
+                    <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
+                      {selectedClip.muted ? "Muted" : `${Math.round((selectedClip.volume ?? 1) * 100)}%`}
+                    </div>
+                  </div>
+                )}
+
                 <div style={{ marginTop: "auto" }}>
                   <button
                     onClick={() => deleteClip(selectedClip.id)}
@@ -2872,7 +3018,7 @@ export default function Board2Page() {
               <button onClick={() => { const n = clamp(pxPerSec / 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>−</button>
               <button onClick={() => { const n = clamp(pxPerSec * 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>+</button>
             </div>
-            <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>cmd+scroll=zoom · space+drag=pan board · ⌫=delete clip</span>
+            <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>space=play · ⌘C/V/D=copy/paste/dup · ⌫=delete · drag vertically=change layer</span>
             <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
               {isExporting && (
                 <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>{Math.round(exportProgress * 100)}%</span>
@@ -2908,7 +3054,7 @@ export default function Board2Page() {
             <div style={{ position: "absolute", left: playhead * pxPerSec - timelineScroll, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none" }} />
           </div>
 
-          {/* Track — two rows: visual clips above, narration audio below */}
+          {/* Track — 5 visual layers above, narration audio row below */}
           <div
             ref={scrollerRef}
             style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
@@ -2929,20 +3075,28 @@ export default function Board2Page() {
             onDragOver={(e) => e.preventDefault()}
             onDrop={handleTimelineDrop}
             onContextMenu={(e) => {
-              if ((e.target as HTMLElement).closest("[data-clipblock]")) return;
               e.preventDefault();
               const rect = scrollerRef.current!.getBoundingClientRect();
               const timeSec = Math.max(0, (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current);
-              setContextMenu({ x: e.clientX, y: e.clientY, timeSec });
+              const clipEl = (e.target as HTMLElement).closest("[data-clipblock]") as HTMLElement | null;
+              const clipId = clipEl?.dataset.clipid;
+              setContextMenu({ x: e.clientX, y: e.clientY, timeSec, clipId });
             }}
           >
             <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + 8 }}>
-              {/* Visual row background */}
-              <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: TRACK_H, background: "rgba(100,130,180,0.05)", borderTop: "1px solid rgba(42,42,42,0.08)" }} />
+              {/* Layer row backgrounds (L0–L4) */}
+              {Array.from({ length: N_LAYERS }, (_, i) => (
+                <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * LAYER_H, height: LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.08)", borderTop: i === 0 ? "1px solid rgba(42,42,42,0.08)" : "1px solid rgba(42,42,42,0.05)" }} />
+              ))}
+              {/* Layer labels L0–L4 (track scroll position) */}
+              {Array.from({ length: N_LAYERS }, (_, i) => (
+                <div key={i} style={{ position: "absolute", left: timelineScroll + 2, top: i * LAYER_H + 1, pointerEvents: "none", zIndex: 15 }}>
+                  <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.3)", letterSpacing: 0.5 }}>L{i}</span>
+                </div>
+              ))}
               {/* Narration row background */}
               <div style={{ position: "absolute", left: 0, right: 0, top: TRACK_H + 4, height: NARRATION_TRACK_H, background: "rgba(255,150,200,0.05)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
-
-              {/* Row label for narration row (tracks scroll position) */}
+              {/* Row label for narration row */}
               <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + 6, pointerEvents: "none", zIndex: 15 }}>
                 <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(180,80,130,0.5)", letterSpacing: 0.5, textTransform: "uppercase" }}>audio</span>
               </div>
@@ -2959,16 +3113,18 @@ export default function Board2Page() {
                 const holdColor = shadeColor(color, 0.82);
                 const transColor = shadeColor(color, 1.18);
                 const dividerLeft = HANDLE_W + holdW;
+                const clipLayer = clip.layer ?? 1;
                 return (
                   <div
                     key={clip.id}
                     data-clipblock
+                    data-clipid={clip.id}
                     style={{
                       position: "absolute",
                       left: clip.startTime * pxPerSec,
-                      top: 4,
+                      top: clipLayer * LAYER_H + 2,
                       width: clipPx,
-                      height: TRACK_H - 8,
+                      height: LAYER_H - 4,
                       border: selected ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.35)",
                       boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
                       cursor: "grab",
@@ -3021,6 +3177,7 @@ export default function Board2Page() {
                   <div
                     key={clip.id}
                     data-clipblock
+                    data-clipid={clip.id}
                     style={{
                       position: "absolute",
                       left: clip.startTime * pxPerSec,
@@ -3076,17 +3233,58 @@ export default function Board2Page() {
       {/* Timeline context menu */}
       {contextMenu && (
         <div
-          style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 9998, background: "#fffdf5", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", minWidth: 130 }}
+          style={{ position: "fixed", left: contextMenu.x, top: contextMenu.y, zIndex: 9998, background: "#fffdf5", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", minWidth: 140 }}
           onClick={(e) => e.stopPropagation()}
         >
-          <div
-            onClick={() => { addPanClip(contextMenu.timeSec); setContextMenu(null); }}
-            style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = PAN_CLIP_COLOR)}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-          >
-            ⟷ Add pan here
-          </div>
+          {contextMenu.clipId ? (
+            // Clip right-click menu
+            <>
+              <div onClick={() => { copyClip(contextMenu.clipId!); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.08)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#c8f135")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ⌘C Copy
+              </div>
+              <div onClick={() => { duplicateClip(contextMenu.clipId!); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.08)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#c8f135")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ⌘D Duplicate
+              </div>
+              {clipboardReady && (
+                <div onClick={() => { pasteClip(); setContextMenu(null); }}
+                  style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.08)" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "#c8f135")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                  ⌘V Paste
+                </div>
+              )}
+              <div onClick={() => { deleteClip(contextMenu.clipId!); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, color: "#ff5e3a" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#ffe5e5")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ✕ Delete
+              </div>
+            </>
+          ) : (
+            // Empty timeline right-click menu
+            <>
+              <div onClick={() => { addPanClip(contextMenu.timeSec); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = PAN_CLIP_COLOR)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ⟷ Add pan here
+              </div>
+              {clipboardReady && (
+                <div onClick={() => { pasteClip(); setContextMenu(null); }}
+                  style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11 }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "#c8f135")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                  ⌘V Paste here
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
 
