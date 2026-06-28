@@ -28,17 +28,21 @@ ANNOTATION TYPES AND HOW TO USE THEM:
 - "arrow": Connects or points to elements. Use arrowStartX/Y and arrowEndX/Y for endpoints. Set boardX=min(startX,endX), boardY=min(startY,endY), boardW=|endX-startX|+10, boardH=|endY-startY|+10.
 - "circle": Circles an image or region. boardX/Y = top-left of the bounding ellipse, boardW/H = ellipse dimensions (add ~60px padding around the clip on each side).
 - "highlight": Highlights a rectangular region. highlightStyle "rect" (translucent fill), "underline" (line under), "curlyBrace" (right-side brace).
+- "emoji": A single large emoji placed on the board for visual emphasis. Use SPARINGLY — at most 1–2 per board. Best for flagging a single key insight or emotional beat.
+  - boardX/Y = top-left of the emoji bounding box. boardW/H = 200 (the emoji renders centered in this box). fontSize = 160–200.
+  - emoji field: choose from this set only: 🤔 ⭐ 🎯 ❗ 💡 🔥 ✨ 📈 📉 ⚠️ ❓ 💬 👀 🚀 ❤️ ✅ ❌ 🌍 🧠 🎨 🏆 💎 🔑 📌 🎬 📊 💰 🔍 🤝 🌟 💥 🎤 📣 🌈 ⏰ 🎁
 
 ANNOTATION STRATEGY:
 1. Analyze the narration for: key claims, named entities, statistics, comparisons, emphasis.
-2. Generate 4–10 annotations total — scale to narration length.
-3. Use ALL four types — not just text. A good board has 1–2 bold title texts, 2–3 arrows connecting related clips, 1–2 circles around important clips, and 0–1 highlights.
+2. Generate 5–10 annotations total — scale to narration length.
+3. Use a MIX of types. A good board has 1–2 bold title texts, 2–3 arrows connecting related clips, 1–2 circles around important clips, 0–1 highlights, and optionally 0–2 emojis for the single most striking idea.
 4. Dramatic titles (Permanent Marker, 100–140px, red or orange) for the board's main theme.
 5. Smaller Caveat/Architects Daughter labels for individual clips.
 6. Arrows should connect clips whose topics are mentioned together in the narration.
 7. Circles should surround the 1–2 clips most central to the narration.
 8. Place labels slightly above or beside images — avoid fully covering them.
 9. Spread annotations across the board; don't cluster everything in one corner.
+10. Only use emojis when they add clear visual meaning — a 💡 near a key insight, 🔥 near something exciting, ⚠️ near a risk. Do NOT emoji-spam.
 
 AVAILABLE COLORS: "#cc2200" (red), "#1a6fd4" (blue), "#e8a800" (gold), "#228b22" (green), "#e06020" (orange), "#1a1a1a" (black)
 
@@ -49,7 +53,7 @@ OUTPUT: Return ONLY valid JSON with this exact schema — no markdown, no explan
   "reasoning": "1–2 sentence explanation of the visual strategy",
   "annotations": [
     {
-      "type": "text" | "arrow" | "circle" | "highlight",
+      "type": "text" | "arrow" | "circle" | "highlight" | "emoji",
       "boardX": number,
       "boardY": number,
       "boardW": number,
@@ -63,7 +67,8 @@ OUTPUT: Return ONLY valid JSON with this exact schema — no markdown, no explan
       "arrowStartY": number,
       "arrowEndX": number,
       "arrowEndY": number,
-      "highlightStyle": "rect" | "underline" | "curlyBrace"
+      "highlightStyle": "rect" | "underline" | "curlyBrace",
+      "emoji": "single emoji character (emoji type only)"
     }
   ]
 }`;

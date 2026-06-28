@@ -35,7 +35,7 @@ type Clip = {
 
 type Annotation = {
   id: string;
-  type: "text" | "arrow" | "circle" | "highlight";
+  type: "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
   boardX: number;
   boardY: number;
   boardW: number;
@@ -51,9 +51,11 @@ type Annotation = {
   arrowEndX?: number;
   arrowEndY?: number;
   highlightStyle?: "rect" | "underline" | "curlyBrace";
+  points?: Array<{ x: number; y: number }>;  // pen
+  emoji?: string;                              // emoji
 };
 
-type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight";
+type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
 
 type MediaItem = {
   id: string;
@@ -101,6 +103,7 @@ const NARRATION_TRACK_H = 44;
 const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
+const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁"];
 const MAGNETIC_SNAP_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
@@ -376,6 +379,27 @@ function drawAnnotationsToCanvas(
       } else {
         drawCurlyBrace(ctx, sx + bw, sy, sy + bh, ann.color, sw);
       }
+    } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(toSX(ann.points[0].x), toSY(ann.points[0].y));
+      for (let i = 1; i < ann.points.length; i++) {
+        ctx.lineTo(toSX(ann.points[i].x), toSY(ann.points[i].y));
+      }
+      ctx.strokeStyle = ann.color;
+      ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.stroke();
+      ctx.restore();
+    } else if (ann.type === "emoji" && ann.emoji) {
+      const fs = Math.max(8, (ann.fontSize ?? 120) * sf);
+      ctx.save();
+      ctx.font = `${fs}px serif`;
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "center";
+      ctx.fillText(ann.emoji, toSX(ann.boardX + ann.boardW / 2), toSY(ann.boardY + ann.boardH / 2));
+      ctx.restore();
     }
   }
 }
@@ -415,6 +439,10 @@ export default function Board2Page() {
   const [annotationHighlightStyle, setAnnotationHighlightStyle] = useState<"rect" | "underline" | "curlyBrace">("rect");
   const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
   const [editingAnnotationText, setEditingAnnotationText] = useState("");
+  const [annotationToolbarOpen, setAnnotationToolbarOpen] = useState(false);
+  const [annotationEmoji, setAnnotationEmoji] = useState("🎯");
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
+  const [penPreviewPoints, setPenPreviewPoints] = useState<Array<{ x: number; y: number }> | null>(null);
 
   // ── AI annotation generation ──
   const [aiModalOpen, setAiModalOpen] = useState(false);
@@ -486,6 +514,7 @@ export default function Board2Page() {
   const annotationFontRef = useRef("Caveat");
   const annotationHighlightStyleRef = useRef<"rect" | "underline" | "curlyBrace">("rect");
   const editingAnnotationTextRef = useRef("");
+  const annotationEmojiRef = useRef("🎯");
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micChunksRef = useRef<Blob[]>([]);
@@ -510,6 +539,7 @@ export default function Board2Page() {
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
   useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
   useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
+  useEffect(() => { annotationEmojiRef.current = annotationEmoji; }, [annotationEmoji]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
 
   useEffect(() => {
@@ -1225,6 +1255,7 @@ export default function Board2Page() {
     setSelectedClipId(null);
     const startX = e.clientX, startY = e.clientY;
     const { boardX: origX, boardY: origY, arrowStartX: origASX, arrowStartY: origASY, arrowEndX: origAEX, arrowEndY: origAEY } = ann;
+    const origPoints = ann.points ? ann.points.map((p) => ({ ...p })) : undefined;
     const onMove = (ev: PointerEvent) => {
       const zoom = boardZoomRef.current;
       const dx = (ev.clientX - startX) / zoom;
@@ -1240,9 +1271,75 @@ export default function Board2Page() {
               arrowStartX: origASX + dx, arrowStartY: origASY! + dy,
               arrowEndX: origAEX! + dx, arrowEndY: origAEY! + dy,
             } : {}),
+            ...(origPoints ? { points: origPoints.map((p) => ({ x: p.x + dx, y: p.y + dy })) } : {}),
           };
         })
       );
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Annotation resize ─────────────────────────────────────────────────────
+
+  function handleAnnotationCornerResize(e: React.PointerEvent, ann: Annotation, corner: "nw" | "ne" | "sw" | "se") {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const { boardX: origX, boardY: origY, boardW: origW, boardH: origH } = ann;
+    const origPoints = ann.points ? ann.points.map((p) => ({ ...p })) : undefined;
+    const origFontSize = ann.fontSize ?? 120;
+    const startClientX = e.clientX, startClientY = e.clientY;
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      const dx = (ev.clientX - startClientX) / zoom;
+      const dy = (ev.clientY - startClientY) / zoom;
+      let newX = origX, newY = origY, newW = origW, newH = origH;
+      if (corner === "se") { newW = Math.max(20, origW + dx); newH = Math.max(20, origH + dy); }
+      else if (corner === "sw") { newW = Math.max(20, origW - dx); newH = Math.max(20, origH + dy); newX = origX + origW - newW; }
+      else if (corner === "ne") { newW = Math.max(20, origW + dx); newH = Math.max(20, origH - dy); newY = origY + origH - newH; }
+      else { newW = Math.max(20, origW - dx); newH = Math.max(20, origH - dy); newX = origX + origW - newW; newY = origY + origH - newH; }
+      setAnnotations((prev) => prev.map((a) => {
+        if (a.id !== ann.id) return a;
+        if (a.type === "pen" && origPoints && origW > 0 && origH > 0) {
+          const scaleX = newW / origW, scaleY = newH / origH;
+          return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH,
+            points: origPoints.map((p) => ({ x: newX + (p.x - origX) * scaleX, y: newY + (p.y - origY) * scaleY })) };
+        }
+        if (a.type === "emoji") {
+          const newFontSize = Math.max(20, origFontSize * (newW / origW));
+          return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH, fontSize: newFontSize };
+        }
+        return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH };
+      }));
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function handleArrowEndpointDrag(e: React.PointerEvent, ann: Annotation, which: "start" | "end") {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const origSX = ann.arrowStartX!, origSY = ann.arrowStartY!;
+    const origEX = ann.arrowEndX!, origEY = ann.arrowEndY!;
+    const startClientX = e.clientX, startClientY = e.clientY;
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      const dx = (ev.clientX - startClientX) / zoom;
+      const dy = (ev.clientY - startClientY) / zoom;
+      const newSX = which === "start" ? origSX + dx : origSX;
+      const newSY = which === "start" ? origSY + dy : origSY;
+      const newEX = which === "end" ? origEX + dx : origEX;
+      const newEY = which === "end" ? origEY + dy : origEY;
+      const minX = Math.min(newSX, newEX), maxX = Math.max(newSX, newEX);
+      const minY = Math.min(newSY, newEY), maxY = Math.max(newSY, newEY);
+      setAnnotations((prev) => prev.map((a) => a.id !== ann.id ? a : {
+        ...a, arrowStartX: newSX, arrowStartY: newSY, arrowEndX: newEX, arrowEndY: newEY,
+        boardX: minX, boardY: minY, boardW: Math.max(1, maxX - minX), boardH: Math.max(1, maxY - minY),
+      }));
     };
     const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
@@ -1270,6 +1367,52 @@ export default function Board2Page() {
       setSelectedAnnotationId(newAnn.id);
       setEditingAnnotationId(newAnn.id);
       setEditingAnnotationText("");
+      return;
+    }
+
+    if (tool === "emoji") {
+      const sz = 120;
+      const newAnn: Annotation = {
+        id: generateId(), type: "emoji",
+        boardX: bx - sz / 2, boardY: by - sz / 2, boardW: sz, boardH: sz,
+        color: "#000", emoji: annotationEmojiRef.current, fontSize: sz,
+      };
+      setAnnotations((prev) => [...prev, newAnn]);
+      setSelectedAnnotationId(newAnn.id);
+      return;
+    }
+
+    if (tool === "pen") {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      const pts: Array<{ x: number; y: number }> = [{ x: bx, y: by }];
+      let lastSampleMs = performance.now();
+      const onMove = (ev: PointerEvent) => {
+        const now = performance.now();
+        if (now - lastSampleMs < 10) return;
+        lastSampleMs = now;
+        const r = container.getBoundingClientRect();
+        const px = (ev.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
+        const py = (ev.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
+        pts.push({ x: px, y: py });
+        setPenPreviewPoints([...pts]);
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        setPenPreviewPoints(null);
+        if (pts.length < 2) return;
+        const minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
+        const minY = Math.min(...pts.map((p) => p.y)), maxY = Math.max(...pts.map((p) => p.y));
+        const id = generateId();
+        setAnnotations((prev) => [...prev, {
+          id, type: "pen", color: annotationColorRef.current, strokeWidth: 4,
+          boardX: minX, boardY: minY, boardW: Math.max(1, maxX - minX), boardH: Math.max(1, maxY - minY),
+          points: pts,
+        }]);
+        setSelectedAnnotationId(id);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
       return;
     }
 
@@ -1679,7 +1822,7 @@ export default function Board2Page() {
     const d = await r.json();
     if (!r.ok) { setAiError(d.error || "Failed to generate annotations"); setAiPhase(null); return false; }
     const raw: Partial<Annotation>[] = Array.isArray(d.annotations) ? d.annotations : [];
-    const validTypes = new Set(["text", "arrow", "circle", "highlight"]);
+    const validTypes = new Set(["text", "arrow", "circle", "highlight", "emoji"]);
     const newAnnotations: Annotation[] = raw
       .filter((a) => a.type && validTypes.has(a.type))
       .map((a) => ({
@@ -1699,6 +1842,7 @@ export default function Board2Page() {
         ...(a.arrowEndX != null ? { arrowEndX: clamp(Number(a.arrowEndX), 0, BOARD_W) } : {}),
         ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, BOARD_H) } : {}),
         ...(a.highlightStyle != null ? { highlightStyle: a.highlightStyle } : {}),
+        ...(a.emoji != null ? { emoji: String(a.emoji) } : {}),
       }));
     setAnnotations((prev) => [...prev, ...newAnnotations]);
     setToast(`Generated ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`);
@@ -2224,15 +2368,37 @@ export default function Board2Page() {
                       // curlyBrace
                       const cx = bx + bw, mid = by + bh / 2, q = Math.min(20, bh * 0.15);
                       return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
+                    } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
+                      const d = ann.points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * boardZoom} ${p.y * boardZoom}`).join(" ");
+                      return <path key={ann.id} d={d} fill="none" stroke={ann.color} strokeWidth={(ann.strokeWidth ?? 4) * boardZoom} strokeLinecap="round" strokeLinejoin="round" />;
+                    } else if (ann.type === "emoji" && ann.emoji) {
+                      return (
+                        <text key={ann.id}
+                          x={(ann.boardX + ann.boardW / 2) * boardZoom}
+                          y={(ann.boardY + ann.boardH / 2) * boardZoom}
+                          fontSize={(ann.fontSize ?? 120) * boardZoom}
+                          textAnchor="middle" dominantBaseline="central"
+                          style={{ userSelect: "none" }}
+                        >{ann.emoji}</text>
+                      );
                     }
                     return null;
                   })}
+                  {/* Live pen preview during drawing */}
+                  {penPreviewPoints && penPreviewPoints.length >= 2 && (
+                    <path
+                      d={penPreviewPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * boardZoom} ${p.y * boardZoom}`).join(" ")}
+                      fill="none" stroke={annotationColor} strokeWidth={4 * boardZoom}
+                      strokeLinecap="round" strokeLinejoin="round" opacity={0.7}
+                    />
+                  )}
                 </svg>
 
-                {/* Annotation DOM overlays (hit targets + text rendering) */}
+                {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
                 {annotations.map((ann) => {
                   const isSel = ann.id === selectedAnnotationId;
                   const isEditing = ann.id === editingAnnotationId;
+                  const showHandles = isSel && annotationTool === "pointer" && !isEditing;
                   return (
                     <div
                       key={ann.id}
@@ -2300,6 +2466,41 @@ export default function Board2Page() {
                           }}
                         />
                       )}
+                      {/* Resize handles */}
+                      {showHandles && (
+                        ann.type === "arrow" && ann.arrowStartX !== undefined ? (
+                          // Arrow: two endpoint handles
+                          (["start", "end"] as const).map((which) => {
+                            const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
+                            const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
+                            return (
+                              <div key={which} style={{
+                                position: "absolute", left: hx - 6, top: hy - 6,
+                                width: 12, height: 12, background: "#ff5e3a",
+                                border: "2px solid #fff", borderRadius: "50%",
+                                cursor: "move", zIndex: 20,
+                              }}
+                              onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
+                            );
+                          })
+                        ) : (
+                          // All other types: four corner handles
+                          (["nw", "ne", "sw", "se"] as const).map((corner) => (
+                            <div key={corner} style={{
+                              position: "absolute",
+                              ...(corner === "nw" ? { left: -5, top: -5 } :
+                                  corner === "ne" ? { right: -5, top: -5 } :
+                                  corner === "sw" ? { left: -5, bottom: -5 } :
+                                                    { right: -5, bottom: -5 }),
+                              width: 10, height: 10, background: "#ff5e3a",
+                              border: "1.5px solid #fff",
+                              cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
+                              zIndex: 20,
+                            }}
+                            onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
+                          ))
+                        )
+                      )}
                     </div>
                   );
                 })}
@@ -2307,7 +2508,7 @@ export default function Board2Page() {
                 {/* Glass pane — captures all pointer events for annotation drawing */}
                 {annotationTool !== "pointer" && !isSpaceDown && (
                   <div
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : "crosshair" }}
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair" }}
                     onPointerDown={handleAnnotationGlassPointerDown}
                   />
                 )}
@@ -2327,99 +2528,158 @@ export default function Board2Page() {
                 {BOARD_W}×{BOARD_H} · {Math.round(boardZoom * 100)}% · space+drag=pan · scroll=zoom
               </div>
 
-              {/* Annotation toolbar — Pro gated, floating at top-center */}
-              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30 }}>
+              {/* Annotation toolbar — collapsible, Pro gated */}
+              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
                 <ProGated featureName="Annotation tools">
-                  <div style={{
-                    display: "flex", alignItems: "center", gap: 2,
-                    background: "#fffdf5",
-                    border: "1.5px solid #2a2a2a",
-                    boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
-                    padding: "4px 8px",
-                    whiteSpace: "nowrap",
-                  }}>
-                    {/* Tool buttons */}
-                    {([
-                      { id: "pointer" as AnnotationTool, icon: "↖", title: "Select / move" },
-                      { id: "text"    as AnnotationTool, icon: "T",  title: "Text" },
-                      { id: "arrow"   as AnnotationTool, icon: "↗",  title: "Arrow" },
-                      { id: "circle"  as AnnotationTool, icon: "○",  title: "Circle / ellipse" },
-                      { id: "highlight" as AnnotationTool, icon: "▭", title: "Highlight" },
-                    ]).map(({ id, icon, title }) => (
-                      <button
-                        key={id}
-                        title={title}
-                        onClick={(e) => { e.stopPropagation(); setAnnotationTool(id); }}
-                        style={{
-                          width: 28, height: 28, border: "none", padding: 0,
-                          outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
-                          background: annotationTool === id ? "#2a2a2a" : "transparent",
-                          color: annotationTool === id ? "#fff" : "#2a2a2a",
-                          cursor: "pointer", fontFamily: "monospace",
-                          fontSize: id === "text" ? 13 : 15, fontWeight: 700,
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                        }}
-                      >
-                        {icon}
-                      </button>
-                    ))}
-
-                    <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-
-                    {/* Color swatches */}
-                    {(["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"]).map((c) => (
-                      <button
-                        key={c}
-                        title={c}
-                        onClick={(e) => { e.stopPropagation(); setAnnotationColor(c); }}
-                        style={{
-                          width: 18, height: 18, padding: 0,
-                          background: c,
-                          border: annotationColor === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)",
-                          cursor: "pointer", flexShrink: 0,
-                        }}
-                      />
-                    ))}
-
-                    {/* Font picker — text tool only */}
-                    {annotationTool === "text" && (
-                      <>
-                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-                        <select
-                          value={annotationFont}
-                          onChange={(e) => { e.stopPropagation(); setAnnotationFont(e.target.value); }}
-                          style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
-                        >
-                          <option value="Caveat">Caveat</option>
-                          <option value="Permanent Marker">Permanent Marker</option>
-                          <option value="Architects Daughter">Architects Daughter</option>
-                          <option value="Patrick Hand">Patrick Hand</option>
-                        </select>
-                      </>
-                    )}
-
-                    {/* Highlight sub-type — highlight tool only */}
-                    {annotationTool === "highlight" && (
-                      <>
-                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-                        {(["rect", "underline", "curlyBrace"] as const).map((s) => (
+                  <>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setAnnotationToolbarOpen((v) => !v); }}
+                      style={{
+                        fontFamily: "monospace", fontSize: 10, fontWeight: 700,
+                        padding: "5px 12px", border: "1.5px solid #2a2a2a",
+                        background: annotationToolbarOpen ? "#2a2a2a" : "#fffdf5",
+                        color: annotationToolbarOpen ? "#c8f135" : "#2a2a2a",
+                        cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      🎨 Annotations {annotationToolbarOpen ? "▲" : "▼"}
+                    </button>
+                    {annotationToolbarOpen && (
+                      <div style={{
+                        display: "flex", alignItems: "center", gap: 2,
+                        background: "#fffdf5",
+                        border: "1.5px solid #2a2a2a",
+                        boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
+                        padding: "4px 8px",
+                        whiteSpace: "nowrap",
+                        position: "relative",
+                      }}>
+                        {/* Tool buttons */}
+                        {([
+                          { id: "pointer"   as AnnotationTool, icon: "↖", title: "Select / move" },
+                          { id: "text"      as AnnotationTool, icon: "T",  title: "Text" },
+                          { id: "arrow"     as AnnotationTool, icon: "↗",  title: "Arrow" },
+                          { id: "circle"    as AnnotationTool, icon: "○",  title: "Circle / ellipse" },
+                          { id: "highlight" as AnnotationTool, icon: "▭",  title: "Highlight" },
+                          { id: "pen"       as AnnotationTool, icon: "✏",  title: "Freehand pen" },
+                          { id: "emoji"     as AnnotationTool, icon: "😀", title: "Emoji" },
+                        ]).map(({ id, icon, title }) => (
                           <button
-                            key={s}
-                            onClick={(e) => { e.stopPropagation(); setAnnotationHighlightStyle(s); }}
+                            key={id}
+                            title={title}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAnnotationTool(id);
+                              if (id === "emoji") setEmojiPickerOpen((v) => !v);
+                              else setEmojiPickerOpen(false);
+                            }}
                             style={{
-                              padding: "2px 5px", fontSize: 9, fontFamily: "monospace",
-                              border: annotationHighlightStyle === s ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.3)",
-                              background: annotationHighlightStyle === s ? "#2a2a2a" : "transparent",
-                              color: annotationHighlightStyle === s ? "#fff" : "#2a2a2a",
-                              cursor: "pointer",
+                              width: 28, height: 28, border: "none", padding: 0,
+                              outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
+                              background: annotationTool === id ? "#2a2a2a" : "transparent",
+                              color: annotationTool === id ? "#fff" : "#2a2a2a",
+                              cursor: "pointer", fontFamily: "monospace",
+                              fontSize: id === "text" ? 13 : 15, fontWeight: 700,
+                              display: "flex", alignItems: "center", justifyContent: "center",
                             }}
                           >
-                            {s === "rect" ? "▭" : s === "underline" ? "_" : "{}"}
+                            {icon}
                           </button>
                         ))}
-                      </>
+
+                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+
+                        {/* Color swatches */}
+                        {(["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"]).map((c) => (
+                          <button
+                            key={c}
+                            title={c}
+                            onClick={(e) => { e.stopPropagation(); setAnnotationColor(c); }}
+                            style={{
+                              width: 18, height: 18, padding: 0,
+                              background: c,
+                              border: annotationColor === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)",
+                              cursor: "pointer", flexShrink: 0,
+                            }}
+                          />
+                        ))}
+
+                        {/* Font picker — text tool only */}
+                        {annotationTool === "text" && (
+                          <>
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+                            <select
+                              value={annotationFont}
+                              onChange={(e) => { e.stopPropagation(); setAnnotationFont(e.target.value); }}
+                              style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
+                            >
+                              <option value="Caveat">Caveat</option>
+                              <option value="Permanent Marker">Permanent Marker</option>
+                              <option value="Architects Daughter">Architects Daughter</option>
+                              <option value="Patrick Hand">Patrick Hand</option>
+                            </select>
+                          </>
+                        )}
+
+                        {/* Highlight sub-type — highlight tool only */}
+                        {annotationTool === "highlight" && (
+                          <>
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+                            {(["rect", "underline", "curlyBrace"] as const).map((s) => (
+                              <button
+                                key={s}
+                                onClick={(e) => { e.stopPropagation(); setAnnotationHighlightStyle(s); }}
+                                style={{
+                                  padding: "2px 5px", fontSize: 9, fontFamily: "monospace",
+                                  border: annotationHighlightStyle === s ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.3)",
+                                  background: annotationHighlightStyle === s ? "#2a2a2a" : "transparent",
+                                  color: annotationHighlightStyle === s ? "#fff" : "#2a2a2a",
+                                  cursor: "pointer",
+                                }}
+                              >
+                                {s === "rect" ? "▭" : s === "underline" ? "_" : "{}"}
+                              </button>
+                            ))}
+                          </>
+                        )}
+
+                        {/* Emoji picker popover */}
+                        {annotationTool === "emoji" && emojiPickerOpen && (
+                          <div style={{
+                            position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
+                            background: "#fffdf5", border: "1.5px solid #2a2a2a",
+                            boxShadow: "3px 3px 0 #2a2a2a", padding: 8, zIndex: 50,
+                            display: "grid", gridTemplateColumns: "repeat(9, 28px)", gap: 2,
+                          }}>
+                            {EMOJI_SET.map((em) => (
+                              <button
+                                key={em}
+                                title={em}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setAnnotationEmoji(em);
+                                  setEmojiPickerOpen(false);
+                                }}
+                                style={{
+                                  width: 28, height: 28, fontSize: 16, border: "none", padding: 0,
+                                  background: annotationEmoji === em ? "#c8f135" : "transparent",
+                                  cursor: "pointer", borderRadius: 2,
+                                }}
+                              >{em}</button>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Selected emoji indicator */}
+                        {annotationTool === "emoji" && (
+                          <span style={{ fontSize: 18, marginLeft: 4, userSelect: "none" }} title="Active emoji">
+                            {annotationEmoji}
+                          </span>
+                        )}
+                      </div>
                     )}
-                  </div>
+                  </>
                 </ProGated>
               </div>
             </div>
@@ -2449,10 +2709,57 @@ export default function Board2Page() {
           <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Properties</div>
 
+            {(() => {
+              const selectedAnnotation = annotations.find((a) => a.id === selectedAnnotationId) ?? null;
+              if (selectedAnnotation) return (
+                <>
+                  <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700 }}>
+                    {selectedAnnotation.type === "text" ? "T Text" : selectedAnnotation.type === "arrow" ? "↗ Arrow" : selectedAnnotation.type === "circle" ? "○ Circle" : selectedAnnotation.type === "highlight" ? "▭ Highlight" : selectedAnnotation.type === "pen" ? "✏ Pen" : `${selectedAnnotation.emoji ?? "😀"} Emoji`}
+                  </div>
+                  {(selectedAnnotation.type === "text" || selectedAnnotation.type === "emoji") && (
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Font size (board px)</div>
+                      <input
+                        type="range"
+                        min={20} max={300} step={1}
+                        value={selectedAnnotation.fontSize ?? (selectedAnnotation.type === "emoji" ? 120 : 80)}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value);
+                          setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, fontSize: v } : a));
+                        }}
+                        style={{ width: "100%", accentColor: "#c8f135" }}
+                      />
+                      <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
+                        {selectedAnnotation.fontSize ?? (selectedAnnotation.type === "emoji" ? 120 : 80)}px
+                      </div>
+                    </div>
+                  )}
+                  <div>
+                    <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Color</div>
+                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                      {["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"].map((c) => (
+                        <button key={c} onClick={() => setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, color: c } : a))}
+                          style={{ width: 20, height: 20, background: c, border: selectedAnnotation.color === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)", cursor: "pointer", padding: 0 }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ marginTop: "auto" }}>
+                    <button onClick={() => deleteAnnotation(selectedAnnotation.id)} style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}>
+                      ✕ Delete annotation
+                    </button>
+                  </div>
+                </>
+              );
+              return null;
+            })()}
+
             {!selectedClip ? (
-              <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: 0 }}>
-                Select a clip to view its properties.
-              </p>
+              !selectedAnnotationId ? (
+                <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: 0 }}>
+                  Select a clip or annotation to view its properties.
+                </p>
+              ) : null
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
