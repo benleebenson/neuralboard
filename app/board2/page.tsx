@@ -454,7 +454,7 @@ export default function Board2Page() {
 
   // ── YouTube modal ──
   const [ytModalOpen, setYtModalOpen] = useState(false);
-  const [ytTab, setYtTab] = useState<YtTab>("paste");
+  const [ytTab, setYtTab] = useState<YtTab>("search");
   const [ytView, setYtView] = useState<YtModalView>("search");
   const [ytUrlInput, setYtUrlInput] = useState("");
   const [ytQuery, setYtQuery] = useState("");
@@ -514,6 +514,7 @@ export default function Board2Page() {
   const annotationFontRef = useRef("Caveat");
   const annotationHighlightStyleRef = useRef<"rect" | "underline" | "curlyBrace">("rect");
   const editingAnnotationTextRef = useRef("");
+  const editingTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const annotationEmojiRef = useRef("🎯");
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -540,6 +541,11 @@ export default function Board2Page() {
   useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
   useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
   useEffect(() => { annotationEmojiRef.current = annotationEmoji; }, [annotationEmoji]);
+  useEffect(() => {
+    if (editingAnnotationId) {
+      requestAnimationFrame(() => editingTextareaRef.current?.focus());
+    }
+  }, [editingAnnotationId]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
 
   useEffect(() => {
@@ -1139,7 +1145,7 @@ export default function Board2Page() {
       });
       setSelectedClipId(clipId);
       setYtModalOpen(false);
-      setYtView("search"); setYtTab("paste"); setYtSelected(null);
+      setYtView("search"); setYtTab("search"); setYtSelected(null);
       setYtResults([]); setYtQuery(""); setYtUrlInput("");
     } catch (e) {
       setYtError(e instanceof Error ? e.message : "Download failed");
@@ -2115,8 +2121,7 @@ export default function Board2Page() {
             )}
           </div>
           <a href="/editor" style={navLinkStyle}>Editor</a>
-          <a href="/board" style={navLinkStyle}>Board</a>
-          <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board 2.0</span>
+          <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
           {session?.user ? (
             <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
           ) : (
@@ -2148,7 +2153,7 @@ export default function Board2Page() {
               ⟷ Add pan clip
             </button>
             <button
-              onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("paste"); setYtError(""); }}
+              onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); }}
               style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
             >
               ▶ Add YouTube
@@ -2413,7 +2418,7 @@ export default function Board2Page() {
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
                         zIndex: 5,
-                        pointerEvents: annotationTool === "pointer" ? "auto" : "none",
+                        pointerEvents: annotationTool === "pointer" || isEditing ? "auto" : "none",
                       }}
                       onClick={(e) => { if (annotationTool === "pointer") { e.stopPropagation(); setSelectedAnnotationId(ann.id); setSelectedClipId(null); } }}
                       onDoubleClick={(e) => {
@@ -2441,7 +2446,7 @@ export default function Board2Page() {
                       )}
                       {ann.type === "text" && isEditing && (
                         <textarea
-                          autoFocus
+                          ref={(el) => { if (isEditing) editingTextareaRef.current = el; }}
                           value={editingAnnotationText}
                           onChange={(e) => setEditingAnnotationText(e.target.value)}
                           onKeyDown={(e) => {
@@ -2506,7 +2511,7 @@ export default function Board2Page() {
                 })}
 
                 {/* Glass pane — captures all pointer events for annotation drawing */}
-                {annotationTool !== "pointer" && !isSpaceDown && (
+                {annotationTool !== "pointer" && !isSpaceDown && !editingAnnotationId && (
                   <div
                     style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair" }}
                     onPointerDown={handleAnnotationGlassPointerDown}

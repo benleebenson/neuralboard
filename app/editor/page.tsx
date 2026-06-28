@@ -2254,8 +2254,7 @@ export default function EditorPage() {
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ EDITOR</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <a href="/board" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Board</a>
-          <a href="/board2" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Board 2.0</a>
+          <a href="/board2" style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace", textDecoration: "none" }}>Board</a>
           {session?.user ? (
             <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
           ) : (
