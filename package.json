@@ -17,6 +17,7 @@
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "recordrtc": "^5.6.2",
+    "roughjs": "^4.6.6",
     "stripe": ">=17.0.0"
   },
   "devDependencies": {

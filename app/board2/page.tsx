@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSession, signIn } from "next-auth/react";
+import rough from "roughjs";
+import { ProGated } from "@/app/components/ProGated";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,7 +27,30 @@ type Clip = {
   boardW?: number;
   boardH?: number;
   holdFraction?: number;
+  sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
 };
+
+type Annotation = {
+  id: string;
+  type: "text" | "arrow" | "circle" | "highlight";
+  boardX: number;
+  boardY: number;
+  boardW: number;
+  boardH: number;
+  color: string;
+  text?: string;
+  fontFamily?: string;
+  fontSize?: number;
+  fontWeight?: "normal" | "bold";
+  strokeWidth?: number;
+  arrowStartX?: number;
+  arrowStartY?: number;
+  arrowEndX?: number;
+  arrowEndY?: number;
+  highlightStyle?: "rect" | "underline" | "curlyBrace";
+};
+
+type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight";
 
 type MediaItem = {
   id: string;
@@ -262,6 +287,94 @@ function extractYouTubeId(url: string): string | null {
   return m ? m[1] : null;
 }
 
+// ─── Annotation canvas helpers ────────────────────────────────────────────────
+
+function drawCurlyBrace(
+  ctx: CanvasRenderingContext2D,
+  x: number, y1: number, y2: number,
+  color: string, sw: number
+) {
+  const h = y2 - y1;
+  const mid = (y1 + y2) / 2;
+  const q = Math.max(8, Math.min(30, h * 0.15));
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = sw;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(x, y1);
+  ctx.bezierCurveTo(x + q, y1, x + q, mid - h * 0.05, x, mid);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x, mid);
+  ctx.bezierCurveTo(x + q, mid + h * 0.05, x + q, y2, x, y2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x, mid);
+  ctx.lineTo(x + q * 1.5, mid);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawAnnotationsToCanvas(
+  ctx: CanvasRenderingContext2D,
+  annotations: Annotation[],
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number
+) {
+  const rc = rough.canvas(ctx.canvas);
+  const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
+  const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
+  for (const ann of annotations) {
+    const sw = Math.max(1, (ann.strokeWidth ?? 3) * sf);
+    const roughSeed = ann.id.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0) & 0xffff;
+    const roughOpts = { stroke: ann.color, strokeWidth: sw, roughness: 1.4, bowing: 1.2, seed: roughSeed };
+    if (ann.type === "text" && ann.text) {
+      const fs = Math.max(8, (ann.fontSize ?? 80) * sf);
+      ctx.save();
+      ctx.font = `${ann.fontWeight ?? "normal"} ${fs}px '${ann.fontFamily ?? "Caveat"}', cursive`;
+      ctx.fillStyle = ann.color;
+      ctx.textBaseline = "top";
+      ctx.fillText(ann.text, toSX(ann.boardX), toSY(ann.boardY));
+      ctx.restore();
+    } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
+      const ax = toSX(ann.arrowStartX), ay = toSY(ann.arrowStartY!);
+      const ex = toSX(ann.arrowEndX!), ey = toSY(ann.arrowEndY!);
+      rc.line(ax, ay, ex, ey, roughOpts);
+      const angle = Math.atan2(ey - ay, ex - ax);
+      const hl = Math.max(12, sw * 5);
+      rc.line(ex, ey, ex - hl * Math.cos(angle - Math.PI / 6), ey - hl * Math.sin(angle - Math.PI / 6), roughOpts);
+      rc.line(ex, ey, ex - hl * Math.cos(angle + Math.PI / 6), ey - hl * Math.sin(angle + Math.PI / 6), roughOpts);
+    } else if (ann.type === "circle") {
+      rc.ellipse(
+        toSX(ann.boardX) + ann.boardW * sf / 2,
+        toSY(ann.boardY) + ann.boardH * sf / 2,
+        ann.boardW * sf, ann.boardH * sf,
+        { ...roughOpts, fill: "none" }
+      );
+    } else if (ann.type === "highlight") {
+      const sx = toSX(ann.boardX), sy = toSY(ann.boardY);
+      const bw = ann.boardW * sf, bh = ann.boardH * sf;
+      const style = ann.highlightStyle ?? "rect";
+      if (style === "rect") {
+        ctx.save();
+        ctx.globalAlpha = 0.3;
+        ctx.fillStyle = ann.color;
+        ctx.fillRect(sx, sy, bw, bh);
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      } else if (style === "underline") {
+        rc.line(sx, sy + bh, sx + bw, sy + bh, roughOpts);
+      } else {
+        drawCurlyBrace(ctx, sx + bw, sy, sy + bh, ann.color, sw);
+      }
+    }
+  }
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Board2Page() {
@@ -285,6 +398,16 @@ export default function Board2Page() {
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number } | null>(null);
+
+  // ── Annotations ──
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [annotationTool, setAnnotationTool] = useState<AnnotationTool>("pointer");
+  const [annotationColor, setAnnotationColor] = useState("#cc2200");
+  const [annotationFont, setAnnotationFont] = useState("Caveat");
+  const [annotationHighlightStyle, setAnnotationHighlightStyle] = useState<"rect" | "underline" | "curlyBrace">("rect");
+  const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
+  const [editingAnnotationText, setEditingAnnotationText] = useState("");
 
   // ── YouTube modal ──
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -341,6 +464,13 @@ export default function Board2Page() {
   const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
   const ytRangeRef = useRef({ start: 0, end: 30 });
+  const prevPlayheadRef = useRef(-1); // previous frame's playhead for entry detection
+  const annotationsRef = useRef<Annotation[]>([]);
+  const annotationToolRef = useRef<AnnotationTool>("pointer");
+  const annotationColorRef = useRef("#cc2200");
+  const annotationFontRef = useRef("Caveat");
+  const annotationHighlightStyleRef = useRef<"rect" | "underline" | "curlyBrace">("rect");
+  const editingAnnotationTextRef = useRef("");
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
@@ -350,6 +480,12 @@ export default function Board2Page() {
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
+  useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
+  useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
+  useEffect(() => { annotationColorRef.current = annotationColor; }, [annotationColor]);
+  useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
+  useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
+  useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
 
   useEffect(() => {
     if (!toast) return;
@@ -434,7 +570,8 @@ export default function Board2Page() {
     currentClips: Clip[],
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
-    H: number
+    H: number,
+    currentAnnotations: Annotation[]
   ) => {
     ctx.fillStyle = "#f5ecd8";
     ctx.fillRect(0, 0, W, H);
@@ -460,6 +597,9 @@ export default function Board2Page() {
       }
     }
     ctx.globalAlpha = 1;
+    if (currentAnnotations.length > 0) {
+      drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
+    }
   }, []);
 
   const drawFrame = useCallback((time: number) => {
@@ -467,7 +607,7 @@ export default function Board2Page() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current);
   }, [renderToCtx]);
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
@@ -475,6 +615,7 @@ export default function Board2Page() {
   const rafLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
     const now = performance.now();
+    const prevT = prevPlayheadRef.current;
     if (lastRafTimeRef.current !== null) {
       const dt = (now - lastRafTimeRef.current) / 1000;
       const next = playheadRef.current + dt;
@@ -483,23 +624,32 @@ export default function Board2Page() {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
         isPlayingRef.current = false;
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        for (const vid of videoCacheRef.current.values()) vid.pause();
+        prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
       playheadRef.current = next; setPlayhead(next);
     }
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
-    // Manage YouTube video playback per frame
+    prevPlayheadRef.current = t;
+    // 3-state video management: active (synced) / ambient (looping) / paused (playback stopped)
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
+      // Ambient baseline: keep all videos playing with loop
+      if (vid.paused) vid.play().catch(() => {});
       const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
       if (isActive) {
-        if (vid.paused) { vid.currentTime = t - clip.startTime; vid.play().catch(() => {}); }
-      } else {
-        if (!vid.paused) vid.pause();
+        const prevActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
+        if (!prevActive) {
+          vid.currentTime = 0; // just entered active range — restart from blob start
+        } else {
+          vid.currentTime = t - clip.startTime; // in range — sync to playhead
+        }
       }
+      // ambient (outside range): no currentTime override — plays and loops naturally
     }
     drawFrame(t);
     rafIdRef.current = requestAnimationFrame(rafCallbackRef.current);
@@ -512,11 +662,12 @@ export default function Board2Page() {
     else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
       for (const vid of ytVideoElsRef.current.values()) vid.pause();
+      for (const vid of videoCacheRef.current.values()) vid.pause();
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
 
-  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [playhead, clips, canvasAspect, isPlaying, drawFrame]);
+  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [playhead, clips, annotations, canvasAspect, isPlaying, drawFrame]);
 
   useEffect(() => {
     if (isPlaying) return;
@@ -542,7 +693,7 @@ export default function Board2Page() {
     } else {
       if (!videoCacheRef.current.has(url)) {
         const vid = document.createElement("video");
-        vid.muted = true; vid.preload = "auto"; vid.src = url;
+        vid.muted = true; vid.loop = true; vid.preload = "auto"; vid.src = url;
         videoCacheRef.current.set(url, vid);
       }
     }
@@ -602,6 +753,7 @@ export default function Board2Page() {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
           startTime: endTime, duration: clipDuration,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
+          sourceDurationSec: item.type === "video" ? item.duration : undefined,
         },
       ];
     });
@@ -703,22 +855,24 @@ export default function Board2Page() {
       const vid = document.createElement("video");
       vid.src = blobUrl;
       vid.muted = true;
+      vid.loop = true;
       vid.preload = "auto";
       vid.playsInline = true;
       if (videoHiddenContainerRef.current) videoHiddenContainerRef.current.appendChild(vid);
       ytVideoElsRef.current.set(clipId, vid);
       ytBlobUrlsRef.current.set(clipId, blobUrl);
 
-      // Wait for metadata to get natural dimensions
-      const dims = await new Promise<{ w: number; h: number }>((resolve) => {
-        const timer = setTimeout(() => resolve({ w: 800, h: 450 }), 3000);
+      // Wait for metadata to get natural dimensions + source duration
+      const meta = await new Promise<{ w: number; h: number; sourceDurationSec: number }>((resolve) => {
+        const timer = setTimeout(() => resolve({ w: 800, h: 450, sourceDurationSec: clipDuration }), 3000);
         vid.addEventListener("loadedmetadata", () => {
           clearTimeout(timer);
+          const sourceDurationSec = isFinite(vid.duration) ? vid.duration : clipDuration;
           if (vid.videoWidth > 0 && vid.videoHeight > 0) {
             const scale = Math.min(1, 800 / vid.videoWidth, 600 / vid.videoHeight);
-            resolve({ w: Math.round(vid.videoWidth * scale), h: Math.round(vid.videoHeight * scale) });
+            resolve({ w: Math.round(vid.videoWidth * scale), h: Math.round(vid.videoHeight * scale), sourceDurationSec });
           } else {
-            resolve({ w: 800, h: 450 });
+            resolve({ w: 800, h: 450, sourceDurationSec });
           }
         }, { once: true });
       });
@@ -726,11 +880,12 @@ export default function Board2Page() {
       const { camX, camY } = getVisibleBoardCenter();
       setClips((prev) => {
         const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-        const pos = findFreeBoardPos(prev, dims.w, dims.h, camX, camY);
+        const pos = findFreeBoardPos(prev, meta.w, meta.h, camX, camY);
         return [...prev, {
           id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
           startTime: endTime, duration: clipDuration,
-          boardX: pos.boardX, boardY: pos.boardY, boardW: dims.w, boardH: dims.h,
+          boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
+          sourceDurationSec: meta.sourceDurationSec,
         }];
       });
       setSelectedClipId(clipId);
@@ -820,6 +975,119 @@ export default function Board2Page() {
     };
     const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Annotation helpers ─────────────────────────────────────────────────────
+
+  function deleteAnnotation(id: string) {
+    setAnnotations((prev) => prev.filter((a) => a.id !== id));
+    setSelectedAnnotationId((prev) => (prev === id ? null : prev));
+    setEditingAnnotationId((prev) => (prev === id ? null : prev));
+  }
+
+  function commitTextEdit(annId: string) {
+    const text = editingAnnotationTextRef.current.trim();
+    if (!text) {
+      deleteAnnotation(annId);
+    } else {
+      setAnnotations((prev) => prev.map((a) => (a.id === annId ? { ...a, text } : a)));
+      setEditingAnnotationId(null);
+    }
+  }
+
+  // ─ Annotation drag (pointer tool) ────────────────────────────────────────
+
+  function handleAnnotationPointerDown(e: React.PointerEvent, ann: Annotation) {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setSelectedAnnotationId(ann.id);
+    setSelectedClipId(null);
+    const startX = e.clientX, startY = e.clientY;
+    const { boardX: origX, boardY: origY, arrowStartX: origASX, arrowStartY: origASY, arrowEndX: origAEX, arrowEndY: origAEY } = ann;
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      const dx = (ev.clientX - startX) / zoom;
+      const dy = (ev.clientY - startY) / zoom;
+      setAnnotations((prev) =>
+        prev.map((a) => {
+          if (a.id !== ann.id) return a;
+          return {
+            ...a,
+            boardX: origX + dx,
+            boardY: origY + dy,
+            ...(origASX !== undefined ? {
+              arrowStartX: origASX + dx, arrowStartY: origASY! + dy,
+              arrowEndX: origAEX! + dx, arrowEndY: origAEY! + dy,
+            } : {}),
+          };
+        })
+      );
+    };
+    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Annotation creation (glass pane) ──────────────────────────────────────
+
+  function handleAnnotationGlassPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.stopPropagation();
+    const container = boardContainerRef.current!;
+    const rect = container.getBoundingClientRect();
+    const bx = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+    const by = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+    const tool = annotationToolRef.current;
+
+    if (tool === "text") {
+      const newAnn: Annotation = {
+        id: generateId(), type: "text",
+        boardX: bx, boardY: by, boardW: 400, boardH: 100,
+        color: annotationColorRef.current,
+        text: "", fontFamily: annotationFontRef.current, fontSize: 80, fontWeight: "normal",
+      };
+      setAnnotations((prev) => [...prev, newAnn]);
+      setSelectedAnnotationId(newAnn.id);
+      setEditingAnnotationId(newAnn.id);
+      setEditingAnnotationText("");
+      return;
+    }
+
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const startBX = bx, startBY = by;
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener("pointerup", onUp);
+      const r = container.getBoundingClientRect();
+      const ex = (ev.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
+      const ey = (ev.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
+      const minBX = Math.min(startBX, ex), maxBX = Math.max(startBX, ex);
+      const minBY = Math.min(startBY, ey), maxBY = Math.max(startBY, ey);
+      const bw = maxBX - minBX, bh = maxBY - minBY;
+      if (bw < 5 && bh < 5) return;
+      const t = annotationToolRef.current;
+      const id = generateId();
+      const color = annotationColorRef.current;
+      if (t === "arrow") {
+        setAnnotations((prev) => [...prev, {
+          id, type: "arrow",
+          boardX: minBX, boardY: minBY, boardW: Math.max(1, bw), boardH: Math.max(1, bh),
+          color, arrowStartX: startBX, arrowStartY: startBY, arrowEndX: ex, arrowEndY: ey, strokeWidth: 3,
+        }]);
+      } else if (t === "circle") {
+        setAnnotations((prev) => [...prev, {
+          id, type: "circle",
+          boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
+          color, strokeWidth: 3,
+        }]);
+      } else if (t === "highlight") {
+        setAnnotations((prev) => [...prev, {
+          id, type: "highlight",
+          boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
+          color, highlightStyle: annotationHighlightStyleRef.current,
+        }]);
+      }
+    };
     window.addEventListener("pointerup", onUp);
   }
 
@@ -925,6 +1193,7 @@ export default function Board2Page() {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
           startTime, duration: item.duration ?? (item.type === "video" ? 5 : 4),
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
+          sourceDurationSec: item.type === "video" ? item.duration : undefined,
         },
       ];
     });
@@ -938,12 +1207,12 @@ export default function Board2Page() {
     const maxEnd = clips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
     const ph = playheadRef.current;
     if (ph >= maxEnd && maxEnd > 0) setPlayhead(0);
-    // Pre-warm YouTube videos during this user gesture to unlock programmatic .play() later
+    prevPlayheadRef.current = ph; // initialize entry-detection baseline for the upcoming play session
+    // Pre-warm ALL video elements during this user gesture to unlock programmatic .play() later
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id);
-      if (!vid || clip.startTime + clip.duration <= ph) continue;
-      vid.currentTime = Math.max(0, ph - clip.startTime);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+      if (!vid) continue;
       vid.play().then(() => vid.pause()).catch(() => {});
     }
     setIsPlaying(true);
@@ -1174,23 +1443,20 @@ export default function Board2Page() {
     setIsExporting(true); isExportingRef.current = true; exportCancelRef.current = false; setExportProgress(0);
     const currentClips = clipsRef.current;
     const currentCameraKeyframes = cameraKeyframesRef.current;
+    const currentAnnotations = annotationsRef.current;
     const totalDur = currentClips.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
     const W = canvasWRef.current, H = canvasHRef.current;
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = W; exportCanvas.height = H;
     const exportCtx = exportCanvas.getContext("2d")!;
-    // Seed videos: clips starting at t=0 begin playing immediately; others wait at t=0
+    // Start all video clips playing ambiently from t=0 — active/ambient logic handles sync per frame
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
       const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
-      if (clip.startTime === 0) {
-        vid.currentTime = 0;
-        vid.play().catch(() => {});
-      } else {
-        vid.pause();
-        vid.currentTime = 0;
-      }
+      vid.loop = true;
+      vid.currentTime = 0;
+      vid.play().catch(() => {});
     }
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
@@ -1208,6 +1474,7 @@ export default function Board2Page() {
     };
     recorder.start(100);
     const exportWallStart = performance.now();
+    let prevExportElapsed = -1; // tracks previous frame for entry detection
     function exportFrame() {
       if (exportCancelRef.current) {
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
@@ -1221,20 +1488,27 @@ export default function Board2Page() {
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
-      // Manage video lifecycle: seek+play once on activation, pause when inactive, let it run
+      // Active clips: play-and-let-run (seek+play only on entry); ambient: per-frame modulo seek
       for (const clip of currentClips) {
         if (clip.type !== "video") continue;
         const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (!vid) continue;
         const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
-        if (isActive && vid.paused) {
-          vid.currentTime = elapsed - clip.startTime;
-          vid.play().catch(() => {});
-        } else if (!isActive && !vid.paused) {
-          vid.pause();
+        if (isActive) {
+          const prevActive = prevExportElapsed >= clip.startTime && prevExportElapsed < clip.startTime + clip.duration;
+          if (!prevActive || vid.paused) {
+            vid.currentTime = elapsed - clip.startTime;
+            vid.play().catch(() => {});
+          }
+          // else: playing naturally in sync with real-time export clock
+        } else {
+          // Ambient: show looping frame at this virtual time
+          const src = Math.max(0.01, clip.sourceDurationSec ?? clip.duration);
+          vid.currentTime = clamp(elapsed % src, 0, src - 0.01);
         }
       }
-      renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H);
+      prevExportElapsed = elapsed;
+      renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations);
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
     exportRafRef.current = requestAnimationFrame(exportFrame);
@@ -1254,6 +1528,7 @@ export default function Board2Page() {
       }
       if (e.code === "Delete" || e.code === "Backspace") {
         if (selectedClipId) deleteClip(selectedClipId);
+        else if (selectedAnnotationId) deleteAnnotation(selectedAnnotationId);
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
@@ -1395,7 +1670,10 @@ export default function Board2Page() {
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
                 onPointerDown={(e) => {
-                  if (e.target === e.currentTarget) setSelectedClipId(null);
+                  if (e.target === e.currentTarget) {
+                    setSelectedClipId(null);
+                    setSelectedAnnotationId(null);
+                  }
                 }}
               >
                 {/* eslint-disable-next-line react-hooks/refs */}
@@ -1459,6 +1737,130 @@ export default function Board2Page() {
                     </div>
                   );
                 })}
+
+                {/* SVG visual layer for non-text annotations */}
+                <svg
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 4, overflow: "visible" }}
+                >
+                  {annotations.filter((a) => a.type !== "text").map((ann) => {
+                    if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
+                      const x1 = ann.arrowStartX * boardZoom, y1 = ann.arrowStartY! * boardZoom;
+                      const x2 = ann.arrowEndX! * boardZoom, y2 = ann.arrowEndY! * boardZoom;
+                      const angle = Math.atan2(y2 - y1, x2 - x1);
+                      const hl = 15;
+                      const sw = ann.strokeWidth ?? 3;
+                      return (
+                        <g key={ann.id}>
+                          <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />
+                          <line x1={x2} y1={y2} x2={x2 - hl * Math.cos(angle - Math.PI / 6)} y2={y2 - hl * Math.sin(angle - Math.PI / 6)} stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />
+                          <line x1={x2} y1={y2} x2={x2 - hl * Math.cos(angle + Math.PI / 6)} y2={y2 - hl * Math.sin(angle + Math.PI / 6)} stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />
+                        </g>
+                      );
+                    } else if (ann.type === "circle") {
+                      return (
+                        <ellipse key={ann.id}
+                          cx={ann.boardX * boardZoom + ann.boardW * boardZoom / 2}
+                          cy={ann.boardY * boardZoom + ann.boardH * boardZoom / 2}
+                          rx={ann.boardW * boardZoom / 2} ry={ann.boardH * boardZoom / 2}
+                          fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3}
+                        />
+                      );
+                    } else if (ann.type === "highlight") {
+                      const style = ann.highlightStyle ?? "rect";
+                      const bx = ann.boardX * boardZoom, by = ann.boardY * boardZoom;
+                      const bw = ann.boardW * boardZoom, bh = ann.boardH * boardZoom;
+                      if (style === "rect") return <rect key={ann.id} x={bx} y={by} width={bw} height={bh} fill={ann.color} fillOpacity={0.3} />;
+                      if (style === "underline") return <line key={ann.id} x1={bx} y1={by + bh} x2={bx + bw} y2={by + bh} stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
+                      // curlyBrace
+                      const cx = bx + bw, mid = by + bh / 2, q = Math.min(20, bh * 0.15);
+                      return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
+                    }
+                    return null;
+                  })}
+                </svg>
+
+                {/* Annotation DOM overlays (hit targets + text rendering) */}
+                {annotations.map((ann) => {
+                  const isSel = ann.id === selectedAnnotationId;
+                  const isEditing = ann.id === editingAnnotationId;
+                  return (
+                    <div
+                      key={ann.id}
+                      style={{
+                        position: "absolute",
+                        left: ann.boardX * boardZoom,
+                        top: ann.boardY * boardZoom,
+                        width: ann.type === "text" ? "auto" : ann.boardW * boardZoom,
+                        height: ann.type === "text" ? "auto" : ann.boardH * boardZoom,
+                        minWidth: ann.type === "text" ? ann.boardW * boardZoom : undefined,
+                        outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
+                        outlineOffset: 3,
+                        cursor: annotationTool === "pointer" ? "pointer" : "default",
+                        zIndex: 5,
+                        pointerEvents: annotationTool === "pointer" ? "auto" : "none",
+                      }}
+                      onClick={(e) => { if (annotationTool === "pointer") { e.stopPropagation(); setSelectedAnnotationId(ann.id); setSelectedClipId(null); } }}
+                      onDoubleClick={(e) => {
+                        if (ann.type === "text" && annotationTool === "pointer") {
+                          e.stopPropagation();
+                          setEditingAnnotationId(ann.id);
+                          setEditingAnnotationText(ann.text ?? "");
+                        }
+                      }}
+                      onPointerDown={(e) => { if (annotationTool === "pointer") handleAnnotationPointerDown(e, ann); }}
+                    >
+                      {ann.type === "text" && !isEditing && (
+                        <div style={{
+                          fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
+                          fontSize: (ann.fontSize ?? 80) * boardZoom,
+                          fontWeight: ann.fontWeight ?? "normal",
+                          color: ann.color,
+                          userSelect: "none",
+                          pointerEvents: "none",
+                          whiteSpace: "pre",
+                          lineHeight: 1.2,
+                        }}>
+                          {ann.text || <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
+                        </div>
+                      )}
+                      {ann.type === "text" && isEditing && (
+                        <textarea
+                          autoFocus
+                          value={editingAnnotationText}
+                          onChange={(e) => setEditingAnnotationText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextEdit(ann.id); }
+                            else if (e.key === "Escape") { if (!ann.text) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
+                          }}
+                          onBlur={() => commitTextEdit(ann.id)}
+                          style={{
+                            fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
+                            fontSize: (ann.fontSize ?? 80) * boardZoom,
+                            fontWeight: ann.fontWeight ?? "normal",
+                            color: ann.color,
+                            background: "rgba(255,255,255,0.15)",
+                            border: "1px dashed rgba(255,94,58,0.6)",
+                            outline: "none",
+                            resize: "none",
+                            minWidth: ann.boardW * boardZoom,
+                            minHeight: (ann.fontSize ?? 80) * boardZoom * 1.4,
+                            padding: 0,
+                            lineHeight: 1.2,
+                            whiteSpace: "pre",
+                          }}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* Glass pane — captures all pointer events for annotation drawing */}
+                {annotationTool !== "pointer" && !isSpaceDown && (
+                  <div
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : "crosshair" }}
+                    onPointerDown={handleAnnotationGlassPointerDown}
+                  />
+                )}
               </div>
 
               {/* Empty state */}
@@ -1473,6 +1875,102 @@ export default function Board2Page() {
               {/* Board info */}
               <div style={{ position: "absolute", bottom: 8, left: 8, fontFamily: "monospace", fontSize: 9, color: "rgba(42,42,42,0.4)", pointerEvents: "none" }}>
                 {BOARD_W}×{BOARD_H} · {Math.round(boardZoom * 100)}% · space+drag=pan · scroll=zoom
+              </div>
+
+              {/* Annotation toolbar — Pro gated, floating at top-center */}
+              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30 }}>
+                <ProGated featureName="Annotation tools">
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 2,
+                    background: "#fffdf5",
+                    border: "1.5px solid #2a2a2a",
+                    boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
+                    padding: "4px 8px",
+                    whiteSpace: "nowrap",
+                  }}>
+                    {/* Tool buttons */}
+                    {([
+                      { id: "pointer" as AnnotationTool, icon: "↖", title: "Select / move" },
+                      { id: "text"    as AnnotationTool, icon: "T",  title: "Text" },
+                      { id: "arrow"   as AnnotationTool, icon: "↗",  title: "Arrow" },
+                      { id: "circle"  as AnnotationTool, icon: "○",  title: "Circle / ellipse" },
+                      { id: "highlight" as AnnotationTool, icon: "▭", title: "Highlight" },
+                    ]).map(({ id, icon, title }) => (
+                      <button
+                        key={id}
+                        title={title}
+                        onClick={(e) => { e.stopPropagation(); setAnnotationTool(id); }}
+                        style={{
+                          width: 28, height: 28, border: "none", padding: 0,
+                          outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
+                          background: annotationTool === id ? "#2a2a2a" : "transparent",
+                          color: annotationTool === id ? "#fff" : "#2a2a2a",
+                          cursor: "pointer", fontFamily: "monospace",
+                          fontSize: id === "text" ? 13 : 15, fontWeight: 700,
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                        }}
+                      >
+                        {icon}
+                      </button>
+                    ))}
+
+                    <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+
+                    {/* Color swatches */}
+                    {(["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"]).map((c) => (
+                      <button
+                        key={c}
+                        title={c}
+                        onClick={(e) => { e.stopPropagation(); setAnnotationColor(c); }}
+                        style={{
+                          width: 18, height: 18, padding: 0,
+                          background: c,
+                          border: annotationColor === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)",
+                          cursor: "pointer", flexShrink: 0,
+                        }}
+                      />
+                    ))}
+
+                    {/* Font picker — text tool only */}
+                    {annotationTool === "text" && (
+                      <>
+                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+                        <select
+                          value={annotationFont}
+                          onChange={(e) => { e.stopPropagation(); setAnnotationFont(e.target.value); }}
+                          style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
+                        >
+                          <option value="Caveat">Caveat</option>
+                          <option value="Permanent Marker">Permanent Marker</option>
+                          <option value="Architects Daughter">Architects Daughter</option>
+                          <option value="Patrick Hand">Patrick Hand</option>
+                        </select>
+                      </>
+                    )}
+
+                    {/* Highlight sub-type — highlight tool only */}
+                    {annotationTool === "highlight" && (
+                      <>
+                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+                        {(["rect", "underline", "curlyBrace"] as const).map((s) => (
+                          <button
+                            key={s}
+                            onClick={(e) => { e.stopPropagation(); setAnnotationHighlightStyle(s); }}
+                            style={{
+                              padding: "2px 5px", fontSize: 9, fontFamily: "monospace",
+                              border: annotationHighlightStyle === s ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.3)",
+                              background: annotationHighlightStyle === s ? "#2a2a2a" : "transparent",
+                              color: annotationHighlightStyle === s ? "#fff" : "#2a2a2a",
+                              cursor: "pointer",
+                            }}
+                          >
+                            {s === "rect" ? "▭" : s === "underline" ? "_" : "{}"}
+                          </button>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                </ProGated>
               </div>
             </div>
 
