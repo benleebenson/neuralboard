@@ -460,6 +460,12 @@ export default function Board2Page() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number; clipId?: string } | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
 
+  // ── Mobile ──
+  const [isMobile, setIsMobile] = useState(false);
+  const [isPortrait, setIsPortrait] = useState(false);
+  const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
+  const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
+
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
@@ -556,6 +562,24 @@ export default function Board2Page() {
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const mobileBoardPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const mobileGestureRef = useRef<{
+    type: "idle" | "deciding" | "pan" | "move" | "pinch";
+    hitClipId: string | null;
+    hitClipIsSelected: boolean;
+    startX: number; startY: number;
+    origPan: { x: number; y: number };
+    clipOrigX: number; clipOrigY: number;
+    pinchStartDist: number; pinchStartZoom: number; pinchStartPan: { x: number; y: number };
+    longPressTimer: ReturnType<typeof setTimeout> | null;
+  }>({
+    type: "idle", hitClipId: null, hitClipIsSelected: false,
+    startX: 0, startY: 0,
+    origPan: { x: 0, y: 0 },
+    clipOrigX: 0, clipOrigY: 0,
+    pinchStartDist: 1, pinchStartZoom: 0.18, pinchStartPan: { x: 0, y: 0 },
+    longPressTimer: null,
+  });
   const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
@@ -579,6 +603,20 @@ export default function Board2Page() {
     }
   }, [editingAnnotationId]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+
+  useEffect(() => {
+    const check = () => {
+      setIsMobile(window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches);
+      setIsPortrait(window.innerHeight > window.innerWidth);
+    };
+    check();
+    window.addEventListener("resize", check);
+    window.addEventListener("orientationchange", check);
+    return () => {
+      window.removeEventListener("resize", check);
+      window.removeEventListener("orientationchange", check);
+    };
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -2255,6 +2293,655 @@ export default function Board2Page() {
       window.removeEventListener("keydown", dismiss);
     };
   }, [contextMenu]);
+
+  // ─── Mobile gesture handlers ──────────────────────────────────────────────
+
+  function handleMobileBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    const pointers = mobileBoardPointersRef.current;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const g = mobileGestureRef.current;
+
+    if (pointers.size === 2) {
+      if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+      const pts = [...pointers.values()];
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      g.type = "pinch";
+      g.pinchStartDist = Math.max(dist, 1);
+      g.pinchStartZoom = boardZoomRef.current;
+      g.pinchStartPan = { ...boardPanRef.current };
+      return;
+    }
+
+    const target = e.target as HTMLElement;
+    const clipEl = target.closest("[data-mbclipid]");
+    const hitClipId = clipEl ? (clipEl as HTMLElement).dataset.mbclipid ?? null : null;
+
+    g.type = "deciding";
+    g.hitClipId = hitClipId;
+    g.hitClipIsSelected = hitClipId !== null && hitClipId === selectedClipId;
+    g.startX = e.clientX;
+    g.startY = e.clientY;
+    g.origPan = { ...boardPanRef.current };
+
+    if (hitClipId) {
+      const clip = clipsRef.current.find((c) => c.id === hitClipId);
+      if (clip?.boardX !== undefined) { g.clipOrigX = clip.boardX; g.clipOrigY = clip.boardY ?? 0; }
+    }
+
+    g.longPressTimer = setTimeout(() => {
+      if (g.type === "deciding" && g.hitClipId) {
+        g.type = "idle";
+        setMobileLongPressClipId(g.hitClipId);
+      }
+    }, 500);
+  }
+
+  function handleMobileBoardPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const pointers = mobileBoardPointersRef.current;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const g = mobileGestureRef.current;
+
+    if (g.type === "pinch" && pointers.size === 2) {
+      const pts = [...pointers.values()];
+      const container = boardContainerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const scale = dist / g.pinchStartDist;
+      const nz = Math.max(0.05, Math.min(3, g.pinchStartZoom * scale));
+      const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+      const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+      const pz = g.pinchStartZoom;
+      const pp = g.pinchStartPan;
+      const np = { x: cx - (cx - pp.x) * (nz / pz), y: cy - (cy - pp.y) * (nz / pz) };
+      boardZoomRef.current = nz;
+      boardPanRef.current = np;
+      setBoardZoom(nz);
+      setBoardPan(np);
+      return;
+    }
+
+    if (g.type === "deciding") {
+      const dx = e.clientX - g.startX;
+      const dy = e.clientY - g.startY;
+      if (Math.hypot(dx, dy) >= 8) {
+        if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+        g.type = g.hitClipIsSelected ? "move" : "pan";
+      }
+    }
+
+    if (g.type === "pan") {
+      const np = { x: g.origPan.x + e.clientX - g.startX, y: g.origPan.y + e.clientY - g.startY };
+      boardPanRef.current = np;
+      setBoardPan(np);
+    } else if (g.type === "move" && g.hitClipId) {
+      const zoom = boardZoomRef.current;
+      const dx = (e.clientX - g.startX) / zoom;
+      const dy = (e.clientY - g.startY) / zoom;
+      setClips((prev) => prev.map((c) => c.id !== g.hitClipId ? c : {
+        ...c, boardX: Math.round(g.clipOrigX + dx), boardY: Math.round(g.clipOrigY + dy),
+      }));
+    }
+  }
+
+  function handleMobileBoardPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    const pointers = mobileBoardPointersRef.current;
+    const g = mobileGestureRef.current;
+    if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+
+    if (g.type === "deciding") {
+      if (g.hitClipId) {
+        setSelectedClipId(g.hitClipId);
+        setMobileDrawer("props");
+      } else {
+        setSelectedClipId(null);
+        setMobileDrawer(null);
+      }
+    }
+
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2 && g.type === "pinch") g.type = "idle";
+    else if (pointers.size === 0) g.type = "idle";
+  }
+
+  // ─── Mobile early returns ─────────────────────────────────────────────────
+
+  if (isMobile && isPortrait) {
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "#f5ecd8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace" }}>
+        <div style={{ fontSize: 52, lineHeight: 1 }}>↻</div>
+        <div style={{ fontSize: 15, fontWeight: 700, marginTop: 18, color: "#2a2a2a" }}>Rotate to landscape</div>
+        <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 8, textAlign: "center", padding: "0 32px", lineHeight: 1.6 }}>Neural Board requires landscape mode</div>
+      </div>
+    );
+  }
+
+  if (isMobile) {
+    const MOBILE_LAYER_H = 30;
+    const MOBILE_TRACK_H = N_LAYERS * MOBILE_LAYER_H;
+    const MOBILE_NARRATION_H = 28;
+    const MOBILE_RULER_H = 28;
+
+    return (
+      <div style={{ ...pageStyle, overflow: "hidden", display: "flex", flexDirection: "column", height: "100dvh" }}>
+        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
+        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+        <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
+
+        {/* ── Compact header ── */}
+        <header style={{ height: 44, flexShrink: 0, display: "flex", alignItems: "center", gap: 6, padding: "0 8px", borderBottom: "1.5px dashed rgba(42,42,42,0.3)", background: "rgba(255,253,245,0.95)", zIndex: 10 }}>
+          <button
+            onClick={() => setMobileDrawer((d) => d === "media" ? null : "media")}
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontFamily: "monospace", background: mobileDrawer === "media" ? "#2a2a2a" : "transparent", color: mobileDrawer === "media" ? "#c8f135" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
+          >≡</button>
+          <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, color: "#2a2a2a", flex: 1, minWidth: 0, lineHeight: 1, overflow: "hidden", whiteSpace: "nowrap" }}>Neural Board</span>
+          <span style={{ fontFamily: "monospace", fontSize: 10, color: "#2a2a2a", letterSpacing: 0.5, border: "1px solid rgba(42,42,42,0.3)", padding: "2px 4px", background: "#fffdf5", flexShrink: 0 }}>
+            {formatTime(playhead)}/{formatTime(timelineDuration)}
+          </span>
+          <button
+            onClick={togglePlay}
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, background: isPlaying ? "#ff5e3a" : "#c8f135", color: isPlaying ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
+          >{isPlaying ? "⏸" : "▶"}</button>
+          <button
+            onClick={generateCameraKeyframes}
+            disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan")}
+            title="Generate camera keyframes"
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? 1 : 0.35, flexShrink: 0 }}
+          >⬡</button>
+          <button
+            onClick={isExporting ? cancelExport : startExport}
+            title={isExporting ? "Cancel export" : "Export video"}
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isExporting ? "#ff5e3a" : "transparent", color: isExporting ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
+          >{isExporting ? "✕" : "⬇"}</button>
+        </header>
+
+        {/* ── Board ── */}
+        <div
+          ref={boardContainerRef}
+          style={{ flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0 }}
+          onPointerDown={handleMobileBoardPointerDown}
+          onPointerMove={handleMobileBoardPointerMove}
+          onPointerUp={handleMobileBoardPointerUp}
+          onPointerCancel={handleMobileBoardPointerUp}
+        >
+          {/* Board surface */}
+          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: "#f0ead6", border: "1.5px dashed rgba(42,42,42,0.2)" }}>
+            {clips.filter((c) => c.boardX !== undefined).map((clip) => {
+              const isSel = clip.id === selectedClipId;
+              return (
+                <div
+                  key={clip.id}
+                  data-mbclipid={clip.id}
+                  style={{
+                    position: "absolute",
+                    left: clip.boardX! * boardZoom,
+                    top: clip.boardY! * boardZoom,
+                    width: clip.boardW! * boardZoom,
+                    height: clip.boardH! * boardZoom,
+                    border: isSel ? "2px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.4)",
+                    boxShadow: isSel ? "0 0 0 2px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : "1px 1px 4px rgba(42,42,42,0.2)",
+                    touchAction: "none",
+                  }}
+                >
+                  <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none" }}>
+                    {clip.type === "image" ? (
+                      <img src={clip.sourceUrl} alt={clip.name} style={{ width: "100%", height: "100%", objectFit: "fill", display: "block" }} draggable={false} />
+                    ) : (
+                      <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <span style={{ color: "#7df5b0", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace" }}>▶ {clip.name}</span>
+                      </div>
+                    )}
+                    <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+                      {clip.name}
+                    </div>
+                  </div>
+                  {isSel && (
+                    <div
+                      style={{ position: "absolute", right: -7, bottom: -7, width: 28, height: 28, background: "#ff5e3a", border: "2px solid #fff", borderRadius: 3, zIndex: 20, touchAction: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
+                      onPointerDown={(e) => handleBoardResizePointerDown(e, clip, "se")}
+                    >
+                      <span style={{ color: "#fff", fontSize: 10, lineHeight: 1, pointerEvents: "none" }}>⤡</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {clips.filter((c) => c.boardX !== undefined).length === 0 && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+              <span style={{ fontFamily: "monospace", fontSize: 10, color: "rgba(42,42,42,0.35)", textAlign: "center" }}>Tap ≡ to add media</span>
+            </div>
+          )}
+
+          <div style={{ position: "absolute", bottom: 6, left: 8, fontFamily: "monospace", fontSize: 8, color: "rgba(42,42,42,0.4)", pointerEvents: "none" }}>
+            {Math.round(boardZoom * 100)}% · pinch to zoom
+          </div>
+
+          {/* Preview PiP */}
+          <div style={{ position: "absolute", top: 6, right: 6, zIndex: 10, pointerEvents: "none" }}>
+            <canvas
+              ref={canvasRef}
+              width={canvasW}
+              height={canvasH}
+              style={{ display: "block", width: Math.round(72 * canvasW / canvasH), height: 72, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
+            />
+          </div>
+
+          {/* Export progress */}
+          {isExporting && (
+            <div style={{ position: "absolute", inset: 0, background: "rgba(255,253,245,0.9)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 20 }}>
+              <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#2a2a2a", marginBottom: 12 }}>Exporting… {Math.round(exportProgress * 100)}%</div>
+              <div style={{ width: 160, height: 8, background: "rgba(42,42,42,0.15)", border: "1px solid #2a2a2a" }}>
+                <div style={{ height: "100%", width: `${exportProgress * 100}%`, background: "#c8f135", transition: "width 0.1s" }} />
+              </div>
+              <button onClick={cancelExport} style={{ marginTop: 16, fontFamily: "monospace", fontSize: 11, background: "transparent", border: "1.5px solid #ff5e3a", color: "#ff5e3a", padding: "5px 14px", cursor: "pointer" }}>Cancel</button>
+            </div>
+          )}
+        </div>
+
+        {/* ── Timeline ── */}
+        <div style={{ flexShrink: 0, background: "rgba(255,253,245,0.9)", borderTop: "1.5px solid rgba(42,42,42,0.15)" }}>
+          {/* Ruler */}
+          <div
+            style={{ height: MOBILE_RULER_H, position: "relative", overflow: "hidden", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(42,42,42,0.03)", touchAction: "none" }}
+            onPointerDown={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const t = Math.max(0, (e.clientX - rect.left + (scrollerRef.current?.scrollLeft ?? 0)) / pxPerSecRef.current);
+              playheadRef.current = t; setPlayhead(t); setIsPlaying(false);
+              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+              const onMove = (ev: PointerEvent) => {
+                const t2 = Math.max(0, (ev.clientX - rect.left + (scrollerRef.current?.scrollLeft ?? 0)) / pxPerSecRef.current);
+                playheadRef.current = t2; setPlayhead(t2);
+              };
+              const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+              window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
+            }}
+          >
+            <div style={{ position: "absolute", left: -timelineScroll, top: 0, width: timelineWidth + 200, height: "100%", pointerEvents: "none" }}>
+              {rulerTicks()}
+            </div>
+            <div style={{ position: "absolute", left: playhead * pxPerSec - timelineScroll, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none" }} />
+          </div>
+          {/* Tracks */}
+          <div
+            ref={scrollerRef}
+            style={{ height: MOBILE_TRACK_H + MOBILE_NARRATION_H + 12, overflowX: "auto", overflowY: "hidden", touchAction: "pan-x", position: "relative" }}
+            onScroll={(e) => { const sl = (e.target as HTMLDivElement).scrollLeft; timelineScrollRef.current = sl; setTimelineScroll(sl); }}
+          >
+            <div style={{ position: "relative", width: Math.max(timelineWidth, 400), height: MOBILE_TRACK_H + MOBILE_NARRATION_H + 8, minWidth: "100%" }}>
+              {Array.from({ length: N_LAYERS }, (_, i) => (
+                <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * MOBILE_LAYER_H, height: MOBILE_LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.09)", borderTop: i > 0 ? "1px solid rgba(42,42,42,0.05)" : "none" }} />
+              ))}
+              <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
+
+              {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const isSel = clip.id === selectedClipId;
+                const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
+                const layer = clip.layer ?? 1;
+                return (
+                  <div
+                    key={clip.id}
+                    style={{
+                      position: "absolute",
+                      left: clip.startTime * pxPerSec,
+                      top: layer * MOBILE_LAYER_H + 2,
+                      width: clipPx,
+                      height: MOBILE_LAYER_H - 4,
+                      background: color,
+                      border: isSel ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.35)",
+                      boxShadow: isSel ? "2px 2px 0 #2a2a2a" : "none",
+                      touchAction: "none",
+                      overflow: "hidden",
+                    }}
+                    onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
+                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); setMobileDrawer("props"); }}
+                  >
+                    <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
+                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
+                    <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
+                      {clip.type === "pan" ? "⟷ Pan" : clip.name}
+                    </span>
+                    <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
+                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
+                  </div>
+                );
+              })}
+
+              {clips.filter((c) => c.type === "narration").map((clip) => {
+                const isSel = clip.id === selectedClipId;
+                const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
+                return (
+                  <div
+                    key={clip.id}
+                    style={{
+                      position: "absolute",
+                      left: clip.startTime * pxPerSec,
+                      top: MOBILE_TRACK_H + 6,
+                      width: clipPx,
+                      height: MOBILE_NARRATION_H,
+                      background: NARRATION_COLOR,
+                      border: isSel ? "1.5px solid #2a2a2a" : "1px solid rgba(180,80,130,0.4)",
+                      overflow: "hidden",
+                      touchAction: "none",
+                    }}
+                    onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
+                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); setMobileDrawer("props"); }}
+                  >
+                    <span style={{ position: "absolute", left: 4, right: HANDLE_W + 2, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#5a1530", pointerEvents: "none" }}>
+                      🎙 {clip.name}
+                    </span>
+                    <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.15)", touchAction: "none" }}
+                      onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
+                  </div>
+                );
+              })}
+
+              <div style={{ position: "absolute", left: playhead * pxPerSec, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none", zIndex: 10 }} />
+            </div>
+          </div>
+        </div>
+
+        {/* ── Bottom drawer ── */}
+        {mobileDrawer && (
+          <>
+            <div style={{ position: "fixed", inset: 0, zIndex: 100 }} onClick={() => setMobileDrawer(null)} />
+            <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 101, background: "#fffdf5", borderTop: "2px solid #2a2a2a", padding: "12px 16px 28px", boxShadow: "0 -4px 24px rgba(0,0,0,0.18)", maxHeight: "55vh", overflowY: "auto" }}>
+              <div style={{ width: 32, height: 3, background: "rgba(42,42,42,0.28)", borderRadius: 2, margin: "0 auto 14px" }} />
+
+              {mobileDrawer === "media" && (
+                <>
+                  <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    <button onClick={() => { mediaUploadRef.current?.click(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}>
+                      ↑  Upload photo / video
+                    </button>
+                    <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}>
+                      ▶  Add YouTube clip
+                    </button>
+                    <button onClick={() => { addPanClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: PAN_CLIP_COLOR }}>
+                      ⟷  Add pan clip
+                    </button>
+                    <ProGated featureName="Narration Recording">
+                      <button
+                        onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
+                        style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: isRecording ? "#ff5e3a" : "#2a2a2a", color: "#fff" }}
+                      >
+                        {isRecording ? "⏹  Stop narration" : "🎙  Record narration"}
+                      </button>
+                    </ProGated>
+                  </div>
+                </>
+              )}
+
+              {mobileDrawer === "props" && selectedClip && (
+                <>
+                  <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
+                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Duration (s)</div>
+                      <input
+                        type="number" inputMode="decimal" step={0.1} min={0.1}
+                        value={selectedClip.duration.toFixed(2)}
+                        onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= 0.1) setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, duration: v } : c)); }}
+                        style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" } as React.CSSProperties}
+                      />
+                    </div>
+                    {selectedClip.type !== "narration" && (
+                      <div>
+                        <div style={{ ...panelLabelStyle, marginBottom: 6 }}>
+                          Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
+                        </div>
+                        <input
+                          type="range" min={0.1} max={0.95} step={0.01}
+                          value={selectedClip.holdFraction ?? HOLD_FRACTION}
+                          onChange={(e) => { const v = parseFloat(e.target.value); if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true); setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)); }}
+                          style={{ width: "100%", accentColor: "#c8f135" }}
+                        />
+                      </div>
+                    )}
+                    {(selectedClip.type === "video" || selectedClip.type === "narration") && (
+                      <div>
+                        <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Volume {Math.round((selectedClip.muted ? 0 : (selectedClip.volume ?? 1)) * 100)}%</div>
+                        <input
+                          type="range" min={0} max={1} step={0.01}
+                          value={selectedClip.muted ? 0 : (selectedClip.volume ?? 1)}
+                          onChange={(e) => { const v = parseFloat(e.target.value); setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, volume: v, muted: false } : c)); }}
+                          style={{ width: "100%", accentColor: "#c8f135" }}
+                        />
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button onClick={() => copyClip(selectedClipId!)} style={{ ...miniButton, flex: 1, padding: "8px", fontSize: 12 }}>⌘ Copy</button>
+                      <button onClick={() => { duplicateClip(selectedClipId!); setMobileDrawer(null); }} style={{ ...miniButton, flex: 1, padding: "8px", fontSize: 12 }}>⎘ Dup</button>
+                    </div>
+                    <button
+                      onClick={() => { deleteClip(selectedClipId!); setMobileDrawer(null); }}
+                      style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", width: "100%", padding: "10px", fontSize: 13, textAlign: "center" }}
+                    >✕ Delete clip</button>
+                  </div>
+                </>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* ── Long-press action sheet ── */}
+        {mobileLongPressClipId && (
+          <>
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 300 }} onClick={() => setMobileLongPressClipId(null)} />
+            <div style={{ position: "fixed", left: 16, right: 16, bottom: 36, zIndex: 301, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>
+              <div onClick={() => { copyClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, borderBottom: "1px solid rgba(42,42,42,0.08)", cursor: "pointer", touchAction: "manipulation" }}>⌘ Copy</div>
+              <div onClick={() => { duplicateClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, borderBottom: "1px solid rgba(42,42,42,0.08)", cursor: "pointer", touchAction: "manipulation" }}>⎘ Duplicate</div>
+              <div onClick={() => { deleteClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, color: "#ff5e3a", cursor: "pointer", touchAction: "manipulation" }}>✕ Delete</div>
+            </div>
+          </>
+        )}
+
+        {/* ── YouTube modal (shared with desktop) ── */}
+        {ytModalOpen && (
+          <div
+            onClick={(e) => { if (e.target === e.currentTarget) setYtModalOpen(false); }}
+            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 640, maxWidth: "95vw", maxHeight: "90vh", display: "flex", flexDirection: "column", fontFamily: "monospace", overflow: "hidden" }}>
+              <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>
+                  {ytView === "search" ? "▶ ADD YOUTUBE CLIP" : `▶ TRIM  —  ${(ytSelected?.title ?? "").slice(0, 45)}${(ytSelected?.title?.length ?? 0) > 45 ? "…" : ""}`}
+                </span>
+                <button onClick={() => setYtModalOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+              </div>
+              <div style={{ flex: 1, overflowY: "auto", padding: 16 }}>
+                {ytView === "search" ? (
+                  <>
+                    <div style={{ display: "flex", marginBottom: 14, borderBottom: "1.5px solid #2a2a2a" }}>
+                      {(["paste", "search"] as const).map((tab) => (
+                        <button key={tab} onClick={() => { setYtTab(tab); setYtError(""); }}
+                          style={{ fontFamily: "monospace", padding: "6px 14px", fontSize: 11, fontWeight: ytTab === tab ? 700 : 400, background: ytTab === tab ? "#2a2a2a" : "transparent", color: ytTab === tab ? "#fffdf5" : "#2a2a2a", border: "none", borderBottom: ytTab === tab ? "2px solid #c8f135" : "none", cursor: "pointer" }}>
+                          {tab === "paste" ? "Paste URL" : "Search"}
+                        </button>
+                      ))}
+                    </div>
+                    {ytTab === "paste" ? (
+                      <div>
+                        <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                          <input autoFocus type="text" value={ytUrlInput}
+                            onChange={(e) => setYtUrlInput(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") handleYtPasteUrl(); }}
+                            placeholder="https://www.youtube.com/watch?v=..."
+                            style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                          />
+                          <button onClick={handleYtPasteUrl} style={{ ...miniButton, padding: "8px 16px", fontSize: 12, fontWeight: 700 }}>Next →</button>
+                        </div>
+                        {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, margin: 0 }}>{ytError}</p>}
+                        <p style={{ fontSize: 10, color: "#9a9a9a", lineHeight: 1.6, marginTop: 10 }}>Paste a YouTube URL — you&apos;ll trim it in the next step.</p>
+                      </div>
+                    ) : (
+                      /* Search tab — identical to desktop render, references same state */
+                      (() => {
+                        return (
+                          <div>
+                            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                              <input autoFocus type="text" value={ytQuery}
+                                onChange={(e) => setYtQuery(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === "Enter") handleYtSearch(); }}
+                                placeholder="Search YouTube…"
+                                style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                              />
+                              <button onClick={() => handleYtSearch()} disabled={ytLoading || !ytQuery.trim()}
+                                style={{ ...miniButton, padding: "8px 16px", fontSize: 12, fontWeight: 700, opacity: (ytLoading || !ytQuery.trim()) ? 0.5 : 1 }}>
+                                {ytLoading ? "…" : "Search"}
+                              </button>
+                            </div>
+                            <div style={{ display: "flex", gap: 0, marginBottom: 12, border: "1.5px solid #2a2a2a", width: "fit-content" }}>
+                              {([["All", false], ["Shorts", true]] as const).map(([label, val]) => {
+                                const active = ytShortsOnly === val;
+                                return (
+                                  <button key={label} onClick={() => setYtShortsOnly(val)}
+                                    style={{ ...miniButton, fontSize: 11, padding: "4px 8px", background: active ? "#2a2a2a" : "transparent", color: active ? "#fffdf5" : "#2a2a2a", marginRight: label === "Shorts" ? -1 : 0, position: "relative", zIndex: active ? 1 : 0 }}>
+                                    {label}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, marginBottom: 8, marginTop: 0 }}>{ytError}</p>}
+                            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                              {ytResults.map((r) => (
+                                <div key={r.id} onClick={() => {
+                                  const maxSec = parseDurationSec(r.duration);
+                                  const initEnd = Math.min(30, maxSec || 30);
+                                  setYtSelected(r);
+                                  setYtStart(0); setYtStartInput("0:00");
+                                  setYtEnd(initEnd); setYtEndInput(formatTimestamp(initEnd));
+                                  ytRangeRef.current = { start: 0, end: initEnd };
+                                  setYtView("trim");
+                                }}
+                                  style={{ display: "flex", gap: 10, padding: "8px", border: "1.5px solid rgba(42,42,42,0.2)", cursor: "pointer", background: ytSelected?.id === r.id ? "#c8f135" : "transparent" }}>
+                                  {r.thumbnail && <img src={r.thumbnail} alt="" style={{ width: 80, height: 45, objectFit: "cover", flexShrink: 0 }} />}
+                                  <div style={{ minWidth: 0 }}>
+                                    <div style={{ fontWeight: 700, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.title}</div>
+                                    <div style={{ fontSize: 10, color: "#6a6a6a", marginTop: 2 }}>{r.channel} {r.duration ? `· ${r.duration}` : ""}</div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })()
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {(() => {
+                      const maxSec = parseDurationSec(ytSelected?.duration) || 600;
+                      const clipLen = Math.max(0, ytEnd - ytStart);
+                      return (
+                        <div>
+                          <div style={{ marginBottom: 12, fontWeight: 700, fontSize: 12, color: "#2a2a2a" }}>Set trim range (max 30 s)</div>
+                          <div ref={ytSliderTrackRef}
+                            style={{ position: "relative", height: 36, background: "rgba(42,42,42,0.06)", border: "1.5px solid #2a2a2a", marginBottom: 10, cursor: "pointer" }}
+                            onPointerDown={(e) => {
+                              const rect = ytSliderTrackRef.current!.getBoundingClientRect();
+                              const frac = (e.clientX - rect.left) / rect.width;
+                              const t = frac * maxSec;
+                              const distStart = Math.abs(t - ytRangeRef.current.start);
+                              const distEnd = Math.abs(t - ytRangeRef.current.end);
+                              const which = distStart < distEnd ? "start" : "end";
+                              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                              const onMove = (ev: PointerEvent) => {
+                                const f2 = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+                                const newT = f2 * maxSec;
+                                if (which === "start") {
+                                  const newStart = Math.min(newT, ytRangeRef.current.end - 0.5);
+                                  if (ytRangeRef.current.end - newStart > 30) { ytRangeRef.current.start = ytRangeRef.current.end - 30; }
+                                  else { ytRangeRef.current.start = newStart; }
+                                  setYtStart(ytRangeRef.current.start); setYtStartInput(formatTimestamp(ytRangeRef.current.start));
+                                } else {
+                                  const newEnd = Math.max(newT, ytRangeRef.current.start + 0.5);
+                                  const clampedEnd = Math.min(maxSec, newEnd);
+                                  if (clampedEnd - ytRangeRef.current.start > 30) { ytRangeRef.current.end = ytRangeRef.current.start + 30; }
+                                  else { ytRangeRef.current.end = clampedEnd; }
+                                  setYtEnd(ytRangeRef.current.end); setYtEndInput(formatTimestamp(ytRangeRef.current.end));
+                                }
+                              };
+                              const onUp2 = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp2); };
+                              window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp2);
+                            }}
+                          >
+                            <div style={{ position: "absolute", top: 0, bottom: 0, left: `${(ytStart / maxSec) * 100}%`, width: `${((ytEnd - ytStart) / maxSec) * 100}%`, background: "rgba(200,241,53,0.45)", border: "2px solid #2a2a2a" }} />
+                            <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: `${(ytStart / maxSec) * 100}%`, width: 10, height: 24, background: "#2a2a2a", cursor: "ew-resize", marginLeft: -5 }} />
+                            <div style={{ position: "absolute", top: "50%", transform: "translateY(-50%)", left: `${(ytEnd / maxSec) * 100}%`, width: 10, height: 24, background: "#2a2a2a", cursor: "ew-resize", marginLeft: -5 }} />
+                          </div>
+                          <div style={{ display: "flex", gap: 12, marginBottom: 8 }}>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>Start</div>
+                              <input type="text" value={ytStartInput} placeholder="0:00"
+                                onChange={(e) => {
+                                  setYtStartInput(e.target.value);
+                                  const p = parseTimestampSec(e.target.value);
+                                  if (p !== null) {
+                                    const curEnd = ytRangeRef.current.end;
+                                    const newStart = Math.max(0, Math.min(curEnd - 0.5, p));
+                                    ytRangeRef.current.start = newStart; setYtStart(newStart);
+                                    if (curEnd - newStart > 30) { const newEnd = newStart + 30; ytRangeRef.current.end = newEnd; setYtEnd(newEnd); setYtEndInput(formatTimestamp(newEnd)); }
+                                  }
+                                }}
+                                onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
+                                style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                              />
+                            </div>
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 10, color: "#6a6a6a", marginBottom: 3 }}>End</div>
+                              <input type="text" value={ytEndInput} placeholder="0:30"
+                                onChange={(e) => {
+                                  setYtEndInput(e.target.value);
+                                  const p = parseTimestampSec(e.target.value);
+                                  if (p !== null) {
+                                    const newEnd = Math.max(ytRangeRef.current.start + 0.5, Math.min(maxSec, Math.min(p, ytRangeRef.current.start + 30)));
+                                    ytRangeRef.current.end = newEnd; setYtEnd(newEnd);
+                                  }
+                                }}
+                                onBlur={() => setYtEndInput(formatTimestamp(ytEnd))}
+                                style={{ width: "100%", fontFamily: "monospace", fontSize: 13, border: "1.5px solid #2a2a2a", padding: "6px 8px", background: "#fffdf5", boxSizing: "border-box" } as React.CSSProperties}
+                              />
+                            </div>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>
+                            Clip length: {formatTimestamp(clipLen)}<span style={{ marginLeft: 8 }}>· {formatTimestamp(maxSec)} total</span>
+                          </div>
+                          {ytError && <p style={{ color: "#ff3a3a", fontSize: 11, fontFamily: "monospace", marginTop: 6, marginBottom: 0 }}>{ytError}</p>}
+                        </div>
+                      );
+                    })()}
+                  </>
+                )}
+              </div>
+              {ytView === "trim" && (
+                <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, alignItems: "center" }}>
+                  <button onClick={() => { setYtView("search"); setYtSelected(null); setYtError(""); }} style={{ ...miniButton, padding: "6px 12px", fontSize: 11 }}>← back</button>
+                  <button onClick={handleYtConfirm} disabled={ytLoading}
+                    style={{ ...miniButton, marginLeft: "auto", padding: "6px 18px", fontSize: 12, fontWeight: 700, background: "#c8f135", borderColor: "#2a2a2a", opacity: ytLoading ? 0.5 : 1 }}>
+                    {ytLoading ? "downloading…" : "Add to board"}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Toast ── */}
+        {toast && (
+          <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
+            {toast}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
