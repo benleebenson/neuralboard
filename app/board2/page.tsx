@@ -710,6 +710,8 @@ export default function Board2Page() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
     renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current);
   }, [renderToCtx]);
 
@@ -726,9 +728,10 @@ export default function Board2Page() {
       if (next >= maxEnd) {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
         isPlayingRef.current = false;
-        for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; vid.pause(); }
-        for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; vid.pause(); }
-        for (const vid of videoCacheRef.current.values()) { vid.muted = true; vid.pause(); }
+        // Mute but DO NOT pause — paused video elements render black via drawImage
+        for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
+        for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
+        for (const vid of videoCacheRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
         for (const clipId of [...activeNarrationRef.current.keys()]) {
           const entry = activeNarrationRef.current.get(clipId);
           if (entry) { try { entry.bufNode.stop(); } catch {} try { entry.bufNode.disconnect(); } catch {} try { entry.gainNode.disconnect(); } catch {} }
@@ -756,14 +759,15 @@ export default function Board2Page() {
         vid.volume = clip.muted ? 0 : (clip.volume ?? 1);
         const prevActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
         if (!prevActive) {
-          vid.currentTime = 0; // just entered active range — restart from blob start
-        } else {
-          vid.currentTime = t - clip.startTime; // in range — sync to playhead
+          // Just entered active range — seek to correct position and let video play naturally.
+          // Do NOT seek every tick: constant currentTime assignment triggers micro-seeks that
+          // produce black frames, especially when paired with pause() calls.
+          vid.currentTime = Math.max(0, t - clip.startTime);
         }
       } else {
         vid.muted = true;
       }
-      // ambient (outside range): no currentTime override — plays and loops naturally
+      // Ambient (outside active range): video loops naturally — no currentTime override.
     }
     // Narration audio: spawn on entry, stop on exit
     for (const clip of clipsRef.current) {
@@ -844,9 +848,11 @@ export default function Board2Page() {
       }
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
-      for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; vid.pause(); }
-      for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; vid.pause(); }
-      for (const vid of videoCacheRef.current.values()) { vid.muted = true; vid.pause(); }
+      // Mute but DO NOT pause — paused video elements render black via drawImage.
+      // Videos loop ambiently so the preview canvas always has valid frames to draw.
+      for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
+      for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
+      for (const vid of videoCacheRef.current.values()) { vid.muted = true; if (vid.paused) vid.play().catch(() => {}); }
       // Stop all active narration audio
       for (const clipId of [...activeNarrationRef.current.keys()]) {
         const entry = activeNarrationRef.current.get(clipId);
@@ -2067,6 +2073,8 @@ export default function Board2Page() {
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = W; exportCanvas.height = H;
     const exportCtx = exportCanvas.getContext("2d")!;
+    exportCtx.imageSmoothingEnabled = true;
+    exportCtx.imageSmoothingQuality = "high";
     // Start all video clips playing ambiently from t=0 — active/ambient logic handles sync per frame
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
@@ -2144,17 +2152,18 @@ export default function Board2Page() {
     let prevExportElapsed = -1; // tracks previous frame for entry detection
     function exportFrame() {
       if (exportCancelRef.current) {
-        for (const vid of ytVideoElsRef.current.values()) vid.pause();
-        for (const vid of videoByClipIdRef.current.values()) vid.pause();
-        for (const vid of videoCacheRef.current.values()) vid.pause();
+        // Mute but DO NOT pause after export — keep ambient loop alive for canvas preview
+        for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; }
+        for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; }
+        for (const vid of videoCacheRef.current.values()) { vid.muted = true; }
         exportAudioCtx?.close().catch(() => {});
         recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
       }
       const elapsed = (performance.now() - exportWallStart) / 1000;
       if (elapsed >= totalDur) {
-        for (const vid of ytVideoElsRef.current.values()) vid.pause();
-        for (const vid of videoByClipIdRef.current.values()) vid.pause();
-        for (const vid of videoCacheRef.current.values()) vid.pause();
+        for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; }
+        for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; }
+        for (const vid of videoCacheRef.current.values()) { vid.muted = true; }
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
