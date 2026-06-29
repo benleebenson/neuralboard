@@ -535,6 +535,7 @@ export default function Board2Page() {
   const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
   const ytVideoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement
   const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
+  const videoByClipIdRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement for regular/pasted clips
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
   const ytRangeRef = useRef({ start: 0, end: 30 });
   const prevPlayheadRef = useRef(-1); // previous frame's playhead for entry detection
@@ -692,7 +693,7 @@ export default function Board2Page() {
           ctx.drawImage(img, sx - sw / 2, sy - sh / 2, sw, sh);
         }
       } else {
-        const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+        const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (vid && vid.readyState >= 2) {
           ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh);
         }
@@ -725,8 +726,9 @@ export default function Board2Page() {
       if (next >= maxEnd) {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
         isPlayingRef.current = false;
-        for (const vid of ytVideoElsRef.current.values()) vid.pause();
-        for (const vid of videoCacheRef.current.values()) vid.pause();
+        for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; vid.pause(); }
+        for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; vid.pause(); }
+        for (const vid of videoCacheRef.current.values()) { vid.muted = true; vid.pause(); }
         for (const clipId of [...activeNarrationRef.current.keys()]) {
           const entry = activeNarrationRef.current.get(clipId);
           if (entry) { try { entry.bufNode.stop(); } catch {} try { entry.bufNode.disconnect(); } catch {} try { entry.gainNode.disconnect(); } catch {} }
@@ -743,18 +745,23 @@ export default function Board2Page() {
     // 3-state video management: active (synced) / ambient (looping) / paused (playback stopped)
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       // Ambient baseline: keep all videos playing with loop
       if (vid.paused) vid.play().catch(() => {});
       const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
+      // Bug 3: unmute + set volume in active range, mute outside
       if (isActive) {
+        vid.muted = false;
+        vid.volume = clip.muted ? 0 : (clip.volume ?? 1);
         const prevActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
         if (!prevActive) {
           vid.currentTime = 0; // just entered active range — restart from blob start
         } else {
           vid.currentTime = t - clip.startTime; // in range — sync to playhead
         }
+      } else {
+        vid.muted = true;
       }
       // ambient (outside range): no currentTime override — plays and loops naturally
     }
@@ -837,8 +844,9 @@ export default function Board2Page() {
       }
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
-      for (const vid of ytVideoElsRef.current.values()) vid.pause();
-      for (const vid of videoCacheRef.current.values()) vid.pause();
+      for (const vid of ytVideoElsRef.current.values()) { vid.muted = true; vid.pause(); }
+      for (const vid of videoByClipIdRef.current.values()) { vid.muted = true; vid.pause(); }
+      for (const vid of videoCacheRef.current.values()) { vid.muted = true; vid.pause(); }
       // Stop all active narration audio
       for (const clipId of [...activeNarrationRef.current.keys()]) {
         const entry = activeNarrationRef.current.get(clipId);
@@ -859,7 +867,7 @@ export default function Board2Page() {
     if (isPlaying) return;
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       const relTime = playhead - clip.startTime;
       if (relTime >= 0 && relTime <= clip.duration) vid.currentTime = relTime;
@@ -880,9 +888,23 @@ export default function Board2Page() {
       if (!videoCacheRef.current.has(url)) {
         const vid = document.createElement("video");
         vid.muted = true; vid.loop = true; vid.preload = "auto"; vid.src = url;
+        vid.onloadeddata = () => drawFrame(playheadRef.current);
+        vid.play().catch(() => {});
         videoCacheRef.current.set(url, vid);
       }
     }
+  }
+
+  // Creates a dedicated video element per clip.id — required for correct paste/duplicate (Bug 2)
+  function ensureClipVideoEl(clipId: string, url: string): HTMLVideoElement {
+    const existing = videoByClipIdRef.current.get(clipId);
+    if (existing) return existing;
+    const vid = document.createElement("video");
+    vid.muted = true; vid.loop = true; vid.preload = "auto"; vid.src = url;
+    vid.onloadeddata = () => drawFrame(playheadRef.current);
+    vid.play().catch(() => {});
+    videoByClipIdRef.current.set(clipId, vid);
+    return vid;
   }
 
   function getVisibleBoardCenter(): { camX: number; camY: number } {
@@ -930,6 +952,7 @@ export default function Board2Page() {
     const { camX, camY } = getVisibleBoardCenter();
     const clipId = generateId();
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
+    if (item.type === "video") ensureClipVideoEl(clipId, item.url);
     setClips((prev) => {
       const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
@@ -948,15 +971,21 @@ export default function Board2Page() {
   }
 
   function deleteClip(clipId: string) {
-    const vid = ytVideoElsRef.current.get(clipId);
-    if (vid) {
-      vid.pause();
-      vid.src = "";
-      if (videoHiddenContainerRef.current?.contains(vid)) videoHiddenContainerRef.current.removeChild(vid);
+    const ytVid = ytVideoElsRef.current.get(clipId);
+    if (ytVid) {
+      ytVid.muted = true; ytVid.pause(); ytVid.src = "";
+      if (videoHiddenContainerRef.current?.contains(ytVid)) videoHiddenContainerRef.current.removeChild(ytVid);
       ytVideoElsRef.current.delete(clipId);
     }
+    const clipVid = videoByClipIdRef.current.get(clipId);
+    if (clipVid) { clipVid.muted = true; clipVid.pause(); clipVid.src = ""; videoByClipIdRef.current.delete(clipId); }
+    // Only revoke YouTube blob if no other clip still references the same URL
     const blobUrl = ytBlobUrlsRef.current.get(clipId);
-    if (blobUrl) { URL.revokeObjectURL(blobUrl); ytBlobUrlsRef.current.delete(clipId); }
+    if (blobUrl) {
+      const otherRefs = clipsRef.current.filter((c) => c.id !== clipId && c.sourceUrl === blobUrl);
+      if (otherRefs.length === 0) URL.revokeObjectURL(blobUrl);
+      ytBlobUrlsRef.current.delete(clipId);
+    }
     const clip = clipsRef.current.find((c) => c.id === clipId);
     if (clip?.type === "narration") {
       stopNarrationAudio(clipId);
@@ -988,6 +1017,7 @@ export default function Board2Page() {
     const startTime = playheadRef.current;
     const layer = freeLayerAtTime(clipsRef.current, startTime, src.duration, "", src.layer ?? 1);
     const newClip: Clip = { ...src, id: generateId(), startTime, layer };
+    if (src.type === "video") ensureClipVideoEl(newClip.id, src.sourceUrl);
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
   }
@@ -998,6 +1028,7 @@ export default function Board2Page() {
     const startTime = clip.startTime + clip.duration;
     const layer = freeLayerAtTime(clipsRef.current, startTime, clip.duration, "", clip.layer ?? 1);
     const newClip: Clip = { ...clip, id: generateId(), startTime, layer };
+    if (clip.type === "video") ensureClipVideoEl(newClip.id, clip.sourceUrl);
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
   }
@@ -1173,6 +1204,8 @@ export default function Board2Page() {
       vid.loop = true;
       vid.preload = "auto";
       vid.playsInline = true;
+      vid.onloadeddata = () => drawFrame(playheadRef.current);
+      vid.play().catch(() => {});
       if (videoHiddenContainerRef.current) videoHiddenContainerRef.current.appendChild(vid);
       ytVideoElsRef.current.set(clipId, vid);
       ytBlobUrlsRef.current.set(clipId, blobUrl);
@@ -1645,6 +1678,7 @@ export default function Board2Page() {
     const duration = item.duration ?? (item.type === "video" ? 5 : 4);
     const clipId = generateId();
     loadMedia(item.url, item.type);
+    if (item.type === "video") ensureClipVideoEl(clipId, item.url);
     const { w, h } = getMediaDimensions(item.url, item.type);
     const { camX, camY } = getVisibleBoardCenter();
     setClips((prev) => {
@@ -1677,7 +1711,7 @@ export default function Board2Page() {
     // Pre-warm ALL video elements during this user gesture to unlock programmatic .play() later
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       vid.play().then(() => vid.pause()).catch(() => {});
     }
@@ -2036,7 +2070,7 @@ export default function Board2Page() {
     // Start all video clips playing ambiently from t=0 — active/ambient logic handles sync per frame
     for (const clip of currentClips) {
       if (clip.type !== "video") continue;
-      const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+      const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
       if (!vid) continue;
       vid.loop = true;
       vid.currentTime = 0;
@@ -2045,23 +2079,28 @@ export default function Board2Page() {
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
 
-    // ── Narration audio setup ─────────────────────────────────────────────────
-    const narrationClips = currentClips.filter((c) => c.type === "narration");
+    // ── Audio setup (narration + video clips) ────────────────────────────────
+    const audioClips = currentClips.filter((c) => c.type === "narration" || c.type === "video");
     let exportAudioCtx: AudioContext | null = null;
     let exportAudioDest: MediaStreamAudioDestinationNode | null = null;
     type AudioItem = { clip: Clip; buffer: AudioBuffer };
     let audioBuffers: AudioItem[] = [];
 
-    if (narrationClips.length > 0) {
+    if (audioClips.length > 0) {
       exportAudioCtx = new AudioContext();
       exportAudioDest = exportAudioCtx.createMediaStreamDestination();
-      audioBuffers = await Promise.all(
-        narrationClips.map(async (clip) => {
-          const ab = await fetch(clip.sourceUrl).then((r) => r.arrayBuffer());
-          const buffer = await exportAudioCtx!.decodeAudioData(ab);
-          return { clip, buffer } as AudioItem;
+      const results = await Promise.all(
+        audioClips.map(async (clip) => {
+          try {
+            const ab = await fetch(clip.sourceUrl).then((r) => r.arrayBuffer());
+            const buffer = await exportAudioCtx!.decodeAudioData(ab);
+            return { clip, buffer } as AudioItem;
+          } catch {
+            return null; // video with no audio track, unsupported codec, etc.
+          }
         })
       );
+      audioBuffers = results.filter((x): x is AudioItem => x !== null);
     }
 
     const exportStream = exportAudioDest
@@ -2083,7 +2122,7 @@ export default function Board2Page() {
     };
     recorder.start(100);
 
-    // Schedule narration audio relative to export start (export runs at real-time 1x speed)
+    // Schedule audio relative to export start (export runs at real-time 1x speed)
     if (exportAudioCtx && exportAudioDest && audioBuffers.length > 0) {
       const exportStartAcTime = exportAudioCtx.currentTime;
       for (const { clip, buffer } of audioBuffers) {
@@ -2094,6 +2133,10 @@ export default function Board2Page() {
         bufNode.buffer = buffer;
         bufNode.connect(gainNode);
         bufNode.start(exportStartAcTime + clip.startTime);
+        // For video clips, stop at clip end (buffer may be longer than clip.duration)
+        if (clip.type === "video") {
+          bufNode.stop(exportStartAcTime + clip.startTime + clip.duration);
+        }
       }
     }
 
@@ -2102,6 +2145,7 @@ export default function Board2Page() {
     function exportFrame() {
       if (exportCancelRef.current) {
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        for (const vid of videoByClipIdRef.current.values()) vid.pause();
         for (const vid of videoCacheRef.current.values()) vid.pause();
         exportAudioCtx?.close().catch(() => {});
         recorder.stop(); setIsExporting(false); isExportingRef.current = false; setExportProgress(0); return;
@@ -2109,6 +2153,7 @@ export default function Board2Page() {
       const elapsed = (performance.now() - exportWallStart) / 1000;
       if (elapsed >= totalDur) {
         for (const vid of ytVideoElsRef.current.values()) vid.pause();
+        for (const vid of videoByClipIdRef.current.values()) vid.pause();
         for (const vid of videoCacheRef.current.values()) vid.pause();
         recorder.stop(); return;
       }
@@ -2116,7 +2161,7 @@ export default function Board2Page() {
       // Active clips: play-and-let-run (seek+play only on entry); ambient: per-frame modulo seek
       for (const clip of currentClips) {
         if (clip.type !== "video") continue;
-        const vid = ytVideoElsRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
+        const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
         if (!vid) continue;
         const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
         if (isActive) {
