@@ -525,6 +525,7 @@ export default function Board2Page() {
   const lastRafTimeRef = useRef<number | null>(null);
   const rafIdRef = useRef<number | null>(null);
   const mediaUploadRef = useRef<HTMLInputElement>(null);
+  const narrationUploadRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const videoCacheRef = useRef<Map<string, HTMLVideoElement>>(new Map());
   const exportCancelRef = useRef(false);
@@ -1171,6 +1172,51 @@ export default function Board2Page() {
     if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
     if (micRafRef.current !== null) { cancelAnimationFrame(micRafRef.current); micRafRef.current = null; }
     setIsRecording(false);
+  }
+
+  async function handleNarrationUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const isVideoFile = file.type.startsWith("video/") || /\.(mp4|mov|webm|mkv)$/i.test(file.name);
+    setToast("Processing audio…");
+    try {
+      let blobUrl: string;
+      let audioBlob: Blob;
+      if (isVideoFile) {
+        // Extract just the audio track from the video container
+        const arrayBuffer = await file.arrayBuffer();
+        const tmpCtx = new AudioContext();
+        const audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer);
+        await tmpCtx.close().catch(() => {});
+        const wavBlob = audioBufferToWav(audioBuffer);
+        blobUrl = URL.createObjectURL(wavBlob);
+        audioBlob = wavBlob;
+      } else {
+        audioBlob = file;
+        blobUrl = URL.createObjectURL(file);
+      }
+      const dur: number = await new Promise((resolve) => {
+        const audio = new Audio(blobUrl);
+        audio.onloadedmetadata = () => resolve(isFinite(audio.duration) ? audio.duration : 1);
+        audio.onerror = () => resolve(1);
+      });
+      if (dur < 0.1) { URL.revokeObjectURL(blobUrl); setToast("No audio found in file"); return; }
+      const waveform = await generateNarrationWaveform(blobUrl).catch(() => undefined);
+      setClips((prev) => [...prev, {
+        id: generateId(),
+        type: "narration" as const,
+        name: file.name.replace(/\.[^.]+$/, "").slice(0, 40),
+        sourceUrl: blobUrl,
+        audioBlob,
+        startTime: playheadRef.current,
+        duration: dur,
+        waveform,
+      }]);
+      setToast(isVideoFile ? "Audio extracted from video" : "Narration added");
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Failed to process file");
+    }
   }
 
   // ─ Media upload ───────────────────────────────────────────────────────────
@@ -2427,6 +2473,7 @@ export default function Board2Page() {
       <div style={{ ...pageStyle, overflow: "hidden", display: "flex", flexDirection: "column", height: "100dvh" }}>
         <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
         <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+        <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
         <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
         {/* ── Compact header ── */}
@@ -2670,6 +2717,12 @@ export default function Board2Page() {
                         style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: isRecording ? "#ff5e3a" : "#2a2a2a", color: "#fff" }}
                       >
                         {isRecording ? "⏹  Stop narration" : "🎙  Record narration"}
+                      </button>
+                      <button
+                        onClick={() => { narrationUploadRef.current?.click(); setMobileDrawer(null); }}
+                        style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
+                      >
+                        ↑  Upload audio / mp4
                       </button>
                     </ProGated>
                   </div>
@@ -3033,6 +3086,19 @@ export default function Board2Page() {
                   <>⏹ Stop ({Math.floor(recElapsed / 60)}:{String(Math.floor(recElapsed % 60)).padStart(2, "0")})</>
                 ) : "🎙 Record Narration"}
               </button>
+              <button
+                onClick={() => narrationUploadRef.current?.click()}
+                style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%" }}
+              >
+                ↑ Upload audio / mp4
+              </button>
+              <input
+                ref={narrationUploadRef}
+                type="file"
+                accept="audio/*,video/mp4,video/quicktime,video/webm"
+                style={{ display: "none" }}
+                onChange={handleNarrationUpload}
+              />
             </ProGated>
             {isRecording && (
               <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>
