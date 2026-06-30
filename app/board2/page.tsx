@@ -31,6 +31,7 @@ type Clip = {
   boardH?: number;
   holdFraction?: number;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
+  thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
@@ -543,6 +544,7 @@ export default function Board2Page() {
   const ytVideoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement
   const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
   const videoByClipIdRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement for regular/pasted clips
+  const thumbnailImagesRef = useRef<Map<string, HTMLImageElement | null>>(new Map()); // clip.id → pre-loaded thumbnail image (null = capture failed)
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
   const ytRangeRef = useRef({ start: 0, end: 30 });
   const prevPlayheadRef = useRef(-1); // previous frame's playhead for entry detection
@@ -733,8 +735,24 @@ export default function Board2Page() {
         }
       } else {
         const vid = ytVideoElsRef.current.get(clip.id) ?? videoByClipIdRef.current.get(clip.id) ?? videoCacheRef.current.get(clip.sourceUrl);
-        if (vid && vid.readyState >= 2) {
-          ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh);
+        const thumbEl = thumbnailImagesRef.current.get(clip.id);
+        let drewLive = false;
+        if (vid && vid.readyState >= 2 && !vid.ended) {
+          try { ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh); drewLive = true; } catch { drewLive = false; }
+        }
+        if (!drewLive) {
+          if (thumbEl) {
+            ctx.drawImage(thumbEl, sx - sw / 2, sy - sh / 2, sw, sh);
+          } else {
+            // Thumbnail not yet captured or failed — draw black box with play icon
+            ctx.fillStyle = "#111";
+            ctx.fillRect(sx - sw / 2, sy - sh / 2, sw, sh);
+            ctx.fillStyle = "rgba(255,255,255,0.6)";
+            ctx.font = `${Math.max(16, Math.min(sw, sh) * 0.3)}px sans-serif`;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText("▶", sx, sy);
+            ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+          }
         }
       }
     }
@@ -940,6 +958,44 @@ export default function Board2Page() {
     }
   }
 
+  async function captureVideoThumbnail(clipId: string, vid: HTMLVideoElement): Promise<void> {
+    if (thumbnailImagesRef.current.has(clipId)) return; // already captured or pre-set (pasted clip)
+    try {
+      if (vid.readyState < 2) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("timeout")), 8000);
+          const onReady = () => { clearTimeout(timer); resolve(); };
+          const onErr = () => { clearTimeout(timer); reject(vid.error); };
+          vid.addEventListener("canplay", onReady, { once: true });
+          vid.addEventListener("error", onErr, { once: true });
+        });
+      }
+      const seekTime = isFinite(vid.duration) && vid.duration < 1 ? 0 : 0.1;
+      vid.currentTime = seekTime;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("seeked timeout")), 5000);
+        vid.addEventListener("seeked", () => { clearTimeout(timer); resolve(); }, { once: true });
+      });
+      const w = vid.videoWidth || 640;
+      const h = vid.videoHeight || 360;
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const ctx2d = canvas.getContext("2d");
+      if (!ctx2d) throw new Error("no 2d ctx");
+      ctx2d.drawImage(vid, 0, 0, w, h);
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+      if (!blob) throw new Error("toBlob failed");
+      const thumbUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = thumbUrl;
+      await new Promise<void>((resolve) => { img.onload = () => resolve(); img.onerror = () => resolve(); });
+      thumbnailImagesRef.current.set(clipId, img);
+      setClips((prev) => prev.map((c) => c.id === clipId ? { ...c, thumbnailBlobUrl: thumbUrl } : c));
+    } catch {
+      thumbnailImagesRef.current.set(clipId, null); // mark failed — renders black box fallback
+    }
+  }
+
   // Creates a dedicated video element per clip.id — required for correct paste/duplicate (Bug 2)
   function ensureClipVideoEl(clipId: string, url: string): HTMLVideoElement {
     const existing = videoByClipIdRef.current.get(clipId);
@@ -949,6 +1005,7 @@ export default function Board2Page() {
     vid.onloadeddata = () => drawFrame(playheadRef.current);
     vid.play().catch(() => {});
     videoByClipIdRef.current.set(clipId, vid);
+    captureVideoThumbnail(clipId, vid); // fire-and-forget; skips if thumbnail already pre-set
     return vid;
   }
 
@@ -1031,6 +1088,13 @@ export default function Board2Page() {
       if (otherRefs.length === 0) URL.revokeObjectURL(blobUrl);
       ytBlobUrlsRef.current.delete(clipId);
     }
+    // Revoke thumbnail blob only if no other clip shares the same thumbnailBlobUrl
+    const clip2 = clipsRef.current.find((c) => c.id === clipId);
+    if (clip2?.thumbnailBlobUrl) {
+      const thumbRefs = clipsRef.current.filter((c) => c.id !== clipId && c.thumbnailBlobUrl === clip2.thumbnailBlobUrl);
+      if (thumbRefs.length === 0) URL.revokeObjectURL(clip2.thumbnailBlobUrl);
+    }
+    thumbnailImagesRef.current.delete(clipId);
     const clip = clipsRef.current.find((c) => c.id === clipId);
     if (clip?.type === "narration") {
       stopNarrationAudio(clipId);
@@ -1062,7 +1126,12 @@ export default function Board2Page() {
     const startTime = playheadRef.current;
     const layer = freeLayerAtTime(clipsRef.current, startTime, src.duration, "", src.layer ?? 1);
     const newClip: Clip = { ...src, id: generateId(), startTime, layer };
-    if (src.type === "video") ensureClipVideoEl(newClip.id, src.sourceUrl);
+    if (src.type === "video") {
+      // Pre-set thumbnail so ensureClipVideoEl skips re-capture (same source video)
+      const srcThumb = thumbnailImagesRef.current.get(src.id);
+      if (srcThumb !== undefined) thumbnailImagesRef.current.set(newClip.id, srcThumb);
+      ensureClipVideoEl(newClip.id, src.sourceUrl);
+    }
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
   }
@@ -1073,7 +1142,12 @@ export default function Board2Page() {
     const startTime = clip.startTime + clip.duration;
     const layer = freeLayerAtTime(clipsRef.current, startTime, clip.duration, "", clip.layer ?? 1);
     const newClip: Clip = { ...clip, id: generateId(), startTime, layer };
-    if (clip.type === "video") ensureClipVideoEl(newClip.id, clip.sourceUrl);
+    if (clip.type === "video") {
+      // Pre-set thumbnail so ensureClipVideoEl skips re-capture (same source video)
+      const srcThumb = thumbnailImagesRef.current.get(clip.id);
+      if (srcThumb !== undefined) thumbnailImagesRef.current.set(newClip.id, srcThumb);
+      ensureClipVideoEl(newClip.id, clip.sourceUrl);
+    }
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
   }
@@ -1299,6 +1373,7 @@ export default function Board2Page() {
       if (videoHiddenContainerRef.current) videoHiddenContainerRef.current.appendChild(vid);
       ytVideoElsRef.current.set(clipId, vid);
       ytBlobUrlsRef.current.set(clipId, blobUrl);
+      captureVideoThumbnail(clipId, vid); // fire-and-forget
 
       // Wait for metadata to get natural dimensions + source duration
       const meta = await new Promise<{ w: number; h: number; sourceDurationSec: number }>((resolve) => {
