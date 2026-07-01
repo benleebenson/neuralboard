@@ -553,6 +553,7 @@ export default function Board2Page() {
   // Switch-based video playback: one dedicated <video> element per clip.id, even for duplicates sharing a sourceUrl.
   const videoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement
   const videoRangeStateRef = useRef<Map<string, boolean>>(new Map()); // clip.id → wasInRange (previous frame)
+  const videoStuckFrameCountRef = useRef<Map<string, number>>(new Map()); // clip.id → consecutive failed-draw frames while active
   const hasPrewarmedRef = useRef(false); // first-play autoplay unlock, once per session
   const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
   const thumbnailImagesRef = useRef<Map<string, HTMLImageElement | null>>(new Map()); // clip.id → pre-loaded thumbnail image (null = capture failed)
@@ -750,8 +751,25 @@ export default function Board2Page() {
         const vid = videoElsRef.current.get(clip.id);
         const thumbEl = thumbnailImagesRef.current.get(clip.id);
         let drewLive = false;
-        if (vid && vid.readyState >= 2 && !vid.paused) {
+        // readyState >= 3 (HAVE_FUTURE_DATA) + currentTime > 0.05 = a decoded frame actually
+        // exists to draw — readyState >= 2 alone can be true before the first frame is decoded,
+        // which showed the thumbnail-frozen-while-audio-plays bug on a clip's first playthrough.
+        if (vid && vid.readyState >= 3 && !vid.paused && !vid.ended && vid.currentTime > 0.05) {
           try { ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh); drewLive = true; } catch { drewLive = false; }
+        }
+        if (drewLive) {
+          videoStuckFrameCountRef.current.set(clip.id, 0);
+        } else if (vid && !vid.paused && time >= clip.startTime && time < clip.startTime + clip.duration) {
+          // Clip should be actively playing but produced no drawable frame this render — track
+          // consecutive misses and nudge playback if it's stuck for a few frames in a row.
+          const misses = (videoStuckFrameCountRef.current.get(clip.id) ?? 0) + 1;
+          videoStuckFrameCountRef.current.set(clip.id, misses);
+          if (misses >= 3) {
+            vid.currentTime = 0.1;
+            vid.play().catch(() => {});
+            videoStuckFrameCountRef.current.set(clip.id, 0);
+            console.warn("[video] clip", clip.id, "stuck — nudging playback");
+          }
         }
         if (!drewLive) {
           if (thumbEl) {
@@ -834,11 +852,41 @@ export default function Board2Page() {
     updateVideoVolume(clip, vid);
   }
 
+  // Silences a clip's audio path (gain node if it exists, else native mute) — the "off" state
+  // shared by switchVideoOff and pre-warming.
+  function setClipAudioOff(clipId: string, vid: HTMLVideoElement) {
+    const nodes = videoAudioNodesRef.current.get(clipId);
+    if (nodes) nodes.gainNode.gain.value = 0; else vid.muted = true;
+  }
+
   // Switch OFF: exit from a clip's active range, for the live preview.
   function switchVideoOff(clip: Clip, vid: HTMLVideoElement) {
-    const nodes = videoAudioNodesRef.current.get(clip.id);
-    if (nodes) nodes.gainNode.gain.value = 0; else vid.muted = true;
+    setClipAudioOff(clip.id, vid);
     pauseAndReset(vid);
+  }
+
+  // Warms up a freshly created video element's decoder with a silent play()→pause() cycle so
+  // its first "real" entry (restart-on-entry, Step 16.10) already has a decoded frame ready to
+  // draw — otherwise the first playthrough plays audio while the canvas still shows the frozen
+  // thumbnail until the decoder catches up. Runs once, as soon as the element can play.
+  function prewarmVideoElement(clipId: string, vid: HTMLVideoElement) {
+    vid.addEventListener("canplay", () => {
+      // If the clip has already had a real entry by the time canplay fires (e.g. pasted
+      // directly onto the currently-playing position), don't interfere — pausing/silencing it
+      // here would kill playback that's already legitimately underway.
+      if (videoRangeStateRef.current.get(clipId)) return;
+      ensureVideoAudioNodes(clipId, vid);
+      setClipAudioOff(clipId, vid); // keep the warm-up silent
+      vid.play().then(() => {
+        if (videoRangeStateRef.current.get(clipId)) return; // became active while warming up
+        pauseAndReset(vid);
+        console.log("[video] pre-warmed clip", clipId);
+      }).catch((err) => {
+        if (videoRangeStateRef.current.get(clipId)) return;
+        pauseAndReset(vid);
+        console.warn("[video] pre-warm failed for clip", clipId, err); // not fatal — will still try on entry
+      });
+    }, { once: true });
   }
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
@@ -1086,12 +1134,12 @@ export default function Board2Page() {
     videoHiddenContainerRef.current?.appendChild(vid);
     videoElsRef.current.set(clipId, vid);
     videoRangeStateRef.current.set(clipId, false);
-    // If the session's first-play autoplay unlock already happened, this element missed it
-    // (e.g. a background YouTube download finishing after Play was first pressed) — best-effort
-    // unlock it now so its later programmatic play() on entry isn't silently blocked.
-    if (hasPrewarmedRef.current) {
-      vid.play().then(() => vid.pause()).catch(() => {});
-    }
+    videoStuckFrameCountRef.current.set(clipId, 0);
+    // Warm the decoder now (silent play→pause) so the element's first real entry has a
+    // drawable frame ready instead of showing the thumbnail while its audio already plays.
+    // Also covers autoplay unlock for elements created after the session's first Play click
+    // (e.g. a background YouTube download finishing mid-session).
+    prewarmVideoElement(clipId, vid);
     captureVideoThumbnail(clipId, url); // fire-and-forget; uses a separate temp element, never seeks vid
     return vid;
   }
@@ -1164,6 +1212,7 @@ export default function Board2Page() {
       videoElsRef.current.delete(clipId);
     }
     videoRangeStateRef.current.delete(clipId);
+    videoStuckFrameCountRef.current.delete(clipId);
     const audioNodes = videoAudioNodesRef.current.get(clipId);
     if (audioNodes) {
       try { audioNodes.gainNode.gain.value = 0; audioNodes.sourceNode.disconnect(); audioNodes.gainNode.disconnect(); } catch {}
