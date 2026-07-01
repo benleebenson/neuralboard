@@ -32,6 +32,9 @@ type Clip = {
   holdFraction?: number;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
   thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
+  sourceBlob?: Blob;          // the actual video Blob backing sourceUrl (video clips only) — cloned
+                               // per-instance on paste/duplicate so each <video> element gets its
+                               // own independent blob instead of sharing one decoder-limited URL
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
@@ -67,6 +70,7 @@ type MediaItem = {
   type: "image" | "video";
   url: string;
   duration?: number;
+  blob?: Blob; // video only — source for cloning a fresh blob when placed on the board
 };
 
 type TimelineDrag = {
@@ -555,7 +559,6 @@ export default function Board2Page() {
   const videoRangeStateRef = useRef<Map<string, boolean>>(new Map()); // clip.id → wasInRange (previous frame)
   const videoStuckFrameCountRef = useRef<Map<string, number>>(new Map()); // clip.id → consecutive failed-draw frames while active
   const hasPrewarmedRef = useRef(false); // first-play autoplay unlock, once per session
-  const ytBlobUrlsRef = useRef<Map<string, string>>(new Map()); // clip.id → blob URL for revocation
   const thumbnailImagesRef = useRef<Map<string, HTMLImageElement | null>>(new Map()); // clip.id → pre-loaded thumbnail image (null = capture failed)
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
   const ytRangeRef = useRef({ start: 0, end: 30 });
@@ -1198,6 +1201,7 @@ export default function Board2Page() {
           startTime: endTime, duration: clipDuration, layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
+          sourceBlob: item.type === "video" ? item.blob : undefined,
         },
       ];
     });
@@ -1218,21 +1222,20 @@ export default function Board2Page() {
       try { audioNodes.gainNode.gain.value = 0; audioNodes.sourceNode.disconnect(); audioNodes.gainNode.disconnect(); } catch {}
       videoAudioNodesRef.current.delete(clipId);
     }
-    // Only revoke YouTube blob if no other clip still references the same URL
-    const blobUrl = ytBlobUrlsRef.current.get(clipId);
-    if (blobUrl) {
-      const otherRefs = clipsRef.current.filter((c) => c.id !== clipId && c.sourceUrl === blobUrl);
-      if (otherRefs.length === 0) URL.revokeObjectURL(blobUrl);
-      ytBlobUrlsRef.current.delete(clipId);
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    // Every video clip now owns an independent blob (Step 16.12) — the only exception is a
+    // clip still using the original upload's URL, which the media library needs to keep alive
+    // so the same file can be dragged onto the board again later.
+    if (clip?.type === "video" && clip.sourceUrl) {
+      const stillInLibrary = mediaLibrary.some((m) => m.url === clip.sourceUrl);
+      if (!stillInLibrary) URL.revokeObjectURL(clip.sourceUrl);
     }
     // Revoke thumbnail blob only if no other clip shares the same thumbnailBlobUrl
-    const clip2 = clipsRef.current.find((c) => c.id === clipId);
-    if (clip2?.thumbnailBlobUrl) {
-      const thumbRefs = clipsRef.current.filter((c) => c.id !== clipId && c.thumbnailBlobUrl === clip2.thumbnailBlobUrl);
-      if (thumbRefs.length === 0) URL.revokeObjectURL(clip2.thumbnailBlobUrl);
+    if (clip?.thumbnailBlobUrl) {
+      const thumbRefs = clipsRef.current.filter((c) => c.id !== clipId && c.thumbnailBlobUrl === clip.thumbnailBlobUrl);
+      if (thumbRefs.length === 0) URL.revokeObjectURL(clip.thumbnailBlobUrl);
     }
     thumbnailImagesRef.current.delete(clipId);
-    const clip = clipsRef.current.find((c) => c.id === clipId);
     if (clip?.type === "narration") {
       stopNarrationAudio(clipId);
       URL.revokeObjectURL(clip.sourceUrl);
@@ -1257,33 +1260,62 @@ export default function Board2Page() {
     setClipboardReady(true);
   }
 
-  function pasteClip() {
+  // Clones the underlying video bytes into a brand-new, independent Blob (+ object URL) so a
+  // duplicate's <video> element gets its own genuinely separate source instead of sharing one
+  // blob URL with the original — Chrome only renders live frames for the most recently active
+  // of several elements pointed at the same blob URL, which showed as duplicates freezing on
+  // their thumbnail while their audio still played. Falls back to sharing the original URL if
+  // cloning fails (e.g. out of memory on a very large source) — not fatal, just re-exposes the
+  // old shared-decoder limitation for that one duplicate.
+  async function cloneVideoSource(clip: Clip): Promise<{ sourceUrl: string; sourceBlob?: Blob }> {
+    if (!clip.sourceBlob) return { sourceUrl: clip.sourceUrl, sourceBlob: clip.sourceBlob };
+    try {
+      const arrayBuffer = await clip.sourceBlob.arrayBuffer();
+      const clonedBlob = new Blob([arrayBuffer], { type: clip.sourceBlob.type });
+      return { sourceUrl: URL.createObjectURL(clonedBlob), sourceBlob: clonedBlob };
+    } catch {
+      return { sourceUrl: clip.sourceUrl, sourceBlob: clip.sourceBlob };
+    }
+  }
+
+  async function pasteClip() {
     const src = clipboardRef.current;
     if (!src) return;
     const startTime = playheadRef.current;
+    const newId = generateId();
+    const cloned = src.type === "video" ? await cloneVideoSource(src) : null;
+    // Recompute against the freshest clips (cloning is async and other edits may land meanwhile)
     const layer = freeLayerAtTime(clipsRef.current, startTime, src.duration, "", src.layer ?? 1);
-    const newClip: Clip = { ...src, id: generateId(), startTime, layer };
+    const newClip: Clip = {
+      ...src, id: newId, startTime, layer,
+      ...(cloned ? { sourceUrl: cloned.sourceUrl, sourceBlob: cloned.sourceBlob } : {}),
+    };
     if (src.type === "video") {
       // Pre-set thumbnail so createVideoElement skips re-capture (same source video)
       const srcThumb = thumbnailImagesRef.current.get(src.id);
       if (srcThumb !== undefined) thumbnailImagesRef.current.set(newClip.id, srcThumb);
-      createVideoElement(newClip.id, src.sourceUrl);
+      createVideoElement(newClip.id, newClip.sourceUrl);
     }
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
   }
 
-  function duplicateClip(clipId: string) {
+  async function duplicateClip(clipId: string) {
     const clip = clipsRef.current.find((c) => c.id === clipId);
     if (!clip) return;
     const startTime = clip.startTime + clip.duration;
+    const newId = generateId();
+    const cloned = clip.type === "video" ? await cloneVideoSource(clip) : null;
     const layer = freeLayerAtTime(clipsRef.current, startTime, clip.duration, "", clip.layer ?? 1);
-    const newClip: Clip = { ...clip, id: generateId(), startTime, layer };
+    const newClip: Clip = {
+      ...clip, id: newId, startTime, layer,
+      ...(cloned ? { sourceUrl: cloned.sourceUrl, sourceBlob: cloned.sourceBlob } : {}),
+    };
     if (clip.type === "video") {
       // Pre-set thumbnail so createVideoElement skips re-capture (same source video)
       const srcThumb = thumbnailImagesRef.current.get(clip.id);
       if (srcThumb !== undefined) thumbnailImagesRef.current.set(newClip.id, srcThumb);
-      createVideoElement(newClip.id, clip.sourceUrl);
+      createVideoElement(newClip.id, newClip.sourceUrl);
     }
     setClips((prev) => [...prev, newClip]);
     setSelectedClipId(newClip.id);
@@ -1448,7 +1480,7 @@ export default function Board2Page() {
           videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
         }
       }
-      const item: MediaItem = { id: generateId(), name: file.name, type, url, duration };
+      const item: MediaItem = { id: generateId(), name: file.name, type, url, duration, blob: type === "video" ? file : undefined };
       setMediaLibrary((prev) => [...prev, item]);
       await addClipAndPlaceOnBoard(item);
     }
@@ -1518,7 +1550,6 @@ export default function Board2Page() {
         const clipId = generateId();
 
         const vid = createVideoElement(clipId, blobUrl);
-        ytBlobUrlsRef.current.set(clipId, blobUrl);
 
         // Wait for metadata to get natural dimensions + source duration
         const meta = await new Promise<{ w: number; h: number; sourceDurationSec: number }>((resolve) => {
@@ -1549,6 +1580,7 @@ export default function Board2Page() {
             startTime: endTime, duration: clipDuration, layer,
             boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
             sourceDurationSec: meta.sourceDurationSec,
+            sourceBlob: blob,
           }];
         });
         setSelectedClipId(clipId);
