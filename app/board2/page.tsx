@@ -1303,6 +1303,8 @@ export default function Board2Page() {
       URL.revokeObjectURL(clip.sourceUrl);
     }
     setClips((prev) => prev.filter((c) => c.id !== clipId));
+    setSelectedClipIds((prev) => prev.filter((id) => id !== clipId));
+    selectedClipIdsRef.current = selectedClipIdsRef.current.filter((id) => id !== clipId);
     setSelectedClipId((prev) => (prev === clipId ? null : prev));
   }
 
@@ -1995,6 +1997,8 @@ export default function Board2Page() {
 
   function deleteAnnotation(id: string) {
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
+    setSelectedAnnotationIds((prev) => prev.filter((annId) => annId !== id));
+    selectedAnnotationIdsRef.current = selectedAnnotationIdsRef.current.filter((annId) => annId !== id);
     setSelectedAnnotationId((prev) => (prev === id ? null : prev));
     setEditingAnnotationId((prev) => (prev === id ? null : prev));
   }
@@ -2093,6 +2097,11 @@ export default function Board2Page() {
         }
         if (a.type === "emoji") {
           const newFontSize = Math.max(20, origFontSize * (newW / origW));
+          return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH, fontSize: newFontSize };
+        }
+        if (a.type === "text") {
+          const scale = origW > 0 && origH > 0 ? Math.max(newW / origW, newH / origH) : 1;
+          const newFontSize = Math.max(8, origFontSize * scale);
           return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH, fontSize: newFontSize };
         }
         return { ...a, boardX: newX, boardY: newY, boardW: newW, boardH: newH };
@@ -2246,7 +2255,7 @@ export default function Board2Page() {
   ) {
     e.stopPropagation();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setSelectedClipId(clip.id);
+    if (!selectedClipIdsRef.current.includes(clip.id)) setClipSelection([clip.id]);
     const rect = scrollerRef.current!.getBoundingClientRect();
     const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
     const cursorOffsetSec = kind === "move" ? clickTimeSec - clip.startTime : 0;
@@ -2345,6 +2354,44 @@ export default function Board2Page() {
     scrub(e.clientX);
     const onMove = (ev: PointerEvent) => scrub(ev.clientX);
     const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  function handleTimelinePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("[data-clipblock]")) return;
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const start = timelinePointFromClient(e.clientX, e.clientY);
+    const marquee: NonNullable<TimelineMarquee> = { startX: start.x, startY: start.y, currentX: start.x, currentY: start.y };
+    timelineMarqueeRef.current = marquee;
+    timelineMarqueeStartClientRef.current = { x: e.clientX, y: e.clientY };
+    setTimelineMarquee(marquee);
+    const onMove = (ev: PointerEvent) => {
+      const point = timelinePointFromClient(ev.clientX, ev.clientY);
+      const next: NonNullable<TimelineMarquee> = { ...marquee, currentX: point.x, currentY: point.y };
+      timelineMarqueeRef.current = next;
+      setTimelineMarquee(next);
+      setClipSelection(selectedClipIdsInTimelineMarquee(next));
+    };
+    const onUp = (ev: PointerEvent) => {
+      const startClient = timelineMarqueeStartClientRef.current;
+      const moved = startClient ? Math.hypot(ev.clientX - startClient.x, ev.clientY - startClient.y) : 0;
+      if (moved < 4) {
+        clearBoardSelection();
+        const point = timelinePointFromClient(ev.clientX, ev.clientY);
+        setPlayhead(Math.max(0, point.x / pxPerSecRef.current));
+        setIsPlaying(false);
+      } else if (timelineMarqueeRef.current) {
+        setClipSelection(selectedClipIdsInTimelineMarquee(timelineMarqueeRef.current));
+      }
+      timelineMarqueeRef.current = null;
+      timelineMarqueeStartClientRef.current = null;
+      setTimelineMarquee(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -2923,8 +2970,21 @@ export default function Board2Page() {
       }
       if (inInput) return;
       if (e.code === "Delete" || e.code === "Backspace") {
-        if (selectedClipId) deleteClip(selectedClipId);
-        else if (selectedAnnotationId) deleteAnnotation(selectedAnnotationId);
+        const clipIds = selectedClipIdsRef.current.length > 0 ? selectedClipIdsRef.current : selectedClipId ? [selectedClipId] : [];
+        const annotationIds = selectedAnnotationIdsRef.current.length > 0 ? selectedAnnotationIdsRef.current : selectedAnnotationId ? [selectedAnnotationId] : [];
+        if (clipIds.length > 0) {
+          e.preventDefault();
+          clipIds.forEach((id) => deleteClip(id));
+          selectedClipIdsRef.current = [];
+          setSelectedClipIds([]);
+          setSelectedClipId(null);
+        } else if (annotationIds.length > 0) {
+          e.preventDefault();
+          setAnnotations((prev) => prev.filter((ann) => !annotationIds.includes(ann.id)));
+          selectedAnnotationIdsRef.current = [];
+          setSelectedAnnotationIds([]);
+          setSelectedAnnotationId(null);
+        }
       }
       const meta = e.metaKey || e.ctrlKey;
       if (meta && e.code === "KeyC" && selectedClipId) {
@@ -4022,7 +4082,7 @@ export default function Board2Page() {
                         cursor: "grab",
                         overflow: "visible",
                       }}
-                      onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
+                      onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
                       onPointerDown={(e) => { if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
@@ -4180,6 +4240,7 @@ export default function Board2Page() {
                 </svg>
 
                 {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
+                {/* eslint-disable-next-line react-hooks/refs */}
                 {annotations.map((ann) => {
                   const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
@@ -4200,7 +4261,7 @@ export default function Board2Page() {
                         zIndex: 5,
                         pointerEvents: annotationTool === "pointer" || isEditing ? "auto" : "none",
                       }}
-                      onClick={(e) => { if (annotationTool === "pointer") { e.stopPropagation(); setSelectedAnnotationId(ann.id); setSelectedClipId(null); } }}
+                      onClick={(e) => { if (annotationTool === "pointer") { e.stopPropagation(); setAnnotationSelection([ann.id]); } }}
                       onDoubleClick={(e) => {
                         if (ann.type === "text" && annotationTool === "pointer") {
                           e.stopPropagation();
@@ -4724,15 +4785,7 @@ export default function Board2Page() {
               timelineScrollRef.current = sl;
               setTimelineScroll(sl);
             }}
-            onPointerDown={(e) => {
-              if ((e.target as HTMLElement) === scrollerRef.current) {
-                setSelectedClipId(null);
-                const rect = scrollerRef.current!.getBoundingClientRect();
-                const x = e.clientX - rect.left + timelineScrollRef.current;
-                setPlayhead(Math.max(0, x / pxPerSecRef.current));
-                setIsPlaying(false);
-              }
-            }}
+            onPointerDown={handleTimelinePointerDown}
             onDragOver={(e) => e.preventDefault()}
             onDrop={handleTimelineDrop}
             onContextMenu={(e) => {
@@ -4761,11 +4814,20 @@ export default function Board2Page() {
               <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + 6, pointerEvents: "none", zIndex: 15 }}>
                 <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(180,80,130,0.5)", letterSpacing: 0.5, textTransform: "uppercase" }}>audio</span>
               </div>
+              {timelineMarquee && (() => {
+                const left = Math.min(timelineMarquee.startX, timelineMarquee.currentX);
+                const top = Math.min(timelineMarquee.startY, timelineMarquee.currentY);
+                const width = Math.abs(timelineMarquee.currentX - timelineMarquee.startX);
+                const height = Math.abs(timelineMarquee.currentY - timelineMarquee.startY);
+                return (
+                  <div style={{ position: "absolute", left, top, width, height, border: "1.5px dashed #ff5e3a", background: "rgba(255,94,58,0.12)", pointerEvents: "none", zIndex: 30 }} />
+                );
+              })()}
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
                 const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
-                const selected = clip.id === selectedClipId;
+                const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const hf = clip.holdFraction ?? HOLD_FRACTION;
                 const innerW = clipPx - HANDLE_W * 2;
@@ -4792,7 +4854,7 @@ export default function Board2Page() {
                       userSelect: "none",
                       overflow: "hidden",
                     }}
-                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
+                    onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
                     {/* Hold region */}
@@ -4832,7 +4894,7 @@ export default function Board2Page() {
 
               {/* Narration clips row */}
               {clips.filter((c) => c.type === "narration").map((clip) => {
-                const selected = clip.id === selectedClipId;
+                const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 return (
                   <div
@@ -4852,7 +4914,7 @@ export default function Board2Page() {
                       userSelect: "none",
                       overflow: "hidden",
                     }}
-                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); }}
+                    onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
                     {/* Left resize handle */}
