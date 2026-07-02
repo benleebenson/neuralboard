@@ -498,6 +498,7 @@ export default function Board2Page() {
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [canvasAspect, setCanvasAspect] = useState<"16:9" | "9:16">("16:9");
@@ -586,6 +587,7 @@ export default function Board2Page() {
   const clipsRef = useRef<Clip[]>(clips);
   const selectedClipIdsRef = useRef<string[]>([]);
   const selectedAnnotationIdsRef = useRef<string[]>([]);
+  const mutedLayersRef = useRef<Record<number, boolean>>({});
   const playheadRef = useRef(0);
   const isPlayingRef = useRef(false);
   const canvasWRef = useRef(canvasW);
@@ -665,6 +667,7 @@ export default function Board2Page() {
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
+  useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
@@ -889,13 +892,31 @@ export default function Board2Page() {
   // Applies clip.volume/muted to whichever audio path is live for this clip: the Web Audio
   // gain node if one exists, otherwise the video element's native volume/muted as a fallback
   // (e.g. createMediaElementSource threw).
+  function effectiveClipVolume(clip: Clip): number {
+    if (clip.muted) return 0;
+    if (clip.type === "video" && mutedLayersRef.current[clip.layer ?? 1]) return 0;
+    return clip.volume ?? 1;
+  }
+
+  function toggleLayerMute(layer: number) {
+    const next = { ...mutedLayersRef.current, [layer]: !mutedLayersRef.current[layer] };
+    mutedLayersRef.current = next;
+    setMutedLayers(next);
+    for (const clip of clipsRef.current) {
+      if (clip.type !== "video" || (clip.layer ?? 1) !== layer) continue;
+      const vid = videoElsRef.current.get(clip.id);
+      if (vid) updateVideoVolume(clip, vid);
+    }
+  }
+
   function updateVideoVolume(clip: Clip, vid: HTMLVideoElement) {
+    const effectiveVolume = effectiveClipVolume(clip);
     const nodes = videoAudioNodesRef.current.get(clip.id);
     if (nodes) {
-      nodes.gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
+      nodes.gainNode.gain.value = effectiveVolume;
     } else {
       vid.muted = false;
-      vid.volume = clip.muted ? 0 : (clip.volume ?? 1);
+      vid.volume = effectiveVolume;
     }
   }
 
@@ -958,6 +979,7 @@ export default function Board2Page() {
 
   const rafLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
+    // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
     const prevT = prevPlayheadRef.current;
     if (lastRafTimeRef.current !== null) {
@@ -2892,7 +2914,7 @@ export default function Board2Page() {
       const exportStartAcTime = exportAudioCtx.currentTime;
       for (const { clip, buffer } of audioBuffers) {
         const gainNode = exportAudioCtx.createGain();
-        gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
+        gainNode.gain.value = effectiveClipVolume(clip);
         gainNode.connect(exportAudioDest);
         const bufNode = exportAudioCtx.createBufferSource();
         bufNode.buffer = buffer;
@@ -2916,6 +2938,7 @@ export default function Board2Page() {
       }
     }
 
+    // eslint-disable-next-line react-hooks/purity
     const exportWallStart = performance.now();
     let prevExportElapsed = -1; // tracks previous frame for entry detection
     function exportFrame() {
@@ -3459,6 +3482,32 @@ export default function Board2Page() {
             <div style={{ position: "relative", width: Math.max(timelineWidth, 400), height: MOBILE_TRACK_H + MOBILE_NARRATION_H + 8, minWidth: "100%" }}>
               {Array.from({ length: N_LAYERS }, (_, i) => (
                 <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * MOBILE_LAYER_H, height: MOBILE_LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.09)", borderTop: i > 0 ? "1px solid rgba(42,42,42,0.05)" : "none" }} />
+              ))}
+              {Array.from({ length: N_LAYERS }, (_, i) => (
+                <button
+                  key={`mute-${i}`}
+                  title={mutedLayers[i] ? `Unmute layer L${i}` : `Mute layer L${i}`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); toggleLayerMute(i); }}
+                  style={{
+                    position: "absolute",
+                    left: timelineScroll + 2,
+                    top: i * MOBILE_LAYER_H + 1,
+                    zIndex: 20,
+                    width: 20,
+                    height: 16,
+                    padding: 0,
+                    border: "1px solid rgba(42,42,42,0.35)",
+                    background: mutedLayers[i] ? "#ff5e3a" : "rgba(255,253,245,0.88)",
+                    color: mutedLayers[i] ? "#fff" : "#2a2a2a",
+                    fontSize: 8,
+                    lineHeight: "14px",
+                    fontFamily: "monospace",
+                    touchAction: "manipulation",
+                  }}
+                >
+                  {mutedLayers[i] ? "×" : `L${i}`}
+                </button>
               ))}
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
@@ -4804,8 +4853,27 @@ export default function Board2Page() {
               ))}
               {/* Layer labels L0–L4 (track scroll position) */}
               {Array.from({ length: N_LAYERS }, (_, i) => (
-                <div key={i} style={{ position: "absolute", left: timelineScroll + 2, top: i * LAYER_H + 1, pointerEvents: "none", zIndex: 15 }}>
-                  <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.3)", letterSpacing: 0.5 }}>L{i}</span>
+                <div key={i} style={{ position: "absolute", left: timelineScroll + 2, top: i * LAYER_H + 1, zIndex: 15, display: "flex", alignItems: "center", gap: 3 }}>
+                  <button
+                    title={mutedLayers[i] ? `Unmute layer L${i}` : `Mute layer L${i}`}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => { e.stopPropagation(); toggleLayerMute(i); }}
+                    style={{
+                      width: 16,
+                      height: 14,
+                      padding: 0,
+                      border: "1px solid rgba(42,42,42,0.35)",
+                      background: mutedLayers[i] ? "#ff5e3a" : "rgba(255,253,245,0.85)",
+                      color: mutedLayers[i] ? "#fff" : "#2a2a2a",
+                      fontSize: 8,
+                      lineHeight: "12px",
+                      fontFamily: "monospace",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {mutedLayers[i] ? "×" : "♪"}
+                  </button>
+                  <span style={{ fontSize: 7, fontFamily: "monospace", color: mutedLayers[i] ? "#ff5e3a" : "rgba(42,42,42,0.3)", letterSpacing: 0.5 }}>L{i}</span>
                 </div>
               ))}
               {/* Narration row background */}
