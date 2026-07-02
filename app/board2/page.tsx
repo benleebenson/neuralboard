@@ -82,17 +82,52 @@ type TimelineDrag = {
   cursorOffsetSec: number;
 };
 
+type BoardMarquee = {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+} | null;
+
+type TimelineMarquee = {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+} | null;
+
 type YtSearchResult = {
   id: string;
   title: string;
   channel: string;
   duration: string | number;
   thumbnail: string;
+  // Set when this selection originated from a Neural Search placeholder click, so
+  // handleYtConfirm knows to reuse the placeholder's board position and remove it on success.
+  placeholderId?: string;
+  boardX?: number;
+  boardY?: number;
 };
 type YtModalView = "search" | "trim";
 type YtTab = "paste" | "search";
 
 type DownloadToast = { id: string; title: string; status: "downloading" | "done" | "error"; error?: string };
+
+// Neural Search: a not-yet-downloaded YouTube candidate placed on the board as a clickable
+// thumbnail. Lives outside `clips` — no timeline presence, ignored by camera keyframes/export.
+type NeuralPlaceholder = {
+  id: string;
+  boardX: number;
+  boardY: number;
+  boardW: number;
+  boardH: number;
+  videoId: string;
+  title: string;
+  channel: string;
+  thumbnailUrl: string;
+  viewCount: number;
+  durationSec: number;
+};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -248,7 +283,7 @@ function endOfLayer(clips: Clip[], layer: number, excludeId: string): number {
 }
 
 function findFreeBoardPos(
-  existing: Clip[],
+  existing: Array<{ boardX?: number; boardY?: number; boardW?: number; boardH?: number }>,
   clipW: number,
   clipH: number,
   camX: number = BOARD_W / 2,
@@ -324,6 +359,13 @@ function formatTimestamp(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function formatViewCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M views`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K views`;
+  if (n > 0) return `${n} views`;
+  return "";
 }
 
 function parseTimestampSec(s: string): number | null {
@@ -455,6 +497,7 @@ export default function Board2Page() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [canvasAspect, setCanvasAspect] = useState<"16:9" | "9:16">("16:9");
@@ -483,6 +526,7 @@ export default function Board2Page() {
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [selectedAnnotationIds, setSelectedAnnotationIds] = useState<string[]>([]);
   const [annotationTool, setAnnotationTool] = useState<AnnotationTool>("pointer");
   const [annotationColor, setAnnotationColor] = useState("#cc2200");
   const [annotationFont, setAnnotationFont] = useState("Caveat");
@@ -519,6 +563,16 @@ export default function Board2Page() {
   const [ytShortsOnly, setYtShortsOnly] = useState(false);
   const [downloadToasts, setDownloadToasts] = useState<DownloadToast[]>([]);
 
+  // ── Neural Search ──
+  const [neuralModalOpen, setNeuralModalOpen] = useState(false);
+  const [neuralConcept, setNeuralConcept] = useState("");
+  const [neuralPhase, setNeuralPhase] = useState<string | null>(null);
+  const [neuralError, setNeuralError] = useState("");
+  const [neuralPlaceholders, setNeuralPlaceholders] = useState<NeuralPlaceholder[]>([]);
+  const [hoveredPlaceholderId, setHoveredPlaceholderId] = useState<string | null>(null);
+  const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
+  const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
+
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
@@ -530,6 +584,8 @@ export default function Board2Page() {
   const boardContainerRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const clipsRef = useRef<Clip[]>(clips);
+  const selectedClipIdsRef = useRef<string[]>([]);
+  const selectedAnnotationIdsRef = useRef<string[]>([]);
   const playheadRef = useRef(0);
   const isPlayingRef = useRef(false);
   const canvasWRef = useRef(canvasW);
@@ -551,6 +607,10 @@ export default function Board2Page() {
   const timelineScrollRef = useRef(0);
   const pendingScrollLeftRef = useRef<number | null>(null);
   const timelineDragRef = useRef<TimelineDrag | null>(null);
+  const boardMarqueeRef = useRef<BoardMarquee>(null);
+  const timelineMarqueeRef = useRef<TimelineMarquee>(null);
+  const boardMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
+  const timelineMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
   const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
   const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
@@ -603,6 +663,8 @@ export default function Board2Page() {
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
+  useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
@@ -1523,6 +1585,11 @@ export default function Board2Page() {
     const ytSel = ytSelected;
     const start = ytStart, end = ytEnd;
     const title = (ytSel.title ?? "YouTube clip").slice(0, 40);
+    // Set when this download originated from a Neural Search placeholder click — reuse its
+    // board position instead of auto-placing, and remove it once the real clip lands.
+    const sourcePlaceholderId = ytSel.placeholderId;
+    const placeholderBoardX = ytSel.boardX;
+    const placeholderBoardY = ytSel.boardY;
 
     // Close the modal instantly — download continues in the background via a toast
     setYtModalOpen(false);
@@ -1574,7 +1641,9 @@ export default function Board2Page() {
         setClips((prev) => {
           const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
           const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
-          const pos = findFreeBoardPos(prev, meta.w, meta.h, camX, camY);
+          const pos = (placeholderBoardX !== undefined && placeholderBoardY !== undefined)
+            ? { boardX: placeholderBoardX, boardY: placeholderBoardY }
+            : findFreeBoardPos(prev, meta.w, meta.h, camX, camY);
           return [...prev, {
             id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
             startTime: endTime, duration: clipDuration, layer,
@@ -1584,6 +1653,9 @@ export default function Board2Page() {
           }];
         });
         setSelectedClipId(clipId);
+        if (sourcePlaceholderId) {
+          setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== sourcePlaceholderId));
+        }
 
         setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
         setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 2000);
@@ -1595,26 +1667,232 @@ export default function Board2Page() {
     })();
   }
 
+  // ─ Neural Search ──────────────────────────────────────────────────────────
+
+  async function runNeuralSearch() {
+    const concept = neuralConcept.trim();
+    if (!concept) return;
+    setNeuralError("");
+    setNeuralPhase("Analyzing concept...");
+    // The API call is a single round trip — stage the copy so the wait doesn't feel opaque.
+    const t1 = setTimeout(() => setNeuralPhase("Searching YouTube..."), 1800);
+    const t2 = setTimeout(() => setNeuralPhase("Ranking by popularity..."), 5000);
+    try {
+      const res = await fetch("/api/neural-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ concept }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Search failed (${res.status})`);
+      }
+      const data = await res.json() as {
+        videos: Array<{ videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number }>;
+      };
+      const videos = Array.isArray(data.videos) ? data.videos : [];
+      if (videos.length === 0) {
+        setNeuralError("No videos found — try describing the concept differently");
+        return;
+      }
+
+      // Place each candidate on the board, avoiding overlap with existing clips, existing
+      // placeholders, and the other candidates from this same search.
+      const { camX, camY } = getVisibleBoardCenter();
+      const occupied: Array<{ boardX?: number; boardY?: number; boardW?: number; boardH?: number }> =
+        [...clipsRef.current, ...neuralPlaceholders];
+      const newPlaceholders: NeuralPlaceholder[] = videos.map((v) => {
+        const w = 800, h = 450;
+        const pos = findFreeBoardPos(occupied, w, h, camX, camY);
+        occupied.push({ boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h });
+        return {
+          id: generateId(), boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
+          videoId: v.videoId, title: v.title, channel: v.channel, thumbnailUrl: v.thumbnailUrl,
+          viewCount: v.viewCount, durationSec: v.durationSec,
+        };
+      });
+      setNeuralPlaceholders((prev) => [...prev, ...newPlaceholders]);
+      setNeuralModalOpen(false);
+      setNeuralConcept("");
+    } catch (e) {
+      setNeuralError(e instanceof Error ? e.message : "Search failed");
+    } finally {
+      clearTimeout(t1); clearTimeout(t2);
+      setNeuralPhase(null);
+    }
+  }
+
+  function removeNeuralPlaceholder(id: string) {
+    setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  function openTrimModalForPlaceholder(ph: NeuralPlaceholder) {
+    const initEnd = Math.min(30, ph.durationSec || 30);
+    setYtSelected({
+      id: ph.videoId, title: ph.title, channel: ph.channel, duration: ph.durationSec, thumbnail: ph.thumbnailUrl,
+      placeholderId: ph.id, boardX: ph.boardX, boardY: ph.boardY,
+    });
+    setYtStart(0); setYtStartInput("0:00");
+    setYtEnd(initEnd); setYtEndInput(formatTimestamp(initEnd));
+    ytRangeRef.current = { start: 0, end: initEnd };
+    setYtView("trim");
+    setYtError("");
+    setYtModalOpen(true);
+  }
+
+  function setClipSelection(ids: string[]) {
+    const unique = Array.from(new Set(ids));
+    selectedClipIdsRef.current = unique;
+    setSelectedClipIds(unique);
+    setSelectedClipId(unique[unique.length - 1] ?? null);
+    if (unique.length > 0) {
+      selectedAnnotationIdsRef.current = [];
+      setSelectedAnnotationIds([]);
+      setSelectedAnnotationId(null);
+    }
+  }
+
+  function setAnnotationSelection(ids: string[]) {
+    const unique = Array.from(new Set(ids));
+    selectedAnnotationIdsRef.current = unique;
+    setSelectedAnnotationIds(unique);
+    setSelectedAnnotationId(unique[unique.length - 1] ?? null);
+    if (unique.length > 0) {
+      selectedClipIdsRef.current = [];
+      setSelectedClipIds([]);
+      setSelectedClipId(null);
+    }
+  }
+
+  function setMixedBoardSelection(clipIds: string[], annotationIds: string[]) {
+    const uniqueClipIds = Array.from(new Set(clipIds));
+    const uniqueAnnotationIds = Array.from(new Set(annotationIds));
+    selectedClipIdsRef.current = uniqueClipIds;
+    selectedAnnotationIdsRef.current = uniqueAnnotationIds;
+    setSelectedClipIds(uniqueClipIds);
+    setSelectedAnnotationIds(uniqueAnnotationIds);
+    setSelectedClipId(uniqueClipIds[uniqueClipIds.length - 1] ?? null);
+    setSelectedAnnotationId(uniqueAnnotationIds.length > 0 && uniqueClipIds.length === 0 ? uniqueAnnotationIds[uniqueAnnotationIds.length - 1] : null);
+  }
+
+  function clearBoardSelection() {
+    selectedClipIdsRef.current = [];
+    selectedAnnotationIdsRef.current = [];
+    setSelectedClipIds([]);
+    setSelectedAnnotationIds([]);
+    setSelectedClipId(null);
+    setSelectedAnnotationId(null);
+  }
+
+  function clientToBoardPoint(clientX: number, clientY: number) {
+    const rect = boardContainerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return {
+      x: (clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current,
+      y: (clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current,
+    };
+  }
+
+  function rectsIntersect(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function selectionFromBoardMarquee(marquee: NonNullable<BoardMarquee>) {
+    const x = Math.min(marquee.startX, marquee.currentX);
+    const y = Math.min(marquee.startY, marquee.currentY);
+    const w = Math.abs(marquee.currentX - marquee.startX);
+    const h = Math.abs(marquee.currentY - marquee.startY);
+    const clipIds = clipsRef.current
+      .filter((clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+      .filter((clip) => rectsIntersect({ x, y, w, h }, { x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH! }))
+      .map((clip) => clip.id);
+    const annotationIds = annotationsRef.current
+      .filter((ann) => rectsIntersect({ x, y, w, h }, { x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH }))
+      .map((ann) => ann.id);
+    return { clipIds, annotationIds };
+  }
+
+  function timelinePointFromClient(clientX: number, clientY: number) {
+    const rect = scrollerRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    return {
+      x: clientX - rect.left + timelineScrollRef.current,
+      y: clientY - rect.top,
+    };
+  }
+
+  function selectedClipIdsInTimelineMarquee(marquee: NonNullable<TimelineMarquee>) {
+    const left = Math.min(marquee.startX, marquee.currentX);
+    const right = Math.max(marquee.startX, marquee.currentX);
+    const top = Math.min(marquee.startY, marquee.currentY);
+    const bottom = Math.max(marquee.startY, marquee.currentY);
+    return clipsRef.current
+      .filter((clip) => {
+        const clipLeft = clip.startTime * pxPerSecRef.current;
+        const clipRight = clipLeft + Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSecRef.current);
+        const clipTop = clip.type === "narration" ? TRACK_H + 8 : (clip.layer ?? 1) * LAYER_H + 2;
+        const clipBottom = clipTop + (clip.type === "narration" ? NARRATION_TRACK_H - 8 : LAYER_H - 4);
+        return clipLeft < right && clipRight > left && clipTop < bottom && clipBottom > top;
+      })
+      .sort((a, b) => a.startTime - b.startTime)
+      .map((clip) => clip.id);
+  }
+
   // ─ Board clip drag ────────────────────────────────────────────────────────
 
   function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setSelectedClipId(clip.id);
+    const movingClipIds = selectedClipIdsRef.current.includes(clip.id) ? [...selectedClipIdsRef.current] : [clip.id];
+    const movingAnnotationIds = selectedClipIdsRef.current.includes(clip.id) ? [...selectedAnnotationIdsRef.current] : [];
+    if (!selectedClipIdsRef.current.includes(clip.id)) setClipSelection([clip.id]);
     const startX = e.clientX, startY = e.clientY;
-    const origX = clip.boardX!, origY = clip.boardY!;
+    const origClips = new Map(
+      clipsRef.current
+        .filter((c) => movingClipIds.includes(c.id) && c.boardX !== undefined && c.boardY !== undefined)
+        .map((c) => [c.id, { x: c.boardX!, y: c.boardY! }])
+    );
+    const origAnnotations = new Map(
+      annotationsRef.current
+        .filter((a) => movingAnnotationIds.includes(a.id))
+        .map((a) => [a.id, {
+          x: a.boardX, y: a.boardY,
+          arrowStartX: a.arrowStartX, arrowStartY: a.arrowStartY, arrowEndX: a.arrowEndX, arrowEndY: a.arrowEndY,
+          points: a.points ? a.points.map((p) => ({ ...p })) : undefined,
+        }])
+    );
     const onMove = (ev: PointerEvent) => {
       const zoom = boardZoomRef.current;
+      const dx = (ev.clientX - startX) / zoom;
+      const dy = (ev.clientY - startY) / zoom;
       setClips((prev) =>
         prev.map((c) =>
-          c.id !== clip.id ? c : {
+          !movingClipIds.includes(c.id) || !origClips.has(c.id) ? c : {
             ...c,
-            boardX: Math.round(origX + (ev.clientX - startX) / zoom),
-            boardY: Math.round(origY + (ev.clientY - startY) / zoom),
+            boardX: Math.round(origClips.get(c.id)!.x + dx),
+            boardY: Math.round(origClips.get(c.id)!.y + dy),
           }
         )
       );
+      if (movingAnnotationIds.length > 0) {
+        setAnnotations((prev) => prev.map((a) => {
+          const orig = origAnnotations.get(a.id);
+          if (!orig) return a;
+          return {
+            ...a,
+            boardX: orig.x + dx,
+            boardY: orig.y + dy,
+            ...(orig.arrowStartX !== undefined ? {
+              arrowStartX: orig.arrowStartX + dx,
+              arrowStartY: orig.arrowStartY! + dy,
+              arrowEndX: orig.arrowEndX! + dx,
+              arrowEndY: orig.arrowEndY! + dy,
+            } : {}),
+            ...(orig.points ? { points: orig.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) } : {}),
+          };
+        }));
+      }
     };
     const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
@@ -1674,6 +1952,45 @@ export default function Board2Page() {
     window.addEventListener("pointerup", onUp);
   }
 
+  function handleBoardSurfacePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.target !== e.currentTarget) return;
+    if (isSpaceDownRef.current || annotationToolRef.current !== "pointer") {
+      clearBoardSelection();
+      return;
+    }
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const start = clientToBoardPoint(e.clientX, e.clientY);
+    const marquee: NonNullable<BoardMarquee> = { startX: start.x, startY: start.y, currentX: start.x, currentY: start.y };
+    boardMarqueeRef.current = marquee;
+    boardMarqueeStartClientRef.current = { x: e.clientX, y: e.clientY };
+    setBoardMarquee(marquee);
+    const onMove = (ev: PointerEvent) => {
+      const point = clientToBoardPoint(ev.clientX, ev.clientY);
+      const next: NonNullable<BoardMarquee> = { ...marquee, currentX: point.x, currentY: point.y };
+      boardMarqueeRef.current = next;
+      setBoardMarquee(next);
+      const { clipIds, annotationIds } = selectionFromBoardMarquee(next);
+      setMixedBoardSelection(clipIds, annotationIds);
+    };
+    const onUp = (ev: PointerEvent) => {
+      const startClient = boardMarqueeStartClientRef.current;
+      const moved = startClient ? Math.hypot(ev.clientX - startClient.x, ev.clientY - startClient.y) : 0;
+      if (moved < 4) clearBoardSelection();
+      else if (boardMarqueeRef.current) {
+        const { clipIds, annotationIds } = selectionFromBoardMarquee(boardMarqueeRef.current);
+        setMixedBoardSelection(clipIds, annotationIds);
+      }
+      boardMarqueeRef.current = null;
+      boardMarqueeStartClientRef.current = null;
+      setBoardMarquee(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   // ─ Annotation helpers ─────────────────────────────────────────────────────
 
   function deleteAnnotation(id: string) {
@@ -1698,30 +2015,50 @@ export default function Board2Page() {
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setSelectedAnnotationId(ann.id);
-    setSelectedClipId(null);
+    const movingAnnotationIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedAnnotationIdsRef.current] : [ann.id];
+    const movingClipIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedClipIdsRef.current] : [];
+    if (!selectedAnnotationIdsRef.current.includes(ann.id)) setAnnotationSelection([ann.id]);
     const startX = e.clientX, startY = e.clientY;
-    const { boardX: origX, boardY: origY, arrowStartX: origASX, arrowStartY: origASY, arrowEndX: origAEX, arrowEndY: origAEY } = ann;
-    const origPoints = ann.points ? ann.points.map((p) => ({ ...p })) : undefined;
+    const origAnnotations = new Map(
+      annotationsRef.current
+        .filter((a) => movingAnnotationIds.includes(a.id))
+        .map((a) => [a.id, {
+          x: a.boardX, y: a.boardY,
+          arrowStartX: a.arrowStartX, arrowStartY: a.arrowStartY, arrowEndX: a.arrowEndX, arrowEndY: a.arrowEndY,
+          points: a.points ? a.points.map((p) => ({ ...p })) : undefined,
+        }])
+    );
+    const origClips = new Map(
+      clipsRef.current
+        .filter((c) => movingClipIds.includes(c.id) && c.boardX !== undefined && c.boardY !== undefined)
+        .map((c) => [c.id, { x: c.boardX!, y: c.boardY! }])
+    );
     const onMove = (ev: PointerEvent) => {
       const zoom = boardZoomRef.current;
       const dx = (ev.clientX - startX) / zoom;
       const dy = (ev.clientY - startY) / zoom;
       setAnnotations((prev) =>
         prev.map((a) => {
-          if (a.id !== ann.id) return a;
+          const orig = origAnnotations.get(a.id);
+          if (!orig) return a;
           return {
             ...a,
-            boardX: origX + dx,
-            boardY: origY + dy,
-            ...(origASX !== undefined ? {
-              arrowStartX: origASX + dx, arrowStartY: origASY! + dy,
-              arrowEndX: origAEX! + dx, arrowEndY: origAEY! + dy,
+            boardX: orig.x + dx,
+            boardY: orig.y + dy,
+            ...(orig.arrowStartX !== undefined ? {
+              arrowStartX: orig.arrowStartX + dx, arrowStartY: orig.arrowStartY! + dy,
+              arrowEndX: orig.arrowEndX! + dx, arrowEndY: orig.arrowEndY! + dy,
             } : {}),
-            ...(origPoints ? { points: origPoints.map((p) => ({ x: p.x + dx, y: p.y + dy })) } : {}),
+            ...(orig.points ? { points: orig.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) } : {}),
           };
         })
       );
+      if (movingClipIds.length > 0) {
+        setClips((prev) => prev.map((c) => {
+          const orig = origClips.get(c.id);
+          return orig ? { ...c, boardX: Math.round(orig.x + dx), boardY: Math.round(orig.y + dy) } : c;
+        }));
+      }
     };
     const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
     window.addEventListener("pointermove", onMove);
@@ -2780,6 +3117,82 @@ export default function Board2Page() {
     );
   }
 
+  // ─── Neural Search modal ────────────────────────────────────────────────────
+
+  function renderNeuralSearchModal() {
+    if (!neuralModalOpen) return null;
+    return (
+      <div
+        onClick={(e) => { if (e.target === e.currentTarget && !neuralPhase) setNeuralModalOpen(false); }}
+        style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+      >
+        <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 480, maxWidth: "95vw", fontFamily: "monospace", overflow: "hidden" }}>
+          {/* Header */}
+          <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>🔮 NEURAL SEARCH</span>
+            <button
+              onClick={() => { if (!neuralPhase) setNeuralModalOpen(false); }}
+              style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15, opacity: neuralPhase ? 0.4 : 1 }}
+            >×</button>
+          </div>
+
+          <div style={{ padding: 16 }}>
+            <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
+              Describe your video concept. We&apos;ll find YouTube videos to match.
+            </p>
+            <textarea
+              value={neuralConcept}
+              onChange={(e) => setNeuralConcept(e.target.value)}
+              disabled={!!neuralPhase}
+              placeholder="e.g. The connection between microplastics in our body and mental health decline in modern society…"
+              rows={6}
+              style={{
+                width: "100%", fontFamily: "monospace", fontSize: 11,
+                border: "1.5px solid #2a2a2a", padding: "8px",
+                resize: "vertical", boxSizing: "border-box",
+                background: neuralPhase ? "#f5f5f0" : "#fff",
+              } as React.CSSProperties}
+            />
+
+            {neuralPhase && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#1a6fd4" }}>
+                ⟳ {neuralPhase}
+              </div>
+            )}
+            {neuralError && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#cc2200" }}>
+                ✗ {neuralError}
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => { if (!neuralPhase) setNeuralModalOpen(false); }}
+              disabled={!!neuralPhase}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: neuralPhase ? 0.4 : 1 }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={runNeuralSearch}
+              disabled={!!neuralPhase || !neuralConcept.trim()}
+              style={{
+                ...miniButton, padding: "6px 18px", fontSize: 12, fontWeight: 700,
+                background: "#e4cfff", borderColor: "#2a2a2a",
+                opacity: (!!neuralPhase || !neuralConcept.trim()) ? 0.5 : 1,
+                cursor: (!!neuralPhase || !neuralConcept.trim()) ? "not-allowed" : "pointer",
+              }}
+            >
+              {neuralPhase ? "Working…" : "Find Videos →"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
   if (isMobile && isPortrait) {
@@ -2883,9 +3296,46 @@ export default function Board2Page() {
                 </div>
               );
             })}
+
+            {/* Neural Search placeholders — not yet downloaded, tap to trim & add */}
+            {neuralPlaceholders.map((ph) => (
+              <div
+                key={ph.id}
+                style={{
+                  position: "absolute",
+                  left: ph.boardX * boardZoom,
+                  top: ph.boardY * boardZoom,
+                  width: ph.boardW * boardZoom,
+                  height: ph.boardH * boardZoom,
+                  border: "2px dashed #a855f7",
+                  boxShadow: "1px 1px 4px rgba(42,42,42,0.2)",
+                  touchAction: "none",
+                  cursor: "pointer",
+                }}
+                onClick={() => openTrimModalForPlaceholder(ph)}
+              >
+                <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none", background: "#1a1a2e" }}>
+                  {ph.thumbnailUrl && (
+                    <img src={ph.thumbnailUrl} alt={ph.title} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", opacity: 0.85 }} draggable={false} />
+                  )}
+                  <div style={{ position: "absolute", top: 2, left: 2, padding: "1px 4px", background: "#a855f7", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", fontWeight: 700 }}>
+                    🔮 NOT ADDED
+                  </div>
+                  <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+                    {ph.title} {ph.viewCount > 0 && `· ${formatViewCount(ph.viewCount)}`}
+                  </div>
+                </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); removeNeuralPlaceholder(ph.id); }}
+                  style={{ position: "absolute", top: -8, right: -8, width: 20, height: 20, borderRadius: "50%", background: "#ff5e3a", border: "2px solid #fff", color: "#fff", fontSize: 11, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 20, touchAction: "none" }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
           </div>
 
-          {clips.filter((c) => c.boardX !== undefined).length === 0 && (
+          {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && (
             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
               <span style={{ fontFamily: "monospace", fontSize: 10, color: "rgba(42,42,42,0.35)", textAlign: "center" }}>Tap ≡ to add media</span>
             </div>
@@ -3040,6 +3490,14 @@ export default function Board2Page() {
                     <button onClick={() => { addPanClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: PAN_CLIP_COLOR }}>
                       ⟷  Add pan clip
                     </button>
+                    <ProGated featureName="Neural Search">
+                      <button
+                        onClick={() => { setNeuralModalOpen(true); setNeuralConcept(""); setNeuralError(""); setNeuralPhase(null); setMobileDrawer(null); }}
+                        style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: "#e4cfff" }}
+                      >
+                        🔮  Neural Search
+                      </button>
+                    </ProGated>
                     <ProGated featureName="Narration Recording">
                       <button
                         onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
@@ -3322,6 +3780,7 @@ export default function Board2Page() {
           </div>
         )}
         {renderDownloadToasts()}
+        {renderNeuralSearchModal()}
       </div>
     );
   }
@@ -3401,6 +3860,15 @@ export default function Board2Page() {
             >
               ▶ Add YouTube
             </button>
+
+            <ProGated featureName="Neural Search">
+              <button
+                onClick={() => { setNeuralModalOpen(true); setNeuralConcept(""); setNeuralError(""); setNeuralPhase(null); }}
+                style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", background: "#e4cfff" }}
+              >
+                🔮 Neural Search
+              </button>
+            </ProGated>
 
             <ProGated featureName="Narration Recording">
               <button
@@ -3524,16 +3992,20 @@ export default function Board2Page() {
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
-                onPointerDown={(e) => {
-                  if (e.target === e.currentTarget) {
-                    setSelectedClipId(null);
-                    setSelectedAnnotationId(null);
-                  }
-                }}
+                onPointerDown={handleBoardSurfacePointerDown}
               >
+                {boardMarquee && (() => {
+                  const x = Math.min(boardMarquee.startX, boardMarquee.currentX) * boardZoom;
+                  const y = Math.min(boardMarquee.startY, boardMarquee.currentY) * boardZoom;
+                  const w = Math.abs(boardMarquee.currentX - boardMarquee.startX) * boardZoom;
+                  const h = Math.abs(boardMarquee.currentY - boardMarquee.startY) * boardZoom;
+                  return (
+                    <div style={{ position: "absolute", left: x, top: y, width: w, height: h, border: "1.5px dashed #ff5e3a", background: "rgba(255,94,58,0.1)", pointerEvents: "none", zIndex: 20 }} />
+                  );
+                })()}
                 {/* eslint-disable-next-line react-hooks/refs */}
                 {clips.filter((c) => c.boardX !== undefined).map((clip) => {
-                  const isSel = clip.id === selectedClipId;
+                  const isSel = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                   return (
                     <div
                       key={clip.id}
@@ -3592,6 +4064,58 @@ export default function Board2Page() {
                     </div>
                   );
                 })}
+
+                {/* Neural Search placeholders — not yet downloaded, click to trim & add */}
+                {neuralPlaceholders.map((ph) => (
+                  <div
+                    key={ph.id}
+                    style={{
+                      position: "absolute",
+                      left: ph.boardX * boardZoom,
+                      top: ph.boardY * boardZoom,
+                      width: ph.boardW * boardZoom,
+                      height: ph.boardH * boardZoom,
+                      border: "2px dashed #a855f7",
+                      boxShadow: "1px 1px 4px rgba(42,42,42,0.2)",
+                      cursor: "pointer",
+                      overflow: "visible",
+                    }}
+                    onClick={(e) => { e.stopPropagation(); openTrimModalForPlaceholder(ph); }}
+                    onMouseEnter={() => setHoveredPlaceholderId(ph.id)}
+                    onMouseLeave={() => setHoveredPlaceholderId((prev) => (prev === ph.id ? null : prev))}
+                  >
+                    <div style={{ position: "absolute", inset: 0, overflow: "hidden", background: "#1a1a2e" }}>
+                      {ph.thumbnailUrl && (
+                        <img
+                          src={ph.thumbnailUrl}
+                          alt={ph.title}
+                          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", opacity: 0.85, userSelect: "none", pointerEvents: "none" }}
+                          draggable={false}
+                        />
+                      )}
+                      <div style={{ position: "absolute", top: 3, left: 3, padding: "1px 5px", background: "#a855f7", color: "#fff", fontSize: 9, fontFamily: "monospace", fontWeight: 700, pointerEvents: "none" }}>
+                        🔮 NOT ADDED
+                      </div>
+                    </div>
+                    {hoveredPlaceholderId === ph.id && (
+                      <div style={{
+                        position: "absolute", bottom: 0, left: 0, right: 0, padding: "4px 6px",
+                        background: "rgba(42,42,42,0.85)", color: "#fff", fontFamily: "monospace",
+                        pointerEvents: "none",
+                      }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ph.title}</div>
+                        {ph.viewCount > 0 && <div style={{ fontSize: 9, color: "#d4a8ff", marginTop: 1 }}>{formatViewCount(ph.viewCount)}</div>}
+                      </div>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); removeNeuralPlaceholder(ph.id); }}
+                      title="Remove"
+                      style={{ position: "absolute", top: -8, right: -8, width: 18, height: 18, borderRadius: "50%", background: "#ff5e3a", border: "1.5px solid #fff", color: "#fff", fontSize: 10, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10 }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
 
                 {/* SVG visual layer for non-text annotations */}
                 <svg
@@ -3657,7 +4181,7 @@ export default function Board2Page() {
 
                 {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
                 {annotations.map((ann) => {
-                  const isSel = ann.id === selectedAnnotationId;
+                  const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
                   const showHandles = isSel && annotationTool === "pointer" && !isEditing;
                   return (
@@ -3776,7 +4300,7 @@ export default function Board2Page() {
               </div>
 
               {/* Empty state */}
-              {clips.filter((c) => c.boardX !== undefined).length === 0 && (
+              {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
                   <span style={{ fontFamily: "monospace", fontSize: 11, color: "rgba(42,42,42,0.4)" }}>
                     Upload images or videos to auto-add to the board
@@ -4777,6 +5301,7 @@ export default function Board2Page() {
         </div>
       )}
       {renderDownloadToasts()}
+      {renderNeuralSearchModal()}
     </div>
   );
 }
@@ -4908,4 +5433,3 @@ const miniButton: React.CSSProperties = {
   cursor: "pointer",
   fontSize: 10,
 };
-
