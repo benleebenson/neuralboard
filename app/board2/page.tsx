@@ -620,6 +620,28 @@ export default function Board2Page() {
   const [top5Concept, setTop5Concept] = useState("");
   const [top5Phase, setTop5Phase] = useState<string | null>(null);
   const [top5Error, setTop5Error] = useState("");
+
+  // ── Mobile Top 5 Tinder flow ──
+  type MobileVideoCandidate = { videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number; };
+  type MobileTop5ItemData = { rank: number; label: string; blurb: string; videos: MobileVideoCandidate[]; };
+  type MobileTop5ApiData = { title: string; items: MobileTop5ItemData[]; };
+  type MobileAcceptedVideo = { videoId: string; trimStart: number; trimEnd: number; title: string; };
+
+  const [mobileDesktopOverride, setMobileDesktopOverride] = useState(false);
+  const [mobileTop5Screen, setMobileTop5Screen] = useState<"prompt" | "loading" | "swipe" | "build" | "done">("prompt");
+  const [mobileTop5Concept, setMobileTop5Concept] = useState("");
+  const [mobileTop5Data, setMobileTop5Data] = useState<MobileTop5ApiData | null>(null);
+  const [mobileTop5CurrentRank, setMobileTop5CurrentRank] = useState(5);
+  const [mobileTop5ResultsByRank, setMobileTop5ResultsByRank] = useState<Map<number, MobileVideoCandidate[]>>(new Map());
+  const [mobileTop5IndexByRank, setMobileTop5IndexByRank] = useState<Map<number, number>>(new Map());
+  const [mobileTop5AcceptedByRank, setMobileTop5AcceptedByRank] = useState<Map<number, MobileAcceptedVideo>>(new Map());
+  const [mobileTop5TrimStart, setMobileTop5TrimStart] = useState(0);
+  const [mobileTop5TrimEnd, setMobileTop5TrimEnd] = useState(30);
+  const [mobileTop5CardAnim, setMobileTop5CardAnim] = useState<"accept" | "reject" | null>(null);
+  const [mobileTop5LoadingRank, setMobileTop5LoadingRank] = useState<number | null>(null);
+  const [mobileTop5BuildPhase, setMobileTop5BuildPhase] = useState<string | null>(null);
+  const [mobileTop5Error, setMobileTop5Error] = useState("");
+
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
 
@@ -692,6 +714,7 @@ export default function Board2Page() {
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const mobileSwipeTouchStartXRef = useRef<number | null>(null);
   const mobileBoardPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const mobileGestureRef = useRef<{
     type: "idle" | "deciding" | "pan" | "move" | "pinch";
@@ -1953,6 +1976,588 @@ export default function Board2Page() {
       clearTimeout(t1); clearTimeout(t2);
       setTop5Phase(null);
     }
+  }
+
+  // ─ Mobile Top 5 Tinder flow ──────────────────────────────────────────────
+
+  async function runMobileTop5Search() {
+    const concept = mobileTop5Concept.trim();
+    if (!concept) return;
+    setMobileTop5Error("");
+    setMobileTop5Screen("loading");
+    try {
+      const res = await fetch("/api/top5-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ concept }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Search failed (${res.status})`);
+      }
+      const data = await res.json() as { title: string; items: Array<{ rank: number; label: string; blurb: string; videos: Array<{ videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number }> }> };
+      if (!data.items || data.items.length === 0) throw new Error("Nothing found — try a different concept");
+
+      setMobileTop5Data(data);
+
+      const byRank = new Map<number, typeof data.items[0]["videos"]>();
+      const idxByRank = new Map<number, number>();
+      data.items.forEach((item) => {
+        byRank.set(item.rank, item.videos);
+        idxByRank.set(item.rank, 0);
+      });
+      setMobileTop5ResultsByRank(byRank);
+      setMobileTop5IndexByRank(idxByRank);
+
+      const firstRankData = data.items.find((i) => i.rank === 5);
+      const firstDur = firstRankData?.videos[0]?.durationSec ?? 30;
+      setMobileTop5TrimStart(0);
+      setMobileTop5TrimEnd(Math.min(30, firstDur));
+      setMobileTop5CurrentRank(5);
+      setMobileTop5AcceptedByRank(new Map());
+      setMobileTop5Screen("swipe");
+    } catch (e) {
+      setMobileTop5Error(e instanceof Error ? e.message : "Search failed");
+      setMobileTop5Screen("prompt");
+    }
+  }
+
+  function getMobileCurrentVideo() {
+    const results = mobileTop5ResultsByRank.get(mobileTop5CurrentRank) ?? [];
+    const index = mobileTop5IndexByRank.get(mobileTop5CurrentRank) ?? 0;
+    return results[index] ?? null;
+  }
+
+  function advanceMobileToNextRank(accepted: Map<number, { videoId: string; trimStart: number; trimEnd: number; title: string }>) {
+    const nextRank = mobileTop5CurrentRank - 1;
+    if (nextRank < 1) {
+      setMobileTop5AcceptedByRank(accepted);
+      buildMobileTop5Video(accepted);
+    } else {
+      setMobileTop5CurrentRank(nextRank);
+      const nextResults = mobileTop5ResultsByRank.get(nextRank) ?? [];
+      const nextDur = nextResults[0]?.durationSec ?? 30;
+      setMobileTop5TrimStart(0);
+      setMobileTop5TrimEnd(Math.min(30, nextDur));
+    }
+  }
+
+  function handleMobileAccept() {
+    const video = getMobileCurrentVideo();
+    if (!video || mobileTop5LoadingRank !== null) return;
+    setMobileTop5CardAnim("accept");
+    setTimeout(() => {
+      setMobileTop5CardAnim(null);
+      const newAccepted = new Map(mobileTop5AcceptedByRank);
+      newAccepted.set(mobileTop5CurrentRank, {
+        videoId: video.videoId,
+        trimStart: mobileTop5TrimStart,
+        trimEnd: mobileTop5TrimEnd,
+        title: video.title,
+      });
+      setMobileTop5AcceptedByRank(newAccepted);
+      advanceMobileToNextRank(newAccepted);
+    }, 320);
+  }
+
+  function handleMobileReject() {
+    const results = mobileTop5ResultsByRank.get(mobileTop5CurrentRank) ?? [];
+    if (mobileTop5LoadingRank !== null) return;
+    setMobileTop5CardAnim("reject");
+    setTimeout(() => {
+      setMobileTop5CardAnim(null);
+      const currentIdx = mobileTop5IndexByRank.get(mobileTop5CurrentRank) ?? 0;
+      const nextIdx = currentIdx + 1;
+      if (nextIdx < results.length) {
+        const nextDur = results[nextIdx]?.durationSec ?? 30;
+        setMobileTop5TrimStart(0);
+        setMobileTop5TrimEnd(Math.min(30, nextDur));
+        setMobileTop5IndexByRank((prev) => {
+          const m = new Map(prev);
+          m.set(mobileTop5CurrentRank, nextIdx);
+          return m;
+        });
+      } else {
+        // Exhausted results — fetch more for this rank
+        const label = mobileTop5Data?.items.find((i) => i.rank === mobileTop5CurrentRank)?.label ?? "";
+        fetchMoreMobileVideos(mobileTop5CurrentRank, label);
+      }
+    }, 320);
+  }
+
+  async function fetchMoreMobileVideos(rank: number, label: string) {
+    setMobileTop5LoadingRank(rank);
+    try {
+      const query = `${label} documentary highlights best moments`;
+      const res = await fetch("/api/yt-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, limit: 8 }),
+      });
+      if (!res.ok) return;
+      const raw = await res.json() as Array<Record<string, unknown>>;
+      const newVideos = (Array.isArray(raw) ? raw : []).map((r) => {
+        const dur = r.duration_seconds ?? r.durationSec;
+        const durStr = typeof r.duration === "string" ? r.duration : undefined;
+        let durationSec = typeof dur === "number" ? dur : 0;
+        if (!durationSec && durStr) {
+          const parts = durStr.split(":").map(Number);
+          if (parts.length === 2) durationSec = (parts[0] || 0) * 60 + (parts[1] || 0);
+          else if (parts.length === 3) durationSec = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+        }
+        return {
+          videoId: (r.id ?? r.videoId) as string,
+          title: String(r.title ?? "YouTube clip"),
+          channel: String(r.channel ?? r.channelTitle ?? ""),
+          thumbnailUrl: String(r.thumbnail ?? r.thumbnailUrl ?? ""),
+          viewCount: Number(r.viewCount ?? r.view_count ?? r.views ?? 0),
+          durationSec,
+        };
+      }).filter((v) => !!v.videoId);
+
+      if (newVideos.length > 0) {
+        setMobileTop5ResultsByRank((prev) => {
+          const m = new Map(prev);
+          const existing = m.get(rank) ?? [];
+          m.set(rank, [...existing, ...newVideos]);
+          return m;
+        });
+        const nextDur = newVideos[0]?.durationSec ?? 30;
+        setMobileTop5TrimStart(0);
+        setMobileTop5TrimEnd(Math.min(30, nextDur));
+      }
+    } finally {
+      setMobileTop5LoadingRank(null);
+    }
+  }
+
+  async function buildMobileTop5Video(accepted: Map<number, { videoId: string; trimStart: number; trimEnd: number; title: string }>) {
+    setMobileTop5Screen("build");
+    setMobileTop5BuildPhase("Setting up...");
+
+    // Set 9:16 canvas
+    setCanvasAspect("9:16");
+    canvasWRef.current = CANVAS_H_LAND; // 1080
+    canvasHRef.current = CANVAS_W_LAND; // 1920
+
+    const RANK_COLORS: Record<number, string> = {
+      5: "#7c3d1a", 4: "#d4651e", 3: "#cc2200", 2: "#b00000", 1: "#c49a00",
+    };
+    const CLIP_W = 750, CLIP_H = 422;
+    const CLIP_STRIDE = CLIP_W + 80;
+    const CLIP_START_X = 150;
+    const CLIP_Y = 1280;
+
+    // Add rank label annotations
+    const newAnnotations: Annotation[] = [];
+    for (let rank = 5; rank >= 1; rank--) {
+      const i = 5 - rank;
+      const colX = CLIP_START_X + i * CLIP_STRIDE;
+      const label = mobileTop5Data?.items.find((item) => item.rank === rank)?.label ?? `#${rank}`;
+      newAnnotations.push({
+        id: generateId(),
+        type: "text",
+        boardX: colX,
+        boardY: CLIP_Y - 220,
+        boardW: CLIP_W,
+        boardH: 200,
+        color: RANK_COLORS[rank] ?? "#2a2a2a",
+        text: `#${rank}`,
+        fontFamily: "Permanent Marker",
+        fontSize: 170,
+        fontWeight: "bold",
+      });
+      newAnnotations.push({
+        id: generateId(),
+        type: "text",
+        boardX: colX,
+        boardY: CLIP_Y - 60,
+        boardW: CLIP_W,
+        boardH: 60,
+        color: "#2a2a2a",
+        text: label,
+        fontFamily: "Caveat",
+        fontSize: 48,
+        fontWeight: "normal",
+      });
+    }
+    annotationsRef.current = [...annotationsRef.current, ...newAnnotations];
+    setAnnotations((prev) => [...prev, ...newAnnotations]);
+
+    const newClips: Clip[] = [];
+    const ranks = [5, 4, 3, 2, 1];
+    for (let ri = 0; ri < ranks.length; ri++) {
+      const rank = ranks[ri];
+      const acc = accepted.get(rank);
+      if (!acc) continue;
+      const i = 5 - rank;
+      const colX = CLIP_START_X + i * CLIP_STRIDE;
+      const startTime = i * 5;
+
+      setMobileTop5BuildPhase(`Downloading #${rank} (${ri + 1}/5)...`);
+      try {
+        const dlRes = await fetch("/api/ytdl", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: `https://www.youtube.com/watch?v=${acc.videoId}`,
+            start: acc.trimStart,
+            end: acc.trimEnd,
+          }),
+        });
+        if (!dlRes.ok) throw new Error(`Download failed (${dlRes.status})`);
+        const blob = await dlRes.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const clipId = generateId();
+        const clipDur = acc.trimEnd - acc.trimStart;
+        createVideoElement(clipId, blobUrl);
+        const clip: Clip = {
+          id: clipId,
+          type: "video",
+          name: acc.title.slice(0, 40),
+          sourceUrl: blobUrl,
+          startTime,
+          duration: Math.min(clipDur, 5),
+          layer: 1,
+          boardX: colX,
+          boardY: CLIP_Y,
+          boardW: CLIP_W,
+          boardH: CLIP_H,
+          sourceBlob: blob,
+          youtubeId: acc.videoId,
+          ytStart: acc.trimStart,
+          ytEnd: acc.trimEnd,
+        };
+        newClips.push(clip);
+        // Update ref immediately so preview renders each clip as it arrives
+        clipsRef.current = [...clipsRef.current, clip];
+        setClips((prev) => [...prev, clip]);
+      } catch {
+        // Continue even if one download fails
+      }
+    }
+
+    setMobileTop5BuildPhase("Generating camera path...");
+    generateCameraKeyframes();
+
+    setMobileTop5BuildPhase(null);
+    setMobileTop5Screen("done");
+  }
+
+  function renderMobileTop5Flow() {
+    const acceptedCount = mobileTop5AcceptedByRank.size;
+    const totalRanks = 5;
+    const video = getMobileCurrentVideo();
+    const currentResults = mobileTop5ResultsByRank.get(mobileTop5CurrentRank) ?? [];
+    const currentIdx = mobileTop5IndexByRank.get(mobileTop5CurrentRank) ?? 0;
+    const currentItem = mobileTop5Data?.items.find((i) => i.rank === mobileTop5CurrentRank);
+
+    const bg = "#fffdf5";
+    const ink = "#2a2a2a";
+    const accent = "#c8f135";
+
+    // Card slide animation
+    let cardTransform = "translateX(0)";
+    let cardOpacity = 1;
+    if (mobileTop5CardAnim === "accept") { cardTransform = "translateX(110%)"; cardOpacity = 0; }
+    if (mobileTop5CardAnim === "reject") { cardTransform = "translateX(-110%)"; cardOpacity = 0; }
+
+    return (
+      <div style={{ position: "fixed", inset: 0, background: bg, fontFamily: "monospace", display: "flex", flexDirection: "column", height: "100dvh", overflow: "hidden" }}>
+        <style>{`
+          @media (orientation: landscape) {
+            .m5-landscape-warn { display: flex !important; }
+            .m5-portrait-content { display: none !important; }
+          }
+          @supports not (height: 100dvh) {
+            .m5-root { height: 100vh !important; }
+          }
+        `}</style>
+
+        {/* Landscape warning (hidden by default, shown in landscape via CSS) */}
+        <div className="m5-landscape-warn" style={{ display: "none", position: "fixed", inset: 0, zIndex: 9999, background: bg, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
+          <div style={{ fontSize: 40 }}>↕</div>
+          <div style={{ fontWeight: 700, fontSize: 15 }}>Rotate to portrait</div>
+          <div style={{ fontSize: 11, color: "#6a6a6a", textAlign: "center", padding: "0 32px", lineHeight: 1.6 }}>The mobile Top 5 builder works in portrait mode</div>
+        </div>
+
+        <div className="m5-portrait-content" style={{ display: "flex", flexDirection: "column", height: "100dvh", paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
+
+          {/* Header */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderBottom: `1.5px dashed rgba(42,42,42,0.25)`, flexShrink: 0 }}>
+            <span style={{ fontFamily: "'Caveat', cursive", fontSize: 20, fontWeight: 700, color: ink, flex: 1 }}>
+              {mobileTop5Screen === "swipe" || mobileTop5Screen === "loading" ? "Top 5 Builder" : mobileTop5Screen === "build" || mobileTop5Screen === "done" ? "Building..." : "Top 5 Builder"}
+            </span>
+            <button
+              onClick={() => setMobileDesktopOverride(true)}
+              style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", background: "transparent", border: "1px solid rgba(42,42,42,0.3)", padding: "4px 8px", cursor: "pointer" }}
+            >
+              Desktop version
+            </button>
+          </div>
+
+          {/* Screen 1: Prompt */}
+          {mobileTop5Screen === "prompt" && (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: 20, gap: 16, overflowY: "auto" }}>
+              <div>
+                <div style={{ fontFamily: "'Caveat', cursive", fontSize: 30, fontWeight: 700, color: ink, lineHeight: 1.2, marginBottom: 8 }}>
+                  What&apos;s your Top 5?
+                </div>
+                <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.5 }}>
+                  Describe your concept and we&apos;ll find video candidates for each rank. Swipe right to keep, left to skip.
+                </div>
+              </div>
+              {mobileTop5Error && (
+                <div style={{ fontSize: 12, color: "#cc2200", background: "#fff0ee", border: "1px solid #cc2200", padding: "8px 12px" }}>
+                  {mobileTop5Error}
+                </div>
+              )}
+              <textarea
+                value={mobileTop5Concept}
+                onChange={(e) => setMobileTop5Concept(e.target.value)}
+                placeholder="e.g. Top 5 conspiracies that turned out to be true"
+                style={{
+                  flex: 1, minHeight: "36dvh", width: "100%", boxSizing: "border-box",
+                  fontFamily: "monospace", fontSize: 15, lineHeight: 1.6,
+                  border: "1.5px solid #2a2a2a", padding: 14, resize: "none",
+                  background: "#fff",
+                } as React.CSSProperties}
+                onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) runMobileTop5Search(); }}
+              />
+              <ProGated featureName="Top 5 Neural Search">
+                <button
+                  onClick={runMobileTop5Search}
+                  disabled={!mobileTop5Concept.trim()}
+                  style={{
+                    width: "100%", padding: 18, fontFamily: "monospace", fontSize: 16, fontWeight: 700,
+                    background: mobileTop5Concept.trim() ? ink : "#ccc",
+                    color: mobileTop5Concept.trim() ? accent : "#888",
+                    border: "none", cursor: mobileTop5Concept.trim() ? "pointer" : "not-allowed",
+                    boxShadow: mobileTop5Concept.trim() ? "3px 3px 0 rgba(0,0,0,0.15)" : "none",
+                    minHeight: 60,
+                  }}
+                >
+                  Generate →
+                </button>
+              </ProGated>
+            </div>
+          )}
+
+          {/* Screen 2: Loading */}
+          {mobileTop5Screen === "loading" && (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 24, padding: 32 }}>
+              <style>{`@keyframes m5spin { to { transform: rotate(360deg); } } @keyframes m5dot { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }`}</style>
+              <div style={{ width: 48, height: 48, borderRadius: "50%", border: "3px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink, marginBottom: 6 }}>
+                  {mobileTop5Error || "Generating list..."}
+                </div>
+                <div style={{ fontSize: 11, color: "#6a6a6a" }}>Finding the best video candidates for each rank</div>
+              </div>
+              <button
+                onClick={() => { setMobileTop5Screen("prompt"); setMobileTop5Error(""); }}
+                style={{ fontFamily: "monospace", fontSize: 12, background: "transparent", border: "1.5px solid rgba(42,42,42,0.4)", padding: "10px 20px", cursor: "pointer", color: "#6a6a6a" }}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+
+          {/* Screen 3: Swipe */}
+          {mobileTop5Screen === "swipe" && (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+              {/* Progress bar */}
+              <div style={{ padding: "10px 16px 0", flexShrink: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink }}>
+                    #{mobileTop5CurrentRank} — {currentItem?.label ?? ""}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#6a6a6a" }}>{acceptedCount}/{totalRanks}</div>
+                </div>
+                <div style={{ height: 3, background: "rgba(42,42,42,0.1)", borderRadius: 2 }}>
+                  <div style={{ height: "100%", width: `${(acceptedCount / totalRanks) * 100}%`, background: accent, borderRadius: 2, transition: "width 0.3s" }} />
+                </div>
+                {currentItem?.blurb && (
+                  <div style={{ fontSize: 10, color: "#6a6a6a", marginTop: 5, lineHeight: 1.4 }}>{currentItem.blurb}</div>
+                )}
+              </div>
+
+              {/* Card area */}
+              <div style={{ flex: 1, padding: "10px 16px", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+                {mobileTop5LoadingRank === mobileTop5CurrentRank ? (
+                  <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, border: "1.5px solid rgba(42,42,42,0.2)", background: "#fff" }}>
+                    <div style={{ width: 32, height: 32, borderRadius: "50%", border: "2.5px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
+                    <div style={{ fontSize: 11, color: "#6a6a6a" }}>Finding more videos...</div>
+                  </div>
+                ) : video ? (
+                  <div
+                    style={{
+                      flex: 1, display: "flex", flexDirection: "column", border: "1.5px solid rgba(42,42,42,0.25)", background: "#fff",
+                      transform: cardTransform, opacity: cardOpacity,
+                      transition: mobileTop5CardAnim ? "transform 0.3s ease-in, opacity 0.3s" : "none",
+                      overflow: "hidden", minHeight: 0,
+                    }}
+                    onTouchStart={(e) => { mobileSwipeTouchStartXRef.current = e.touches[0].clientX; }}
+                    onTouchEnd={(e) => {
+                      const startX = mobileSwipeTouchStartXRef.current;
+                      if (startX === null) return;
+                      const dx = e.changedTouches[0].clientX - startX;
+                      mobileSwipeTouchStartXRef.current = null;
+                      if (Math.abs(dx) < 50) return;
+                      if (dx > 0) handleMobileAccept();
+                      else handleMobileReject();
+                    }}
+                  >
+                    {/* YouTube embed */}
+                    <div style={{ aspectRatio: "16/9", flexShrink: 0, background: "#000", position: "relative" }}>
+                      <iframe
+                        key={video.videoId}
+                        src={`https://www.youtube.com/embed/${video.videoId}?autoplay=1&mute=1&controls=1&modestbranding=1&rel=0&playsinline=1`}
+                        allow="autoplay; encrypted-media"
+                        allowFullScreen
+                        style={{ width: "100%", height: "100%", border: "none", display: "block" }}
+                      />
+                    </div>
+
+                    {/* Video info */}
+                    <div style={{ padding: "10px 12px 6px", flexShrink: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13, lineHeight: 1.3, marginBottom: 2, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                        {video.title}
+                      </div>
+                      <div style={{ fontSize: 10, color: "#6a6a6a" }}>
+                        {video.channel}{video.viewCount > 0 ? ` · ${(video.viewCount / 1e6).toFixed(1)}M views` : ""}
+                      </div>
+                    </div>
+
+                    {/* Trim slider */}
+                    <div style={{ padding: "4px 12px 10px", flexShrink: 0 }}>
+                      <div style={{ fontSize: 9, color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>
+                        Trim · {Math.floor(mobileTop5TrimStart / 60)}:{String(Math.floor(mobileTop5TrimStart % 60)).padStart(2, "0")} – {Math.floor(mobileTop5TrimEnd / 60)}:{String(Math.floor(mobileTop5TrimEnd % 60)).padStart(2, "0")}
+                      </div>
+                      <div style={{ position: "relative", height: 32 }}>
+                        <input
+                          type="range" min={0} max={Math.max(0, Math.min(video.durationSec - 0.5, 30) - 0.5)} step={0.5}
+                          value={mobileTop5TrimStart}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setMobileTop5TrimStart(v);
+                            if (mobileTop5TrimEnd - v < 0.5) setMobileTop5TrimEnd(Math.min(v + 0.5, Math.min(video.durationSec, 30)));
+                          }}
+                          style={{ position: "absolute", width: "100%", height: "100%", opacity: 0.5, accentColor: "#cc2200", cursor: "pointer" }}
+                        />
+                        <input
+                          type="range" min={0.5} max={Math.min(video.durationSec, 30)} step={0.5}
+                          value={mobileTop5TrimEnd}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setMobileTop5TrimEnd(v);
+                            if (v - mobileTop5TrimStart < 0.5) setMobileTop5TrimStart(Math.max(v - 0.5, 0));
+                          }}
+                          style={{ position: "absolute", width: "100%", height: "100%", accentColor: "#2a2a2a", cursor: "pointer" }}
+                        />
+                      </div>
+                      <div style={{ fontSize: 9, color: "#aaa", textAlign: "right" }}>
+                        {currentIdx + 1} / {currentResults.length} · swipe to choose
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", border: "1.5px dashed rgba(42,42,42,0.2)", color: "#6a6a6a", fontSize: 12 }}>
+                    No more candidates
+                  </div>
+                )}
+              </div>
+
+              {/* Action buttons */}
+              <div style={{ display: "flex", gap: 16, padding: "10px 20px 16px", flexShrink: 0, paddingBottom: "calc(16px + env(safe-area-inset-bottom))" }}>
+                <button
+                  onClick={handleMobileReject}
+                  disabled={!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null}
+                  style={{
+                    flex: 1, minHeight: 60, fontSize: 28, background: "#fff", border: "2px solid #2a2a2a",
+                    cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                    boxShadow: "3px 3px 0 rgba(42,42,42,0.15)",
+                    opacity: (!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null) ? 0.4 : 1,
+                  }}
+                >
+                  ✕
+                </button>
+                <button
+                  onClick={handleMobileAccept}
+                  disabled={!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null}
+                  style={{
+                    flex: 1, minHeight: 60, fontSize: 28, background: ink, color: accent, border: "2px solid #2a2a2a",
+                    cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                    boxShadow: "3px 3px 0 rgba(0,0,0,0.3)",
+                    opacity: (!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null) ? 0.4 : 1,
+                  }}
+                >
+                  ✓
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Screen 4: Build */}
+          {(mobileTop5Screen === "build" || mobileTop5Screen === "done") && (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: 32, textAlign: "center" }}>
+              {mobileTop5Screen === "build" && (
+                <>
+                  <div style={{ width: 48, height: 48, borderRadius: "50%", border: "3px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
+                  <div>
+                    <div style={{ fontFamily: "'Caveat', cursive", fontSize: 24, fontWeight: 700, color: ink, marginBottom: 6 }}>
+                      Building your Top 5...
+                    </div>
+                    <div style={{ fontSize: 12, color: "#6a6a6a" }}>{mobileTop5BuildPhase ?? "Preparing..."}</div>
+                  </div>
+                </>
+              )}
+              {mobileTop5Screen === "done" && (
+                <>
+                  <div style={{ fontSize: 56 }}>🏆</div>
+                  <div>
+                    <div style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: ink, marginBottom: 8 }}>
+                      Your Top 5 is ready!
+                    </div>
+                    <div style={{ fontSize: 12, color: "#6a6a6a", lineHeight: 1.6 }}>
+                      5 clips downloaded, labels added, and camera path generated. Tap Preview or Export to finish.
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%" }}>
+                    <button
+                      onClick={() => { setMobileDesktopOverride(true); setTimeout(() => togglePlay(), 300); }}
+                      style={{ ...sketchButton, width: "100%", padding: 16, fontSize: 15, textAlign: "center", background: "#c8f135" }}
+                    >
+                      ▶ Play Preview
+                    </button>
+                    <button
+                      onClick={() => { setMobileDesktopOverride(true); setTimeout(() => startExport(), 300); }}
+                      style={{ ...sketchButton, width: "100%", padding: 16, fontSize: 15, textAlign: "center" }}
+                    >
+                      ⬇ Export Video
+                    </button>
+                    <button
+                      onClick={() => {
+                        setMobileTop5Screen("prompt");
+                        setMobileTop5Concept("");
+                        setMobileTop5Data(null);
+                        setMobileTop5AcceptedByRank(new Map());
+                        setMobileTop5ResultsByRank(new Map());
+                        setMobileTop5IndexByRank(new Map());
+                      }}
+                      style={{ fontFamily: "monospace", fontSize: 12, background: "transparent", border: "1.5px solid rgba(42,42,42,0.3)", padding: "10px", cursor: "pointer", color: "#6a6a6a" }}
+                    >
+                      Start over
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+        </div>
+      </div>
+    );
   }
 
   function removeImagePlaceholder(id: string) {
@@ -3696,6 +4301,13 @@ export default function Board2Page() {
 
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
+  // Mobile Top 5 Tinder flow — takes over the entire mobile experience.
+  // mobileDesktopOverride lets the user escape to the desktop UI.
+  if (isMobile && !mobileDesktopOverride) {
+    return renderMobileTop5Flow();
+  }
+
+  // Below: existing mobile board (landscape) — only shown when mobileDesktopOverride is true
   if (isMobile && isPortrait) {
     return (
       <div style={{ position: "fixed", inset: 0, background: "#f5ecd8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace" }}>
