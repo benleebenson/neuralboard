@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import { ProGated } from "@/app/components/ProGated";
+import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,11 @@ type Clip = {
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
+  // youtube save/restore:
+  youtubeId?: string;
+  ytStart?: number;
+  ytEnd?: number;
+  needsRedownload?: boolean;
 };
 
 type Annotation = {
@@ -180,6 +186,19 @@ const PREVIEW_H_PX = 135;
 let _idCounter = 0;
 function generateId(): string {
   return `b2_${Date.now()}_${++_idCounter}`;
+}
+
+function mimeToExt(mime: string, fallbackName: string): string {
+  const map: Record<string, string> = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp",
+    "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov",
+    "audio/wav": "wav", "audio/wave": "wav", "audio/mpeg": "mp3",
+    "audio/mp4": "m4a", "audio/ogg": "ogg", "audio/webm": "webm",
+  };
+  if (map[mime]) return map[mime];
+  const m = fallbackName.match(/\.([a-z0-9]+)$/i);
+  return m ? m[1].toLowerCase() : "bin";
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -538,6 +557,12 @@ export default function Board2Page() {
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
+  // ── Save / Load ──
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [saveName, setSaveName] = useState("My Board");
+  const [isSaving, setIsSaving] = useState(false);
+  const [isLoadingProject, setIsLoadingProject] = useState(false);
+
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
@@ -617,6 +642,7 @@ export default function Board2Page() {
   const rafIdRef = useRef<number | null>(null);
   const mediaUploadRef = useRef<HTMLInputElement>(null);
   const narrationUploadRef = useRef<HTMLInputElement>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
@@ -1692,6 +1718,7 @@ export default function Board2Page() {
             boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
             sourceDurationSec: meta.sourceDurationSec,
             sourceBlob: blob,
+            youtubeId: ytSel.id, ytStart: start, ytEnd: end,
           }];
         });
         setSelectedClipId(clipId);
@@ -3467,6 +3494,7 @@ export default function Board2Page() {
         <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
         <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
         <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
+        <input ref={projectFileInputRef} type="file" accept=".nbp,.zip" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }} />
         <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
         {/* ── Compact header ── */}
@@ -3494,6 +3522,11 @@ export default function Board2Page() {
             title={isExporting ? "Cancel export" : "Export video"}
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isExporting ? "#ff5e3a" : "transparent", color: isExporting ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
           >{isExporting ? "✕" : "⬇"}</button>
+          <button
+            onClick={() => setSaveModalOpen(true)}
+            title="Save / load project"
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
+          >💾</button>
         </header>
 
         {/* ── Board ── */}
@@ -3524,15 +3557,23 @@ export default function Board2Page() {
                     touchAction: "none",
                   }}
                 >
-                  <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none" }}>
-                    {clip.type === "image" ? (
+                  <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: clip.needsRedownload ? "auto" : "none" }}>
+                    {clip.needsRedownload ? (
+                      <div
+                        style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3 }}
+                        onClick={(e) => { e.stopPropagation(); redownloadYtClip(clip.id); }}
+                      >
+                        <span style={{ color: "#ff9f5e", fontSize: 16, pointerEvents: "none" }}>▶</span>
+                        <span style={{ color: "#ff9f5e", fontSize: Math.max(6, 7 * boardZoom), fontFamily: "monospace", textAlign: "center", pointerEvents: "none" }}>tap to re-download</span>
+                      </div>
+                    ) : clip.type === "image" ? (
                       <img src={clip.sourceUrl} alt={clip.name} style={{ width: "100%", height: "100%", objectFit: "fill", display: "block" }} draggable={false} />
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
                         <span style={{ color: "#7df5b0", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace" }}>▶ {clip.name}</span>
                       </div>
                     )}
-                    <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+                    <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none" }}>
                       {clip.name}
                     </div>
                   </div>
@@ -3830,6 +3871,19 @@ export default function Board2Page() {
                         ↑  Upload audio / mp4
                       </button>
                     </ProGated>
+                    <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
+                    <button
+                      onClick={() => { setSaveModalOpen(true); setMobileDrawer(null); }}
+                      style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
+                    >
+                      💾  Save project
+                    </button>
+                    <button
+                      onClick={() => { projectFileInputRef.current?.click(); setMobileDrawer(null); }}
+                      style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
+                    >
+                      📂  Open project
+                    </button>
                   </div>
                 </>
               )}
@@ -4100,8 +4154,180 @@ export default function Board2Page() {
         {renderDownloadToasts()}
         {renderNeuralSearchModal()}
         {renderImagePreviewModal()}
+
+        {/* ── Save modal ── */}
+        {saveModalOpen && (
+          <div style={{ position: "fixed", inset: 0, zIndex: 9998, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.45)" }} onClick={() => setSaveModalOpen(false)}>
+            <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", padding: "24px 28px", minWidth: 280, width: "calc(100vw - 48px)", maxWidth: 360, boxShadow: "4px 4px 0 #2a2a2a" }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 14 }}>Save project</div>
+              <input
+                type="text" value={saveName} onChange={(e) => setSaveName(e.target.value)}
+                placeholder="Board name" autoFocus
+                onKeyDown={(e) => { if (e.key === "Enter") saveBoard(); if (e.key === "Escape") setSaveModalOpen(false); }}
+                style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "12px 10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" as const, marginBottom: 14, outline: "none" }}
+              />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700, padding: "10px 0" }}>
+                  {isSaving ? "Saving…" : "💾 Download .nbp"}
+                </button>
+                <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1, padding: "10px 0" }}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
+  }
+
+  // ─── Save / Load ──────────────────────────────────────────────────────────
+
+  async function saveBoard() {
+    if (isSaving) return;
+    setIsSaving(true);
+    setToast("Saving…");
+    try {
+      type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob"> & {
+        assetFile?: string;
+        assetMime?: string;
+      };
+      const manifestClips: ManifestClip[] = [];
+      const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
+
+      for (const clip of clipsRef.current) {
+        const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
+        if (clip.type === "pan") {
+          manifestClips.push(rest);
+        } else if (clip.youtubeId) {
+          manifestClips.push({ ...rest, needsRedownload: true });
+        } else if (clip.type === "narration" && clip.audioBlob) {
+          const buf = await clip.audioBlob.arrayBuffer();
+          const assetFile = `assets/${clip.id}.${mimeToExt(clip.audioBlob.type, clip.name)}`;
+          zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
+          manifestClips.push({ ...rest, assetFile, assetMime: clip.audioBlob.type || "audio/wav" });
+        } else if (clip.sourceUrl) {
+          const blob = await fetch(clip.sourceUrl).then((r) => r.blob());
+          const ext = mimeToExt(blob.type, clip.name);
+          const assetFile = `assets/${clip.id}.${ext}`;
+          const buf = await blob.arrayBuffer();
+          zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
+          manifestClips.push({ ...rest, assetFile, assetMime: blob.type });
+        } else {
+          manifestClips.push(rest);
+        }
+      }
+
+      const manifest = {
+        version: 1,
+        name: saveName,
+        savedAt: new Date().toISOString(),
+        clips: manifestClips,
+        cameraKeyframes: cameraKeyframesRef.current,
+        annotations: annotationsRef.current,
+        canvasAspect,
+        pxPerSec: pxPerSecRef.current,
+        boardZoom: boardZoomRef.current,
+        boardPan: boardPanRef.current,
+      };
+      zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
+
+      const zipped = zipSync(zipFiles);
+      const dlBlob = new Blob([zipped], { type: "application/zip" });
+      const url = URL.createObjectURL(dlBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(saveName || "board").replace(/[^a-z0-9_-]/gi, "_")}.nbp`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setSaveModalOpen(false);
+      setToast("Board saved!");
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Save failed");
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function loadBoard(file: File) {
+    if (isLoadingProject) return;
+    setIsLoadingProject(true);
+    setToast("Loading project…");
+    try {
+      const buffer = await file.arrayBuffer();
+      const files = unzipSync(new Uint8Array(buffer));
+      if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
+      const manifest = JSON.parse(strFromU8(files["manifest.json"]));
+
+      // Revoke existing blob URLs
+      for (const clip of clipsRef.current) {
+        if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
+      }
+      // Clean up all video elements
+      for (const vid of videoElsRef.current.values()) { vid.pause(); vid.src = ""; }
+      videoElsRef.current.clear();
+      imgCacheRef.current.clear();
+
+      const loadedClips: Clip[] = [];
+      for (const mc of (manifest.clips ?? [])) {
+        if (mc.type === "pan") {
+          loadedClips.push({ ...mc, sourceUrl: "" });
+        } else if (mc.needsRedownload) {
+          loadedClips.push({ ...mc, sourceUrl: "" });
+        } else if (mc.assetFile && files[mc.assetFile]) {
+          const data = files[mc.assetFile];
+          const blob = new Blob([data], { type: mc.assetMime || "application/octet-stream" });
+          const blobUrl = URL.createObjectURL(blob);
+          if (mc.type === "narration") {
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
+          } else if (mc.type === "image") {
+            loadMedia(blobUrl, "image");
+            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+          } else if (mc.type === "video") {
+            createVideoElement(mc.id, blobUrl);
+            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+          }
+        } else {
+          loadedClips.push({ ...mc, sourceUrl: mc.sourceUrl ?? "" });
+        }
+      }
+
+      setClips(loadedClips);
+      setCameraKeyframes(manifest.cameraKeyframes ?? []);
+      setAnnotations(manifest.annotations ?? []);
+      if (manifest.canvasAspect) setCanvasAspect(manifest.canvasAspect);
+      if (manifest.pxPerSec) { pxPerSecRef.current = manifest.pxPerSec; setPxPerSec(manifest.pxPerSec); }
+      if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
+      if (manifest.boardPan) { boardPanRef.current = manifest.boardPan; setBoardPan(manifest.boardPan); }
+      if (manifest.name) setSaveName(manifest.name);
+      setToast(`Loaded "${manifest.name ?? "board"}"`);
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Failed to load project");
+    } finally {
+      setIsLoadingProject(false);
+    }
+  }
+
+  async function redownloadYtClip(clipId: string) {
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (!clip?.youtubeId) return;
+    setToast("Re-downloading video…");
+    try {
+      const dlRes = await fetch("/api/ytdl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${clip.youtubeId}`, start: clip.ytStart ?? 0, end: clip.ytEnd ?? 30 }),
+      });
+      if (!dlRes.ok) {
+        const err = await dlRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Download failed (${dlRes.status})`);
+      }
+      const blob = await dlRes.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      createVideoElement(clipId, blobUrl);
+      setClips((prev) => prev.map((c) => c.id !== clipId ? c : { ...c, sourceUrl: blobUrl, sourceBlob: blob, needsRedownload: false }));
+      setToast("Video ready");
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Re-download failed");
+    }
   }
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -4141,6 +4367,8 @@ export default function Board2Page() {
               </span>
             )}
           </div>
+          <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
+          <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <a href="/editor" style={navLinkStyle}>Editor</a>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
           {session?.user ? (
@@ -4285,6 +4513,13 @@ export default function Board2Page() {
               style={{ display: "none" }}
               onChange={handleMediaUpload}
             />
+            <input
+              ref={projectFileInputRef}
+              type="file"
+              accept=".nbp,.zip"
+              style={{ display: "none" }}
+              onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }}
+            />
             <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
               Upload images or videos — they auto-place on the board and timeline.
             </p>
@@ -4345,7 +4580,15 @@ export default function Board2Page() {
                       onPointerDown={(e) => { if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
-                        {clip.type === "image" ? (
+                        {clip.needsRedownload ? (
+                          <div
+                            style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", gap: 4 }}
+                            onClick={(e) => { e.stopPropagation(); redownloadYtClip(clip.id); }}
+                          >
+                            <span style={{ color: "#ff9f5e", fontSize: 18, pointerEvents: "none" }}>▶</span>
+                            <span style={{ color: "#ff9f5e", fontSize: 8, fontFamily: "monospace", textAlign: "center", pointerEvents: "none", padding: "0 4px" }}>click to re-download</span>
+                          </div>
+                        ) : clip.type === "image" ? (
                           <img
                             src={clip.sourceUrl}
                             alt={clip.name}
@@ -5693,6 +5936,27 @@ export default function Board2Page() {
       {renderDownloadToasts()}
       {renderNeuralSearchModal()}
       {renderImagePreviewModal()}
+
+      {/* Save modal */}
+      {saveModalOpen && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 9998, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.45)" }} onClick={() => setSaveModalOpen(false)}>
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", padding: "24px 28px", minWidth: 300, boxShadow: "4px 4px 0 #2a2a2a" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ fontFamily: "monospace", fontSize: 11, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 14 }}>Save project</div>
+            <input
+              type="text" value={saveName} onChange={(e) => setSaveName(e.target.value)}
+              placeholder="Board name" autoFocus
+              onKeyDown={(e) => { if (e.key === "Enter") saveBoard(); if (e.key === "Escape") setSaveModalOpen(false); }}
+              style={{ width: "100%", fontFamily: "monospace", fontSize: 14, padding: "9px 10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" as const, marginBottom: 14, outline: "none" }}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700 }}>
+                {isSaving ? "Saving…" : "💾 Download .nbp"}
+              </button>
+              <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1 }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
