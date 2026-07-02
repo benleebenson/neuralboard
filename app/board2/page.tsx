@@ -129,6 +129,20 @@ type NeuralPlaceholder = {
   durationSec: number;
 };
 
+// Neural Search: a not-yet-downloaded Google Image candidate placed on the board as a
+// clickable thumbnail. Lives outside `clips` — no timeline presence, ignored by camera
+// keyframes/export, same as NeuralPlaceholder.
+type ImagePlaceholder = {
+  id: string;
+  boardX: number;
+  boardY: number;
+  boardW: number;
+  boardH: number;
+  imageUrl: string;
+  title: string;
+  sourceUrl: string;
+};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const CANVAS_W_LAND = 1920;
@@ -570,7 +584,11 @@ export default function Board2Page() {
   const [neuralPhase, setNeuralPhase] = useState<string | null>(null);
   const [neuralError, setNeuralError] = useState("");
   const [neuralPlaceholders, setNeuralPlaceholders] = useState<NeuralPlaceholder[]>([]);
+  const [imagePlaceholders, setImagePlaceholders] = useState<ImagePlaceholder[]>([]);
   const [hoveredPlaceholderId, setHoveredPlaceholderId] = useState<string | null>(null);
+  const [imagePreviewTarget, setImagePreviewTarget] = useState<ImagePlaceholder | null>(null);
+  const [imagePreviewWorking, setImagePreviewWorking] = useState(false);
+  const [imagePreviewError, setImagePreviewError] = useState("");
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
 
@@ -1713,19 +1731,22 @@ export default function Board2Page() {
       }
       const data = await res.json() as {
         videos: Array<{ videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number }>;
+        images: Array<{ imageUrl: string; title: string; sourceUrl: string }>;
       };
       const videos = Array.isArray(data.videos) ? data.videos : [];
-      if (videos.length === 0) {
-        setNeuralError("No videos found — try describing the concept differently");
+      const images = Array.isArray(data.images) ? data.images : [];
+      if (videos.length === 0 && images.length === 0) {
+        setNeuralError("Nothing found — try describing the concept differently");
         return;
       }
 
-      // Place each candidate on the board, avoiding overlap with existing clips, existing
-      // placeholders, and the other candidates from this same search.
+      // Place every candidate (videos + images) on the board through one shared occupied-rect
+      // list, avoiding overlap with existing clips, existing placeholders, and each other — and
+      // so the two types end up mixed spatially rather than videos landing in one cluster.
       const { camX, camY } = getVisibleBoardCenter();
       const occupied: Array<{ boardX?: number; boardY?: number; boardW?: number; boardH?: number }> =
-        [...clipsRef.current, ...neuralPlaceholders];
-      const newPlaceholders: NeuralPlaceholder[] = videos.map((v) => {
+        [...clipsRef.current, ...neuralPlaceholders, ...imagePlaceholders];
+      const newVideoPlaceholders: NeuralPlaceholder[] = videos.map((v) => {
         const w = 800, h = 450;
         const pos = findFreeBoardPos(occupied, w, h, camX, camY);
         occupied.push({ boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h });
@@ -1735,7 +1756,17 @@ export default function Board2Page() {
           viewCount: v.viewCount, durationSec: v.durationSec,
         };
       });
-      setNeuralPlaceholders((prev) => [...prev, ...newPlaceholders]);
+      const newImagePlaceholders: ImagePlaceholder[] = images.map((img) => {
+        const w = 600, h = 400;
+        const pos = findFreeBoardPos(occupied, w, h, camX, camY);
+        occupied.push({ boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h });
+        return {
+          id: generateId(), boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
+          imageUrl: img.imageUrl, title: img.title, sourceUrl: img.sourceUrl,
+        };
+      });
+      setNeuralPlaceholders((prev) => [...prev, ...newVideoPlaceholders]);
+      setImagePlaceholders((prev) => [...prev, ...newImagePlaceholders]);
       setNeuralModalOpen(false);
       setNeuralConcept("");
     } catch (e) {
@@ -1748,6 +1779,62 @@ export default function Board2Page() {
 
   function removeNeuralPlaceholder(id: string) {
     setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  function removeImagePlaceholder(id: string) {
+    setImagePlaceholders((prev) => prev.filter((p) => p.id !== id));
+    setImagePreviewTarget((prev) => (prev?.id === id ? null : prev));
+  }
+
+  // "Add to Board" on an image placeholder: fetch the full image through /api/proxy-image
+  // (server-side, sidesteps browser CORS on arbitrary Google Images sources), turn it into a
+  // real image Clip at the placeholder's board position, and drop the placeholder.
+  async function commitImagePlaceholder(ph: ImagePlaceholder) {
+    setImagePreviewWorking(true);
+    setImagePreviewError("");
+    const toastId = generateId();
+    setDownloadToasts((prev) => [...prev, { id: toastId, title: ph.title, status: "downloading" }]);
+    try {
+      const res = await fetch(`/api/proxy-image?url=${encodeURIComponent(ph.imageUrl)}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Fetch failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      loadMedia(blobUrl, "image");
+      const img = imgCacheRef.current.get(blobUrl);
+      if (img && !img.complete) {
+        await new Promise<void>((resolve) => {
+          img.addEventListener("load", () => resolve(), { once: true });
+          img.addEventListener("error", () => resolve(), { once: true });
+        });
+      }
+      const { w, h } = getMediaDimensions(blobUrl, "image");
+      const clipId = generateId();
+      setClips((prev) => {
+        const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+        const layer = freeLayerAtTime(prev, endTime, 4, clipId, 1);
+        return [...prev, {
+          id: clipId, type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
+          startTime: endTime, duration: 4, layer,
+          boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
+        }];
+      });
+      setSelectedClipId(clipId);
+      removeImagePlaceholder(ph.id);
+      setImagePreviewTarget(null);
+
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 2000);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to add image";
+      setImagePreviewError(message);
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "error", error: message } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 5000);
+    } finally {
+      setImagePreviewWorking(false);
+    }
   }
 
   function openTrimModalForPlaceholder(ph: NeuralPlaceholder) {
@@ -3221,7 +3308,7 @@ export default function Board2Page() {
 
           <div style={{ padding: 16 }}>
             <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
-              Describe your video concept. We&apos;ll find YouTube videos to match.
+              Describe your video concept. We&apos;ll find YouTube videos and Google Images to match.
             </p>
             <textarea
               value={neuralConcept}
@@ -3268,7 +3355,88 @@ export default function Board2Page() {
                 cursor: (!!neuralPhase || !neuralConcept.trim()) ? "not-allowed" : "pointer",
               }}
             >
-              {neuralPhase ? "Working…" : "Find Videos →"}
+              {neuralPhase ? "Working…" : "Find Videos & Images →"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Image placeholder preview modal ────────────────────────────────────────
+
+  function renderImagePreviewModal() {
+    const ph = imagePreviewTarget;
+    if (!ph) return null;
+    return (
+      <div
+        onClick={(e) => { if (e.target === e.currentTarget && !imagePreviewWorking) setImagePreviewTarget(null); }}
+        style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+      >
+        <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 480, maxWidth: "95vw", fontFamily: "monospace", overflow: "hidden" }}>
+          {/* Header */}
+          <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>🖼 IMAGE PREVIEW</span>
+            <button
+              onClick={() => { if (!imagePreviewWorking) setImagePreviewTarget(null); }}
+              style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15, opacity: imagePreviewWorking ? 0.4 : 1 }}
+            >×</button>
+          </div>
+
+          <div style={{ padding: 16 }}>
+            <img
+              src={ph.imageUrl}
+              alt={ph.title}
+              style={{ width: "100%", maxHeight: 280, objectFit: "contain", display: "block", background: "#1a1a1a", border: "1.5px solid #2a2a2a" }}
+            />
+            <div style={{ marginTop: 10, fontSize: 12, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {ph.title}
+            </div>
+            {ph.sourceUrl && (
+              <div style={{ fontSize: 10, color: "#6a6a6a", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {ph.sourceUrl}
+              </div>
+            )}
+
+            {imagePreviewWorking && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#1a6fd4" }}>
+                ⟳ Downloading image…
+              </div>
+            )}
+            {imagePreviewError && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#cc2200" }}>
+                ✗ {imagePreviewError}
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => removeImagePlaceholder(ph.id)}
+              disabled={imagePreviewWorking}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, color: "#cc2200", opacity: imagePreviewWorking ? 0.4 : 1 }}
+            >
+              Remove Suggestion
+            </button>
+            <button
+              onClick={() => { if (!imagePreviewWorking) setImagePreviewTarget(null); }}
+              disabled={imagePreviewWorking}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: imagePreviewWorking ? 0.4 : 1 }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => commitImagePlaceholder(ph)}
+              disabled={imagePreviewWorking}
+              style={{
+                ...miniButton, padding: "6px 18px", fontSize: 12, fontWeight: 700,
+                background: "#a8d8ff", borderColor: "#2a2a2a",
+                opacity: imagePreviewWorking ? 0.5 : 1,
+                cursor: imagePreviewWorking ? "not-allowed" : "pointer",
+              }}
+            >
+              {imagePreviewWorking ? "Working…" : "Add to Board →"}
             </button>
           </div>
         </div>
@@ -3416,9 +3584,50 @@ export default function Board2Page() {
                 </button>
               </div>
             ))}
+
+            {/* Neural Search image placeholders — not yet downloaded, tap to preview & add */}
+            {imagePlaceholders.map((ph) => (
+              <div
+                key={ph.id}
+                style={{
+                  position: "absolute",
+                  left: ph.boardX * boardZoom,
+                  top: ph.boardY * boardZoom,
+                  width: ph.boardW * boardZoom,
+                  height: ph.boardH * boardZoom,
+                  border: "2px dashed #3b82f6",
+                  boxShadow: "1px 1px 4px rgba(42,42,42,0.2)",
+                  touchAction: "none",
+                  cursor: "pointer",
+                }}
+                onClick={() => setImagePreviewTarget(ph)}
+              >
+                <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: "none", background: "#3a3a3a" }}>
+                  <img
+                    src={ph.imageUrl}
+                    alt={ph.title}
+                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", opacity: 0.9 }}
+                    draggable={false}
+                    onError={() => removeImagePlaceholder(ph.id)}
+                  />
+                  <div style={{ position: "absolute", top: 2, left: 2, padding: "1px 4px", background: "#3b82f6", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", fontWeight: 700 }}>
+                    🖼 NOT ADDED
+                  </div>
+                  <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+                    {ph.title}
+                  </div>
+                </div>
+                <button
+                  onClick={(e) => { e.stopPropagation(); removeImagePlaceholder(ph.id); }}
+                  style={{ position: "absolute", top: -8, right: -8, width: 20, height: 20, borderRadius: "50%", background: "#ff5e3a", border: "2px solid #fff", color: "#fff", fontSize: 11, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 20, touchAction: "none" }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
           </div>
 
-          {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && (
+          {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && imagePlaceholders.length === 0 && (
             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
               <span style={{ fontFamily: "monospace", fontSize: 10, color: "rgba(42,42,42,0.35)", textAlign: "center" }}>Tap ≡ to add media</span>
             </div>
@@ -3890,6 +4099,7 @@ export default function Board2Page() {
         )}
         {renderDownloadToasts()}
         {renderNeuralSearchModal()}
+        {renderImagePreviewModal()}
       </div>
     );
   }
@@ -4226,6 +4436,56 @@ export default function Board2Page() {
                   </div>
                 ))}
 
+                {/* Neural Search image placeholders — not yet downloaded, click to preview & add */}
+                {imagePlaceholders.map((ph) => (
+                  <div
+                    key={ph.id}
+                    style={{
+                      position: "absolute",
+                      left: ph.boardX * boardZoom,
+                      top: ph.boardY * boardZoom,
+                      width: ph.boardW * boardZoom,
+                      height: ph.boardH * boardZoom,
+                      border: "2px dashed #3b82f6",
+                      boxShadow: "1px 1px 4px rgba(42,42,42,0.2)",
+                      cursor: "pointer",
+                      overflow: "visible",
+                    }}
+                    onClick={(e) => { e.stopPropagation(); setImagePreviewTarget(ph); }}
+                    onMouseEnter={() => setHoveredPlaceholderId(ph.id)}
+                    onMouseLeave={() => setHoveredPlaceholderId((prev) => (prev === ph.id ? null : prev))}
+                  >
+                    <div style={{ position: "absolute", inset: 0, overflow: "hidden", background: "#3a3a3a" }}>
+                      <img
+                        src={ph.imageUrl}
+                        alt={ph.title}
+                        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", opacity: 0.9, userSelect: "none", pointerEvents: "none" }}
+                        draggable={false}
+                        onError={() => removeImagePlaceholder(ph.id)}
+                      />
+                      <div style={{ position: "absolute", top: 3, left: 3, padding: "1px 5px", background: "#3b82f6", color: "#fff", fontSize: 9, fontFamily: "monospace", fontWeight: 700, pointerEvents: "none" }}>
+                        🖼 NOT ADDED
+                      </div>
+                    </div>
+                    {hoveredPlaceholderId === ph.id && (
+                      <div style={{
+                        position: "absolute", bottom: 0, left: 0, right: 0, padding: "4px 6px",
+                        background: "rgba(42,42,42,0.85)", color: "#fff", fontFamily: "monospace",
+                        pointerEvents: "none",
+                      }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ph.title}</div>
+                      </div>
+                    )}
+                    <button
+                      onClick={(e) => { e.stopPropagation(); removeImagePlaceholder(ph.id); }}
+                      title="Remove"
+                      style={{ position: "absolute", top: -8, right: -8, width: 18, height: 18, borderRadius: "50%", background: "#ff5e3a", border: "1.5px solid #fff", color: "#fff", fontSize: 10, lineHeight: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10 }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+
                 {/* SVG visual layer for non-text annotations */}
                 <svg
                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 4, overflow: "visible" }}
@@ -4410,7 +4670,7 @@ export default function Board2Page() {
               </div>
 
               {/* Empty state */}
-              {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && (
+              {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && imagePlaceholders.length === 0 && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
                   <span style={{ fontFamily: "monospace", fontSize: 11, color: "rgba(42,42,42,0.4)" }}>
                     Upload images or videos to auto-add to the board
@@ -5432,6 +5692,7 @@ export default function Board2Page() {
       )}
       {renderDownloadToasts()}
       {renderNeuralSearchModal()}
+      {renderImagePreviewModal()}
     </div>
   );
 }
