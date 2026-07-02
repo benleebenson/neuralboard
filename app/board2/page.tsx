@@ -614,6 +614,12 @@ export default function Board2Page() {
   const [imagePreviewTarget, setImagePreviewTarget] = useState<ImagePlaceholder | null>(null);
   const [imagePreviewWorking, setImagePreviewWorking] = useState(false);
   const [imagePreviewError, setImagePreviewError] = useState("");
+
+  // ── Top 5 Neural Search ──
+  const [top5ModalOpen, setTop5ModalOpen] = useState(false);
+  const [top5Concept, setTop5Concept] = useState("");
+  const [top5Phase, setTop5Phase] = useState<string | null>(null);
+  const [top5Error, setTop5Error] = useState("");
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
 
@@ -1806,6 +1812,147 @@ export default function Board2Page() {
 
   function removeNeuralPlaceholder(id: string) {
     setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  // ─ Top 5 Neural Search ────────────────────────────────────────────────────
+
+  async function runTop5Search() {
+    const concept = top5Concept.trim();
+    if (!concept) return;
+    setTop5Error("");
+    setTop5Phase("Generating list...");
+    const t1 = setTimeout(() => setTop5Phase("Searching videos..."), 4000);
+    const t2 = setTimeout(() => setTop5Phase("Arranging on board..."), 10000);
+    try {
+      const res = await fetch("/api/top5-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ concept }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Search failed (${res.status})`);
+      }
+      const data = await res.json() as {
+        title: string;
+        items: Array<{
+          rank: number;
+          label: string;
+          blurb: string;
+          videos: Array<{ videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number }>;
+        }>;
+      };
+
+      if (!data.items || data.items.length === 0) {
+        setTop5Error("Nothing found — try a different concept");
+        return;
+      }
+
+      // ── Column layout constants ──────────────────────────────────────────
+      // 5 columns, each 750px wide, rank #5 on the left → rank #1 on the right
+      const COL_STRIDE = 750;
+      const COL_START_X = 100;
+      const TITLE_Y = 60;
+      const RANK_Y = 280;        // y of the big rank number (#5, #4, …)
+      const LABEL_Y = 450;       // y of the item label below the rank number
+      const VIDEO_Y_START = 540; // y of first video placeholder
+      const VIDEO_GAP = 30;      // gap between stacked videos
+      const VIDEO_W = 700;
+      const VIDEO_H = 400;
+      const VIDEO_X_PAD = 25;    // padding from column left edge
+
+      const RANK_COLORS: Record<number, string> = {
+        5: "#7c3d1a",  // brown
+        4: "#d4651e",  // orange
+        3: "#cc2200",  // red
+        2: "#b00000",  // bold red
+        1: "#c49a00",  // gold
+      };
+
+      const newAnnotations: Annotation[] = [];
+
+      // Title annotation spanning all columns
+      newAnnotations.push({
+        id: generateId(),
+        type: "text",
+        boardX: COL_START_X,
+        boardY: TITLE_Y,
+        boardW: 3800,
+        boardH: 250,
+        color: "#cc2200",
+        text: data.title,
+        fontFamily: "Permanent Marker",
+        fontSize: 180,
+        fontWeight: "bold",
+      });
+
+      const newPlaceholders: NeuralPlaceholder[] = [];
+
+      // items arrive sorted rank 5→1 from API
+      data.items.forEach((item) => {
+        const rankIndex = 5 - item.rank; // 0=rank5, 4=rank1
+        const colX = COL_START_X + rankIndex * COL_STRIDE;
+        const color = RANK_COLORS[item.rank] ?? "#2a2a2a";
+
+        // Big rank number annotation
+        newAnnotations.push({
+          id: generateId(),
+          type: "text",
+          boardX: colX,
+          boardY: RANK_Y,
+          boardW: VIDEO_W,
+          boardH: 180,
+          color,
+          text: `#${item.rank}`,
+          fontFamily: "Permanent Marker",
+          fontSize: item.rank === 2 ? 150 : 140,
+          fontWeight: item.rank <= 2 ? "bold" : "normal",
+        });
+
+        // Item label annotation
+        newAnnotations.push({
+          id: generateId(),
+          type: "text",
+          boardX: colX,
+          boardY: LABEL_Y,
+          boardW: VIDEO_W,
+          boardH: 80,
+          color: "#2a2a2a",
+          text: item.label,
+          fontFamily: "Caveat",
+          fontSize: 60,
+          fontWeight: "normal",
+        });
+
+        // Video placeholders for this rank
+        item.videos.forEach((v, vi) => {
+          const boardY = VIDEO_Y_START + vi * (VIDEO_H + VIDEO_GAP);
+          newPlaceholders.push({
+            id: generateId(),
+            boardX: colX + VIDEO_X_PAD,
+            boardY,
+            boardW: VIDEO_W,
+            boardH: VIDEO_H,
+            videoId: v.videoId,
+            title: v.title,
+            channel: v.channel,
+            thumbnailUrl: v.thumbnailUrl,
+            viewCount: v.viewCount,
+            durationSec: v.durationSec,
+          });
+        });
+      });
+
+      setAnnotations((prev) => [...prev, ...newAnnotations]);
+      setNeuralPlaceholders((prev) => [...prev, ...newPlaceholders]);
+      setTop5ModalOpen(false);
+      setTop5Concept("");
+    } catch (e) {
+      setTop5Error(e instanceof Error ? e.message : "Search failed");
+    } finally {
+      clearTimeout(t1); clearTimeout(t2);
+      setTop5Phase(null);
+    }
   }
 
   function removeImagePlaceholder(id: string) {
@@ -3390,6 +3537,82 @@ export default function Board2Page() {
     );
   }
 
+  // ─── Top 5 Neural Search modal ──────────────────────────────────────────────
+
+  function renderTop5Modal() {
+    if (!top5ModalOpen) return null;
+    return (
+      <div
+        onClick={(e) => { if (e.target === e.currentTarget && !top5Phase) setTop5ModalOpen(false); }}
+        style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+      >
+        <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 500, maxWidth: "95vw", fontFamily: "monospace", overflow: "hidden" }}>
+          {/* Header */}
+          <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>🏆 TOP 5 NEURAL SEARCH</span>
+            <button
+              onClick={() => { if (!top5Phase) setTop5ModalOpen(false); }}
+              style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15, opacity: top5Phase ? 0.4 : 1 }}
+            >×</button>
+          </div>
+
+          <div style={{ padding: 16 }}>
+            <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
+              Describe a Top 5 concept. GPT-4o will generate the ranked list, then find 2–3 YouTube candidates per rank and arrange them on the board in columns.
+            </p>
+            <textarea
+              value={top5Concept}
+              onChange={(e) => setTop5Concept(e.target.value)}
+              disabled={!!top5Phase}
+              placeholder="e.g. Top 5 conspiracies that turned out to be true…"
+              rows={5}
+              style={{
+                width: "100%", fontFamily: "monospace", fontSize: 11,
+                border: "1.5px solid #2a2a2a", padding: "8px",
+                resize: "vertical", boxSizing: "border-box",
+                background: top5Phase ? "#f5f5f0" : "#fff",
+              } as React.CSSProperties}
+            />
+
+            {top5Phase && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#1a6fd4" }}>
+                ⟳ {top5Phase}
+              </div>
+            )}
+            {top5Error && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "#cc2200" }}>
+                ✗ {top5Error}
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => { if (!top5Phase) setTop5ModalOpen(false); }}
+              disabled={!!top5Phase}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: top5Phase ? 0.4 : 1 }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={runTop5Search}
+              disabled={!!top5Phase || !top5Concept.trim()}
+              style={{
+                ...miniButton, padding: "6px 18px", fontSize: 12, fontWeight: 700,
+                background: "#fef3c7", borderColor: "#2a2a2a",
+                opacity: (!!top5Phase || !top5Concept.trim()) ? 0.5 : 1,
+                cursor: (!!top5Phase || !top5Concept.trim()) ? "not-allowed" : "pointer",
+              }}
+            >
+              {top5Phase ? "Working…" : "Generate Top 5 →"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ─── Image placeholder preview modal ────────────────────────────────────────
 
   function renderImagePreviewModal() {
@@ -3857,6 +4080,14 @@ export default function Board2Page() {
                         🔮  Neural Search
                       </button>
                     </ProGated>
+                    <ProGated featureName="Top 5 Neural Search">
+                      <button
+                        onClick={() => { setTop5ModalOpen(true); setTop5Concept(""); setTop5Error(""); setTop5Phase(null); setMobileDrawer(null); }}
+                        style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: "#fef3c7" }}
+                      >
+                        🏆  Top 5
+                      </button>
+                    </ProGated>
                     <ProGated featureName="Narration Recording">
                       <button
                         onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
@@ -4153,6 +4384,7 @@ export default function Board2Page() {
         )}
         {renderDownloadToasts()}
         {renderNeuralSearchModal()}
+        {renderTop5Modal()}
         {renderImagePreviewModal()}
 
         {/* ── Save modal ── */}
@@ -4414,6 +4646,15 @@ export default function Board2Page() {
                 style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", background: "#e4cfff" }}
               >
                 🔮 Neural Search
+              </button>
+            </ProGated>
+
+            <ProGated featureName="Top 5 Neural Search">
+              <button
+                onClick={() => { setTop5ModalOpen(true); setTop5Concept(""); setTop5Error(""); setTop5Phase(null); }}
+                style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", background: "#fef3c7" }}
+              >
+                🏆 Top 5
               </button>
             </ProGated>
 
@@ -5935,6 +6176,7 @@ export default function Board2Page() {
       )}
       {renderDownloadToasts()}
       {renderNeuralSearchModal()}
+      {renderTop5Modal()}
       {renderImagePreviewModal()}
 
       {/* Save modal */}
