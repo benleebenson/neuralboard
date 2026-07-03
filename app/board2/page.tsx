@@ -72,7 +72,7 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 
 type CharacterAction = {
   id: string;
-  type: "walkTo" | "jumpTo" | "pointAt" | "emote" | "idle";
+  type: "walkTo" | "jumpTo" | "pointAt" | "emote" | "idle" | "grapple";
   startTime: number;
   duration: number;
   targetX?: number;
@@ -546,6 +546,11 @@ function drawAnnotationsToCanvas(
 
 // ─── Character — module-level helpers ────────────────────────────────────────
 
+// Distance thresholds for auto-mode travel type selection
+const CHAR_WALK_DIST = 500;   // board px — below this: walkTo
+const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
+const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
+
 function getCharInitPos(clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]): { x: number; y: number } {
   const placed = clips.filter((c) => c.boardX !== undefined);
   if (placed.length === 0) return { x: BOARD_W / 2, y: BOARD_H * 0.75 };
@@ -555,17 +560,132 @@ function getCharInitPos(clips: { boardX?: number; boardY?: number; boardW?: numb
   return { x: (minX + maxX) / 2, y: maxY + 80 };
 }
 
+// Snap a desired Y position to the nearest clip top edge at x, if any clip spans that x.
+// Returns the clip's boardY (feet land on the top surface). Falls back to desiredY if no clip.
+function resolveGroundY(
+  x: number,
+  desiredY: number,
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+): number {
+  const PAD = 40; // don't stand on the extreme corners of an image
+  const candidates = clips.filter((c) =>
+    c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined &&
+    (c.type === "image" || c.type === "video") &&
+    x >= c.boardX! + PAD && x <= c.boardX! + (c.boardW ?? 0) - PAD &&
+    c.boardY! <= desiredY  // top edge must be at or above the target point
+  );
+  if (candidates.length === 0) return desiredY;
+  // When clips overlap horizontally (stacked images), stand on the topmost one (smallest boardY).
+  // Among all candidates whose top edge is <= desiredY, pick the one with the LARGEST boardY
+  // (highest top edge, closest to desiredY from above).
+  return Math.max(...candidates.map((c) => c.boardY!));
+}
+
+// Snap a board position to the top surface of the clip under x (for action placement).
+function snapToClipTop(
+  tx: number, ty: number,
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+): { x: number; y: number } {
+  const PAD = 40;
+  const candidates = clips.filter((c) =>
+    c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined && c.boardH !== undefined &&
+    (c.type === "image" || c.type === "video") &&
+    tx >= c.boardX! && tx <= c.boardX! + (c.boardW ?? 0)
+  );
+  if (candidates.length === 0) return { x: tx, y: ty };
+  // Pick topmost clip whose body contains the click point (boardY <= ty <= boardY + boardH)
+  const hit = candidates
+    .filter((c) => ty >= c.boardY! && ty <= c.boardY! + (c.boardH ?? 0))
+    .sort((a, b) => a.boardY! - b.boardY!)[0];  // topmost
+  if (hit) {
+    // Clamp x to the inner span (not on extreme edges)
+    const cx = Math.max(hit.boardX! + PAD, Math.min(hit.boardX! + (hit.boardW ?? 0) - PAD, tx));
+    return { x: cx, y: hit.boardY! };
+  }
+  return { x: tx, y: ty };
+}
+
+// Resolve fromX/fromY for each action (position continuity pass).
+// Handles both manual and auto-derived actions merged in time order.
 function resolveCharActions(actions: CharacterAction[], initX: number, initY: number): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
   const result: ResolvedCharAction[] = [];
   for (const a of sorted) {
     result.push({ ...a, fromX: x, fromY: y });
-    if ((a.type === "walkTo" || a.type === "jumpTo") && a.targetX !== undefined) {
+    if ((a.type === "walkTo" || a.type === "jumpTo" || a.type === "grapple") && a.targetX !== undefined) {
       x = a.targetX; y = a.targetY ?? y;
     }
+    // pointAt/emote/idle don't change position
   }
   return result;
+}
+
+// Merge auto-derived actions with manual overrides:
+// manual actions take priority — any derived action overlapping a manual one is suppressed.
+function mergeCharActions(derived: CharacterAction[], manual: CharacterAction[]): CharacterAction[] {
+  return [
+    ...derived.filter((d) => !manual.some((m) =>
+      d.startTime < m.startTime + m.duration && d.startTime + d.duration > m.startTime
+    )),
+    ...manual,
+  ].sort((a, b) => a.startTime - b.startTime);
+}
+
+// Derive character actions automatically from the clip timeline (auto-follow mode).
+function deriveAutoCharActions(clips: Clip[], initX: number, initY: number): CharacterAction[] {
+  const boardClips = clips
+    .filter((c) => c.boardX !== undefined && c.type !== "narration" && c.type !== "pan")
+    .sort((a, b) => a.startTime - b.startTime);
+  if (boardClips.length === 0) return [];
+
+  const actions: CharacterAction[] = [];
+  let curX = initX, curY = initY;
+
+  for (const clip of boardClips) {
+    const tx = clip.boardX! + (clip.boardW ?? 0) / 2;
+    const ty = clip.boardY!;  // stand on top edge
+    const dist = Math.hypot(tx - curX, ty - curY);
+
+    let moveType: CharacterAction["type"];
+    let moveDur: number;
+    if (dist < CHAR_WALK_DIST)      { moveType = "walkTo";  moveDur = 1.5; }
+    else if (dist < CHAR_JUMP_DIST) { moveType = "jumpTo";  moveDur = 1.0; }
+    else                             { moveType = "grapple"; moveDur = 1.5; }
+
+    // Travel: ends when clip starts; begins moveDur before that
+    const travelEnd = clip.startTime;
+    const travelStart = Math.max(0, travelEnd - moveDur);
+    const actualDur = travelEnd - travelStart;
+
+    if (dist > 20 && actualDur > 0.15) {
+      actions.push({
+        id: `auto_${clip.id}_mv`,
+        type: moveType,
+        startTime: travelStart,
+        duration: actualDur,
+        targetX: tx, targetY: ty,
+      });
+    }
+
+    // PointAt beat: first CHAR_POINT_BEAT seconds of the clip hold
+    const holdDur = clip.duration * (clip.holdFraction ?? HOLD_FRACTION);
+    const pointDur = Math.min(CHAR_POINT_BEAT, holdDur - 0.1);
+    if (pointDur > 0.2) {
+      actions.push({
+        id: `auto_${clip.id}_pt`,
+        type: "pointAt",
+        startTime: clip.startTime,
+        duration: pointDur,
+        targetX: clip.boardX! + (clip.boardW ?? 0) / 2,
+        targetY: clip.boardY! + (clip.boardH ?? 0) * 0.35,
+      });
+    }
+
+    curX = tx; curY = ty;
+  }
+
+  return actions;
 }
 
 type CharPoseResult = {
@@ -581,18 +701,27 @@ type CharPoseResult = {
   emojiAlpha?: number;
   pointTargetBX?: number;
   pointTargetBY?: number;
+  grappleAnchorBX?: number;
+  grappleAnchorBY?: number;
+  grappleRopeAlpha?: number;
 };
 
-function evalCharAtTime(time: number, resolved: ResolvedCharAction[], initX: number, initY: number): CharPoseResult {
+function evalCharAtTime(
+  time: number,
+  resolved: ResolvedCharAction[],
+  initX: number,
+  initY: number,
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+): CharPoseResult {
   const idlePose = (rx: number, ry: number): CharPoseResult => {
     const t = time * 2;
     return {
       boardX: rx, boardY: ry, facing: 1,
       headBob: Math.sin(t) * 2, bodyLean: 0,
       leftLegA: 0, rightLegA: 0,
-      leftArmA: Math.sin(t * 0.7) * 0.12 + 0.3,
-      rightArmA: Math.sin(t * 0.7 + Math.PI) * 0.12 - 0.3,
-      leftForeA: 0.15, rightForeA: -0.15,
+      leftArmA: Math.sin(t * 0.7) * 0.12 + 0.15,
+      rightArmA: Math.sin(t * 0.7 + Math.PI) * 0.12 - 0.15,
+      leftForeA: 0.2, rightForeA: -0.2,
       airY: 0,
     };
   };
@@ -606,7 +735,7 @@ function evalCharAtTime(time: number, resolved: ResolvedCharAction[], initX: num
       const end = a.startTime + a.duration;
       if (end <= time && end > lastEnd) {
         lastEnd = end;
-        if ((a.type === "walkTo" || a.type === "jumpTo") && a.targetX !== undefined) {
+        if ((a.type === "walkTo" || a.type === "jumpTo" || a.type === "grapple") && a.targetX !== undefined) {
           rx = a.targetX; ry = a.targetY ?? ry;
         } else {
           rx = a.fromX; ry = a.fromY;
@@ -621,7 +750,9 @@ function evalCharAtTime(time: number, resolved: ResolvedCharAction[], initX: num
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const bx = active.fromX + (tx - active.fromX) * progress;
-    const by = active.fromY + (ty - active.fromY) * progress;
+    // Ground-resolve the feet Y along the path so he steps UP onto clip surfaces
+    const rawBy = active.fromY + (ty - active.fromY) * progress;
+    const by = resolveGroundY(bx, rawBy, clips);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const dist = Math.hypot(tx - active.fromX, ty - active.fromY);
     const stepFreq = Math.max(4, dist * 0.015);
@@ -643,27 +774,115 @@ function evalCharAtTime(time: number, resolved: ResolvedCharAction[], initX: num
     const by = active.fromY + (ty - active.fromY) * progress;
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const airY = -150 * 4 * progress * (1 - progress);
-    const tuck = Math.sin(Math.PI * progress);
+
+    // Three-phase jump: takeoff / mid-air / landing — limbs never collapse toward center
+    let leftLegA: number, rightLegA: number, leftArmA: number, rightArmA: number;
+    let leftForeA = 0, rightForeA = 0, headBob = 0;
+
+    if (progress < 0.15) {
+      // Takeoff crouch: legs push off (spread slightly), arms swing back
+      const t = progress / 0.15;
+      leftLegA  = lerp(0,    0.3,  t);
+      rightLegA = lerp(0,   -0.3,  t);
+      leftArmA  = lerp(0.15,-0.45, t);
+      rightArmA = lerp(-0.15,-0.45, t);
+    } else if (progress < 0.75) {
+      // Mid-air: both legs trail back (symmetric tuck), both arms raised forward for balance
+      const t = (progress - 0.15) / 0.6;
+      leftLegA  = lerp(0.3, -0.55, t);
+      rightLegA = lerp(-0.3,-0.45, t);
+      leftForeA  = lerp(0, -0.3, t);
+      rightForeA = lerp(0, -0.3, t);
+      leftArmA  = lerp(-0.45, -0.5, t);
+      rightArmA = lerp(-0.45, -0.5, t);
+      headBob   = -Math.sin(Math.PI * t) * 4;
+    } else {
+      // Landing: legs extend down ahead, arms splay for balance, then settle
+      const t = (progress - 0.75) / 0.25;
+      leftLegA  = lerp(-0.55, 0.25, t);
+      rightLegA = lerp(-0.45, 0.15, t);
+      leftArmA  = lerp(-0.5,  0.4,  t);
+      rightArmA = lerp(-0.5, -0.4,  t);
+      leftForeA  = lerp(-0.3, 0, t);
+      rightForeA = lerp(-0.3, 0, t);
+    }
+
     return {
       boardX: bx, boardY: by, facing,
-      headBob: -tuck * 5, bodyLean: 0,
-      leftLegA: -tuck * 0.7, rightLegA: tuck * 0.7,
-      leftArmA: -tuck * 0.9, rightArmA: tuck * 0.9,
-      leftForeA: 0, rightForeA: 0,
+      headBob, bodyLean: 0,
+      leftLegA, rightLegA, leftArmA, rightArmA, leftForeA, rightForeA,
       airY,
     };
+  }
+
+  if (active.type === "grapple") {
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    // Anchor point: above and between start+end, biased toward destination
+    const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
+    const anchorBY = Math.min(active.fromY, ty) - 380;
+
+    if (progress < 0.15) {
+      // Aim + fire: arms raise toward anchor, rope extends
+      const t = progress / 0.15;
+      return {
+        boardX: active.fromX, boardY: active.fromY, facing,
+        headBob: 0, bodyLean: 0,
+        leftLegA: 0.1, rightLegA: -0.1,
+        leftArmA: lerp(0.15, -1.1, t), rightArmA: lerp(-0.15, -1.1, t),
+        leftForeA: lerp(0.2, -0.25, t), rightForeA: lerp(-0.2, -0.25, t),
+        airY: 0,
+        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
+        grappleRopeAlpha: t,
+      };
+    } else if (progress < 0.85) {
+      // Swing: pendulum bezier arc from start to end dipping below anchor
+      const t = (progress - 0.15) / 0.7;
+      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      // Bezier control point sags downward mid-swing
+      const ctrlBX = (active.fromX + tx) / 2;
+      const ctrlBY = Math.max(active.fromY, ty) + 180;
+      const bx = (1-eased)*(1-eased)*active.fromX + 2*(1-eased)*eased*ctrlBX + eased*eased*tx;
+      const by = (1-eased)*(1-eased)*active.fromY + 2*(1-eased)*eased*ctrlBY + eased*eased*ty;
+      return {
+        boardX: bx, boardY: by, facing,
+        headBob: -3, bodyLean: 0,
+        leftLegA: -0.45, rightLegA: -0.35,
+        leftArmA: -1.1, rightArmA: -1.1,
+        leftForeA: -0.25, rightForeA: -0.25,
+        airY: 0,
+        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
+        grappleRopeAlpha: 1,
+      };
+    } else {
+      // Release + land
+      const t = (progress - 0.85) / 0.15;
+      return {
+        boardX: tx, boardY: ty, facing,
+        headBob: 0, bodyLean: 0,
+        leftLegA: lerp(-0.45, 0.2, t), rightLegA: lerp(-0.35, 0.15, t),
+        leftArmA: lerp(-1.1, 0.3, t), rightArmA: lerp(-1.1, -0.3, t),
+        leftForeA: 0, rightForeA: 0,
+        airY: 0,
+        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
+        grappleRopeAlpha: 1 - t,
+      };
+    }
   }
 
   if (active.type === "pointAt") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = (tx - active.fromX) >= 0 ? 1 : -1;
     const armProgress = Math.min(1, progress / 0.3);
+    // Weight shift: stance leg slightly offset toward target side
+    const stanceShift = facing === 1 ? 0.08 : -0.08;
     return {
       boardX: active.fromX, boardY: active.fromY, facing,
       headBob: 0, bodyLean: 0,
-      leftLegA: 0, rightLegA: 0,
-      leftArmA: 0.3, rightArmA: -0.3,
-      leftForeA: 0.15, rightForeA: -0.15,
+      leftLegA: stanceShift, rightLegA: -stanceShift * 0.5,
+      // Arm defaults — will be overridden in draw for the pointing arm
+      leftArmA: 0.15, rightArmA: 0.15,
+      leftForeA: 0.2, rightForeA: 0.2,
       airY: 0,
       pointTargetBX: active.fromX + (tx - active.fromX) * armProgress,
       pointTargetBY: active.fromY + (ty - active.fromY) * armProgress,
@@ -700,16 +919,43 @@ function drawCharacterToCanvas(
   W: number,
   H: number,
   initX: number,
-  initY: number
+  initY: number,
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
 ) {
   if (!showChar) return;
-  const p = evalCharAtTime(time, resolved, initX, initY);
+  const p = evalCharAtTime(time, resolved, initX, initY, clips);
   const { facing } = p;
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
   const sy = (p.boardY - cam.cameraY) * sf + H / 2;
   const S = sf;
   const lw = Math.max(1, 3 * S);
+
+  // ── Grapple rope (drawn before character transform so coords are screen-space) ──
+  if (p.grappleAnchorBX !== undefined && p.grappleRopeAlpha && p.grappleRopeAlpha > 0) {
+    const anchorSX = (p.grappleAnchorBX - cam.cameraX) * sf + W / 2;
+    const anchorSY = (p.grappleAnchorBY! - cam.cameraY) * sf + H / 2;
+    // Rope exits from roughly above the character's head
+    const handSX = sx;
+    const handSY = sy - 180 * S;
+    const ctrlSX = (handSX + anchorSX) / 2;
+    const ctrlSY = Math.min(handSY, anchorSY) - 20 * S;
+    ctx.save();
+    ctx.globalAlpha = p.grappleRopeAlpha;
+    ctx.strokeStyle = "#5a3a1a";
+    ctx.lineWidth = Math.max(1, 1.8 * S);
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(handSX, handSY);
+    ctx.quadraticCurveTo(ctrlSX, ctrlSY, anchorSX, anchorSY);
+    ctx.stroke();
+    // Anchor spike
+    ctx.fillStyle = "#5a3a1a";
+    ctx.beginPath();
+    ctx.arc(anchorSX, anchorSY, 3 * S, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
 
   ctx.save();
   ctx.translate(sx, sy + p.airY * S);
@@ -728,20 +974,21 @@ function drawCharacterToCanvas(
   const shoulderY = hipY - torsoLen;
   const headCY = shoulderY - 18 * S + bobS;
 
-  // Legs
-  const drawLeg = (angle: number) => {
-    const kx = Math.sin(angle) * legLen;
-    const ky = hipY + Math.cos(angle) * legLen;
+  // Legs (two-segment: thigh + shin with independent shin angle)
+  const drawLeg = (thighA: number, shinA: number) => {
+    const kx = Math.sin(thighA) * legLen;
+    const ky = hipY + Math.cos(thighA) * legLen;
     ctx.beginPath();
     ctx.moveTo(0, hipY);
     ctx.lineTo(kx, ky);
-    ctx.lineTo(kx + Math.sin(angle * 0.5) * legLen, ky + Math.cos(angle * 0.5) * legLen);
+    ctx.lineTo(kx + Math.sin(shinA) * legLen, ky + Math.cos(shinA) * legLen);
     ctx.stroke();
   };
-  drawLeg(p.leftLegA);
-  drawLeg(p.rightLegA);
+  // Shin angle = thigh angle + forearm angle (using leftForeA/rightForeA as shin bend)
+  drawLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
+  drawLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
 
-  // Torso + arms (in hip-relative space)
+  // Torso
   ctx.save();
   ctx.translate(0, hipY);
   ctx.rotate(p.bodyLean);
@@ -751,21 +998,22 @@ function drawCharacterToCanvas(
   let lArmA = p.leftArmA, rArmA = p.rightArmA;
   let lForeA = p.leftForeA, rForeA = p.rightForeA;
 
-  // Override arm angles for pointAt
+  // Override pointing arm; other arm hangs relaxed (not tucked inward)
   if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
-    const shoulderBY = p.boardY - 141; // approx shoulder in board Y (above feet)
+    const shoulderBY = p.boardY - 141;
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
-    const tdyCanvas = p.pointTargetBY - shoulderBY; // positive = below shoulder
+    const tdyCanvas = p.pointTargetBY - shoulderBY;
     const mag = Math.hypot(tdxLocal, tdyCanvas);
     if (mag > 0) {
-      // arm angle: sin(θ)=x-component, cos(θ)=y-component (0=down, π/2=right)
       const pointAngle = Math.atan2(tdxLocal, tdyCanvas);
+      const RELAX_ARM = 0.15;  // natural hang angle
+      const RELAX_FORE = 0.2;
       if (tdxLocal >= 0) {
         rArmA = pointAngle; rForeA = pointAngle;
-        lArmA = 0.3; lForeA = 0.12;
+        lArmA = RELAX_ARM;  lForeA = RELAX_FORE;
       } else {
         lArmA = pointAngle; lForeA = pointAngle;
-        rArmA = -0.3; rForeA = -0.12;
+        rArmA = RELAX_ARM;  rForeA = RELAX_FORE;
       }
     }
   }
@@ -783,16 +1031,10 @@ function drawCharacterToCanvas(
   drawArm(7 * S, rArmA, rForeA);
   ctx.restore(); // un-lean
 
-  // Head
+  // Head — blank circle only (no face features)
   ctx.beginPath(); ctx.arc(0, headCY, headR, 0, Math.PI * 2); ctx.stroke();
-  // Eyes
-  ctx.fillStyle = "#2a2a2a";
-  ctx.beginPath(); ctx.arc(-7 * S, headCY - 5 * S, 2 * S, 0, Math.PI * 2); ctx.fill();
-  ctx.beginPath(); ctx.arc(7 * S, headCY - 5 * S, 2 * S, 0, Math.PI * 2); ctx.fill();
-  // Smile
-  ctx.beginPath(); ctx.arc(0, headCY + 2 * S, 6 * S, 0.1, Math.PI - 0.1); ctx.stroke();
 
-  // Emoji
+  // Emoji emote
   if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
     ctx.save();
     ctx.globalAlpha = p.emojiAlpha;
@@ -866,7 +1108,9 @@ export default function Board2Page() {
   // ── Character ──
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
-  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "pointAt" | "emote" | null>(null);
+  const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
+  const [resolvedCharActions, setResolvedCharActions] = useState<ResolvedCharAction[]>([]);
+  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
@@ -1035,7 +1279,8 @@ export default function Board2Page() {
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
-  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "pointAt" | "emote" | null>(null);
+  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
+  const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
@@ -1064,15 +1309,22 @@ export default function Board2Page() {
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
   useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
+  useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
-  // Recompute resolved character positions whenever actions or clips change
+  // Recompute resolved character positions whenever actions, mode, or clips change
   useEffect(() => {
     const init = getCharInitPos(clipsRef.current);
     charInitXRef.current = init.x;
     charInitYRef.current = init.y;
-    resolvedCharActionsRef.current = resolveCharActions(characterActionsRef.current, init.x, init.y);
+    const manual = characterActionsRef.current;
+    const merged = characterModeRef.current === "auto"
+      ? mergeCharActions(deriveAutoCharActions(clipsRef.current, init.x, init.y), manual)
+      : manual;
+    const resolved = resolveCharActions(merged, init.x, init.y);
+    resolvedCharActionsRef.current = resolved;
+    setResolvedCharActions(resolved);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [characterActions, clips]);
+  }, [characterActions, characterMode, clips]);
 
   useEffect(() => {
     const check = () => {
@@ -1244,7 +1496,8 @@ export default function Board2Page() {
     if (showCharacterRef.current) {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
-        cam, sf, W, H, charInitXRef.current, charInitYRef.current
+        cam, sf, W, H, charInitXRef.current, charInitYRef.current,
+        clipsRef.current
       );
     }
     if (currentAnnotations.length > 0) {
@@ -5457,6 +5710,7 @@ export default function Board2Page() {
         boardPan: boardPanRef.current,
         characterActions: characterActionsRef.current,
         showCharacter: showCharacterRef.current,
+        characterMode: characterModeRef.current,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
@@ -5530,6 +5784,7 @@ export default function Board2Page() {
       if (manifest.name) setSaveName(manifest.name);
       if (manifest.characterActions) setCharacterActions(manifest.characterActions);
       if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
+      if (manifest.characterMode) setCharacterMode(manifest.characterMode);
       setToast(`Loaded "${manifest.name ?? "board"}"`);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
@@ -6363,10 +6618,31 @@ export default function Board2Page() {
                         {showCharacter && (
                           <>
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
+                            {/* Auto / Manual mode toggle */}
+                            <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
+                              {(["auto", "manual"] as const).map((m) => (
+                                <button
+                                  key={m}
+                                  title={m === "auto" ? "Follow camera keyframes automatically" : "Manually place actions only"}
+                                  onClick={(e) => { e.stopPropagation(); setCharacterMode(m); }}
+                                  style={{
+                                    padding: "3px 7px", fontFamily: "monospace", fontSize: 9, cursor: "pointer",
+                                    border: "none", borderRight: m === "auto" ? "1px solid rgba(42,42,42,0.35)" : "none",
+                                    background: characterMode === m ? "#2a2a2a" : "transparent",
+                                    color: characterMode === m ? CHARACTER_COLOR : "#2a2a2a",
+                                    fontWeight: characterMode === m ? 700 : 400,
+                                  }}
+                                >
+                                  {m === "auto" ? "Auto" : "Manual"}
+                                </button>
+                              ))}
+                            </div>
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
                             {/* Action buttons — click to enter crosshair placement mode */}
                             {([
                               { mode: "walkTo" as const, label: "Walk", title: "Click board to walk to position (1.5s)" },
                               { mode: "jumpTo" as const, label: "Jump", title: "Click board to jump to position (1.0s)" },
+                              { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.5s)" },
                               { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
                               { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
                             ]).map(({ mode, label, title }) => (
@@ -6454,16 +6730,18 @@ export default function Board2Page() {
                     e.stopPropagation();
                     const rect = boardContainerRef.current?.getBoundingClientRect();
                     if (!rect) return;
-                    const bx = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
-                    const by = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
-                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, pointAt: 2.0 };
+                    const rawBx = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+                    const rawBy = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+                    // Snap target to top of clip surface if clicked on an image/video
+                    const snapped = snapToClipTop(rawBx, rawBy, clipsRef.current);
+                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, grapple: 1.5, pointAt: 2.0 };
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
                       startTime: playheadRef.current,
                       duration: durationMap[characterAddMode] ?? 1.5,
-                      targetX: Math.round(bx),
-                      targetY: Math.round(by),
+                      targetX: Math.round(snapped.x),
+                      targetY: Math.round(snapped.y),
                     };
                     setCharacterActions((prev) => [...prev, newAction]);
                     setCharacterAddMode(null);
@@ -6915,10 +7193,11 @@ export default function Board2Page() {
                   <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + NARRATION_TRACK_H + 10, pointerEvents: "none", zIndex: 15 }}>
                     <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(60,130,60,0.6)", letterSpacing: 0.5, textTransform: "uppercase" }}>char</span>
                   </div>
-                  {/* Character action blocks */}
-                  {characterActions.map((action) => {
+                  {/* Character action blocks — show derived auto-actions (dimmed) + manual actions */}
+                  {resolvedCharActions.map((action) => {
+                    const isAuto = characterMode === "auto" && !characterActions.find((m) => m.id === action.id);
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
-                    const icons: Record<string, string> = { walkTo: "⇒", jumpTo: "↑", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸" };
+                    const icons: Record<string, string> = { walkTo: "⇒", jumpTo: "↑", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸" };
                     return (
                       <div
                         key={action.id}
@@ -6930,34 +7209,39 @@ export default function Board2Page() {
                           top: TRACK_H + NARRATION_TRACK_H + 10,
                           width: actionPx,
                           height: CHARACTER_TRACK_H - 4,
-                          background: CHARACTER_COLOR,
-                          border: "1.5px solid rgba(60,130,60,0.5)",
-                          cursor: "grab",
+                          background: isAuto ? "rgba(180,220,170,0.45)" : CHARACTER_COLOR,
+                          border: isAuto ? "1px dashed rgba(60,130,60,0.35)" : "1.5px solid rgba(60,130,60,0.5)",
+                          cursor: isAuto ? "default" : "grab",
                           userSelect: "none",
                           overflow: "hidden",
                           display: "flex",
                           alignItems: "center",
+                          opacity: isAuto ? 0.7 : 1,
                         }}
-                        onPointerDown={(e) => handleCharActionPointerDown(e, action, "move")}
-                        onContextMenu={(e) => {
+                        onPointerDown={isAuto ? undefined : (e) => handleCharActionPointerDown(e, action, "move")}
+                        onContextMenu={isAuto ? undefined : (e) => {
                           e.preventDefault();
                           e.stopPropagation();
                           setCharActionContextMenu({ x: e.clientX, y: e.clientY, actionId: action.id });
                         }}
                       >
-                        {/* Left resize */}
-                        <div
-                          style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
-                          onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-left")}
-                        />
+                        {/* Left resize — manual only */}
+                        {!isAuto && (
+                          <div
+                            style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                            onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-left")}
+                          />
+                        )}
                         <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#2a4a2a", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
                           {icons[action.type]} {action.type}
                         </span>
-                        {/* Right resize */}
-                        <div
-                          style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
-                          onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-right")}
-                        />
+                        {/* Right resize — manual only */}
+                        {!isAuto && (
+                          <div
+                            style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                            onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-right")}
+                          />
+                        )}
                       </div>
                     );
                   })}
