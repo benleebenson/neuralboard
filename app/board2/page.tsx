@@ -70,6 +70,26 @@ type Annotation = {
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
 
+type CharacterAction = {
+  id: string;
+  type: "walkTo" | "jumpTo" | "pointAt" | "emote" | "idle";
+  startTime: number;
+  duration: number;
+  targetX?: number;
+  targetY?: number;
+  emoji?: string;
+};
+
+type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
+
+type CharTimelineDrag = {
+  kind: "move" | "resize-left" | "resize-right";
+  actionId: string;
+  origStartTime: number;
+  origDuration: number;
+  cursorOffsetSec: number;
+};
+
 type MediaItem = {
   id: string;
   name: string;
@@ -180,6 +200,8 @@ const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
 const EXPORT_FPS = 60;
 const PREVIEW_H_PX = 135;
+const CHARACTER_TRACK_H = 36;
+const CHARACTER_COLOR = "#cdeac0";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -522,6 +544,269 @@ function drawAnnotationsToCanvas(
   }
 }
 
+// ─── Character — module-level helpers ────────────────────────────────────────
+
+function getCharInitPos(clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]): { x: number; y: number } {
+  const placed = clips.filter((c) => c.boardX !== undefined);
+  if (placed.length === 0) return { x: BOARD_W / 2, y: BOARD_H * 0.75 };
+  const minX = Math.min(...placed.map((c) => c.boardX!));
+  const maxX = Math.max(...placed.map((c) => c.boardX! + (c.boardW ?? 0)));
+  const maxY = Math.max(...placed.map((c) => c.boardY! + (c.boardH ?? 0)));
+  return { x: (minX + maxX) / 2, y: maxY + 80 };
+}
+
+function resolveCharActions(actions: CharacterAction[], initX: number, initY: number): ResolvedCharAction[] {
+  const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
+  let x = initX, y = initY;
+  const result: ResolvedCharAction[] = [];
+  for (const a of sorted) {
+    result.push({ ...a, fromX: x, fromY: y });
+    if ((a.type === "walkTo" || a.type === "jumpTo") && a.targetX !== undefined) {
+      x = a.targetX; y = a.targetY ?? y;
+    }
+  }
+  return result;
+}
+
+type CharPoseResult = {
+  boardX: number; boardY: number;
+  facing: 1 | -1;
+  headBob: number;
+  bodyLean: number;
+  leftLegA: number; rightLegA: number;
+  leftArmA: number; rightArmA: number;
+  leftForeA: number; rightForeA: number;
+  airY: number;
+  emojiText?: string;
+  emojiAlpha?: number;
+  pointTargetBX?: number;
+  pointTargetBY?: number;
+};
+
+function evalCharAtTime(time: number, resolved: ResolvedCharAction[], initX: number, initY: number): CharPoseResult {
+  const idlePose = (rx: number, ry: number): CharPoseResult => {
+    const t = time * 2;
+    return {
+      boardX: rx, boardY: ry, facing: 1,
+      headBob: Math.sin(t) * 2, bodyLean: 0,
+      leftLegA: 0, rightLegA: 0,
+      leftArmA: Math.sin(t * 0.7) * 0.12 + 0.3,
+      rightArmA: Math.sin(t * 0.7 + Math.PI) * 0.12 - 0.3,
+      leftForeA: 0.15, rightForeA: -0.15,
+      airY: 0,
+    };
+  };
+
+  const active = resolved.find((a) => time >= a.startTime && time < a.startTime + a.duration);
+
+  if (!active) {
+    let rx = initX, ry = initY;
+    let lastEnd = -1;
+    for (const a of resolved) {
+      const end = a.startTime + a.duration;
+      if (end <= time && end > lastEnd) {
+        lastEnd = end;
+        if ((a.type === "walkTo" || a.type === "jumpTo") && a.targetX !== undefined) {
+          rx = a.targetX; ry = a.targetY ?? ry;
+        } else {
+          rx = a.fromX; ry = a.fromY;
+        }
+      }
+    }
+    return idlePose(rx, ry);
+  }
+
+  const progress = Math.max(0, Math.min(1, (time - active.startTime) / active.duration));
+
+  if (active.type === "walkTo") {
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const bx = active.fromX + (tx - active.fromX) * progress;
+    const by = active.fromY + (ty - active.fromY) * progress;
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const dist = Math.hypot(tx - active.fromX, ty - active.fromY);
+    const stepFreq = Math.max(4, dist * 0.015);
+    const phase = progress * stepFreq * Math.PI * 2;
+    const swing = 0.5;
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: Math.sin(phase * 2) * 2, bodyLean: Math.sin(phase) * 0.05,
+      leftLegA: Math.sin(phase) * swing, rightLegA: Math.sin(phase + Math.PI) * swing,
+      leftArmA: Math.sin(phase + Math.PI) * 0.35, rightArmA: Math.sin(phase) * 0.35,
+      leftForeA: Math.sin(phase + Math.PI) * 0.15, rightForeA: Math.sin(phase) * 0.15,
+      airY: 0,
+    };
+  }
+
+  if (active.type === "jumpTo") {
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const bx = active.fromX + (tx - active.fromX) * progress;
+    const by = active.fromY + (ty - active.fromY) * progress;
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const airY = -150 * 4 * progress * (1 - progress);
+    const tuck = Math.sin(Math.PI * progress);
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: -tuck * 5, bodyLean: 0,
+      leftLegA: -tuck * 0.7, rightLegA: tuck * 0.7,
+      leftArmA: -tuck * 0.9, rightArmA: tuck * 0.9,
+      leftForeA: 0, rightForeA: 0,
+      airY,
+    };
+  }
+
+  if (active.type === "pointAt") {
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const facing: 1 | -1 = (tx - active.fromX) >= 0 ? 1 : -1;
+    const armProgress = Math.min(1, progress / 0.3);
+    return {
+      boardX: active.fromX, boardY: active.fromY, facing,
+      headBob: 0, bodyLean: 0,
+      leftLegA: 0, rightLegA: 0,
+      leftArmA: 0.3, rightArmA: -0.3,
+      leftForeA: 0.15, rightForeA: -0.15,
+      airY: 0,
+      pointTargetBX: active.fromX + (tx - active.fromX) * armProgress,
+      pointTargetBY: active.fromY + (ty - active.fromY) * armProgress,
+    };
+  }
+
+  if (active.type === "emote") {
+    const hop = Math.sin(Math.PI * Math.min(1, progress * 3)) * -20;
+    const emojiAlpha = progress <= 0.2
+      ? progress / 0.2
+      : progress <= 0.8 ? 1
+      : Math.max(0, 1 - (progress - 0.8) / 0.2);
+    return {
+      boardX: active.fromX, boardY: active.fromY, facing: 1,
+      headBob: hop * 0.4, bodyLean: Math.sin(progress * Math.PI * 4) * 0.08,
+      leftLegA: 0, rightLegA: 0,
+      leftArmA: 0.5, rightArmA: -0.5,
+      leftForeA: 0.2, rightForeA: -0.2,
+      airY: hop,
+      emojiText: active.emoji, emojiAlpha,
+    };
+  }
+
+  return idlePose(active.fromX, active.fromY);
+}
+
+function drawCharacterToCanvas(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  resolved: ResolvedCharAction[],
+  showChar: boolean,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number,
+  initX: number,
+  initY: number
+) {
+  if (!showChar) return;
+  const p = evalCharAtTime(time, resolved, initX, initY);
+  const { facing } = p;
+
+  const sx = (p.boardX - cam.cameraX) * sf + W / 2;
+  const sy = (p.boardY - cam.cameraY) * sf + H / 2;
+  const S = sf;
+  const lw = Math.max(1, 3 * S);
+
+  ctx.save();
+  ctx.translate(sx, sy + p.airY * S);
+  ctx.scale(facing, 1);
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = lw;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const legLen = 38 * S;
+  const torsoLen = 65 * S;
+  const armLen = 32 * S;
+  const headR = 20 * S;
+  const bobS = p.headBob * S;
+  const hipY = -76 * S + bobS * 0.25;
+  const shoulderY = hipY - torsoLen;
+  const headCY = shoulderY - 18 * S + bobS;
+
+  // Legs
+  const drawLeg = (angle: number) => {
+    const kx = Math.sin(angle) * legLen;
+    const ky = hipY + Math.cos(angle) * legLen;
+    ctx.beginPath();
+    ctx.moveTo(0, hipY);
+    ctx.lineTo(kx, ky);
+    ctx.lineTo(kx + Math.sin(angle * 0.5) * legLen, ky + Math.cos(angle * 0.5) * legLen);
+    ctx.stroke();
+  };
+  drawLeg(p.leftLegA);
+  drawLeg(p.rightLegA);
+
+  // Torso + arms (in hip-relative space)
+  ctx.save();
+  ctx.translate(0, hipY);
+  ctx.rotate(p.bodyLean);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
+
+  const relSY = -torsoLen;
+  let lArmA = p.leftArmA, rArmA = p.rightArmA;
+  let lForeA = p.leftForeA, rForeA = p.rightForeA;
+
+  // Override arm angles for pointAt
+  if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
+    const shoulderBY = p.boardY - 141; // approx shoulder in board Y (above feet)
+    const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
+    const tdyCanvas = p.pointTargetBY - shoulderBY; // positive = below shoulder
+    const mag = Math.hypot(tdxLocal, tdyCanvas);
+    if (mag > 0) {
+      // arm angle: sin(θ)=x-component, cos(θ)=y-component (0=down, π/2=right)
+      const pointAngle = Math.atan2(tdxLocal, tdyCanvas);
+      if (tdxLocal >= 0) {
+        rArmA = pointAngle; rForeA = pointAngle;
+        lArmA = 0.3; lForeA = 0.12;
+      } else {
+        lArmA = pointAngle; lForeA = pointAngle;
+        rArmA = -0.3; rForeA = -0.12;
+      }
+    }
+  }
+
+  const drawArm = (sOff: number, armA: number, foreA: number) => {
+    const ex = sOff + Math.sin(armA) * armLen;
+    const ey = relSY + Math.cos(armA) * armLen;
+    ctx.beginPath();
+    ctx.moveTo(sOff, relSY);
+    ctx.lineTo(ex, ey);
+    ctx.lineTo(ex + Math.sin(foreA) * armLen, ey + Math.cos(foreA) * armLen);
+    ctx.stroke();
+  };
+  drawArm(-7 * S, lArmA, lForeA);
+  drawArm(7 * S, rArmA, rForeA);
+  ctx.restore(); // un-lean
+
+  // Head
+  ctx.beginPath(); ctx.arc(0, headCY, headR, 0, Math.PI * 2); ctx.stroke();
+  // Eyes
+  ctx.fillStyle = "#2a2a2a";
+  ctx.beginPath(); ctx.arc(-7 * S, headCY - 5 * S, 2 * S, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(7 * S, headCY - 5 * S, 2 * S, 0, Math.PI * 2); ctx.fill();
+  // Smile
+  ctx.beginPath(); ctx.arc(0, headCY + 2 * S, 6 * S, 0.1, Math.PI - 0.1); ctx.stroke();
+
+  // Emoji
+  if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = p.emojiAlpha;
+    ctx.font = `${Math.max(12, 80 * S)}px serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    ctx.scale(1 / facing, 1);
+    ctx.fillText(p.emojiText, 0, headCY - headR - 12 * S);
+    ctx.restore();
+  }
+
+  ctx.restore(); // top-level
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Board2Page() {
@@ -577,6 +862,15 @@ export default function Board2Page() {
   const [annotationEmoji, setAnnotationEmoji] = useState("🎯");
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [penPreviewPoints, setPenPreviewPoints] = useState<Array<{ x: number; y: number }> | null>(null);
+
+  // ── Character ──
+  const [showCharacter, setShowCharacter] = useState(false);
+  const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
+  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "pointAt" | "emote" | null>(null);
+  const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
+  const [characterEmoji, setCharacterEmoji] = useState("🤔");
+  const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
+  const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
 
   // ── AI annotation generation ──
   const [aiModalOpen, setAiModalOpen] = useState(false);
@@ -736,6 +1030,13 @@ export default function Board2Page() {
   const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
+  const showCharacterRef = useRef(false);
+  const characterActionsRef = useRef<CharacterAction[]>([]);
+  const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
+  const charInitXRef = useRef(BOARD_W / 2);
+  const charInitYRef = useRef(BOARD_H * 0.75);
+  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "pointAt" | "emote" | null>(null);
+  const charActionDragRef = useRef<CharTimelineDrag | null>(null);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
@@ -761,6 +1062,17 @@ export default function Board2Page() {
     }
   }, [editingAnnotationId]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
+  useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
+  useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
+  // Recompute resolved character positions whenever actions or clips change
+  useEffect(() => {
+    const init = getCharInitPos(clipsRef.current);
+    charInitXRef.current = init.x;
+    charInitYRef.current = init.y;
+    resolvedCharActionsRef.current = resolveCharActions(characterActionsRef.current, init.x, init.y);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [characterActions, clips]);
 
   useEffect(() => {
     const check = () => {
@@ -929,6 +1241,12 @@ export default function Board2Page() {
       }
     }
     ctx.globalAlpha = 1;
+    if (showCharacterRef.current) {
+      drawCharacterToCanvas(
+        ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
+        cam, sf, W, H, charInitXRef.current, charInitYRef.current
+      );
+    }
     if (currentAnnotations.length > 0) {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
@@ -3228,6 +3546,61 @@ export default function Board2Page() {
     window.addEventListener("pointerup", onUp);
   }
 
+  // ─ Character action timeline drag ────────────────────────────────────────
+
+  function handleCharActionPointerDown(
+    e: React.PointerEvent,
+    action: CharacterAction,
+    kind: "move" | "resize-left" | "resize-right"
+  ) {
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const rect = scrollerRef.current!.getBoundingClientRect();
+    const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
+    const cursorOffsetSec = kind === "move" ? clickTimeSec - action.startTime : 0;
+    charActionDragRef.current = {
+      kind, actionId: action.id,
+      origStartTime: action.startTime, origDuration: action.duration,
+      cursorOffsetSec,
+    };
+    const onMove = (ev: PointerEvent) => {
+      const drag = charActionDragRef.current;
+      if (!drag) return;
+      const cursorSec = (ev.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
+      setCharacterActions((prev) =>
+        prev.map((a) => {
+          if (a.id !== drag.actionId) return a;
+          if (drag.kind === "move") {
+            const rawStart = Math.max(0, cursorSec - drag.cursorOffsetSec);
+            // No-overlap: don't allow start time to produce overlap with other char actions
+            const others = prev.filter((oa) => oa.id !== drag.actionId);
+            const overlaps = others.some((oa) => rawStart < oa.startTime + oa.duration && rawStart + drag.origDuration > oa.startTime);
+            if (overlaps) return a;
+            return { ...a, startTime: rawStart };
+          }
+          if (drag.kind === "resize-right") {
+            const newEnd = Math.max(drag.origStartTime + 0.1, cursorSec);
+            return { ...a, duration: Math.max(0.1, newEnd - drag.origStartTime) };
+          }
+          // resize-left
+          const newStart = clamp(cursorSec, 0, drag.origStartTime + drag.origDuration - 0.1);
+          return {
+            ...a,
+            startTime: newStart,
+            duration: Math.max(0.1, drag.origStartTime + drag.origDuration - newStart),
+          };
+        })
+      );
+    };
+    const onUp = () => {
+      charActionDragRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   // ─ Ruler scrub ────────────────────────────────────────────────────────────
 
   function handleRulerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
@@ -3916,6 +4289,17 @@ export default function Board2Page() {
       window.removeEventListener("keydown", dismiss);
     };
   }, [contextMenu]);
+
+  useEffect(() => {
+    if (!charActionContextMenu) return;
+    const dismiss = () => setCharActionContextMenu(null);
+    window.addEventListener("click", dismiss, { once: true });
+    window.addEventListener("keydown", dismiss, { once: true });
+    return () => {
+      window.removeEventListener("click", dismiss);
+      window.removeEventListener("keydown", dismiss);
+    };
+  }, [charActionContextMenu]);
 
   // ─── Mobile gesture handlers ──────────────────────────────────────────────
 
@@ -5071,6 +5455,8 @@ export default function Board2Page() {
         pxPerSec: pxPerSecRef.current,
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
+        characterActions: characterActionsRef.current,
+        showCharacter: showCharacterRef.current,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
@@ -5142,6 +5528,8 @@ export default function Board2Page() {
       if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
       if (manifest.boardPan) { boardPanRef.current = manifest.boardPan; setBoardPan(manifest.boardPan); }
       if (manifest.name) setSaveName(manifest.name);
+      if (manifest.characterActions) setCharacterActions(manifest.characterActions);
+      if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
       setToast(`Loaded "${manifest.name ?? "board"}"`);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
@@ -5933,6 +6321,155 @@ export default function Board2Page() {
                   </>
                 </ProGated>
               </div>
+
+              {/* Character toolbar — collapsible, Pro gated */}
+              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 29, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, marginTop: annotationToolbarOpen ? 48 : 0 }}>
+                <ProGated featureName="Character">
+                  <>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setCharacterToolbarOpen((v) => !v); }}
+                      style={{
+                        fontFamily: "monospace", fontSize: 10, fontWeight: 700,
+                        padding: "5px 12px", border: "1.5px solid #2a2a2a",
+                        background: characterToolbarOpen ? "#2a2a2a" : "#fffdf5",
+                        color: characterToolbarOpen ? CHARACTER_COLOR : "#2a2a2a",
+                        cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
+                        whiteSpace: "nowrap",
+                        marginTop: annotationToolbarOpen ? 0 : 36,
+                      }}
+                    >
+                      🧍 Character {characterToolbarOpen ? "▲" : "▼"}
+                    </button>
+                    {characterToolbarOpen && (
+                      <div style={{
+                        display: "flex", alignItems: "center", gap: 4,
+                        background: "#fffdf5", border: "1.5px solid #2a2a2a",
+                        boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
+                        padding: "5px 10px", whiteSpace: "nowrap", position: "relative",
+                      }}>
+                        {/* Show/hide toggle */}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setShowCharacter((v) => !v); }}
+                          style={{
+                            padding: "3px 8px", fontFamily: "monospace", fontSize: 9, cursor: "pointer",
+                            border: "1px solid rgba(42,42,42,0.35)",
+                            background: showCharacter ? CHARACTER_COLOR : "transparent",
+                            color: "#2a2a2a",
+                          }}
+                        >
+                          {showCharacter ? "● On" : "○ Off"}
+                        </button>
+
+                        {showCharacter && (
+                          <>
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
+                            {/* Action buttons — click to enter crosshair placement mode */}
+                            {([
+                              { mode: "walkTo" as const, label: "Walk", title: "Click board to walk to position (1.5s)" },
+                              { mode: "jumpTo" as const, label: "Jump", title: "Click board to jump to position (1.0s)" },
+                              { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
+                              { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
+                            ]).map(({ mode, label, title }) => (
+                              <button
+                                key={mode}
+                                title={title}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (mode === "emote") {
+                                    setCharacterEmojiPickerOpen((v) => !v);
+                                    setCharacterAddMode(mode);
+                                  } else {
+                                    setCharacterEmojiPickerOpen(false);
+                                    setCharacterAddMode((prev) => (prev === mode ? null : mode));
+                                  }
+                                }}
+                                style={{
+                                  padding: "3px 7px", fontFamily: "monospace", fontSize: 9,
+                                  border: characterAddMode === mode ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.35)",
+                                  background: characterAddMode === mode ? "#2a2a2a" : "transparent",
+                                  color: characterAddMode === mode ? CHARACTER_COLOR : "#2a2a2a",
+                                  cursor: characterAddMode === mode ? "crosshair" : "pointer",
+                                }}
+                              >
+                                {label}
+                              </button>
+                            ))}
+
+                            {characterAddMode && characterAddMode !== "emote" && (
+                              <span style={{ fontSize: 9, fontFamily: "monospace", color: "#666", marginLeft: 2 }}>
+                                ← click board
+                              </span>
+                            )}
+
+                            {/* Emote emoji picker */}
+                            {characterEmojiPickerOpen && (
+                              <div style={{
+                                position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
+                                background: "#fffdf5", border: "1.5px solid #2a2a2a",
+                                boxShadow: "3px 3px 0 #2a2a2a", padding: 8, zIndex: 55,
+                                display: "grid", gridTemplateColumns: "repeat(9, 28px)", gap: 2,
+                              }}>
+                                {EMOJI_SET.map((em) => (
+                                  <button
+                                    key={em}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setCharacterEmoji(em);
+                                      setCharacterEmojiPickerOpen(false);
+                                      // Place emote action at playhead
+                                      const newAction: CharacterAction = {
+                                        id: generateId(), type: "emote",
+                                        startTime: playheadRef.current, duration: 2.0,
+                                        emoji: em,
+                                      };
+                                      setCharacterActions((prev) => [...prev, newAction]);
+                                      setCharacterAddMode(null);
+                                    }}
+                                    style={{
+                                      width: 28, height: 28, fontSize: 16, border: "none", padding: 0,
+                                      background: characterEmoji === em ? CHARACTER_COLOR : "transparent",
+                                      cursor: "pointer", borderRadius: 2,
+                                    }}
+                                  >{em}</button>
+                                ))}
+                              </div>
+                            )}
+
+                            {characterAddMode === "emote" && !characterEmojiPickerOpen && (
+                              <span style={{ fontSize: 16, marginLeft: 2 }}>{characterEmoji}</span>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </>
+                </ProGated>
+              </div>
+
+              {/* Character placement overlay — captures board click when characterAddMode is set */}
+              {showCharacter && characterAddMode && characterAddMode !== "emote" && (
+                <div
+                  style={{ position: "absolute", inset: 0, cursor: "crosshair", zIndex: 28 }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const rect = boardContainerRef.current?.getBoundingClientRect();
+                    if (!rect) return;
+                    const bx = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+                    const by = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, pointAt: 2.0 };
+                    const newAction: CharacterAction = {
+                      id: generateId(),
+                      type: characterAddMode,
+                      startTime: playheadRef.current,
+                      duration: durationMap[characterAddMode] ?? 1.5,
+                      targetX: Math.round(bx),
+                      targetY: Math.round(by),
+                    };
+                    setCharacterActions((prev) => [...prev, newAction]);
+                    setCharacterAddMode(null);
+                  }}
+                />
+              )}
             </div>
 
             {/* Preview overlay — small PiP, top-right */}
@@ -6184,7 +6721,7 @@ export default function Board2Page() {
           {/* Track — 5 visual layers above, narration audio row below */}
           <div
             ref={scrollerRef}
-            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + 12, position: "relative", overflowX: "auto", overflowY: "hidden" }}
+            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 16, position: "relative", overflowX: "auto", overflowY: "hidden" }}
             onScroll={(e) => {
               const sl = (e.target as HTMLDivElement).scrollLeft;
               timelineScrollRef.current = sl;
@@ -6202,7 +6739,7 @@ export default function Board2Page() {
               setContextMenu({ x: e.clientX, y: e.clientY, timeSec, clipId });
             }}
           >
-            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + 8 }}>
+            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 12 }}>
               {/* Layer row backgrounds (L0–L4) */}
               {Array.from({ length: N_LAYERS }, (_, i) => (
                 <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * LAYER_H, height: LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.08)", borderTop: i === 0 ? "1px solid rgba(42,42,42,0.08)" : "1px solid rgba(42,42,42,0.05)" }} />
@@ -6371,11 +6908,85 @@ export default function Board2Page() {
                 );
               })}
 
+              {/* Character row background */}
+              {showCharacter && (
+                <>
+                  <div style={{ position: "absolute", left: 0, right: 0, top: TRACK_H + NARRATION_TRACK_H + 8, height: CHARACTER_TRACK_H, background: "rgba(100,200,100,0.06)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
+                  <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + NARRATION_TRACK_H + 10, pointerEvents: "none", zIndex: 15 }}>
+                    <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(60,130,60,0.6)", letterSpacing: 0.5, textTransform: "uppercase" }}>char</span>
+                  </div>
+                  {/* Character action blocks */}
+                  {characterActions.map((action) => {
+                    const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
+                    const icons: Record<string, string> = { walkTo: "⇒", jumpTo: "↑", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸" };
+                    return (
+                      <div
+                        key={action.id}
+                        data-charaction
+                        data-actionid={action.id}
+                        style={{
+                          position: "absolute",
+                          left: action.startTime * pxPerSec,
+                          top: TRACK_H + NARRATION_TRACK_H + 10,
+                          width: actionPx,
+                          height: CHARACTER_TRACK_H - 4,
+                          background: CHARACTER_COLOR,
+                          border: "1.5px solid rgba(60,130,60,0.5)",
+                          cursor: "grab",
+                          userSelect: "none",
+                          overflow: "hidden",
+                          display: "flex",
+                          alignItems: "center",
+                        }}
+                        onPointerDown={(e) => handleCharActionPointerDown(e, action, "move")}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setCharActionContextMenu({ x: e.clientX, y: e.clientY, actionId: action.id });
+                        }}
+                      >
+                        {/* Left resize */}
+                        <div
+                          style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                          onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-left")}
+                        />
+                        <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#2a4a2a", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
+                          {icons[action.type]} {action.type}
+                        </span>
+                        {/* Right resize */}
+                        <div
+                          style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                          onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-right")}
+                        />
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
               <div style={{ position: "absolute", left: playhead * pxPerSec, top: 0, bottom: 0, width: 2, background: "#ff5e3a", pointerEvents: "none", zIndex: 10 }} />
             </div>
           </div>
         </div>
       </div>
+
+      {/* Character action context menu */}
+      {charActionContextMenu && (
+        <div
+          style={{ position: "fixed", left: charActionContextMenu.x, top: charActionContextMenu.y, zIndex: 9999, background: "#fffdf5", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", minWidth: 120 }}
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div
+            onClick={() => { setCharacterActions((prev) => prev.filter((a) => a.id !== charActionContextMenu.actionId)); setCharActionContextMenu(null); }}
+            style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, color: "#ff5e3a" }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "#ffe5e5")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            ✕ Delete action
+          </div>
+        </div>
+      )}
 
       {/* Timeline context menu */}
       {contextMenu && (
