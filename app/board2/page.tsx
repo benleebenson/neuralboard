@@ -72,16 +72,17 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 
 type CharacterAction = {
   id: string;
-  type: "walkTo" | "jumpTo" | "flip" | "zipline" | "wallClimb" | "grapple" | "run"
+  type: "walkTo" | "jumpTo" | "flip" | "zipline" | "wallClimb" | "grapple"
       | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
   targetY?: number;
   emoji?: string;
-  cameraSynced?: boolean; // "run" only — boardX tracks the live camera cameraX instead of lerping to targetX
   startX?: number;        // explicit start-position override (entrance/exit flips start offscreen, not chained)
   startY?: number;
+  entranceFlip?: boolean; // marks the auto-derived flip onto the first media clip — used to hide the
+                           // character before this action starts (see characterEntranceTime)
 };
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
@@ -556,7 +557,7 @@ const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these change the character's resting board position
-const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple", "run"]);
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple"]);
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -650,13 +651,16 @@ function mergeCharActions(derived: CharacterAction[], manual: CharacterAction[])
   ].sort((a, b) => a.startTime - b.startTime);
 }
 
-// Derive character actions automatically from the clip timeline + camera keyframes (auto-follow mode).
-// Recomputed fresh every call — callers should memoize on [clips, cameraKeyframes] so a clip reorder,
-// add/delete, holdFraction change, board-position move, or a fresh "Generate camera keyframes" run
-// always produces an up-to-date plan (no stored/stale derived actions).
+// Derive character actions automatically from the clip timeline (auto-follow mode).
+// Recomputed fresh every call — callers should memoize on [clips] so a clip reorder, add/delete,
+// holdFraction change, or board-position move always produces an up-to-date plan (no stored/stale
+// derived actions).
+//
+// Pan clips never carry the character: if a pan comes before he's entered, he simply isn't rendered
+// yet (see entranceFlip / characterEntranceTime in the component); if a pan falls mid-timeline, he
+// idles in place on whatever clip he last landed on and resumes once the pan ends.
 function deriveAutoCharActions(
   clips: Clip[],
-  cameraKeyframes: CameraKeyframe[],
   initX: number,
   initY: number
 ): CharacterAction[] {
@@ -668,6 +672,7 @@ function deriveAutoCharActions(
   const actions: CharacterAction[] = [];
   let curX = initX, curY = initY;
   let prev: Clip | null = null;
+  let hasEntered = false;
   const OFFSCREEN_PAD = 900; // heuristic — this pure fn has no canvas W/H, so "offscreen" is a generous fixed offset
 
   for (const clip of focusClips) {
@@ -677,61 +682,63 @@ function deriveAutoCharActions(
     const transEnd = clip.startTime + clip.duration;
     const isPan = clip.type === "pan";
 
+    if (isPan) {
+      // Character is either not on yet (handled by characterEntranceTime hiding him) or idling in
+      // place on his last landing spot — no action, no position change, just skip past it.
+      prev = clip;
+      continue;
+    }
+
     // Where the character needs to be standing when the camera finishes settling on this clip
-    const arriveX = isPan ? interpolateCameraKeyframes(cameraKeyframes, holdStart).cameraX : clip.boardX! + (clip.boardW ?? 0) / 2;
-    const arriveY = isPan ? interpolateCameraKeyframes(cameraKeyframes, holdStart).cameraY : clip.boardY!;
-    const dx = arriveX - curX, dy = arriveY - curY;
-    const dist = Math.hypot(dx, dy);
+    const arriveX = clip.boardX! + (clip.boardW ?? 0) / 2;
+    const arriveY = clip.boardY!;
 
     // Travel is timed to the camera's OWN transition window so he arrives exactly when it settles:
     // the camera moves from the previous clip's stop during [prevHoldEnd, prevTransEnd] (see
-    // generateCameraKeyframes) — mirror that window here rather than a fixed travel duration.
-    let travelStart: number, travelEnd: number, isEntrance = false;
+    // generateCameraKeyframes) — mirror that window here rather than a fixed travel duration. The
+    // entrance flip onto the first media clip follows the same rule using the preceding pan's window
+    // (if any); with nothing preceding it at all, it starts at t=0 and lands at holdStart.
+    let travelStart: number, travelEnd: number;
     if (!prev) {
-      isEntrance = true;
-      travelEnd = holdStart;
-      travelStart = Math.max(0, travelEnd - 1.0);
+      travelStart = 0;
+      travelEnd = Math.max(travelStart + 0.15, holdStart);
     } else {
       const prevHf = prev.holdFraction ?? HOLD_FRACTION;
       travelStart = prev.startTime + prev.duration * prevHf;
       travelEnd = Math.max(travelStart + 0.15, prev.startTime + prev.duration);
     }
 
-    if (dist > 20 && travelEnd - travelStart > 0.1) {
-      let moveType: CharacterAction["type"];
-      if (isEntrance) moveType = "flip";
-      else if (dy > 300 && Math.abs(dx) > 150) moveType = "zipline";     // big drop — slide down a line
-      else if (dy < -300 && dist < CHAR_JUMP_DIST * 1.3) moveType = "wallClimb"; // big climb, short reach
-      else if (dist < CHAR_WALK_DIST) moveType = "walkTo";
-      else if (dist < CHAR_JUMP_DIST) moveType = "jumpTo";
-      else moveType = "grapple";
-
+    if (!hasEntered) {
+      // Entrance: flip in from offscreen-left, landing exactly as the camera settles into the hold.
       actions.push({
         id: `auto_${clip.id}_mv`,
-        type: moveType,
+        type: "flip",
         startTime: travelStart,
         duration: travelEnd - travelStart,
         targetX: arriveX, targetY: arriveY,
-        ...(isEntrance ? { startX: arriveX - OFFSCREEN_PAD, startY: arriveY } : {}),
+        startX: arriveX - OFFSCREEN_PAD, startY: arriveY,
+        entranceFlip: true,
       });
-    }
+      hasEntered = true;
+    } else {
+      const dx = arriveX - curX, dy = arriveY - curY;
+      const dist = Math.hypot(dx, dy);
+      if (dist > 20 && travelEnd - travelStart > 0.1) {
+        let moveType: CharacterAction["type"];
+        if (dy > 300 && Math.abs(dx) > 150) moveType = "zipline";     // big drop — slide down a line
+        else if (dy < -300 && dist < CHAR_JUMP_DIST * 1.3) moveType = "wallClimb"; // big climb, short reach
+        else if (dist < CHAR_WALK_DIST) moveType = "walkTo";
+        else if (dist < CHAR_JUMP_DIST) moveType = "jumpTo";
+        else moveType = "grapple";
 
-    if (isPan) {
-      // Rooftop run: position tracks the camera's live cameraX for the whole sweep (see evalCharAtTime),
-      // so he's always on/near whichever image is centered in the viewport, not on a fixed-duration run.
-      const runDur = Math.max(0.2, holdEnd - holdStart);
-      const endCam = interpolateCameraKeyframes(cameraKeyframes, holdEnd);
-      actions.push({
-        id: `auto_${clip.id}_run`,
-        type: "run",
-        startTime: holdStart,
-        duration: runDur,
-        cameraSynced: true,
-        targetX: endCam.cameraX, targetY: endCam.cameraY,
-      });
-      curX = endCam.cameraX; curY = endCam.cameraY;
-      prev = clip;
-      continue;
+        actions.push({
+          id: `auto_${clip.id}_mv`,
+          type: moveType,
+          startTime: travelStart,
+          duration: travelEnd - travelStart,
+          targetX: arriveX, targetY: arriveY,
+        });
+      }
     }
 
     // Hold behavior: pointAt beat, then sitAndWatch (video) / explainGesture (long holds) for the rest
@@ -779,8 +786,9 @@ function deriveAutoCharActions(
     prev = clip;
   }
 
-  // Exit: flip offscreen after the last clip's transition ends
-  if (prev) {
+  // Exit: flip offscreen after the last clip's transition ends. Skipped entirely if he never
+  // entered (e.g. the timeline is pan-only — nothing to exit from).
+  if (prev && hasEntered) {
     const lastTransEnd = prev.startTime + prev.duration;
     const dir = curX >= initX ? 1 : -1;
     actions.push({
@@ -819,8 +827,7 @@ function evalCharAtTime(
   resolved: ResolvedCharAction[],
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
-  camX: number
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
   // Legs +0.12/-0.12 (feet slightly apart), upper arms +0.08/-0.08 (hanging at sides), forearms
@@ -982,27 +989,6 @@ function evalCharAtTime(
     }
   }
 
-  if (active.type === "run") {
-    // Camera-synced rooftop run — boardX tracks the live cameraX (passed in from the caller,
-    // computed at this same `time`), so he's always in frame during the opening pan sweep
-    // rather than following a fixed-duration lerp between two points.
-    const tx = active.targetX ?? camX;
-    const bx = active.cameraSynced ? camX : lerp(active.fromX, tx, progress);
-    const by = resolveGroundY(bx, active.fromY, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    const stepFreq = 10;
-    const phase = progress * stepFreq * Math.PI * 2;
-    const swing = 0.7;
-    return {
-      boardX: bx, boardY: by, facing,
-      headBob: Math.sin(phase * 2) * 2.5, bodyLean: 0.1 * facing,
-      leftLegA: Math.sin(phase) * swing, rightLegA: Math.sin(phase + Math.PI) * swing,
-      leftArmA: Math.sin(phase + Math.PI) * 0.5, rightArmA: Math.sin(phase) * 0.5,
-      leftForeA: Math.sin(phase + Math.PI) * 0.25, rightForeA: Math.sin(phase) * 0.25,
-      airY: Math.abs(Math.sin(phase)) * 6,
-    };
-  }
-
   if (active.type === "flip") {
     // Entrance/exit — a full airborne rotation while flying to/from offscreen
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
@@ -1134,10 +1120,11 @@ function drawCharacterToCanvas(
   H: number,
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  entranceTime: number
 ) {
-  if (!showChar) return;
-  const p = evalCharAtTime(time, resolved, initX, initY, clips, cam.cameraX);
+  if (!showChar || time < entranceTime) return;
+  const p = evalCharAtTime(time, resolved, initX, initY, clips);
   const { facing } = p;
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
@@ -1508,6 +1495,7 @@ export default function Board2Page() {
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
+  const characterEntranceTimeRef = useRef(-Infinity);
   const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
@@ -1542,23 +1530,34 @@ export default function Board2Page() {
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
-  // array reference), cameraKeyframes (a "Generate camera keyframes" run), characterActions
-  // (manual edits), or characterMode change. There is no way for this to go stale: a clip reorder
-  // or a fresh keyframe generation is automatically reflected on the very next render.
+  // array reference), characterActions (manual edits), or characterMode change. There is no way
+  // for this to go stale: a clip reorder is automatically reflected on the very next render.
   const charInit = useMemo(() => getCharInitPos(clips), [clips]);
   const resolvedCharActions = useMemo(() => {
     const merged = characterMode === "auto"
-      ? mergeCharActions(deriveAutoCharActions(clips, cameraKeyframes, charInit.x, charInit.y), characterActions)
+      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y), characterActions)
       : characterActions;
     return resolveCharActions(merged, charInit.x, charInit.y);
-  }, [clips, cameraKeyframes, characterActions, characterMode, charInit]);
+  }, [clips, characterActions, characterMode, charInit]);
+
+  // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
+  // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
+  // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
+  const characterEntranceTime = useMemo(() => {
+    if (characterMode !== "auto") return -Infinity;
+    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined));
+    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
+    const entrance = resolvedCharActions.find((a) => a.entranceFlip);
+    return entrance ? entrance.startTime : -Infinity;
+  }, [characterMode, clips, resolvedCharActions]);
 
   // Mirror the memoized result into refs for the RAF draw loop (which must avoid stale closures)
   useEffect(() => {
     charInitXRef.current = charInit.x;
     charInitYRef.current = charInit.y;
     resolvedCharActionsRef.current = resolvedCharActions;
-  }, [charInit, resolvedCharActions]);
+    characterEntranceTimeRef.current = characterEntranceTime;
+  }, [charInit, resolvedCharActions, characterEntranceTime]);
 
   useEffect(() => {
     const check = () => {
@@ -1731,7 +1730,7 @@ export default function Board2Page() {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
-        clipsRef.current
+        clipsRef.current, characterEntranceTimeRef.current
       );
     }
     if (currentAnnotations.length > 0) {
@@ -7436,7 +7435,7 @@ export default function Board2Page() {
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
                       walkTo: "⇒", jumpTo: "↑", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
-                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", run: "🏃", sitAndWatch: "🍿", explainGesture: "💬",
+                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (
                       <div
