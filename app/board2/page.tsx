@@ -758,10 +758,11 @@ function deriveAutoCharActions(
       if (restDur > 0.6) {
         if (clip.type === "video") {
           actions.push({ id: `auto_${clip.id}_watch`, type: "sitAndWatch", startTime: restStart, duration: restDur, targetX: arriveX, targetY: arriveY });
-        } else if (holdDur > 4) {
+        } else {
+          // Any image hold with meaningful time left after the point beat gets talking gestures —
+          // previously gated on holdDur > 4s, which almost no image clip hit, so idle silently won.
           actions.push({ id: `auto_${clip.id}_gest`, type: "explainGesture", startTime: restStart, duration: restDur, targetX: arriveX, targetY: arriveY });
         }
-        // else: falls back to the idle pose — no explicit action needed
       }
     }
 
@@ -809,6 +810,7 @@ type CharPoseResult = {
   facing: 1 | -1;
   headBob: number;
   bodyLean: number;
+  spinAngle?: number; // full-body rotation around the torso center (flip only) — separate from bodyLean's upper-body-only lean
   leftLegA: number; rightLegA: number;
   leftArmA: number; rightArmA: number;
   leftForeA: number; rightForeA: number;
@@ -990,19 +992,60 @@ function evalCharAtTime(
   }
 
   if (active.type === "flip") {
-    // Entrance/exit — a full airborne rotation while flying to/from offscreen
+    // Entrance/exit — a full airborne rotation while flying to/from offscreen.
+    // Three phases: crouch takeoff (no rotation), airborne arc with an eased 0→2π whole-body
+    // spin held in a fixed tuck, then a landing recovery with rotation already resolved to 0.
+    // The spin itself is applied as `spinAngle` (rotated around the torso center in the draw
+    // step below) — NOT via bodyLean, which only ever rotates the upper body around the hip and
+    // reads as a cartwheel-smear when used for a full flip.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const bx = lerp(active.fromX, tx, progress);
     const by = lerp(active.fromY, ty, progress);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const airY = -180 * 4 * progress * (1 - progress);
-    const spin = progress * Math.PI * 2 * facing;
+
+    const TUCK_LEG = 1.2, TUCK_ARM = 0.9;
+    let spinAngle = 0;
+    let leftLegA: number, rightLegA: number, leftArmA: number, rightArmA: number;
+
+    if (progress < 0.15) {
+      // Takeoff: crouch, arms swing back — no rotation yet
+      const t = progress / 0.15;
+      leftLegA  = lerp(0, 0.5, t);
+      rightLegA = lerp(0, -0.5, t);
+      leftArmA  = lerp(0.15, -0.6, t);
+      rightArmA = lerp(-0.15, -0.6, t);
+    } else if (progress < 0.8) {
+      // Airborne: eased 0→2π rotation across THIS window only; limbs hold a fixed tuck throughout
+      const t = (progress - 0.15) / 0.65;
+      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      spinAngle = eased * Math.PI * 2 * facing;
+      leftLegA = TUCK_LEG; rightLegA = -TUCK_LEG;
+      leftArmA = TUCK_ARM; rightArmA = -TUCK_ARM;
+    } else {
+      // Landing: rotation already at 2π ≡ 0 (set to 0 outright — no visible tilt) before feet
+      // touch; legs extend to meet the ground, crouch-absorb impact, then recover to standing.
+      const t = (progress - 0.8) / 0.2;
+      spinAngle = 0;
+      if (t < 0.5) {
+        const lt = t / 0.5;
+        leftLegA  = lerp(TUCK_LEG, 0.45, lt);
+        rightLegA = lerp(-TUCK_LEG, -0.35, lt);
+        leftArmA  = lerp(TUCK_ARM, 0.35, lt);
+        rightArmA = lerp(-TUCK_ARM, -0.3, lt);
+      } else {
+        const lt = (t - 0.5) / 0.5;
+        leftLegA  = lerp(0.45, 0.12, lt);
+        rightLegA = lerp(-0.35, -0.12, lt);
+        leftArmA  = lerp(0.35, 0.08, lt);
+        rightArmA = lerp(-0.3, -0.08, lt);
+      }
+    }
+
     return {
       boardX: bx, boardY: by, facing,
-      headBob: 0, bodyLean: spin,
-      leftLegA: 0.3, rightLegA: -0.3,
-      leftArmA: -0.4, rightArmA: 0.4,
-      leftForeA: -0.2, rightForeA: 0.2,
+      headBob: 0, bodyLean: 0, spinAngle,
+      leftLegA, rightLegA, leftArmA, rightArmA, leftForeA: 0, rightForeA: 0,
       airY,
     };
   }
@@ -1056,16 +1099,31 @@ function evalCharAtTime(
   }
 
   if (active.type === "explainGesture") {
-    // Animated talking-with-hands loop for long holds; feet stay planted
-    const t = time * 1.3;
-    const gestureL = Math.sin(t) * 0.5 + Math.sin(t * 2.3) * 0.15;
-    const gestureR = Math.sin(t + Math.PI * 0.6) * 0.5 - Math.sin(t * 1.7) * 0.15;
+    // Animated talking-with-hands loop for image holds: arms alternate raising to gesture height
+    // on independent, slightly-drifting periods (~1s each) so the beats don't lock into a
+    // metronome, punctuated by an occasional two-arm "you see?" spread. Feet stay planted; head
+    // bob / lean / leg weight-shift ride along with the beats to sell it as talking, not idling.
+    const lPhase = time * (Math.PI * 2 / 1.0) + Math.sin(time * 0.17) * 0.6;
+    const rPhase = time * (Math.PI * 2 / 1.15) + Math.PI + Math.sin(time * 0.13 + 1.7) * 0.5;
+    const lRaise = Math.pow(Math.max(0, Math.sin(lPhase)), 1.6);
+    const rRaise = Math.pow(Math.max(0, Math.sin(rPhase)), 1.6);
+
+    // Two-arm spread roughly every ~4.3s (non-integer period to avoid syncing with the arm beats)
+    const spreadCycle = time % 4.3;
+    const spread = Math.max(0, 1 - Math.abs(spreadCycle - 2.0) / 0.5);
+
+    const leftArmA = 0.15 + lRaise * 0.95 + spread * 0.35;
+    const rightArmA = -0.15 - rRaise * 0.95 - spread * 0.35;
+    const leftForeA = 0.15 + lRaise * 0.35 + spread * 0.15;
+    const rightForeA = -0.15 - rRaise * 0.35 - spread * 0.15;
+
     return {
       boardX: active.fromX, boardY: active.fromY, facing: 1,
-      headBob: Math.sin(t * 1.1) * 1.5, bodyLean: Math.sin(t * 0.5) * 0.04,
-      leftLegA: 0.1, rightLegA: -0.1,
-      leftArmA: gestureL - 0.3, rightArmA: -gestureR + 0.3,
-      leftForeA: 0.2, rightForeA: -0.2,
+      headBob: Math.sin(time * 1.1) * 1.5 + (lRaise + rRaise) * 1.5,
+      bodyLean: Math.sin(time * 0.6) * 0.05 + (lRaise - rRaise) * 0.06,
+      leftLegA: 0.1 + Math.sin(time * 0.5) * 0.06,
+      rightLegA: -0.1 - Math.sin(time * 0.5 + 1.3) * 0.06,
+      leftArmA, rightArmA, leftForeA, rightForeA,
       airY: 0,
     };
   }
@@ -1182,6 +1240,16 @@ function drawCharacterToCanvas(
   const headR = HEAD_R_RAW * S;
   const bobS = p.headBob * S;
   const hipY = -HIP_RAW * S + bobS * 0.25;
+
+  // Whole-body spin (flip only): rotates legs + torso group together around the torso midpoint,
+  // so a flip reads as the whole character turning over rather than the cartwheel-smear you get
+  // rotating just the upper body around the hip. No-op for every other pose (spinAngle undefined).
+  if (p.spinAngle) {
+    const spinCenterY = hipY - torsoLen / 2;
+    ctx.translate(0, spinCenterY);
+    ctx.rotate(p.spinAngle);
+    ctx.translate(0, -spinCenterY);
+  }
 
   // Legs (two-segment: thigh + shin with independent shin angle). Local-x sign is negated so that
   // a POSITIVE angle always means "outward from body midline" for both legs — the un-negated form
