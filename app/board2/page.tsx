@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import { ProGated } from "@/app/components/ProGated";
@@ -72,12 +72,16 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 
 type CharacterAction = {
   id: string;
-  type: "walkTo" | "jumpTo" | "pointAt" | "emote" | "idle" | "grapple";
+  type: "walkTo" | "jumpTo" | "flip" | "zipline" | "wallClimb" | "grapple" | "run"
+      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
   targetY?: number;
   emoji?: string;
+  cameraSynced?: boolean; // "run" only — boardX tracks the live camera cameraX instead of lerping to targetX
+  startX?: number;        // explicit start-position override (entrance/exit flips start offscreen, not chained)
+  startY?: number;
 };
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
@@ -191,7 +195,7 @@ const NARRATION_TRACK_H = 44;
 const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
-const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁"];
+const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
@@ -551,6 +555,18 @@ const CHAR_WALK_DIST = 500;   // board px — below this: walkTo
 const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
+// Travel-type action kinds — these change the character's resting board position
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple", "run"]);
+
+// Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
+// yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
+function seededRandom(seed: string): number {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+  h ^= h << 13; h ^= h >>> 17; h ^= h << 5;
+  return ((h >>> 0) % 100000) / 100000;
+}
+
 function getCharInitPos(clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]): { x: number; y: number } {
   const placed = clips.filter((c) => c.boardX !== undefined);
   if (placed.length === 0) return { x: BOARD_W / 2, y: BOARD_H * 0.75 };
@@ -612,11 +628,13 @@ function resolveCharActions(actions: CharacterAction[], initX: number, initY: nu
   let x = initX, y = initY;
   const result: ResolvedCharAction[] = [];
   for (const a of sorted) {
-    result.push({ ...a, fromX: x, fromY: y });
-    if ((a.type === "walkTo" || a.type === "jumpTo" || a.type === "grapple") && a.targetX !== undefined) {
+    // startX/startY (entrance/exit flips) override the chained position for this action only —
+    // the chain continues from targetX/targetY afterward, same as any other travel action.
+    result.push({ ...a, fromX: a.startX ?? x, fromY: a.startY ?? y });
+    if (CHAR_TRAVEL_TYPES.has(a.type) && a.targetX !== undefined) {
       x = a.targetX; y = a.targetY ?? y;
     }
-    // pointAt/emote/idle don't change position
+    // pointAt/sitAndWatch/explainGesture/emote/idle don't change position
   }
   return result;
 }
@@ -632,57 +650,147 @@ function mergeCharActions(derived: CharacterAction[], manual: CharacterAction[])
   ].sort((a, b) => a.startTime - b.startTime);
 }
 
-// Derive character actions automatically from the clip timeline (auto-follow mode).
-function deriveAutoCharActions(clips: Clip[], initX: number, initY: number): CharacterAction[] {
-  const boardClips = clips
-    .filter((c) => c.boardX !== undefined && c.type !== "narration" && c.type !== "pan")
+// Derive character actions automatically from the clip timeline + camera keyframes (auto-follow mode).
+// Recomputed fresh every call — callers should memoize on [clips, cameraKeyframes] so a clip reorder,
+// add/delete, holdFraction change, board-position move, or a fresh "Generate camera keyframes" run
+// always produces an up-to-date plan (no stored/stale derived actions).
+function deriveAutoCharActions(
+  clips: Clip[],
+  cameraKeyframes: CameraKeyframe[],
+  initX: number,
+  initY: number
+): CharacterAction[] {
+  const focusClips = clips
+    .filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined))
     .sort((a, b) => a.startTime - b.startTime);
-  if (boardClips.length === 0) return [];
+  if (focusClips.length === 0) return [];
 
   const actions: CharacterAction[] = [];
   let curX = initX, curY = initY;
+  let prev: Clip | null = null;
+  const OFFSCREEN_PAD = 900; // heuristic — this pure fn has no canvas W/H, so "offscreen" is a generous fixed offset
 
-  for (const clip of boardClips) {
-    const tx = clip.boardX! + (clip.boardW ?? 0) / 2;
-    const ty = clip.boardY!;  // stand on top edge
-    const dist = Math.hypot(tx - curX, ty - curY);
+  for (const clip of focusClips) {
+    const hf = clip.holdFraction ?? HOLD_FRACTION;
+    const holdStart = clip.startTime;
+    const holdEnd = clip.startTime + clip.duration * hf;
+    const transEnd = clip.startTime + clip.duration;
+    const isPan = clip.type === "pan";
 
-    let moveType: CharacterAction["type"];
-    let moveDur: number;
-    if (dist < CHAR_WALK_DIST)      { moveType = "walkTo";  moveDur = 1.5; }
-    else if (dist < CHAR_JUMP_DIST) { moveType = "jumpTo";  moveDur = 1.0; }
-    else                             { moveType = "grapple"; moveDur = 1.5; }
+    // Where the character needs to be standing when the camera finishes settling on this clip
+    const arriveX = isPan ? interpolateCameraKeyframes(cameraKeyframes, holdStart).cameraX : clip.boardX! + (clip.boardW ?? 0) / 2;
+    const arriveY = isPan ? interpolateCameraKeyframes(cameraKeyframes, holdStart).cameraY : clip.boardY!;
+    const dx = arriveX - curX, dy = arriveY - curY;
+    const dist = Math.hypot(dx, dy);
 
-    // Travel: ends when clip starts; begins moveDur before that
-    const travelEnd = clip.startTime;
-    const travelStart = Math.max(0, travelEnd - moveDur);
-    const actualDur = travelEnd - travelStart;
+    // Travel is timed to the camera's OWN transition window so he arrives exactly when it settles:
+    // the camera moves from the previous clip's stop during [prevHoldEnd, prevTransEnd] (see
+    // generateCameraKeyframes) — mirror that window here rather than a fixed travel duration.
+    let travelStart: number, travelEnd: number, isEntrance = false;
+    if (!prev) {
+      isEntrance = true;
+      travelEnd = holdStart;
+      travelStart = Math.max(0, travelEnd - 1.0);
+    } else {
+      const prevHf = prev.holdFraction ?? HOLD_FRACTION;
+      travelStart = prev.startTime + prev.duration * prevHf;
+      travelEnd = Math.max(travelStart + 0.15, prev.startTime + prev.duration);
+    }
 
-    if (dist > 20 && actualDur > 0.15) {
+    if (dist > 20 && travelEnd - travelStart > 0.1) {
+      let moveType: CharacterAction["type"];
+      if (isEntrance) moveType = "flip";
+      else if (dy > 300 && Math.abs(dx) > 150) moveType = "zipline";     // big drop — slide down a line
+      else if (dy < -300 && dist < CHAR_JUMP_DIST * 1.3) moveType = "wallClimb"; // big climb, short reach
+      else if (dist < CHAR_WALK_DIST) moveType = "walkTo";
+      else if (dist < CHAR_JUMP_DIST) moveType = "jumpTo";
+      else moveType = "grapple";
+
       actions.push({
         id: `auto_${clip.id}_mv`,
         type: moveType,
         startTime: travelStart,
-        duration: actualDur,
-        targetX: tx, targetY: ty,
+        duration: travelEnd - travelStart,
+        targetX: arriveX, targetY: arriveY,
+        ...(isEntrance ? { startX: arriveX - OFFSCREEN_PAD, startY: arriveY } : {}),
       });
     }
 
-    // PointAt beat: first CHAR_POINT_BEAT seconds of the clip hold
-    const holdDur = clip.duration * (clip.holdFraction ?? HOLD_FRACTION);
+    if (isPan) {
+      // Rooftop run: position tracks the camera's live cameraX for the whole sweep (see evalCharAtTime),
+      // so he's always on/near whichever image is centered in the viewport, not on a fixed-duration run.
+      const runDur = Math.max(0.2, holdEnd - holdStart);
+      const endCam = interpolateCameraKeyframes(cameraKeyframes, holdEnd);
+      actions.push({
+        id: `auto_${clip.id}_run`,
+        type: "run",
+        startTime: holdStart,
+        duration: runDur,
+        cameraSynced: true,
+        targetX: endCam.cameraX, targetY: endCam.cameraY,
+      });
+      curX = endCam.cameraX; curY = endCam.cameraY;
+      prev = clip;
+      continue;
+    }
+
+    // Hold behavior: pointAt beat, then sitAndWatch (video) / explainGesture (long holds) for the rest
+    const holdDur = clip.duration * hf;
     const pointDur = Math.min(CHAR_POINT_BEAT, holdDur - 0.1);
     if (pointDur > 0.2) {
       actions.push({
         id: `auto_${clip.id}_pt`,
         type: "pointAt",
-        startTime: clip.startTime,
+        startTime: holdStart,
         duration: pointDur,
         targetX: clip.boardX! + (clip.boardW ?? 0) / 2,
         targetY: clip.boardY! + (clip.boardH ?? 0) * 0.35,
       });
+      const restStart = holdStart + pointDur;
+      const restDur = holdEnd - restStart;
+      if (restDur > 0.6) {
+        if (clip.type === "video") {
+          actions.push({ id: `auto_${clip.id}_watch`, type: "sitAndWatch", startTime: restStart, duration: restDur, targetX: arriveX, targetY: arriveY });
+        } else if (holdDur > 4) {
+          actions.push({ id: `auto_${clip.id}_gest`, type: "explainGesture", startTime: restStart, duration: restDur, targetX: arriveX, targetY: arriveY });
+        }
+        // else: falls back to the idle pose — no explicit action needed
+      }
     }
 
-    curX = tx; curY = ty;
+    // Auto emotes — deterministic per clip.id so regenerating the plan never reshuffles them.
+    // Max one per hold.
+    if (clip.type === "video") {
+      if (holdDur > 1.5 && seededRandom(clip.id + ":emoteVideo") < 0.3) {
+        const vidStart = holdStart + holdDur * (0.3 + seededRandom(clip.id + ":emoteVideoPos") * 0.4);
+        const emoji = seededRandom(clip.id + ":emoteVideoChoice") < 0.5 ? "😂" : "👀";
+        if (vidStart + 1.5 < transEnd) actions.push({ id: `auto_${clip.id}_emote`, type: "emote", startTime: vidStart, duration: 1.5, emoji });
+      }
+    } else if (pointDur > 0.2 && seededRandom(clip.id + ":emoteArrive") < 0.3) {
+      const emoji = seededRandom(clip.id + ":emoteChoice") < 0.5 ? "💡" : "❗";
+      const emoteStart = holdStart + pointDur + 0.3;
+      if (emoteStart + 1.5 < transEnd) actions.push({ id: `auto_${clip.id}_emote`, type: "emote", startTime: emoteStart, duration: 1.5, emoji });
+    } else if (holdDur > 4 && seededRandom(clip.id + ":emoteMid") < 0.35) {
+      const midStart = holdStart + holdDur * 0.5;
+      if (midStart + 1.5 < transEnd) actions.push({ id: `auto_${clip.id}_emote`, type: "emote", startTime: midStart, duration: 1.5, emoji: "🤔" });
+    }
+
+    curX = arriveX; curY = arriveY;
+    prev = clip;
+  }
+
+  // Exit: flip offscreen after the last clip's transition ends
+  if (prev) {
+    const lastTransEnd = prev.startTime + prev.duration;
+    const dir = curX >= initX ? 1 : -1;
+    actions.push({
+      id: `auto_exit`,
+      type: "flip",
+      startTime: lastTransEnd,
+      duration: 1.0,
+      targetX: curX + OFFSCREEN_PAD * dir,
+      targetY: curY,
+    });
   }
 
   return actions;
@@ -711,17 +819,21 @@ function evalCharAtTime(
   resolved: ResolvedCharAction[],
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  camX: number
 ): CharPoseResult {
+  // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
+  // Legs +0.12/-0.12 (feet slightly apart), upper arms +0.08/-0.08 (hanging at sides), forearms
+  // continue the same line with +0.05 additional bend. Body lean 0, no rotation. The idle bob below
+  // is a headBob/breathing offset ONLY — it never touches arm/leg angles.
   const idlePose = (rx: number, ry: number): CharPoseResult => {
     const t = time * 2;
     return {
       boardX: rx, boardY: ry, facing: 1,
       headBob: Math.sin(t) * 2, bodyLean: 0,
-      leftLegA: 0, rightLegA: 0,
-      leftArmA: Math.sin(t * 0.7) * 0.12 + 0.15,
-      rightArmA: Math.sin(t * 0.7 + Math.PI) * 0.12 - 0.15,
-      leftForeA: 0.2, rightForeA: -0.2,
+      leftLegA: 0.12, rightLegA: -0.12,
+      leftArmA: 0.08, rightArmA: -0.08,
+      leftForeA: 0.13, rightForeA: -0.13,
       airY: 0,
     };
   };
@@ -735,7 +847,7 @@ function evalCharAtTime(
       const end = a.startTime + a.duration;
       if (end <= time && end > lastEnd) {
         lastEnd = end;
-        if ((a.type === "walkTo" || a.type === "jumpTo" || a.type === "grapple") && a.targetX !== undefined) {
+        if (CHAR_TRAVEL_TYPES.has(a.type) && a.targetX !== undefined) {
           rx = a.targetX; ry = a.targetY ?? ry;
         } else {
           rx = a.fromX; ry = a.fromY;
@@ -870,6 +982,108 @@ function evalCharAtTime(
     }
   }
 
+  if (active.type === "run") {
+    // Camera-synced rooftop run — boardX tracks the live cameraX (passed in from the caller,
+    // computed at this same `time`), so he's always in frame during the opening pan sweep
+    // rather than following a fixed-duration lerp between two points.
+    const tx = active.targetX ?? camX;
+    const bx = active.cameraSynced ? camX : lerp(active.fromX, tx, progress);
+    const by = resolveGroundY(bx, active.fromY, clips);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const stepFreq = 10;
+    const phase = progress * stepFreq * Math.PI * 2;
+    const swing = 0.7;
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: Math.sin(phase * 2) * 2.5, bodyLean: 0.1 * facing,
+      leftLegA: Math.sin(phase) * swing, rightLegA: Math.sin(phase + Math.PI) * swing,
+      leftArmA: Math.sin(phase + Math.PI) * 0.5, rightArmA: Math.sin(phase) * 0.5,
+      leftForeA: Math.sin(phase + Math.PI) * 0.25, rightForeA: Math.sin(phase) * 0.25,
+      airY: Math.abs(Math.sin(phase)) * 6,
+    };
+  }
+
+  if (active.type === "flip") {
+    // Entrance/exit — a full airborne rotation while flying to/from offscreen
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const bx = lerp(active.fromX, tx, progress);
+    const by = lerp(active.fromY, ty, progress);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const airY = -180 * 4 * progress * (1 - progress);
+    const spin = progress * Math.PI * 2 * facing;
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: 0, bodyLean: spin,
+      leftLegA: 0.3, rightLegA: -0.3,
+      leftArmA: -0.4, rightArmA: 0.4,
+      leftForeA: -0.2, rightForeA: 0.2,
+      airY,
+    };
+  }
+
+  if (active.type === "zipline") {
+    // Slides down a taut line from a fixed anchor near the start — reuses the grapple rope draw
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const bx = lerp(active.fromX, tx, progress);
+    const by = lerp(active.fromY, ty, progress);
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: Math.sin(progress * Math.PI * 6) * 1.5, bodyLean: 0.15 * facing,
+      leftLegA: 0.25, rightLegA: 0.35,
+      leftArmA: -0.9, rightArmA: -0.9,
+      leftForeA: -0.1, rightForeA: -0.1,
+      airY: 0,
+      grappleAnchorBX: active.fromX, grappleAnchorBY: active.fromY - 260,
+      grappleRopeAlpha: 1,
+    };
+  }
+
+  if (active.type === "wallClimb") {
+    // Mostly-vertical climb, alternating limbs
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const bx = lerp(active.fromX, tx, progress);
+    const by = lerp(active.fromY, ty, progress);
+    const climbPhase = progress * 10;
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob: 0, bodyLean: -0.12,
+      leftLegA: Math.sin(climbPhase) * 0.4 + 0.15, rightLegA: Math.sin(climbPhase + Math.PI) * 0.4 - 0.15,
+      leftArmA: Math.sin(climbPhase + Math.PI) * 0.5 - 0.3, rightArmA: Math.sin(climbPhase) * 0.5 - 0.3,
+      leftForeA: 0.1, rightForeA: 0.1,
+      airY: 0,
+    };
+  }
+
+  if (active.type === "sitAndWatch") {
+    // Sits down at fromX/fromY and watches — knees bent, hands resting, gentle idle bob
+    const t = time * 1.5;
+    return {
+      boardX: active.fromX, boardY: active.fromY, facing: 1,
+      headBob: Math.sin(t) * 1.5, bodyLean: 0,
+      leftLegA: 1.3, rightLegA: -1.3,
+      leftArmA: 0.5, rightArmA: -0.5,
+      leftForeA: 0.3, rightForeA: -0.3,
+      airY: 0,
+    };
+  }
+
+  if (active.type === "explainGesture") {
+    // Animated talking-with-hands loop for long holds; feet stay planted
+    const t = time * 1.3;
+    const gestureL = Math.sin(t) * 0.5 + Math.sin(t * 2.3) * 0.15;
+    const gestureR = Math.sin(t + Math.PI * 0.6) * 0.5 - Math.sin(t * 1.7) * 0.15;
+    return {
+      boardX: active.fromX, boardY: active.fromY, facing: 1,
+      headBob: Math.sin(t * 1.1) * 1.5, bodyLean: Math.sin(t * 0.5) * 0.04,
+      leftLegA: 0.1, rightLegA: -0.1,
+      leftArmA: gestureL - 0.3, rightArmA: -gestureR + 0.3,
+      leftForeA: 0.2, rightForeA: -0.2,
+      airY: 0,
+    };
+  }
+
   if (active.type === "pointAt") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = (tx - active.fromX) >= 0 ? 1 : -1;
@@ -923,7 +1137,7 @@ function drawCharacterToCanvas(
   clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
 ) {
   if (!showChar) return;
-  const p = evalCharAtTime(time, resolved, initX, initY, clips);
+  const p = evalCharAtTime(time, resolved, initX, initY, clips, cam.cameraX);
   const { facing } = p;
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
@@ -931,13 +1145,22 @@ function drawCharacterToCanvas(
   const S = sf;
   const lw = Math.max(1, 3 * S);
 
-  // ── Grapple rope (drawn before character transform so coords are screen-space) ──
+  // Raw (unscaled) body proportions — single source of truth reused below for both the S-scaled
+  // draw geometry and the raw board-space magic numbers (grapple hand height, pointAt shoulder
+  // height) that need to stay in sync with them.
+  const HIP_RAW = 76;
+  const TORSO_RAW = 53;     // shortened by NECK_RAW from the original 65 so total height is unchanged
+  const NECK_RAW = 12;
+  const HEAD_R_RAW = 20;
+  const STAND_HEIGHT_RAW = HIP_RAW + TORSO_RAW + NECK_RAW + HEAD_R_RAW * 2; // feet to head-top
+
+  // ── Grapple / zipline rope (drawn before character transform so coords are screen-space) ──
   if (p.grappleAnchorBX !== undefined && p.grappleRopeAlpha && p.grappleRopeAlpha > 0) {
     const anchorSX = (p.grappleAnchorBX - cam.cameraX) * sf + W / 2;
     const anchorSY = (p.grappleAnchorBY! - cam.cameraY) * sf + H / 2;
-    // Rope exits from roughly above the character's head
+    // Rope exits from roughly the raised-hand point, just above the head
     const handSX = sx;
-    const handSY = sy - 180 * S;
+    const handSY = sy - (STAND_HEIGHT_RAW + 5) * S;
     const ctrlSX = (handSX + anchorSX) / 2;
     const ctrlSY = Math.min(handSY, anchorSY) - 20 * S;
     ctx.save();
@@ -966,29 +1189,30 @@ function drawCharacterToCanvas(
   ctx.lineJoin = "round";
 
   const legLen = 38 * S;
-  const torsoLen = 65 * S;
+  const torsoLen = TORSO_RAW * S;
+  const neckLen = NECK_RAW * S;
   const armLen = 32 * S;
-  const headR = 20 * S;
+  const headR = HEAD_R_RAW * S;
   const bobS = p.headBob * S;
-  const hipY = -76 * S + bobS * 0.25;
-  const shoulderY = hipY - torsoLen;
-  const headCY = shoulderY - 18 * S + bobS;
+  const hipY = -HIP_RAW * S + bobS * 0.25;
 
-  // Legs (two-segment: thigh + shin with independent shin angle)
+  // Legs (two-segment: thigh + shin with independent shin angle). Local-x sign is negated so that
+  // a POSITIVE angle always means "outward from body midline" for both legs — the un-negated form
+  // (x = +sin(angle)) makes positive-left/negative-right cross at the ankles instead of spreading.
   const drawLeg = (thighA: number, shinA: number) => {
-    const kx = Math.sin(thighA) * legLen;
+    const kx = -Math.sin(thighA) * legLen;
     const ky = hipY + Math.cos(thighA) * legLen;
     ctx.beginPath();
     ctx.moveTo(0, hipY);
     ctx.lineTo(kx, ky);
-    ctx.lineTo(kx + Math.sin(shinA) * legLen, ky + Math.cos(shinA) * legLen);
+    ctx.lineTo(kx - Math.sin(shinA) * legLen, ky + Math.cos(shinA) * legLen);
     ctx.stroke();
   };
   // Shin angle = thigh angle + forearm angle (using leftForeA/rightForeA as shin bend)
   drawLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
   drawLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
 
-  // Torso
+  // Torso + neck + head all rotate together with bodyLean (e.g. the flip's full-rotation spin)
   ctx.save();
   ctx.translate(0, hipY);
   ctx.rotate(p.bodyLean);
@@ -1000,12 +1224,13 @@ function drawCharacterToCanvas(
 
   // Override pointing arm; other arm hangs relaxed (not tucked inward)
   if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
-    const shoulderBY = p.boardY - 141;
+    const shoulderBY = p.boardY - (HIP_RAW + TORSO_RAW);
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
     const tdyCanvas = p.pointTargetBY - shoulderBY;
     const mag = Math.hypot(tdxLocal, tdyCanvas);
     if (mag > 0) {
-      const pointAngle = Math.atan2(tdxLocal, tdyCanvas);
+      // Negated to match drawArm's negated sin() below (same outward-positive convention as legs)
+      const pointAngle = -Math.atan2(tdxLocal, tdyCanvas);
       const RELAX_ARM = 0.15;  // natural hang angle
       const RELAX_FORE = 0.2;
       if (tdxLocal >= 0) {
@@ -1019,19 +1244,23 @@ function drawCharacterToCanvas(
   }
 
   const drawArm = (sOff: number, armA: number, foreA: number) => {
-    const ex = sOff + Math.sin(armA) * armLen;
+    const ex = sOff - Math.sin(armA) * armLen;
     const ey = relSY + Math.cos(armA) * armLen;
     ctx.beginPath();
     ctx.moveTo(sOff, relSY);
     ctx.lineTo(ex, ey);
-    ctx.lineTo(ex + Math.sin(foreA) * armLen, ey + Math.cos(foreA) * armLen);
+    ctx.lineTo(ex - Math.sin(foreA) * armLen, ey + Math.cos(foreA) * armLen);
     ctx.stroke();
   };
   drawArm(-7 * S, lArmA, lForeA);
   drawArm(7 * S, rArmA, rForeA);
-  ctx.restore(); // un-lean
 
-  // Head — blank circle only (no face features)
+  // Neck — short segment from shoulder up to where the head sits
+  const neckTopY = relSY - neckLen;
+  ctx.beginPath(); ctx.moveTo(0, relSY); ctx.lineTo(0, neckTopY); ctx.stroke();
+
+  // Head — blank circle only (no face features), sitting on top of the neck
+  const headCY = neckTopY - headR;
   ctx.beginPath(); ctx.arc(0, headCY, headR, 0, Math.PI * 2); ctx.stroke();
 
   // Emoji emote
@@ -1046,6 +1275,7 @@ function drawCharacterToCanvas(
     ctx.restore();
   }
 
+  ctx.restore(); // un-lean (torso/neck/head/arms)
   ctx.restore(); // top-level
 }
 
@@ -1109,7 +1339,6 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
-  const [resolvedCharActions, setResolvedCharActions] = useState<ResolvedCharAction[]>([]);
   const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
@@ -1311,20 +1540,25 @@ export default function Board2Page() {
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
-  // Recompute resolved character positions whenever actions, mode, or clips change
+  // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
+  // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
+  // array reference), cameraKeyframes (a "Generate camera keyframes" run), characterActions
+  // (manual edits), or characterMode change. There is no way for this to go stale: a clip reorder
+  // or a fresh keyframe generation is automatically reflected on the very next render.
+  const charInit = useMemo(() => getCharInitPos(clips), [clips]);
+  const resolvedCharActions = useMemo(() => {
+    const merged = characterMode === "auto"
+      ? mergeCharActions(deriveAutoCharActions(clips, cameraKeyframes, charInit.x, charInit.y), characterActions)
+      : characterActions;
+    return resolveCharActions(merged, charInit.x, charInit.y);
+  }, [clips, cameraKeyframes, characterActions, characterMode, charInit]);
+
+  // Mirror the memoized result into refs for the RAF draw loop (which must avoid stale closures)
   useEffect(() => {
-    const init = getCharInitPos(clipsRef.current);
-    charInitXRef.current = init.x;
-    charInitYRef.current = init.y;
-    const manual = characterActionsRef.current;
-    const merged = characterModeRef.current === "auto"
-      ? mergeCharActions(deriveAutoCharActions(clipsRef.current, init.x, init.y), manual)
-      : manual;
-    const resolved = resolveCharActions(merged, init.x, init.y);
-    resolvedCharActionsRef.current = resolved;
-    setResolvedCharActions(resolved);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [characterActions, characterMode, clips]);
+    charInitXRef.current = charInit.x;
+    charInitYRef.current = charInit.y;
+    resolvedCharActionsRef.current = resolvedCharActions;
+  }, [charInit, resolvedCharActions]);
 
   useEffect(() => {
     const check = () => {
@@ -4166,9 +4400,12 @@ export default function Board2Page() {
     setCameraKeyframes(newCameraKeyframes);
     cameraKeyframesRef.current = newCameraKeyframes;
     setKeyframesOutOfDate(false);
+    // Character choreography is a useMemo over [clips, cameraKeyframes, ...] (see resolvedCharActions
+    // above), so setting cameraKeyframes here automatically re-derives auto actions from the new
+    // keyframe order on the very next render — no separate re-sync call needed.
     drawFrame(playheadRef.current);
     const n = allClipsSorted.length;
-    setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all`);
+    setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all — character re-synced`);
   }
 
   // ─ Divider drag (hold/transition split per clip) ──────────────────────────
@@ -7197,7 +7434,10 @@ export default function Board2Page() {
                   {resolvedCharActions.map((action) => {
                     const isAuto = characterMode === "auto" && !characterActions.find((m) => m.id === action.id);
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
-                    const icons: Record<string, string> = { walkTo: "⇒", jumpTo: "↑", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸" };
+                    const icons: Record<string, string> = {
+                      walkTo: "⇒", jumpTo: "↑", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
+                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", run: "🏃", sitAndWatch: "🍿", explainGesture: "💬",
+                    };
                     return (
                       <div
                         key={action.id}
