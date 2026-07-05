@@ -78,11 +78,16 @@ type CharacterAction = {
   duration: number;
   targetX?: number;
   targetY?: number;
+  targetClipId?: string;  // AI-choreographed actions target a clip id instead of raw coords — resolved
+                           // to boardX/Y lazily in resolveCharActions so a clip move never staleifies it.
+                           // Explicit targetX/Y (set by manual placement) always takes precedence.
   emoji?: string;
   startX?: number;        // explicit start-position override (entrance/exit flips start offscreen, not chained)
   startY?: number;
   entranceFlip?: boolean; // marks the auto-derived flip onto the first media clip — used to hide the
                            // character before this action starts (see characterEntranceTime)
+  aiGenerated?: boolean;  // produced by /api/board2/character-choreography — shown with a ✨ badge and
+                           // removable in bulk via "Clear AI choreography", otherwise a normal manual action
 };
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
@@ -622,18 +627,44 @@ function snapToClipTop(
   return { x: tx, y: ty };
 }
 
+// Resolve an action's targetClipId to board coordinates, using the clip's CURRENT position —
+// called fresh every resolveCharActions pass so a clip move is reflected on the very next render,
+// never stale. pointAt targets a point inside the clip (to point AT something); every other
+// targeted type targets the clip's top surface (a place to stand).
+function resolveClipTarget(
+  action: CharacterAction,
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]
+): { x: number; y: number } | undefined {
+  if (!action.targetClipId) return undefined;
+  const c = clips.find((cl) => cl.id === action.targetClipId);
+  if (!c || c.boardX === undefined || c.boardY === undefined) return undefined;
+  const cx = c.boardX + (c.boardW ?? 0) / 2;
+  if (action.type === "pointAt") return { x: cx, y: c.boardY + (c.boardH ?? 0) * 0.35 };
+  return { x: cx, y: c.boardY };
+}
+
 // Resolve fromX/fromY for each action (position continuity pass).
 // Handles both manual and auto-derived actions merged in time order.
-function resolveCharActions(actions: CharacterAction[], initX: number, initY: number): ResolvedCharAction[] {
+function resolveCharActions(
+  actions: CharacterAction[],
+  initX: number,
+  initY: number,
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]
+): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
   const result: ResolvedCharAction[] = [];
   for (const a of sorted) {
+    // Explicit targetX/Y (manual placement) always wins; otherwise resolve targetClipId against
+    // the clip's current position (AI-choreographed actions).
+    const resolvedTarget = resolveClipTarget(a, clips);
+    const targetX = a.targetX ?? resolvedTarget?.x;
+    const targetY = a.targetY ?? resolvedTarget?.y;
     // startX/startY (entrance/exit flips) override the chained position for this action only —
     // the chain continues from targetX/targetY afterward, same as any other travel action.
-    result.push({ ...a, fromX: a.startX ?? x, fromY: a.startY ?? y });
-    if (CHAR_TRAVEL_TYPES.has(a.type) && a.targetX !== undefined) {
-      x = a.targetX; y = a.targetY ?? y;
+    result.push({ ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y });
+    if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
+      x = targetX; y = targetY ?? y;
     }
     // pointAt/sitAndWatch/explainGesture/emote/idle don't change position
   }
@@ -1400,6 +1431,13 @@ export default function Board2Page() {
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
 
+  // ── AI character choreography ──
+  const [directCharacterOpen, setDirectCharacterOpen] = useState(false);
+  const [characterDirection, setCharacterDirection] = useState("");
+  const [syncEmotesToNarration, setSyncEmotesToNarration] = useState(true);
+  const [choreoPhase, setChoreoPhase] = useState<string | null>(null);
+  const [choreoError, setChoreoError] = useState<string | null>(null);
+
   // ── AI annotation generation ──
   const [aiModalOpen, setAiModalOpen] = useState(false);
   const [aiTab, setAiTab] = useState<"audio" | "script">("audio");
@@ -1605,7 +1643,7 @@ export default function Board2Page() {
     const merged = characterMode === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y), characterActions)
       : characterActions;
-    return resolveCharActions(merged, charInit.x, charInit.y);
+    return resolveCharActions(merged, charInit.x, charInit.y, clips);
   }, [clips, characterActions, characterMode, charInit]);
 
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
@@ -4629,6 +4667,139 @@ export default function Board2Page() {
     await applyAnnotationsFromTranscript(d.transcript);
   }
 
+  // ─ AI character choreography ────────────────────────────────────────────────
+
+  async function handleGenerateChoreography() {
+    const allClips = clipsRef.current;
+    const boardClips = allClips.filter((c) => c.boardX !== undefined && (c.type === "image" || c.type === "video"));
+    if (boardClips.length === 0) { setChoreoError("Place some clips on the board first"); return; }
+
+    const narrationClips = allClips.filter((c) => c.type === "narration");
+    const wantsSync = syncEmotesToNarration && narrationClips.length > 0;
+    const direction = characterDirection.trim();
+    if (!direction && !wantsSync) {
+      setChoreoError("Describe what the character should do, or enable narration sync");
+      return;
+    }
+    setChoreoError(null);
+
+    let transcriptPayload: { text: string; segments: { start: number; end: number; text: string }[] } | undefined;
+
+    if (wantsSync) {
+      setChoreoPhase("Transcribing...");
+      let blob: Blob;
+      try {
+        blob = await compileNarrationToBlob(narrationClips);
+      } catch (e) {
+        setChoreoError(e instanceof Error ? e.message : "Failed to compile narration audio");
+        setChoreoPhase(null);
+        return;
+      }
+      if (blob.size > 25 * 1024 * 1024) {
+        setChoreoError("Narration too long — exceeds 25MB. Please split into shorter recordings.");
+        setChoreoPhase(null);
+        return;
+      }
+      const fd = new FormData();
+      fd.append("audio", blob, "narration.wav");
+      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
+      if (!r) { setChoreoError("Network error during transcription. Try again."); setChoreoPhase(null); return; }
+      const d = await r.json();
+      if (!r.ok) { setChoreoError(d.error || "Transcription failed"); setChoreoPhase(null); return; }
+      if (!d.transcript?.trim()) { setChoreoError("Couldn't understand the narration. Try pasting a direction instead."); setChoreoPhase(null); return; }
+      // compileNarrationToBlob renders narration clips relative to the first clip's startTime —
+      // segment timestamps come back relative to that same origin, so offset them back onto the
+      // absolute timeline before they're used to time anything against clip start/holdEnd times.
+      const firstStart = [...narrationClips].sort((a, b) => a.startTime - b.startTime)[0].startTime;
+      const segments: { start: number; end: number; text: string }[] = Array.isArray(d.segments)
+        ? d.segments.map((s: { start: number; end: number; text: string }) => ({
+            start: s.start + firstStart, end: s.end + firstStart, text: s.text,
+          }))
+        : [];
+      transcriptPayload = { text: d.transcript, segments };
+    }
+
+    setChoreoPhase("Choreographing...");
+
+    const focusClips = [...boardClips].sort((a, b) => a.startTime - b.startTime);
+    const cameraFocusOrder = focusClips.map((c) => {
+      const hf = c.holdFraction ?? HOLD_FRACTION;
+      return {
+        clipId: c.id,
+        holdStart: c.startTime,
+        holdEnd: c.startTime + c.duration * hf,
+        transitionEnd: c.startTime + c.duration,
+      };
+    });
+    const timelineClips = focusClips.map((c) => ({
+      id: c.id, type: c.type, startTime: c.startTime, duration: c.duration,
+      boardX: c.boardX, boardY: c.boardY, boardW: c.boardW, boardH: c.boardH,
+      label: c.name,
+    }));
+    const totalDurationSec = Math.max(0, ...allClips.map((c) => c.startTime + c.duration));
+
+    const r2 = await fetch("/api/board2/character-choreography", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        direction,
+        transcript: transcriptPayload,
+        timeline: { totalDurationSec, clips: timelineClips, cameraFocusOrder },
+      }),
+    }).catch(() => null);
+    if (!r2) { setChoreoError("Network error. Try again."); setChoreoPhase(null); return; }
+    const d2 = await r2.json();
+    if (!r2.ok) { setChoreoError(d2.error || "Failed to generate choreography"); setChoreoPhase(null); return; }
+
+    // Server already dropped unknown types / dangling clip refs and clamped times — this pass
+    // turns the raw actions into real CharacterAction objects and re-validates targetClipId
+    // against the CURRENT clip set (it could have changed while the request was in flight).
+    type RawAction = { type?: string; startTime?: number; duration?: number; targetClipId?: string; emoji?: string };
+    const clipIds = new Set(timelineClips.map((c) => c.id));
+    const rawActions: RawAction[] = Array.isArray(d2.actions) ? d2.actions : [];
+    const cleaned: CharacterAction[] = rawActions
+      .filter((a): a is Required<Pick<RawAction, "type">> & RawAction => typeof a.type === "string")
+      .filter((a) => {
+        if (a.type === "emote") return !!a.emoji;
+        if (a.type === "pointAt") return !!a.targetClipId && clipIds.has(a.targetClipId);
+        if (CHAR_TRAVEL_TYPES.has(a.type as CharacterAction["type"])) return !!a.targetClipId && clipIds.has(a.targetClipId);
+        return !a.targetClipId || clipIds.has(a.targetClipId);
+      })
+      .map((a) => {
+        const startTime = clamp(Number(a.startTime) || 0, 0, totalDurationSec);
+        const rawDuration = Number(a.duration) > 0 ? Number(a.duration) : 1.5;
+        const duration = clamp(rawDuration, 0.1, Math.max(0.1, totalDurationSec - startTime));
+        return {
+          id: generateId(),
+          type: a.type as CharacterAction["type"],
+          startTime, duration,
+          ...(a.targetClipId ? { targetClipId: a.targetClipId } : {}),
+          ...(a.type === "emote" && a.emoji ? { emoji: a.emoji } : {}),
+          aiGenerated: true,
+        } as CharacterAction;
+      });
+
+    // Regenerate = clean slate for AI actions, but hand-placed ones are never touched. Then
+    // enforce no-overlap across the whole character row: later-starting action wins, the one
+    // that starts earlier gets truncated to make room (matches the drag/resize invariant that
+    // no two blocks on this row ever overlap).
+    setCharacterActions((prev) => {
+      const handPlaced = prev.filter((a) => !a.aiGenerated);
+      const combined = [...handPlaced, ...cleaned].sort((a, b) => a.startTime - b.startTime);
+      for (let i = 0; i < combined.length - 1; i++) {
+        const end = combined[i].startTime + combined[i].duration;
+        if (end > combined[i + 1].startTime) {
+          combined[i] = { ...combined[i], duration: Math.max(0.1, combined[i + 1].startTime - combined[i].startTime) };
+        }
+      }
+      return combined;
+    });
+
+    setToast(`Generated ${cleaned.length} choreographed action${cleaned.length === 1 ? "" : "s"}`);
+    setChoreoPhase(null);
+    setDirectCharacterOpen(false);
+  }
+
   // ─ Export ─────────────────────────────────────────────────────────────────
 
   function cancelExport() { exportCancelRef.current = true; }
@@ -7018,6 +7189,45 @@ export default function Board2Page() {
                             {characterAddMode === "emote" && !characterEmojiPickerOpen && (
                               <span style={{ fontSize: 16, marginLeft: 2 }}>{characterEmoji}</span>
                             )}
+
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
+                            {/* AI choreography — describe moves in plain language, optionally synced to narration */}
+                            <button
+                              title="Describe what the character should do, or sync emotes to your narration"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDirectCharacterOpen((v) => {
+                                  const next = !v;
+                                  if (next) setSyncEmotesToNarration(clipsRef.current.some((c) => c.type === "narration"));
+                                  return next;
+                                });
+                              }}
+                              style={{
+                                padding: "3px 7px", fontFamily: "monospace", fontSize: 9,
+                                border: "1px solid rgba(42,42,42,0.35)",
+                                background: directCharacterOpen ? "#2a2a2a" : "transparent",
+                                color: directCharacterOpen ? CHARACTER_COLOR : "#2a2a2a",
+                                cursor: "pointer",
+                              }}
+                            >
+                              ✨ Direct
+                            </button>
+                            {characterActions.some((a) => a.aiGenerated) && (
+                              <button
+                                title="Remove all AI-choreographed actions (hand-placed ones are kept)"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCharacterActions((prev) => prev.filter((a) => !a.aiGenerated));
+                                }}
+                                style={{
+                                  padding: "3px 7px", fontFamily: "monospace", fontSize: 9,
+                                  border: "1px solid rgba(42,42,42,0.35)", background: "transparent",
+                                  color: "#2a2a2a", cursor: "pointer",
+                                }}
+                              >
+                                🧹 Clear AI
+                              </button>
+                            )}
                           </>
                         )}
                       </div>
@@ -7542,6 +7752,10 @@ export default function Board2Page() {
                         <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#2a4a2a", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
                           {icons[action.type]} {action.type}
                         </span>
+                        {/* AI-choreographed badge — drag/resize/delete work the same as any manual action */}
+                        {action.aiGenerated && (
+                          <span title="AI-choreographed" style={{ position: "absolute", top: -1, right: 1, fontSize: 8, zIndex: 5, pointerEvents: "none" }}>✨</span>
+                        )}
                         {/* Right resize — manual only */}
                         {!isAuto && (
                           <div
@@ -7862,6 +8076,90 @@ export default function Board2Page() {
       )}
 
       {/* AI Annotation Modal */}
+      {directCharacterOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget && !choreoPhase) setDirectCharacterOpen(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 480, maxWidth: "95vw", fontFamily: "monospace", overflow: "hidden" }}>
+
+            {/* Header */}
+            <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>🎬 DIRECT CHARACTER</span>
+              <button
+                onClick={() => { if (!choreoPhase) setDirectCharacterOpen(false); }}
+                style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15, opacity: choreoPhase ? 0.4 : 1 }}
+              >×</button>
+            </div>
+
+            <div style={{ padding: 16 }}>
+              <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
+                Describe what the character should do through the video. GPT-4o maps it onto your actual clip order and camera timing.
+              </p>
+              <textarea
+                value={characterDirection}
+                onChange={(e) => setCharacterDirection(e.target.value)}
+                disabled={!!choreoPhase}
+                placeholder="He flips in onto image 1, explains it excitedly, grapples to the video and watches with popcorn, then ziplines to the last image and flips off screen"
+                rows={5}
+                style={{
+                  width: "100%", fontFamily: "monospace", fontSize: 11,
+                  border: "1.5px solid #2a2a2a", padding: "8px",
+                  resize: "vertical", boxSizing: "border-box",
+                  background: choreoPhase ? "#f5f5f0" : "#fff",
+                } as React.CSSProperties}
+              />
+
+              {clips.some((c) => c.type === "narration") && (
+                <label style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 10, fontSize: 11, cursor: choreoPhase ? "default" : "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={syncEmotesToNarration}
+                    disabled={!!choreoPhase}
+                    onChange={(e) => setSyncEmotesToNarration(e.target.checked)}
+                  />
+                  Sync emotes to my narration
+                </label>
+              )}
+
+              {choreoPhase && (
+                <div style={{ marginTop: 10, fontSize: 11, color: "#1a6fd4" }}>
+                  ⟳ {choreoPhase}
+                </div>
+              )}
+              {choreoError && (
+                <div style={{ marginTop: 10, fontSize: 11, color: "#cc2200" }}>
+                  ✗ {choreoError}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => { if (!choreoPhase) setDirectCharacterOpen(false); }}
+                disabled={!!choreoPhase}
+                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: choreoPhase ? 0.4 : 1 }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleGenerateChoreography}
+                disabled={!!choreoPhase || (!characterDirection.trim() && !(syncEmotesToNarration && clips.some((c) => c.type === "narration")))}
+                style={{
+                  ...miniButton, padding: "6px 18px", fontSize: 12, fontWeight: 700,
+                  background: "#c8f135", borderColor: "#2a2a2a",
+                  opacity: (!!choreoPhase || (!characterDirection.trim() && !(syncEmotesToNarration && clips.some((c) => c.type === "narration")))) ? 0.5 : 1,
+                  cursor: (!!choreoPhase || (!characterDirection.trim() && !(syncEmotesToNarration && clips.some((c) => c.type === "narration")))) ? "not-allowed" : "pointer",
+                }}
+              >
+                {choreoPhase ? "Working…" : "Generate choreography →"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {aiModalOpen && (
         <div
           onClick={(e) => { if (e.target === e.currentTarget && !aiPhase) setAiModalOpen(false); }}

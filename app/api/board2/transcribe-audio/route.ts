@@ -63,6 +63,16 @@ export async function POST(req: NextRequest) {
     const data = await whisperRes.json();
     const transcript: string = data.text ?? "";
     const durationSec: number = data.duration ?? 0;
+    // verbose_json segments carry per-segment start/end timestamps — needed by callers (e.g.
+    // character choreography) that time actions to moments in the narration. Trim to just the
+    // fields callers need rather than passing through Whisper's full segment object.
+    const segments: Array<{ start: number; end: number; text: string }> = Array.isArray(data.segments)
+      ? data.segments.map((s: { start?: number; end?: number; text?: string }) => ({
+          start: s.start ?? 0,
+          end: s.end ?? 0,
+          text: s.text ?? "",
+        }))
+      : [];
 
     // Whisper cost: ~$0.006/min
     logApiCost(session.user.email, "whisper-board2", +(durationSec * 0.0001).toFixed(5), {
@@ -70,7 +80,7 @@ export async function POST(req: NextRequest) {
       units: durationSec,
     }).catch(() => {});
 
-    return NextResponse.json({ transcript, durationSec });
+    return NextResponse.json({ transcript, durationSec, segments });
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
