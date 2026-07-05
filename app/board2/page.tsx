@@ -5,6 +5,7 @@ import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import { ProGated } from "@/app/components/ProGated";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
+import { AuthoredAnimation, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -855,12 +856,54 @@ type CharPoseResult = {
   grappleRopeAlpha?: number;
 };
 
+const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
+  walkTo: "walk",
+  jumpTo: "jump",
+  flip: "flip",
+  grapple: "grapple-swing",
+  zipline: "zipline-hang",
+  wallClimb: "climb",
+  sitAndWatch: "sit",
+  explainGesture: "explain",
+  idle: "idle",
+};
+
+function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addSpin?: boolean } = {}): CharPoseResult {
+  if (!pose) return base;
+  return {
+    ...base,
+    headBob: pose.headBob,
+    bodyLean: pose.bodyLean,
+    spinAngle: (base.spinAngle ?? 0) + (opts.addSpin ? pose.poseRotation : 0),
+    leftLegA: pose.leftLegA,
+    rightLegA: pose.rightLegA,
+    leftArmA: pose.leftArmA,
+    rightArmA: pose.rightArmA,
+    leftForeA: pose.leftForeA,
+    rightForeA: pose.rightForeA,
+    airY: base.airY + pose.airborneY,
+  };
+}
+
+function authoredProgressForAction(active: ResolvedCharAction, progress: number): number {
+  const tx = active.targetX ?? active.fromX;
+  const ty = active.targetY ?? active.fromY;
+  const dist = Math.hypot(tx - active.fromX, ty - active.fromY);
+  if (active.type === "walkTo") {
+    // One authored walk is a single stride. Cadence is speed-proportional via stride length:
+    // cycles/sec = travelSpeed / stridePx, so total cycles over the action = distance / stridePx.
+    return progress * Math.max(1, dist / 220);
+  }
+  return progress;
+}
+
 function evalCharAtTime(
   time: number,
   resolved: ResolvedCharAction[],
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  authoredAnimations: Record<string, AuthoredAnimation> = {}
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
   // Legs +0.12/-0.12 (feet slightly apart), upper arms +0.08/-0.08 (hanging at sides), forearms
@@ -894,10 +937,15 @@ function evalCharAtTime(
         }
       }
     }
-    return idlePose(rx, ry);
+    const idle = idlePose(rx, ry);
+    return applyAuthoredPose(idle, sampleAnimation(authoredAnimations.idle, (time * 0.35) % 1));
   }
 
   const progress = Math.max(0, Math.min(1, (time - active.startTime) / active.duration));
+  const slotName = ACTION_ANIMATION_SLOT[active.type];
+  const authoredPose = slotName
+    ? sampleAnimation(authoredAnimations[slotName], authoredProgressForAction(active, progress))
+    : null;
 
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
@@ -910,14 +958,14 @@ function evalCharAtTime(
     const stepFreq = Math.max(4, dist * 0.015);
     const phase = progress * stepFreq * Math.PI * 2;
     const swing = 0.5;
-    return {
+    return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
       headBob: Math.sin(phase * 2) * 2, bodyLean: Math.sin(phase) * 0.05,
       leftLegA: Math.sin(phase) * swing, rightLegA: Math.sin(phase + Math.PI) * swing,
       leftArmA: Math.sin(phase + Math.PI) * 0.35, rightArmA: Math.sin(phase) * 0.35,
       leftForeA: Math.sin(phase + Math.PI) * 0.15, rightForeA: Math.sin(phase) * 0.15,
       airY: 0,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "jumpTo") {
@@ -959,12 +1007,12 @@ function evalCharAtTime(
       rightForeA = lerp(-0.3, 0, t);
     }
 
-    return {
+    return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
       headBob, bodyLean: 0,
       leftLegA, rightLegA, leftArmA, rightArmA, leftForeA, rightForeA,
       airY,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "grapple") {
@@ -977,7 +1025,7 @@ function evalCharAtTime(
     if (progress < 0.15) {
       // Aim + fire: arms raise toward anchor, rope extends
       const t = progress / 0.15;
-      return {
+      return applyAuthoredPose({
         boardX: active.fromX, boardY: active.fromY, facing,
         headBob: 0, bodyLean: 0,
         leftLegA: 0.1, rightLegA: -0.1,
@@ -986,7 +1034,7 @@ function evalCharAtTime(
         airY: 0,
         grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
         grappleRopeAlpha: t,
-      };
+      }, authoredPose);
     } else if (progress < 0.85) {
       // Swing: pendulum bezier arc from start to end dipping below anchor
       const t = (progress - 0.15) / 0.7;
@@ -996,7 +1044,7 @@ function evalCharAtTime(
       const ctrlBY = Math.max(active.fromY, ty) + 180;
       const bx = (1-eased)*(1-eased)*active.fromX + 2*(1-eased)*eased*ctrlBX + eased*eased*tx;
       const by = (1-eased)*(1-eased)*active.fromY + 2*(1-eased)*eased*ctrlBY + eased*eased*ty;
-      return {
+      return applyAuthoredPose({
         boardX: bx, boardY: by, facing,
         headBob: -3, bodyLean: 0,
         leftLegA: -0.45, rightLegA: -0.35,
@@ -1005,11 +1053,11 @@ function evalCharAtTime(
         airY: 0,
         grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
         grappleRopeAlpha: 1,
-      };
+      }, authoredPose);
     } else {
       // Release + land
       const t = (progress - 0.85) / 0.15;
-      return {
+      return applyAuthoredPose({
         boardX: tx, boardY: ty, facing,
         headBob: 0, bodyLean: 0,
         leftLegA: lerp(-0.45, 0.2, t), rightLegA: lerp(-0.35, 0.15, t),
@@ -1018,7 +1066,7 @@ function evalCharAtTime(
         airY: 0,
         grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
         grappleRopeAlpha: 1 - t,
-      };
+      }, authoredPose);
     }
   }
 
@@ -1073,12 +1121,12 @@ function evalCharAtTime(
       }
     }
 
-    return {
+    return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
       headBob: 0, bodyLean: 0, spinAngle,
       leftLegA, rightLegA, leftArmA, rightArmA, leftForeA: 0, rightForeA: 0,
       airY,
-    };
+    }, authoredPose, { addSpin: true });
   }
 
   if (active.type === "zipline") {
@@ -1087,7 +1135,7 @@ function evalCharAtTime(
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const bx = lerp(active.fromX, tx, progress);
     const by = lerp(active.fromY, ty, progress);
-    return {
+    return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
       headBob: Math.sin(progress * Math.PI * 6) * 1.5, bodyLean: 0.15 * facing,
       leftLegA: 0.25, rightLegA: 0.35,
@@ -1096,7 +1144,7 @@ function evalCharAtTime(
       airY: 0,
       grappleAnchorBX: active.fromX, grappleAnchorBY: active.fromY - 260,
       grappleRopeAlpha: 1,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "wallClimb") {
@@ -1106,27 +1154,27 @@ function evalCharAtTime(
     const bx = lerp(active.fromX, tx, progress);
     const by = lerp(active.fromY, ty, progress);
     const climbPhase = progress * 10;
-    return {
+    return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
       headBob: 0, bodyLean: -0.12,
       leftLegA: Math.sin(climbPhase) * 0.4 + 0.15, rightLegA: Math.sin(climbPhase + Math.PI) * 0.4 - 0.15,
       leftArmA: Math.sin(climbPhase + Math.PI) * 0.5 - 0.3, rightArmA: Math.sin(climbPhase) * 0.5 - 0.3,
       leftForeA: 0.1, rightForeA: 0.1,
       airY: 0,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "sitAndWatch") {
     // Sits down at fromX/fromY and watches — knees bent, hands resting, gentle idle bob
     const t = time * 1.5;
-    return {
+    return applyAuthoredPose({
       boardX: active.fromX, boardY: active.fromY, facing: 1,
       headBob: Math.sin(t) * 1.5, bodyLean: 0,
       leftLegA: 1.3, rightLegA: -1.3,
       leftArmA: 0.5, rightArmA: -0.5,
       leftForeA: 0.3, rightForeA: -0.3,
       airY: 0,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "explainGesture") {
@@ -1148,7 +1196,7 @@ function evalCharAtTime(
     const leftForeA = 0.15 + lRaise * 0.35 + spread * 0.15;
     const rightForeA = -0.15 - rRaise * 0.35 - spread * 0.15;
 
-    return {
+    return applyAuthoredPose({
       boardX: active.fromX, boardY: active.fromY, facing: 1,
       headBob: Math.sin(time * 1.1) * 1.5 + (lRaise + rRaise) * 1.5,
       bodyLean: Math.sin(time * 0.6) * 0.05 + (lRaise - rRaise) * 0.06,
@@ -1156,7 +1204,7 @@ function evalCharAtTime(
       rightLegA: -0.1 - Math.sin(time * 0.5 + 1.3) * 0.06,
       leftArmA, rightArmA, leftForeA, rightForeA,
       airY: 0,
-    };
+    }, authoredPose);
   }
 
   if (active.type === "pointAt") {
@@ -1210,10 +1258,11 @@ function drawCharacterToCanvas(
   initX: number,
   initY: number,
   clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
-  entranceTime: number
+  entranceTime: number,
+  authoredAnimations: Record<string, AuthoredAnimation> = {}
 ) {
   if (!showChar || time < entranceTime) return;
-  const p = evalCharAtTime(time, resolved, initX, initY, clips);
+  const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations);
   const { facing } = p;
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
@@ -1228,24 +1277,44 @@ function drawCharacterToCanvas(
   const TORSO_RAW = 53;     // shortened by NECK_RAW from the original 65 so total height is unchanged
   const NECK_RAW = 12;
   const HEAD_R_RAW = 20;
-  const STAND_HEIGHT_RAW = HIP_RAW + TORSO_RAW + NECK_RAW + HEAD_R_RAW * 2; // feet to head-top
+
+  const legLen = 38 * S;
+  const torsoLen = TORSO_RAW * S;
+  const neckLen = NECK_RAW * S;
+  const armLen = 32 * S;
+  const headR = HEAD_R_RAW * S;
+  const bobS = p.headBob * S;
+  const hipY = -HIP_RAW * S + bobS * 0.25;
+  const ropeHand = (() => {
+    const relSY = -torsoLen;
+    const sOff = facing >= 0 ? 7 * S : -7 * S;
+    const armA = facing >= 0 ? p.rightArmA : p.leftArmA;
+    const foreA = facing >= 0 ? p.rightForeA : p.leftForeA;
+    const shoulderLocalX = sOff;
+    const shoulderLocalY = hipY + relSY;
+    const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
+    const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
+    const handLocalX = elbowLocalX - Math.sin(foreA) * armLen;
+    const handLocalY = elbowLocalY + Math.cos(foreA) * armLen;
+    return {
+      x: sx + handLocalX * facing,
+      y: sy + p.airY * S + handLocalY,
+    };
+  })();
 
   // ── Grapple / zipline rope (drawn before character transform so coords are screen-space) ──
   if (p.grappleAnchorBX !== undefined && p.grappleRopeAlpha && p.grappleRopeAlpha > 0) {
     const anchorSX = (p.grappleAnchorBX - cam.cameraX) * sf + W / 2;
     const anchorSY = (p.grappleAnchorBY! - cam.cameraY) * sf + H / 2;
-    // Rope exits from roughly the raised-hand point, just above the head
-    const handSX = sx;
-    const handSY = sy - (STAND_HEIGHT_RAW + 5) * S;
-    const ctrlSX = (handSX + anchorSX) / 2;
-    const ctrlSY = Math.min(handSY, anchorSY) - 20 * S;
+    const ctrlSX = (ropeHand.x + anchorSX) / 2;
+    const ctrlSY = Math.min(ropeHand.y, anchorSY) - 20 * S;
     ctx.save();
     ctx.globalAlpha = p.grappleRopeAlpha;
     ctx.strokeStyle = "#5a3a1a";
     ctx.lineWidth = Math.max(1, 1.8 * S);
     ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.moveTo(handSX, handSY);
+    ctx.moveTo(ropeHand.x, ropeHand.y);
     ctx.quadraticCurveTo(ctrlSX, ctrlSY, anchorSX, anchorSY);
     ctx.stroke();
     // Anchor spike
@@ -1263,14 +1332,6 @@ function drawCharacterToCanvas(
   ctx.lineWidth = lw;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-
-  const legLen = 38 * S;
-  const torsoLen = TORSO_RAW * S;
-  const neckLen = NECK_RAW * S;
-  const armLen = 32 * S;
-  const headR = HEAD_R_RAW * S;
-  const bobS = p.headBob * S;
-  const hipY = -HIP_RAW * S + bobS * 0.25;
 
   // Whole-body spin (flip only): rotates legs + torso group together around the torso midpoint,
   // so a flip reads as the whole character turning over rather than the cartwheel-smear you get
@@ -1430,6 +1491,7 @@ export default function Board2Page() {
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
+  const [authoredAnimations, setAuthoredAnimations] = useState<AuthoredAnimation[]>([]);
 
   // ── AI character choreography ──
   const [directCharacterOpen, setDirectCharacterOpen] = useState(false);
@@ -1599,6 +1661,7 @@ export default function Board2Page() {
   const showCharacterRef = useRef(false);
   const characterActionsRef = useRef<CharacterAction[]>([]);
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
+  const authoredAnimationsRef = useRef<Record<string, AuthoredAnimation>>({});
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
@@ -1632,6 +1695,7 @@ export default function Board2Page() {
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
   useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
+  useEffect(() => { authoredAnimationsRef.current = animationMap(authoredAnimations); }, [authoredAnimations]);
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
@@ -1678,6 +1742,23 @@ export default function Board2Page() {
       window.removeEventListener("orientationchange", check);
     };
   }, []);
+
+  useEffect(() => {
+    if (!session?.user?.email) return;
+    let cancelled = false;
+    fetch("/api/board2/character-animations")
+      .then((r) => (r.ok ? r.json() : Promise.reject()))
+      .then((data) => {
+        if (cancelled) return;
+        const raw = Array.isArray(data) ? data : data.animations;
+        const next = (raw ?? []).map(normalizeAnimation).filter(Boolean) as AuthoredAnimation[];
+        setAuthoredAnimations(next);
+      })
+      .catch(() => {
+        if (!cancelled) setAuthoredAnimations([]);
+      });
+    return () => { cancelled = true; };
+  }, [session?.user?.email]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1836,7 +1917,7 @@ export default function Board2Page() {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
-        clipsRef.current, characterEntranceTimeRef.current
+        clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current
       );
     }
     if (currentAnnotations.length > 0) {
@@ -7190,6 +7271,25 @@ export default function Board2Page() {
                               <span style={{ fontSize: 16, marginLeft: 2 }}>{characterEmoji}</span>
                             )}
 
+                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
+                            <ProGated featureName="Pose Lab">
+                              <button
+                                title="Open the visual keyframe animation editor"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  window.location.href = "/board2/poselab";
+                                }}
+                                style={{
+                                  padding: "3px 7px", fontFamily: "monospace", fontSize: 9,
+                                  border: "1px solid rgba(42,42,42,0.35)",
+                                  background: "transparent",
+                                  color: "#2a2a2a",
+                                  cursor: "pointer",
+                                }}
+                              >
+                                🎭 Pose Lab
+                              </button>
+                            </ProGated>
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
                             {/* AI choreography — describe moves in plain language, optionally synced to narration */}
                             <button

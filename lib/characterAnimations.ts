@@ -1,0 +1,184 @@
+export type Pose = {
+  leftLegA: number;
+  rightLegA: number;
+  leftArmA: number;
+  rightArmA: number;
+  leftForeA: number;
+  rightForeA: number;
+  bodyLean: number;
+  headBob: number;
+  poseRotation: number;
+  airborneY: number;
+};
+
+export type PoseKeyframe = {
+  t: number;
+  pose: Pose;
+};
+
+export type AuthoredAnimation = {
+  id: string;
+  name: string;
+  keyframes: PoseKeyframe[];
+  loop: boolean;
+  createdAt: string;
+};
+
+export const RESERVED_ANIMATION_NAMES = [
+  "walk",
+  "run",
+  "jump",
+  "flip",
+  "idle",
+  "explain",
+  "sit",
+  "climb",
+  "zipline-hang",
+  "grapple-swing",
+] as const;
+
+export const DEFAULT_POSE: Pose = {
+  leftLegA: 0.12,
+  rightLegA: -0.12,
+  leftArmA: 0.08,
+  rightArmA: -0.08,
+  leftForeA: 0.13,
+  rightForeA: -0.13,
+  bodyLean: 0,
+  headBob: 0,
+  poseRotation: 0,
+  airborneY: 0,
+};
+
+export function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+export function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function lerpPose(a: Pose, b: Pose, t: number): Pose {
+  return {
+    leftLegA: lerp(a.leftLegA, b.leftLegA, t),
+    rightLegA: lerp(a.rightLegA, b.rightLegA, t),
+    leftArmA: lerp(a.leftArmA, b.leftArmA, t),
+    rightArmA: lerp(a.rightArmA, b.rightArmA, t),
+    leftForeA: lerp(a.leftForeA, b.leftForeA, t),
+    rightForeA: lerp(a.rightForeA, b.rightForeA, t),
+    bodyLean: lerp(a.bodyLean, b.bodyLean, t),
+    headBob: lerp(a.headBob, b.headBob, t),
+    poseRotation: lerp(a.poseRotation, b.poseRotation, t),
+    airborneY: lerp(a.airborneY, b.airborneY, t),
+  };
+}
+
+export function normalizePose(input: Partial<Pose> | undefined): Pose {
+  return { ...DEFAULT_POSE, ...(input ?? {}) };
+}
+
+export function normalizeAnimation(input: unknown): AuthoredAnimation | null {
+  const value = input as Partial<AuthoredAnimation> | null;
+  if (!value || typeof value.name !== "string" || !Array.isArray(value.keyframes)) return null;
+  const keyframes = value.keyframes
+    .map((kf) => {
+      const maybe = kf as Partial<PoseKeyframe>;
+      return {
+        t: clamp(Number(maybe.t ?? 0), 0, 1),
+        pose: normalizePose(maybe.pose),
+      };
+    })
+    .sort((a, b) => a.t - b.t);
+  if (keyframes.length < 2) return null;
+  return {
+    id: typeof value.id === "string" ? value.id : `anim_${Date.now()}`,
+    name: value.name.trim(),
+    keyframes,
+    loop: !!value.loop,
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+  };
+}
+
+export function animationMap(animations: AuthoredAnimation[]): Record<string, AuthoredAnimation> {
+  const map: Record<string, AuthoredAnimation> = {};
+  for (const anim of animations) map[anim.name] = anim;
+  return map;
+}
+
+export function sampleAnimation(animation: AuthoredAnimation | undefined, progress: number): Pose | null {
+  if (!animation || animation.keyframes.length < 2) return null;
+  const sorted = animation.keyframes;
+  let t = progress;
+  if (animation.loop) t = ((t % 1) + 1) % 1;
+  else t = clamp(t, 0, 1);
+  if (t <= sorted[0].t) return sorted[0].pose;
+  const last = sorted[sorted.length - 1];
+  if (t >= last.t) return last.pose;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    if (t >= a.t && t <= b.t) {
+      const span = Math.max(0.0001, b.t - a.t);
+      return lerpPose(a.pose, b.pose, (t - a.t) / span);
+    }
+  }
+  return last.pose;
+}
+
+function pose(patch: Partial<Pose>): Pose {
+  return normalizePose(patch);
+}
+
+export function starterAnimations(now = new Date().toISOString()): AuthoredAnimation[] {
+  return [
+    {
+      id: "starter_walk",
+      name: "walk",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftLegA: 0.46, rightLegA: -0.46, leftArmA: -0.32, rightArmA: 0.32, leftForeA: -0.08, rightForeA: 0.08, bodyLean: 0.04 }) },
+        { t: 0.33, pose: pose({ leftLegA: 0.05, rightLegA: -0.08, leftArmA: 0.02, rightArmA: -0.02, leftForeA: 0.08, rightForeA: -0.08, headBob: -2 }) },
+        { t: 0.66, pose: pose({ leftLegA: -0.46, rightLegA: 0.46, leftArmA: 0.32, rightArmA: -0.32, leftForeA: 0.08, rightForeA: -0.08, bodyLean: -0.04 }) },
+        { t: 1, pose: pose({ leftLegA: 0.46, rightLegA: -0.46, leftArmA: -0.32, rightArmA: 0.32, leftForeA: -0.08, rightForeA: 0.08, bodyLean: 0.04 }) },
+      ],
+    },
+    {
+      id: "starter_jump",
+      name: "jump",
+      loop: false,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftLegA: 0.28, rightLegA: -0.28, leftArmA: -0.45, rightArmA: -0.45 }) },
+        { t: 0.2, pose: pose({ leftLegA: -0.2, rightLegA: -0.15, leftArmA: -0.55, rightArmA: -0.55, airborneY: -45 }) },
+        { t: 0.7, pose: pose({ leftLegA: -0.55, rightLegA: -0.45, leftArmA: -0.5, rightArmA: -0.5, leftForeA: -0.3, rightForeA: -0.3, airborneY: -150 }) },
+        { t: 1, pose: pose({ leftLegA: 0.25, rightLegA: 0.15, leftArmA: 0.4, rightArmA: -0.4 }) },
+      ],
+    },
+    {
+      id: "starter_idle",
+      name: "idle",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ headBob: 0, bodyLean: -0.02 }) },
+        { t: 0.5, pose: pose({ headBob: 2, bodyLean: 0.02 }) },
+        { t: 1, pose: pose({ headBob: 0, bodyLean: -0.02 }) },
+      ],
+    },
+    {
+      id: "starter_explain",
+      name: "explain",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftArmA: 0.15, rightArmA: -0.15, leftForeA: 0.15, rightForeA: -0.15 }) },
+        { t: 0.18, pose: pose({ leftArmA: 0.95, rightArmA: -0.25, leftForeA: 0.45, rightForeA: -0.1, headBob: 2, bodyLean: 0.06 }) },
+        { t: 0.36, pose: pose({ leftArmA: 0.25, rightArmA: -1.0, leftForeA: 0.05, rightForeA: -0.42, headBob: 2, bodyLean: -0.06 }) },
+        { t: 0.55, pose: pose({ leftArmA: 0.8, rightArmA: -0.8, leftForeA: 0.3, rightForeA: -0.3, headBob: 3 }) },
+        { t: 0.78, pose: pose({ leftArmA: 0.25, rightArmA: -0.35, leftForeA: 0.1, rightForeA: -0.12, bodyLean: 0.03 }) },
+        { t: 1, pose: pose({ leftArmA: 0.15, rightArmA: -0.15, leftForeA: 0.15, rightForeA: -0.15 }) },
+      ],
+    },
+  ];
+}
