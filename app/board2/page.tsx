@@ -275,6 +275,14 @@ function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
+function easeInQuad(t: number): number {
+  return t * t;
+}
+
+function easeOutQuad(t: number): number {
+  return 1 - (1 - t) * (1 - t);
+}
+
 function interpolateCameraKeyframes(
   kfs: CameraKeyframe[],
   time: number
@@ -565,7 +573,7 @@ const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 // Travel-type action kinds — these change the character's resting board position
 const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple"]);
 const CHAR_OFFSCREEN_PAD = 900;
-const CHAR_ENTRANCE_Y_LIFT = 250;
+const CHAR_ENTRANCE_Y_LIFT = 600;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -863,6 +871,7 @@ type CharPoseResult = {
   grappleHookT?: number;
   grappleTaut?: boolean;
   grappleImpact?: number;
+  grappleLauncherVisible?: boolean;
 };
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
@@ -1168,6 +1177,7 @@ function evalCharAtTime(
       grappleHookT: hookT,
       grappleTaut: taut,
       grappleImpact: impact,
+      grappleLauncherVisible: progress < 0.9,
     }, null);
   }
 
@@ -1178,10 +1188,14 @@ function evalCharAtTime(
     // open into a flat 2π landing. The draw step rotates around mid-torso, not the feet.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const landingY = resolveGroundY(tx, ty, clips);
-    const bx = lerp(active.fromX, tx, progress);
-    const rawBy = lerp(active.fromY, landingY, progress);
+    const bx = active.entranceFlip
+      ? lerp(active.fromX, tx, easeOutQuad(progress))
+      : lerp(active.fromX, tx, progress);
+    const rawBy = active.entranceFlip
+      ? lerp(active.fromY, landingY, easeInQuad(progress))
+      : lerp(active.fromY, landingY, progress);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    const airY = -180 * 4 * progress * (1 - progress);
+    const airY = active.entranceFlip ? 0 : -180 * 4 * progress * (1 - progress);
     const by = progress >= 0.985 ? landingY : rawBy;
     const flipPose = authoredPose ?? sampleAnimation(FALLBACK_FORWARD_TUCK_FLIP, progress);
 
@@ -1495,18 +1509,20 @@ function drawCharacterToCanvas(
   drawArm(-7 * S, lArmA, lForeA);
   drawArm(7 * S, rArmA, rForeA);
 
-  // Wrist-mounted launcher, always visible and attached to the firing forearm.
-  ctx.save();
-  ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
-  ctx.rotate(launcherMount.angle * facing);
-  ctx.fillStyle = "#8B5A2B";
-  ctx.strokeStyle = "#2a2a2a";
-  ctx.lineWidth = Math.max(1, 1.4 * S);
-  ctx.beginPath();
-  ctx.rect(-9 * S, -5 * S, 18 * S, 10 * S);
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
+  // Wrist-mounted launcher, visible only while the active grapple is firing/zipping.
+  if (p.grappleLauncherVisible) {
+    ctx.save();
+    ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
+    ctx.rotate(launcherMount.angle * facing);
+    ctx.fillStyle = "#8B5A2B";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 1.4 * S);
+    ctx.beginPath();
+    ctx.rect(-9 * S, -5 * S, 18 * S, 10 * S);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Neck — short segment from shoulder up to where the head sits
   const neckTopY = relSY - neckLen;
