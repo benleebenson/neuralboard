@@ -5,7 +5,7 @@ import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import { ProGated } from "@/app/components/ProGated";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
-import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
+import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 
 type CharacterAction = {
   id: string;
-  type: "walkTo" | "jumpTo" | "flip" | "zipline" | "wallClimb" | "grapple"
+  type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
       | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "idle";
   startTime: number;
   duration: number;
@@ -82,6 +82,7 @@ type CharacterAction = {
   targetClipId?: string;  // AI-choreographed actions target a clip id instead of raw coords — resolved
                            // to boardX/Y lazily in resolveCharActions so a clip move never staleifies it.
                            // Explicit targetX/Y (set by manual placement) always takes precedence.
+  viaSurfaceId?: string;   // Reserved for future ridable drawn surfaces; accepted/stored, ignored at runtime for now.
   emoji?: string;
   startX?: number;        // explicit start-position override (entrance/exit flips start offscreen, not chained)
   startY?: number;
@@ -204,6 +205,7 @@ const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
 const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
+const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
 const HOLD_FRACTION = 0.6;
@@ -571,7 +573,7 @@ const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these change the character's resting board position
-const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple"]);
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
 const CHAR_OFFSCREEN_PAD = 900;
 const CHAR_ENTRANCE_Y_LIFT = 600;
 
@@ -771,8 +773,12 @@ function deriveAutoCharActions(
       const dist = Math.hypot(dx, dy);
       if (dist > 20 && travelEnd - travelStart > 0.1) {
         let moveType: CharacterAction["type"];
+        const horizontalDist = Math.abs(dx);
+        const mildHeightChange = Math.abs(dy) <= 300;
+        const skateCandidate = horizontalDist >= 800 && horizontalDist <= 2000 && mildHeightChange;
         if (dy > 300 && Math.abs(dx) > 150) moveType = "zipline";     // big drop — slide down a line
         else if (dy < -300 && dist < CHAR_JUMP_DIST * 1.3) moveType = "wallClimb"; // big climb, short reach
+        else if (skateCandidate && seededRandom(clip.id + ":skateTo") < 0.5) moveType = "skateTo";
         else if (dist < CHAR_WALK_DIST) moveType = "walkTo";
         else if (dist < CHAR_JUMP_DIST) moveType = "jumpTo";
         else moveType = "grapple";
@@ -872,6 +878,7 @@ type CharPoseResult = {
   grappleTaut?: boolean;
   grappleImpact?: number;
   grappleLauncherVisible?: boolean;
+  skateboardVisible?: boolean;
 };
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
@@ -889,6 +896,22 @@ const FALLBACK_FORWARD_TUCK_FLIP: AuthoredAnimation = {
   id: "fallback_forward_tuck_flip",
   name: "flip",
   keyframes: FORWARD_TUCK_FLIP_KEYFRAMES,
+  loop: false,
+  createdAt: "fallback",
+};
+
+const FALLBACK_SKATE_PEDAL: AuthoredAnimation = {
+  id: "fallback_skate_pedal",
+  name: "skate-pedal",
+  keyframes: SKATE_PEDAL_KEYFRAMES,
+  loop: true,
+  createdAt: "fallback",
+};
+
+const FALLBACK_SKATE_OLLY: AuthoredAnimation = {
+  id: "fallback_skate_olly",
+  name: "skate-olly",
+  keyframes: SKATE_OLLY_KEYFRAMES,
   loop: false,
   createdAt: "fallback",
 };
@@ -1051,6 +1074,65 @@ function evalCharAtTime(
       leftLegA, rightLegA, leftArmA, rightArmA, leftForeA, rightForeA,
       airY,
     }, authoredPose);
+  }
+
+  if (active.type === "skateTo") {
+    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const landingY = resolveGroundY(tx, ty, clips);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const dist = Math.hypot(tx - active.fromX, landingY - active.fromY);
+    const cycles = Math.max(1, dist / 450);
+    const preOllyX = tx - facing * Math.min(220, Math.max(120, Math.abs(tx - active.fromX) * 0.22));
+    const preOllyY = resolveGroundY(preOllyX, lerp(active.fromY, landingY, 0.65) + 80, clips);
+
+    let bx = active.fromX;
+    let by = resolveGroundY(active.fromX, active.fromY + 80, clips);
+    let airY = 0;
+    let pose: Pose | null = null;
+    let skateboardVisible = progress < 0.95;
+
+    if (progress < 0.1) {
+      const t = progress / 0.1;
+      bx = lerp(active.fromX, active.fromX + (preOllyX - active.fromX) * 0.08, easeOutQuad(t));
+      by = resolveGroundY(bx, active.fromY + 80, clips);
+      pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * 0.22);
+    } else if (progress < 0.55) {
+      const t = (progress - 0.1) / 0.45;
+      bx = lerp(active.fromX, preOllyX, t);
+      const desiredY = lerp(resolveGroundY(active.fromX, active.fromY + 80, clips), preOllyY, easeInOutCubic(t));
+      const groundY = resolveGroundY(bx, desiredY + 80, clips);
+      by = lerp(desiredY, groundY, 0.35);
+      pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * cycles);
+    } else if (progress < 0.65) {
+      const t = (progress - 0.55) / 0.1;
+      bx = preOllyX;
+      by = preOllyY;
+      pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0, 0.18, t));
+    } else if (progress < 0.9) {
+      const t = (progress - 0.65) / 0.25;
+      bx = lerp(preOllyX, tx, easeOutQuad(t));
+      by = lerp(preOllyY, landingY, t);
+      airY = -150 * 4 * t * (1 - t);
+      pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.18, 0.9, t));
+    } else {
+      const t = (progress - 0.9) / 0.1;
+      bx = tx;
+      by = landingY;
+      skateboardVisible = t < 0.55;
+      pose = t < 0.55
+        ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.9, 1, t / 0.55))
+        : sampleAnimation(authoredAnimations.idle, 0) ?? null;
+    }
+
+    return applyAuthoredPose({
+      boardX: bx, boardY: by, facing,
+      headBob: 0, bodyLean: 0,
+      leftLegA: 0.12, rightLegA: -0.12,
+      leftArmA: 0.08, rightArmA: -0.08,
+      leftForeA: 0.13, rightForeA: -0.13,
+      airY,
+      skateboardVisible,
+    }, pose, { addAirborne: false });
   }
 
   if (active.type === "grapple") {
@@ -2751,25 +2833,31 @@ export default function Board2Page() {
 
   // ─ Media upload ───────────────────────────────────────────────────────────
 
+  // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
+  // in the media library, and places it on the board via addClipAndPlaceOnBoard.
+  async function ingestMediaFile(file: File | Blob, name: string) {
+    const url = URL.createObjectURL(file);
+    const type: "image" | "video" = file.type.startsWith("video") ? "video" : "image";
+    loadMedia(url, type);
+    let duration: number | undefined;
+    if (type === "video") {
+      const meta = await getVideoMeta(url);
+      duration = meta.duration;
+      if (meta.w > 0 && !videoDimsRef.current.has(url)) {
+        const scale = Math.min(1, 800 / meta.w, 600 / meta.h);
+        videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
+      }
+    }
+    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: type === "video" ? file : undefined };
+    setMediaLibrary((prev) => [...prev, item]);
+    await addClipAndPlaceOnBoard(item);
+  }
+
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
     for (const file of files) {
-      const url = URL.createObjectURL(file);
-      const type: "image" | "video" = file.type.startsWith("video") ? "video" : "image";
-      loadMedia(url, type);
-      let duration: number | undefined;
-      if (type === "video") {
-        const meta = await getVideoMeta(url);
-        duration = meta.duration;
-        if (meta.w > 0 && !videoDimsRef.current.has(url)) {
-          const scale = Math.min(1, 800 / meta.w, 600 / meta.h);
-          videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
-        }
-      }
-      const item: MediaItem = { id: generateId(), name: file.name, type, url, duration, blob: type === "video" ? file : undefined };
-      setMediaLibrary((prev) => [...prev, item]);
-      await addClipAndPlaceOnBoard(item);
+      await ingestMediaFile(file, file.name);
     }
   }
 
@@ -5221,6 +5309,44 @@ export default function Board2Page() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
+  });
+
+  // ─ Clipboard image paste ──────────────────────────────────────────────────
+  // Separate from the Step 16.4 clip clipboard above (clipboardRef + the keydown KeyV handler,
+  // which pastes internally-copied clips). This listens for the native "paste" event and only
+  // acts when the OS clipboard actually contains image data — anything else (text paste in an
+  // input, the clip clipboard's own Cmd+V) falls through untouched since we never call
+  // preventDefault unless an image item is found.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable;
+      if (inInput) return;
+      const anyModalOpen = ytModalOpen || neuralModalOpen || top5ModalOpen || saveModalOpen ||
+        aiModalOpen || directCharacterOpen || !!imagePreviewTarget;
+      if (anyModalOpen) return;
+      const items = Array.from(e.clipboardData?.items ?? []);
+      const imageItems = items.filter((item) => item.type.startsWith("image/"));
+      if (imageItems.length === 0) return;
+      e.preventDefault();
+      (async () => {
+        let pastedCount = 0;
+        for (const item of imageItems) {
+          const blob = item.getAsFile();
+          if (!blob) continue;
+          if (blob.size > MAX_PASTED_IMAGE_BYTES) {
+            setToast("Image too large to paste (max 15MB)");
+            continue;
+          }
+          const ext = item.type.split("/")[1] || "png";
+          await ingestMediaFile(blob, `Pasted image ${Date.now()}.${ext}`);
+          pastedCount++;
+        }
+        if (pastedCount > 0) setToast("Image pasted");
+      })();
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
   });
 
   // ─ Context menu dismiss ───────────────────────────────────────────────────
