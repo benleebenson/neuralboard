@@ -129,6 +129,88 @@ function pose(patch: Partial<Pose>): Pose {
   return normalizePose(patch);
 }
 
+export const FORWARD_TUCK_FLIP_KEYFRAMES: PoseKeyframe[] = [
+  {
+    t: 0,
+    pose: pose({
+      leftLegA: -0.62, rightLegA: -0.54,
+      leftArmA: 0.7, rightArmA: 0.7,
+      leftForeA: 1.0, rightForeA: 0.95,
+      bodyLean: -0.2,
+      poseRotation: 0,
+      airborneY: 0,
+    }),
+  },
+  {
+    t: 0.15,
+    pose: pose({
+      leftLegA: -0.08, rightLegA: 0.02,
+      leftArmA: -2.6, rightArmA: -2.45,
+      leftForeA: -0.05, rightForeA: -0.08,
+      bodyLean: -0.08,
+      poseRotation: 0.15 * Math.PI * 2,
+      airborneY: -22,
+    }),
+  },
+  {
+    t: 0.35,
+    pose: pose({
+      leftLegA: -2.05, rightLegA: -1.88,
+      leftArmA: -1.8, rightArmA: -1.65,
+      leftForeA: 2.2, rightForeA: 2.05,
+      bodyLean: -0.12,
+      headBob: -3,
+      poseRotation: 0.35 * Math.PI * 2,
+      airborneY: -110,
+    }),
+  },
+  {
+    t: 0.5,
+    pose: pose({
+      leftLegA: -2.18, rightLegA: -2.0,
+      leftArmA: -1.95, rightArmA: -1.78,
+      leftForeA: 2.35, rightForeA: 2.2,
+      bodyLean: -0.18,
+      headBob: -5,
+      poseRotation: Math.PI,
+      airborneY: -170,
+    }),
+  },
+  {
+    t: 0.7,
+    pose: pose({
+      leftLegA: -1.05, rightLegA: -0.9,
+      leftArmA: -1.0, rightArmA: 1.0,
+      leftForeA: 0.9, rightForeA: 0.82,
+      bodyLean: -0.06,
+      poseRotation: 0.75 * Math.PI * 2,
+      airborneY: -115,
+    }),
+  },
+  {
+    t: 0.88,
+    pose: pose({
+      leftLegA: -0.22, rightLegA: -0.08,
+      leftArmA: -0.9, rightArmA: 0.9,
+      leftForeA: 0.18, rightForeA: 0.12,
+      bodyLean: -0.04,
+      poseRotation: 0.97 * Math.PI * 2,
+      airborneY: -35,
+    }),
+  },
+  {
+    t: 1,
+    pose: pose({
+      leftLegA: -0.52, rightLegA: -0.44,
+      leftArmA: 0.35, rightArmA: 0.3,
+      leftForeA: 1.15, rightForeA: 1.05,
+      bodyLean: -0.12,
+      poseRotation: Math.PI * 2,
+      airborneY: 0,
+    }),
+  },
+];
+
 export function starterAnimations(now = new Date().toISOString()): AuthoredAnimation[] {
   return [
     {
@@ -154,6 +236,13 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
         { t: 0.7, pose: pose({ leftLegA: -0.55, rightLegA: -0.45, leftArmA: -0.5, rightArmA: -0.5, leftForeA: -0.3, rightForeA: -0.3, airborneY: -150 }) },
         { t: 1, pose: pose({ leftLegA: 0.25, rightLegA: 0.15, leftArmA: 0.4, rightArmA: -0.4 }) },
       ],
+    },
+    {
+      id: "starter_flip",
+      name: "flip",
+      loop: false,
+      createdAt: now,
+      keyframes: FORWARD_TUCK_FLIP_KEYFRAMES,
     },
     {
       id: "starter_idle",

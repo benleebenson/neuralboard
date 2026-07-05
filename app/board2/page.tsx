@@ -5,7 +5,7 @@ import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import { ProGated } from "@/app/components/ProGated";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
-import { AuthoredAnimation, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
+import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -868,20 +868,28 @@ const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = 
   idle: "idle",
 };
 
-function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addSpin?: boolean } = {}): CharPoseResult {
+const FALLBACK_FORWARD_TUCK_FLIP: AuthoredAnimation = {
+  id: "fallback_forward_tuck_flip",
+  name: "flip",
+  keyframes: FORWARD_TUCK_FLIP_KEYFRAMES,
+  loop: false,
+  createdAt: "fallback",
+};
+
+function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addSpin?: boolean; addAirborne?: boolean } = {}): CharPoseResult {
   if (!pose) return base;
   return {
     ...base,
     headBob: pose.headBob,
     bodyLean: pose.bodyLean,
-    spinAngle: (base.spinAngle ?? 0) + (opts.addSpin ? pose.poseRotation : 0),
+    spinAngle: (base.spinAngle ?? 0) + (opts.addSpin ? pose.poseRotation * base.facing : 0),
     leftLegA: pose.leftLegA,
     rightLegA: pose.rightLegA,
     leftArmA: pose.leftArmA,
     rightArmA: pose.rightArmA,
     leftForeA: pose.leftForeA,
     rightForeA: pose.rightForeA,
-    airY: base.airY + pose.airborneY,
+    airY: base.airY + (opts.addAirborne === false ? 0 : pose.airborneY),
   };
 }
 
@@ -1071,62 +1079,23 @@ function evalCharAtTime(
   }
 
   if (active.type === "flip") {
-    // Entrance/exit — a full airborne rotation while flying to/from offscreen.
-    // Three phases: crouch takeoff (no rotation), airborne arc with an eased 0→2π whole-body
-    // spin held in a fixed tuck, then a landing recovery with rotation already resolved to 0.
-    // The spin itself is applied as `spinAngle` (rotated around the torso center in the draw
-    // step below) — NOT via bodyLean, which only ever rotates the upper body around the hip and
-    // reads as a cartwheel-smear when used for a full flip.
+    // Forward tuck flip: position stays on the coded parabolic path, while pose + whole-body
+    // rotation sample the same keyframes used by Pose Lab's starter "flip" animation. Rotation
+    // is intentionally piecewise: slow prep/takeoff, fastest through the tight tuck, then eased
+    // open into a flat 2π landing. The draw step rotates around mid-torso, not the feet.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const bx = lerp(active.fromX, tx, progress);
     const by = lerp(active.fromY, ty, progress);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const airY = -180 * 4 * progress * (1 - progress);
-
-    const TUCK_LEG = 1.2, TUCK_ARM = 0.9;
-    let spinAngle = 0;
-    let leftLegA: number, rightLegA: number, leftArmA: number, rightArmA: number;
-
-    if (progress < 0.15) {
-      // Takeoff: crouch, arms swing back — no rotation yet
-      const t = progress / 0.15;
-      leftLegA  = lerp(0, 0.5, t);
-      rightLegA = lerp(0, -0.5, t);
-      leftArmA  = lerp(0.15, -0.6, t);
-      rightArmA = lerp(-0.15, -0.6, t);
-    } else if (progress < 0.8) {
-      // Airborne: eased 0→2π rotation across THIS window only; limbs hold a fixed tuck throughout
-      const t = (progress - 0.15) / 0.65;
-      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      spinAngle = eased * Math.PI * 2 * facing;
-      leftLegA = TUCK_LEG; rightLegA = -TUCK_LEG;
-      leftArmA = TUCK_ARM; rightArmA = -TUCK_ARM;
-    } else {
-      // Landing: rotation already at 2π ≡ 0 (set to 0 outright — no visible tilt) before feet
-      // touch; legs extend to meet the ground, crouch-absorb impact, then recover to standing.
-      const t = (progress - 0.8) / 0.2;
-      spinAngle = 0;
-      if (t < 0.5) {
-        const lt = t / 0.5;
-        leftLegA  = lerp(TUCK_LEG, 0.45, lt);
-        rightLegA = lerp(-TUCK_LEG, -0.35, lt);
-        leftArmA  = lerp(TUCK_ARM, 0.35, lt);
-        rightArmA = lerp(-TUCK_ARM, -0.3, lt);
-      } else {
-        const lt = (t - 0.5) / 0.5;
-        leftLegA  = lerp(0.45, 0.12, lt);
-        rightLegA = lerp(-0.35, -0.12, lt);
-        leftArmA  = lerp(0.35, 0.08, lt);
-        rightArmA = lerp(-0.3, -0.08, lt);
-      }
-    }
+    const flipPose = authoredPose ?? sampleAnimation(FALLBACK_FORWARD_TUCK_FLIP, progress);
 
     return applyAuthoredPose({
       boardX: bx, boardY: by, facing,
-      headBob: 0, bodyLean: 0, spinAngle,
-      leftLegA, rightLegA, leftArmA, rightArmA, leftForeA: 0, rightForeA: 0,
+      headBob: 0, bodyLean: 0, spinAngle: 0,
+      leftLegA: 0, rightLegA: 0, leftArmA: 0, rightArmA: 0, leftForeA: 0, rightForeA: 0,
       airY,
-    }, authoredPose, { addSpin: true });
+    }, flipPose, { addSpin: true, addAirborne: false });
   }
 
   if (active.type === "zipline") {
