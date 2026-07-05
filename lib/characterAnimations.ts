@@ -33,6 +33,7 @@ export const RESERVED_ANIMATION_NAMES = [
   "explain",
   "sit",
   "climb",
+  "grapple-zip",
   "zipline-hang",
   "grapple-swing",
 ] as const;
@@ -211,6 +212,88 @@ export const FORWARD_TUCK_FLIP_KEYFRAMES: PoseKeyframe[] = [
   },
 ];
 
+export const GRAPPLE_ZIP_KEYFRAMES: PoseKeyframe[] = [
+  {
+    t: 0,
+    pose: pose({
+      leftLegA: 0.12, rightLegA: -0.12,
+      leftArmA: 0.55, rightArmA: 0.55,
+      leftForeA: 0.25, rightForeA: 0.25,
+      bodyLean: 0.08,
+    }),
+  },
+  {
+    t: 0.12,
+    pose: pose({
+      leftLegA: 0.1, rightLegA: -0.12,
+      leftArmA: -1.05, rightArmA: -1.05,
+      leftForeA: -0.15, rightForeA: -0.15,
+      bodyLean: -0.08,
+      headBob: -1,
+    }),
+  },
+  {
+    t: 0.3,
+    pose: pose({
+      leftLegA: -0.05, rightLegA: 0.04,
+      leftArmA: -1.15, rightArmA: -1.15,
+      leftForeA: -0.12, rightForeA: -0.12,
+      bodyLean: -0.16,
+      headBob: -2,
+    }),
+  },
+  {
+    t: 0.45,
+    pose: pose({
+      leftLegA: 0.62, rightLegA: 0.46,
+      leftArmA: -1.35, rightArmA: -1.35,
+      leftForeA: 0.35, rightForeA: 0.3,
+      bodyLean: -0.92,
+      airborneY: -18,
+    }),
+  },
+  {
+    t: 0.7,
+    pose: pose({
+      leftLegA: -0.4, rightLegA: 0.72,
+      leftArmA: -1.15, rightArmA: -1.15,
+      leftForeA: 0.55, rightForeA: 0.48,
+      bodyLean: -0.45,
+      airborneY: -12,
+    }),
+  },
+  {
+    t: 0.85,
+    pose: pose({
+      leftLegA: -0.85, rightLegA: -0.55,
+      leftArmA: -0.8, rightArmA: 0.7,
+      leftForeA: 0.9, rightForeA: 0.85,
+      bodyLean: -0.22,
+      airborneY: -4,
+    }),
+  },
+  {
+    t: 0.93,
+    pose: pose({
+      leftLegA: -1.0, rightLegA: -0.9,
+      leftArmA: -0.25, rightArmA: 0.9,
+      leftForeA: 1.15, rightForeA: 1.1,
+      bodyLean: -0.42,
+      airborneY: 0,
+    }),
+  },
+  {
+    t: 1,
+    pose: pose({
+      leftLegA: 0.12, rightLegA: -0.12,
+      leftArmA: 0.08, rightArmA: -0.08,
+      leftForeA: 0.13, rightForeA: -0.13,
+      bodyLean: 0,
+      airborneY: 0,
+    }),
+  },
+];
+
 export function starterAnimations(now = new Date().toISOString()): AuthoredAnimation[] {
   return [
     {
@@ -243,6 +326,20 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
       loop: false,
       createdAt: now,
       keyframes: FORWARD_TUCK_FLIP_KEYFRAMES,
+    },
+    {
+      id: "starter_grapple_zip",
+      name: "grapple-zip",
+      loop: false,
+      createdAt: now,
+      keyframes: GRAPPLE_ZIP_KEYFRAMES,
+    },
+    {
+      id: "starter_grapple_swing_compat",
+      name: "grapple-swing",
+      loop: false,
+      createdAt: now,
+      keyframes: GRAPPLE_ZIP_KEYFRAMES,
     },
     {
       id: "starter_idle",

@@ -564,6 +564,8 @@ const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these change the character's resting board position
 const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "flip", "zipline", "wallClimb", "grapple"]);
+const CHAR_OFFSCREEN_PAD = 900;
+const CHAR_ENTRANCE_Y_LIFT = 250;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -694,7 +696,8 @@ function mergeCharActions(derived: CharacterAction[], manual: CharacterAction[])
 function deriveAutoCharActions(
   clips: Clip[],
   initX: number,
-  initY: number
+  initY: number,
+  cameraKeyframes: CameraKeyframe[] = []
 ): CharacterAction[] {
   const focusClips = clips
     .filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined))
@@ -705,8 +708,6 @@ function deriveAutoCharActions(
   let curX = initX, curY = initY;
   let prev: Clip | null = null;
   let hasEntered = false;
-  const OFFSCREEN_PAD = 900; // heuristic — this pure fn has no canvas W/H, so "offscreen" is a generous fixed offset
-
   for (const clip of focusClips) {
     const hf = clip.holdFraction ?? HOLD_FRACTION;
     const holdStart = clip.startTime;
@@ -742,13 +743,18 @@ function deriveAutoCharActions(
 
     if (!hasEntered) {
       // Entrance: flip in from offscreen-left, landing exactly as the camera settles into the hold.
+      // Start off to the side and above the clip top so the entrance reads as a down-and-across
+      // side-entry flip, not a rise from below the board.
+      const startCam = cameraKeyframes.length > 0 ? interpolateCameraKeyframes(cameraKeyframes, travelStart) : null;
+      const visibleBoardW = startCam ? BOARD_W / Math.max(0.05, startCam.boardZoom) : CHAR_OFFSCREEN_PAD * 2;
+      const startX = startCam ? startCam.cameraX - visibleBoardW / 2 - CHAR_OFFSCREEN_PAD * 0.25 : arriveX - CHAR_OFFSCREEN_PAD;
       actions.push({
         id: `auto_${clip.id}_mv`,
         type: "flip",
         startTime: travelStart,
         duration: travelEnd - travelStart,
         targetX: arriveX, targetY: arriveY,
-        startX: arriveX - OFFSCREEN_PAD, startY: arriveY,
+        startX, startY: arriveY - CHAR_ENTRANCE_Y_LIFT,
         entranceFlip: true,
       });
       hasEntered = true;
@@ -829,7 +835,7 @@ function deriveAutoCharActions(
       type: "flip",
       startTime: lastTransEnd,
       duration: 1.0,
-      targetX: curX + OFFSCREEN_PAD * dir,
+      targetX: curX + CHAR_OFFSCREEN_PAD * dir,
       targetY: curY,
     });
   }
@@ -854,13 +860,15 @@ type CharPoseResult = {
   grappleAnchorBX?: number;
   grappleAnchorBY?: number;
   grappleRopeAlpha?: number;
+  grappleHookT?: number;
+  grappleTaut?: boolean;
+  grappleImpact?: number;
 };
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
   walkTo: "walk",
   jumpTo: "jump",
   flip: "flip",
-  grapple: "grapple-swing",
   zipline: "zipline-hang",
   wallClimb: "climb",
   sitAndWatch: "sit",
@@ -903,6 +911,19 @@ function authoredProgressForAction(active: ResolvedCharAction, progress: number)
     return progress * Math.max(1, dist / 220);
   }
   return progress;
+}
+
+function aimAngleFromPoint(
+  boardX: number,
+  boardY: number,
+  facing: 1 | -1,
+  targetX: number,
+  targetY: number
+): number {
+  const shoulderY = boardY - 129;
+  const dxLocal = (targetX - boardX) * facing;
+  const dy = targetY - shoulderY;
+  return -Math.atan2(dxLocal, dy);
 }
 
 function evalCharAtTime(
@@ -1029,53 +1050,125 @@ function evalCharAtTime(
     // Anchor point: above and between start+end, biased toward destination
     const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
     const anchorBY = Math.min(active.fromY, ty) - 380;
+    const landingY = resolveGroundY(tx, ty, clips);
+    const zipT = progress <= 0.32 ? 0 : progress >= 0.85 ? 1 : easeInOutCubic((progress - 0.32) / 0.53);
+    const sag = Math.sin(Math.PI * zipT) * 28;
+    let bx = active.fromX;
+    let by = active.fromY;
+    let bodyLean = 0;
+    let leftLegA = 0.12, rightLegA = -0.12;
+    let leftArmA = 0.08, rightArmA = -0.08;
+    let leftForeA = 0.13, rightForeA = -0.13;
+    let headBob = 0;
+    let ropeAlpha = 0;
+    let hookT: number | undefined;
+    let taut = false;
+    let impact = 0;
 
-    if (progress < 0.15) {
-      // Aim + fire: arms raise toward anchor, rope extends
-      const t = progress / 0.15;
-      return applyAuthoredPose({
-        boardX: active.fromX, boardY: active.fromY, facing,
-        headBob: 0, bodyLean: 0,
-        leftLegA: 0.1, rightLegA: -0.1,
-        leftArmA: lerp(0.15, -1.1, t), rightArmA: lerp(-0.15, -1.1, t),
-        leftForeA: lerp(0.2, -0.25, t), rightForeA: lerp(-0.2, -0.25, t),
-        airY: 0,
-        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
-        grappleRopeAlpha: t,
-      }, authoredPose);
+    const aimA = aimAngleFromPoint(bx, by, facing, anchorBX, anchorBY);
+    const setFiringArm = (angle: number, fore = angle) => {
+      if (facing >= 0) {
+        rightArmA = angle; rightForeA = fore;
+      } else {
+        leftArmA = angle; leftForeA = fore;
+      }
+    };
+    const setFreeArm = (angle: number, fore = angle * 0.5) => {
+      if (facing >= 0) {
+        leftArmA = angle; leftForeA = fore;
+      } else {
+        rightArmA = angle; rightForeA = fore;
+      }
+    };
+
+    if (progress < 0.08) {
+      const t = progress / 0.08;
+      bodyLean = lerp(0.03, 0.08, t) * facing;
+      setFiringArm(lerp(0.12, 0.62, t), lerp(0.12, 0.45, t));
+      setFreeArm(-0.12, -0.05);
+    } else if (progress < 0.15) {
+      const t = (progress - 0.08) / 0.07;
+      const recoil = Math.max(0, 1 - Math.abs(progress - 0.12) / 0.025) * 0.08;
+      bodyLean = -recoil * facing;
+      setFiringArm(lerp(0.62, aimA, t), lerp(0.45, aimA, t));
+      setFreeArm(lerp(-0.12, 0.45, t), lerp(-0.05, 0.15, t));
+      ropeAlpha = t;
+      hookT = 0.02 + t * 0.1;
+    } else if (progress < 0.28) {
+      const t = (progress - 0.15) / 0.13;
+      setFiringArm(aimA, aimA);
+      setFreeArm(0.35, 0.12);
+      bodyLean = -0.04 * facing;
+      ropeAlpha = 1;
+      hookT = t;
+    } else if (progress < 0.32) {
+      const t = (progress - 0.28) / 0.04;
+      setFiringArm(aimA, aimA);
+      setFreeArm(0.2, 0.06);
+      bodyLean = lerp(0, -0.22, t) * facing;
+      ropeAlpha = 1;
+      hookT = 1;
+      taut = true;
     } else if (progress < 0.85) {
-      // Swing: pendulum bezier arc from start to end dipping below anchor
-      const t = (progress - 0.15) / 0.7;
-      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      // Bezier control point sags downward mid-swing
-      const ctrlBX = (active.fromX + tx) / 2;
-      const ctrlBY = Math.max(active.fromY, ty) + 180;
-      const bx = (1-eased)*(1-eased)*active.fromX + 2*(1-eased)*eased*ctrlBX + eased*eased*tx;
-      const by = (1-eased)*(1-eased)*active.fromY + 2*(1-eased)*eased*ctrlBY + eased*eased*ty;
-      return applyAuthoredPose({
-        boardX: bx, boardY: by, facing,
-        headBob: -3, bodyLean: 0,
-        leftLegA: -0.45, rightLegA: -0.35,
-        leftArmA: -1.1, rightArmA: -1.1,
-        leftForeA: -0.25, rightForeA: -0.25,
-        airY: 0,
-        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
-        grappleRopeAlpha: 1,
-      }, authoredPose);
+      bx = lerp(active.fromX, tx, zipT);
+      by = lerp(active.fromY, landingY, zipT) + sag;
+      const movingAimA = aimAngleFromPoint(bx, by, facing, anchorBX, anchorBY);
+      setFiringArm(movingAimA, movingAimA);
+      ropeAlpha = 1;
+      hookT = 1;
+      taut = true;
+      if (progress < 0.45) {
+        const t = (progress - 0.32) / 0.13;
+        bodyLean = lerp(-0.9, -0.72, t) * facing;
+        leftLegA = lerp(0.5, 0.65, t); rightLegA = lerp(0.35, 0.52, t);
+        setFreeArm(0.75, 0.22);
+        headBob = -3;
+      } else if (progress < 0.7) {
+        const t = (progress - 0.45) / 0.25;
+        bodyLean = lerp(-0.72, -0.35, t) * facing;
+        leftLegA = lerp(0.65, -0.32, t); rightLegA = lerp(0.52, 0.75, t);
+        setFreeArm(lerp(0.75, 0.15, t), lerp(0.22, 0.1, t));
+        headBob = -2;
+      } else {
+        const t = (progress - 0.7) / 0.15;
+        bodyLean = lerp(-0.35, -0.12, t) * facing;
+        leftLegA = lerp(-0.32, -0.72, t); rightLegA = lerp(0.75, -0.45, t);
+        setFreeArm(lerp(0.15, -0.55, t), lerp(0.1, -0.15, t));
+        headBob = -1;
+      }
+    } else if (progress < 0.95) {
+      const t = (progress - 0.85) / 0.1;
+      bx = tx;
+      by = landingY;
+      bodyLean = lerp(-0.34, -0.18, t) * facing;
+      leftLegA = lerp(-0.95, -0.65, t); rightLegA = lerp(-0.85, -0.55, t);
+      leftForeA = lerp(1.15, 0.8, t); rightForeA = lerp(1.05, 0.75, t);
+      setFiringArm(lerp(-0.4, 0.05, t), lerp(-0.1, 0.1, t));
+      setFreeArm(lerp(-0.9, -0.2, t), lerp(-0.4, -0.1, t));
+      impact = Math.max(0, 1 - t * 1.3);
     } else {
-      // Release + land
-      const t = (progress - 0.85) / 0.15;
-      return applyAuthoredPose({
-        boardX: tx, boardY: ty, facing,
-        headBob: 0, bodyLean: 0,
-        leftLegA: lerp(-0.45, 0.2, t), rightLegA: lerp(-0.35, 0.15, t),
-        leftArmA: lerp(-1.1, 0.3, t), rightArmA: lerp(-1.1, -0.3, t),
-        leftForeA: 0, rightForeA: 0,
-        airY: 0,
-        grappleAnchorBX: anchorBX, grappleAnchorBY: anchorBY,
-        grappleRopeAlpha: 1 - t,
-      }, authoredPose);
+      const t = (progress - 0.95) / 0.05;
+      bx = tx;
+      by = landingY;
+      bodyLean = lerp(-0.18, 0, t) * facing;
+      leftLegA = lerp(-0.65, 0.12, t); rightLegA = lerp(-0.55, -0.12, t);
+      leftForeA = lerp(0.8, 0.13, t); rightForeA = lerp(0.75, -0.13, t);
+      setFiringArm(lerp(0.05, -0.08, t), lerp(0.1, -0.13, t));
+      setFreeArm(lerp(-0.2, 0.08, t), lerp(-0.1, 0.13, t));
     }
+
+    return applyAuthoredPose({
+      boardX: bx, boardY: by, facing,
+      headBob, bodyLean,
+      leftLegA, rightLegA, leftArmA, rightArmA, leftForeA, rightForeA,
+      airY: 0,
+      grappleAnchorBX: anchorBX,
+      grappleAnchorBY: anchorBY,
+      grappleRopeAlpha: ropeAlpha,
+      grappleHookT: hookT,
+      grappleTaut: taut,
+      grappleImpact: impact,
+    }, null);
   }
 
   if (active.type === "flip") {
@@ -1084,10 +1177,12 @@ function evalCharAtTime(
     // is intentionally piecewise: slow prep/takeoff, fastest through the tight tuck, then eased
     // open into a flat 2π landing. The draw step rotates around mid-torso, not the feet.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
+    const landingY = resolveGroundY(tx, ty, clips);
     const bx = lerp(active.fromX, tx, progress);
-    const by = lerp(active.fromY, ty, progress);
+    const rawBy = lerp(active.fromY, landingY, progress);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const airY = -180 * 4 * progress * (1 - progress);
+    const by = progress >= 0.985 ? landingY : rawBy;
     const flipPose = authoredPose ?? sampleAnimation(FALLBACK_FORWARD_TUCK_FLIP, progress);
 
     return applyAuthoredPose({
@@ -1254,40 +1349,69 @@ function drawCharacterToCanvas(
   const headR = HEAD_R_RAW * S;
   const bobS = p.headBob * S;
   const hipY = -HIP_RAW * S + bobS * 0.25;
-  const ropeHand = (() => {
+  const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number } => {
     const relSY = -torsoLen;
-    const sOff = facing >= 0 ? 7 * S : -7 * S;
-    const armA = facing >= 0 ? p.rightArmA : p.leftArmA;
-    const foreA = facing >= 0 ? p.rightForeA : p.leftForeA;
+    const useRight = preferFiring ? facing >= 0 : facing < 0;
+    const sOff = useRight ? 7 * S : -7 * S;
+    const armA = useRight ? p.rightArmA : p.leftArmA;
+    const foreA = useRight ? p.rightForeA : p.leftForeA;
     const shoulderLocalX = sOff;
     const shoulderLocalY = hipY + relSY;
     const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
     const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
-    const handLocalX = elbowLocalX - Math.sin(foreA) * armLen;
-    const handLocalY = elbowLocalY + Math.cos(foreA) * armLen;
+    const mountLocalX = elbowLocalX - Math.sin(foreA) * armLen * 0.86;
+    const mountLocalY = elbowLocalY + Math.cos(foreA) * armLen * 0.86;
+    const relX = mountLocalX;
+    const relY = mountLocalY - hipY;
+    const leanCos = Math.cos(p.bodyLean);
+    const leanSin = Math.sin(p.bodyLean);
+    const leanedX = relX * leanCos - relY * leanSin;
+    const leanedY = relX * leanSin + relY * leanCos;
+    const angle = Math.atan2(
+      -Math.sin(foreA) * facing,
+      Math.cos(foreA)
+    );
     return {
-      x: sx + handLocalX * facing,
-      y: sy + p.airY * S + handLocalY,
+      x: sx + leanedX * facing,
+      y: sy + p.airY * S + hipY + leanedY,
+      angle,
+      localX: mountLocalX,
+      localY: mountLocalY,
     };
-  })();
+  };
+  const launcherMount = getForearmMount(true);
 
   // ── Grapple / zipline rope (drawn before character transform so coords are screen-space) ──
   if (p.grappleAnchorBX !== undefined && p.grappleRopeAlpha && p.grappleRopeAlpha > 0) {
     const anchorSX = (p.grappleAnchorBX - cam.cameraX) * sf + W / 2;
     const anchorSY = (p.grappleAnchorBY! - cam.cameraY) * sf + H / 2;
-    const ctrlSX = (ropeHand.x + anchorSX) / 2;
-    const ctrlSY = Math.min(ropeHand.y, anchorSY) - 20 * S;
+    const endT = p.grappleHookT === undefined || p.grappleTaut ? 1 : clamp(p.grappleHookT, 0, 1);
+    const endSX = lerp(launcherMount.x, anchorSX, endT);
+    const endSY = lerp(launcherMount.y, anchorSY, endT);
+    const sag = p.grappleTaut ? 0 : Math.sin(Math.PI * endT) * 12 * S;
+    const ctrlSX = (launcherMount.x + endSX) / 2;
+    const ctrlSY = (launcherMount.y + endSY) / 2 + sag;
     ctx.save();
     ctx.globalAlpha = p.grappleRopeAlpha;
     ctx.strokeStyle = "#5a3a1a";
     ctx.lineWidth = Math.max(1, 1.8 * S);
     ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.moveTo(ropeHand.x, ropeHand.y);
-    ctx.quadraticCurveTo(ctrlSX, ctrlSY, anchorSX, anchorSY);
+    ctx.moveTo(launcherMount.x, launcherMount.y);
+    ctx.quadraticCurveTo(ctrlSX, ctrlSY, endSX, endSY);
     ctx.stroke();
-    // Anchor spike
+    // Hook / anchor claw
     ctx.fillStyle = "#5a3a1a";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 1.3 * S);
+    ctx.beginPath();
+    ctx.moveTo(endSX, endSY);
+    ctx.lineTo(endSX - 7 * S, endSY + 5 * S);
+    ctx.moveTo(endSX, endSY);
+    ctx.lineTo(endSX + 7 * S, endSY + 5 * S);
+    ctx.moveTo(endSX, endSY);
+    ctx.lineTo(endSX, endSY - 8 * S);
+    ctx.stroke();
     ctx.beginPath();
     ctx.arc(anchorSX, anchorSY, 3 * S, 0, Math.PI * 2);
     ctx.fill();
@@ -1371,6 +1495,19 @@ function drawCharacterToCanvas(
   drawArm(-7 * S, lArmA, lForeA);
   drawArm(7 * S, rArmA, rForeA);
 
+  // Wrist-mounted launcher, always visible and attached to the firing forearm.
+  ctx.save();
+  ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
+  ctx.rotate(launcherMount.angle * facing);
+  ctx.fillStyle = "#8B5A2B";
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = Math.max(1, 1.4 * S);
+  ctx.beginPath();
+  ctx.rect(-9 * S, -5 * S, 18 * S, 10 * S);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+
   // Neck — short segment from shoulder up to where the head sits
   const neckTopY = relSY - neckLen;
   ctx.beginPath(); ctx.moveTo(0, relSY); ctx.lineTo(0, neckTopY); ctx.stroke();
@@ -1392,6 +1529,21 @@ function drawCharacterToCanvas(
   }
 
   ctx.restore(); // un-lean (torso/neck/head/arms)
+
+  if (p.grappleImpact && p.grappleImpact > 0) {
+    ctx.save();
+    ctx.globalAlpha = p.grappleImpact;
+    ctx.strokeStyle = "#8B5A2B";
+    ctx.lineWidth = Math.max(1, 1.5 * S);
+    for (const x of [-12, 0, 12]) {
+      ctx.beginPath();
+      ctx.moveTo(x * S, 2 * S);
+      ctx.lineTo((x + Math.sign(x || 1) * 6) * S, 14 * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   ctx.restore(); // top-level
 }
 
@@ -1674,10 +1826,10 @@ export default function Board2Page() {
   const charInit = useMemo(() => getCharInitPos(clips), [clips]);
   const resolvedCharActions = useMemo(() => {
     const merged = characterMode === "auto"
-      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y), characterActions)
+      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes), characterActions)
       : characterActions;
     return resolveCharActions(merged, charInit.x, charInit.y, clips);
-  }, [clips, characterActions, characterMode, charInit]);
+  }, [clips, characterActions, characterMode, charInit, cameraKeyframes]);
 
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
   // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
