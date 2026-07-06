@@ -212,7 +212,9 @@ const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
 const EXPORT_FPS = 60;
-const PREVIEW_H_PX = 135;
+const PREVIEW_DEFAULT_H_PX = 135;
+const PREVIEW_MIN_H_PX = 96;
+const PREVIEW_MAX_H_PX = 620;
 const CHARACTER_TRACK_H = 36;
 const CHARACTER_COLOR = "#cdeac0";
 
@@ -1955,6 +1957,7 @@ export default function Board2Page() {
   const [timelineScroll, setTimelineScroll] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [boardZoom, setBoardZoom] = useState(0.18);
@@ -2084,7 +2087,10 @@ export default function Board2Page() {
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
   const timelineDuration = Math.max(10, ...clips.map((c) => c.startTime + c.duration + 2));
   const timelineWidth = timelineDuration * pxPerSec;
-  const previewW = Math.round(PREVIEW_H_PX * canvasW / canvasH);
+  const previewAspect = canvasW / canvasH;
+  const previewW = Math.round(previewHeight * previewAspect);
+  const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
+  const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
@@ -4237,6 +4243,40 @@ export default function Board2Page() {
       .map((clip) => clip.id);
   }
 
+  function maxPreviewHeight(): number {
+    const boardRect = boardContainerRef.current?.getBoundingClientRect();
+    const maxByBoardH = boardRect ? boardRect.height - 42 : window.innerHeight * 0.72;
+    const maxByBoardW = boardRect ? (boardRect.width - 28) / previewAspect : window.innerWidth * 0.82 / previewAspect;
+    return Math.max(PREVIEW_MIN_H_PX, Math.min(PREVIEW_MAX_H_PX, maxByBoardH, maxByBoardW));
+  }
+
+  function clampPreviewHeight(next: number): number {
+    return Math.round(clamp(next, PREVIEW_MIN_H_PX, maxPreviewHeight()));
+  }
+
+  function handlePreviewResizePointerDown(e: React.PointerEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startH = previewHeight;
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "nesw-resize";
+    const onMove = (ev: PointerEvent) => {
+      const byHeight = startH + (ev.clientY - startY);
+      const byWidth = startH - (ev.clientX - startX) / previewAspect;
+      setPreviewHeight(clampPreviewHeight(Math.max(byHeight, byWidth)));
+    };
+    const onUp = () => {
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   // ─ Board clip drag ────────────────────────────────────────────────────────
 
   function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
@@ -6269,7 +6309,7 @@ export default function Board2Page() {
               ref={canvasRef}
               width={canvasW}
               height={canvasH}
-              style={{ display: "block", width: Math.round(72 * canvasW / canvasH), height: 72, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
+              style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
             />
           </div>
 
@@ -7933,24 +7973,72 @@ export default function Board2Page() {
               )}
             </div>
 
-            {/* Preview overlay — small PiP, top-right */}
-            <div style={{ position: "absolute", top: 8, right: 8, zIndex: 20, pointerEvents: "none" }}>
-              <div style={{ fontSize: 8, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", marginBottom: 2, textAlign: "right", letterSpacing: 0.5 }}>
-                PREVIEW
+            {/* Preview overlay — resizable PiP, top-right */}
+            <div
+              style={{
+                position: "absolute",
+                top: 8,
+                right: 8,
+                zIndex: 20,
+                pointerEvents: "auto",
+                touchAction: "none",
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 3 }}>
+                <div style={{ fontSize: 8, fontFamily: "monospace", color: "rgba(42,42,42,0.58)", letterSpacing: 0.5 }}>
+                  PREVIEW
+                </div>
+                <div style={{ display: "flex", gap: 3 }}>
+                  <button
+                    type="button"
+                    title="Reset preview size"
+                    onClick={(e) => { e.stopPropagation(); setPreviewHeight(PREVIEW_DEFAULT_H_PX); }}
+                    style={{ ...miniButton, width: 36, height: 18, padding: 0, fontSize: 8, background: "rgba(255,253,245,0.9)" }}
+                  >
+                    Reset
+                  </button>
+                  <button
+                    type="button"
+                    title="Maximize preview inside the board area"
+                    onClick={(e) => { e.stopPropagation(); setPreviewHeight(maxPreviewHeight()); }}
+                    style={{ ...miniButton, width: 28, height: 18, padding: 0, fontSize: 8, background: "rgba(255,253,245,0.9)" }}
+                  >
+                    Max
+                  </button>
+                </div>
               </div>
-              <canvas
-                ref={canvasRef}
-                width={canvasW}
-                height={canvasH}
-                style={{
-                  display: "block",
-                  width: previewW,
-                  height: PREVIEW_H_PX,
-                  border: "1.5px solid #2a2a2a",
-                  boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
-                  background: "#111",
-                }}
-              />
+              <div style={{ position: "relative", width: previewW, height: previewHeight }}>
+                <canvas
+                  ref={canvasRef}
+                  width={canvasW}
+                  height={canvasH}
+                  style={{
+                    display: "block",
+                    width: previewW,
+                    height: previewHeight,
+                    border: "1.5px solid #2a2a2a",
+                    boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
+                    background: "#111",
+                  }}
+                />
+                <div
+                  title="Drag to resize preview"
+                  onPointerDown={handlePreviewResizePointerDown}
+                  style={{
+                    position: "absolute",
+                    left: -6,
+                    bottom: -6,
+                    width: 18,
+                    height: 18,
+                    border: "1.5px solid #2a2a2a",
+                    background: "#c8f135",
+                    cursor: "nesw-resize",
+                    boxShadow: "1px 1px 0 rgba(42,42,42,0.45)",
+                  }}
+                />
+              </div>
             </div>
           </div>
 
