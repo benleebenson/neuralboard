@@ -1548,6 +1548,46 @@ function drawCharacterToCanvas(
   drawLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
   drawLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
 
+  if (p.skateboardVisible) {
+    const footPoint = (thighA: number, shinA: number) => {
+      const kx = -Math.sin(thighA) * legLen;
+      const ky = hipY + Math.cos(thighA) * legLen;
+      return {
+        x: kx - Math.sin(shinA) * legLen,
+        y: ky + Math.cos(shinA) * legLen,
+      };
+    };
+    const leftFoot = footPoint(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
+    const rightFoot = footPoint(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
+    const deckCX = (leftFoot.x + rightFoot.x) / 2;
+    const deckCY = Math.max(leftFoot.y, rightFoot.y) + 7 * S;
+    const deckW = 70 * S;
+    const deckH = 8 * S;
+    const upturn = 5 * S;
+    ctx.save();
+    ctx.translate(deckCX, deckCY);
+    ctx.fillStyle = "#f5ecd8";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 2 * S);
+    ctx.beginPath();
+    ctx.moveTo(-deckW / 2, 0);
+    ctx.quadraticCurveTo(-deckW / 2 + 8 * S, -upturn, -deckW / 2 + 16 * S, 0);
+    ctx.lineTo(deckW / 2 - 16 * S, 0);
+    ctx.quadraticCurveTo(deckW / 2 - 8 * S, -upturn, deckW / 2, 0);
+    ctx.lineTo(deckW / 2 - 5 * S, deckH);
+    ctx.lineTo(-deckW / 2 + 5 * S, deckH);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#2a2a2a";
+    [-22 * S, 22 * S].forEach((wx) => {
+      ctx.beginPath();
+      ctx.arc(wx, deckH + 5 * S, 4 * S, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.restore();
+  }
+
   // Torso + neck + head all rotate together with bodyLean (e.g. the flip's full-rotation spin)
   ctx.save();
   ctx.translate(0, hipY);
@@ -1705,7 +1745,7 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
-  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
+  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
@@ -1884,7 +1924,7 @@ export default function Board2Page() {
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
-  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "pointAt" | "emote" | "grapple" | null>(null);
+  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
 
@@ -5060,7 +5100,7 @@ export default function Board2Page() {
     // Server already dropped unknown types / dangling clip refs and clamped times — this pass
     // turns the raw actions into real CharacterAction objects and re-validates targetClipId
     // against the CURRENT clip set (it could have changed while the request was in flight).
-    type RawAction = { type?: string; startTime?: number; duration?: number; targetClipId?: string; emoji?: string };
+    type RawAction = { type?: string; startTime?: number; duration?: number; targetClipId?: string; emoji?: string; viaSurfaceId?: string };
     const clipIds = new Set(timelineClips.map((c) => c.id));
     const rawActions: RawAction[] = Array.isArray(d2.actions) ? d2.actions : [];
     const cleaned: CharacterAction[] = rawActions
@@ -5080,6 +5120,7 @@ export default function Board2Page() {
           type: a.type as CharacterAction["type"],
           startTime, duration,
           ...(a.targetClipId ? { targetClipId: a.targetClipId } : {}),
+          ...(a.viaSurfaceId ? { viaSurfaceId: a.viaSurfaceId } : {}),
           ...(a.type === "emote" && a.emoji ? { emoji: a.emoji } : {}),
           aiGenerated: true,
         } as CharacterAction;
@@ -7458,12 +7499,13 @@ export default function Board2Page() {
                             </div>
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
                             {/* Action buttons — click to enter crosshair placement mode */}
-                            {([
-                              { mode: "walkTo" as const, label: "Walk", title: "Click board to walk to position (1.5s)" },
-                              { mode: "jumpTo" as const, label: "Jump", title: "Click board to jump to position (1.0s)" },
-                              { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.5s)" },
-                              { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
-                              { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
+                              {([
+                                { mode: "walkTo" as const, label: "Walk", title: "Click board to walk to position (1.5s)" },
+                                { mode: "jumpTo" as const, label: "Jump", title: "Click board to jump to position (1.0s)" },
+                                { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (2.5s)" },
+                                { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.5s)" },
+                                { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
+                                { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
                             ]).map(({ mode, label, title }) => (
                               <button
                                 key={mode}
@@ -7611,7 +7653,7 @@ export default function Board2Page() {
                     const rawBy = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
                     // Snap target to top of clip surface if clicked on an image/video
                     const snapped = snapToClipTop(rawBx, rawBy, clipsRef.current);
-                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, grapple: 1.5, pointAt: 2.0 };
+                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, skateTo: 2.5, grapple: 1.5, pointAt: 2.0 };
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
@@ -8075,7 +8117,7 @@ export default function Board2Page() {
                     const isAuto = characterMode === "auto" && !characterActions.find((m) => m.id === action.id);
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (

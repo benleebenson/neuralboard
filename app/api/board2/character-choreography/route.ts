@@ -21,15 +21,15 @@ type TimelineClip = {
 type CameraFocusEntry = { clipId: string; holdStart: number; holdEnd: number; transitionEnd: number };
 
 const VALID_TYPES = new Set([
-  "walkTo", "jumpTo", "flip", "grapple", "zipline", "wallClimb",
+  "walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb",
   "sitAndWatch", "pointAt", "emote", "explainGesture",
 ]);
-const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "flip", "grapple", "zipline", "wallClimb"]);
+const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb"]);
 
 const SYSTEM_PROMPT = `You choreograph a stick-figure explainer character in a video. The character stands on media clips placed on a board while a camera pans between them.
 
-VOCABULARY — output ONLY these action types: walkTo, jumpTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture.
-- walkTo, jumpTo, flip, grapple, zipline, wallClimb: travel moves. Each MUST include targetClipId — the clip the character moves to. Choose the move by distance/drama: walkTo for short hops, jumpTo for medium gaps, flip for a dramatic entrance/exit or big beat, grapple or zipline for long or dramatic traversals across the board, wallClimb only when the target clip sits well above the current position.
+VOCABULARY — output ONLY these action types: walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture.
+- walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb: travel moves. Each MUST include targetClipId — the clip the character moves to. Choose the move by distance/drama: walkTo for short hops, jumpTo for medium gaps, skateTo for medium horizontal travel with mild height changes where a skateboard roll plus olly feels playful, flip for a dramatic entrance/exit or big beat, grapple or zipline for long or dramatic traversals across the board, wallClimb only when the target clip sits well above the current position.
 - sitAndWatch: sit and watch a video clip play. targetClipId = that video clip.
 - pointAt: point at a clip to draw attention to it. targetClipId is REQUIRED.
 - explainGesture: talk with the hands while standing near a clip. targetClipId is optional — omit it to just continue gesturing wherever the character currently is.
@@ -37,6 +37,7 @@ VOCABULARY — output ONLY these action types: walkTo, jumpTo, flip, grapple, zi
 
 RULES:
 - Every action has startTime and duration in seconds, on the ABSOLUTE video timeline (not relative to any clip).
+- viaSurfaceId is an optional string reserved for future ridable drawn surfaces. You may include it only when explicitly requested, but it is currently ignored by runtime playback.
 - Respect the camera schedule given in cameraFocusOrder: during a clip's holdStart–holdEnd window the character should be on or near that clip. Travel actions belong in the TRANSITION window — after one clip's holdEnd and before the next clip's transitionEnd — never in the middle of a hold.
 - Stay within totalDurationSec. It's fine to leave a hold with no explicit action — the renderer fills gaps with idle/gesture poses automatically, so only add actions where they add something.
 - If direction text is provided, treat it as the primary source for WHICH moves happen and roughly when. Map it onto the real clip order — e.g. "flips in onto image 1" means the flip should target the first clip in cameraFocusOrder, "the video" means the nearest clip of type video, "the last image" means the last image-type clip. If the direction conflicts with the camera schedule, keep the user's intended move CHOICE but retime it to the nearest matching clip's actual hold/transition windows.
@@ -47,10 +48,11 @@ Return ONLY valid JSON, no markdown, no commentary, in this exact schema:
 {
   "actions": [
     {
-      "type": "walkTo" | "jumpTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture",
+      "type": "walkTo" | "jumpTo" | "skateTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture",
       "startTime": number,
       "duration": number,
       "targetClipId": "string (omit for emote)",
+      "viaSurfaceId": "string (optional, reserved for future ridable surfaces)",
       "emoji": "string (emote only)"
     }
   ]
@@ -170,7 +172,7 @@ Generate the timed action list for this character now.`;
     // Server-side sanity pass — clamp times/durations, drop unknown types and dangling clip
     // refs — before this ever reaches the client. The client does the fuller pass (overlap
     // truncation against existing manual actions, id generation) since it owns that state.
-    type ValidatedAction = { type: string; startTime: number; duration: number; targetClipId?: string; emoji?: string };
+    type ValidatedAction = { type: string; startTime: number; duration: number; targetClipId?: string; viaSurfaceId?: string; emoji?: string };
     const actions: ValidatedAction[] = rawActions
       .filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
       .map((a) => {
@@ -179,8 +181,9 @@ Generate the timed action list for this character now.`;
         const rawDuration = Number(a.duration) > 0 ? Number(a.duration) : 1.5;
         const duration = Math.max(0.1, Math.min(rawDuration, Math.max(0.1, totalDurationSec - startTime)));
         const targetClipId = typeof a.targetClipId === "string" ? a.targetClipId : undefined;
+        const viaSurfaceId = typeof a.viaSurfaceId === "string" ? a.viaSurfaceId : undefined;
         const emoji = typeof a.emoji === "string" ? a.emoji.slice(0, 8) : undefined;
-        return { type, startTime, duration, targetClipId, emoji };
+        return { type, startTime, duration, targetClipId, viaSurfaceId, emoji };
       })
       .filter((a) => {
         if (!VALID_TYPES.has(a.type)) return false;
