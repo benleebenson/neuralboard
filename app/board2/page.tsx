@@ -576,6 +576,17 @@ const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
 const CHAR_OFFSCREEN_PAD = 900;
 const CHAR_ENTRANCE_Y_LIFT = 600;
+const PHASE_TIME_SCALE = 1.2;
+const SKATE_ROLL_SPEED = 560; // board px/sec
+const SKATE_MOUNT_SEC = 0.3 * PHASE_TIME_SCALE;
+const SKATE_PREP_SEC = 0.25 * PHASE_TIME_SCALE;
+const SKATE_AIR_MIN_SEC = 0.5 * PHASE_TIME_SCALE;
+const SKATE_AIR_MAX_SEC = 0.8 * PHASE_TIME_SCALE;
+const SKATE_LAND_SEC = 0.4 * PHASE_TIME_SCALE;
+const SKATE_EDGE_MARGIN = 50;
+const SKATE_MIN_POP_HEIGHT = 120;
+const SKATE_CLEARANCE_HEIGHT = 90;
+const GRAPPLE_MANUAL_DURATION_SEC = 1.5 * PHASE_TIME_SCALE;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -728,25 +739,27 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
   const sourceCenterX = source.boardX + source.boardW / 2;
   const targetCenterX = target.boardX + target.boardW / 2;
   const facing: 1 | -1 = targetCenterX >= sourceCenterX ? 1 : -1;
-  const edgeMargin = 50;
-  const landingInset = 80;
   const edgeX = facing === 1
-    ? source.boardX + source.boardW - edgeMargin
-    : source.boardX + edgeMargin;
-  const nearTargetEdgeX = facing === 1 ? target.boardX : target.boardX + target.boardW;
-  const gapEndX = clampInsideClipX(target, nearTargetEdgeX + facing * landingInset, edgeMargin);
-  const finalX = clampInsideClipX(target, gapEndX + facing * 60, edgeMargin);
+    ? source.boardX + source.boardW - SKATE_EDGE_MARGIN
+    : source.boardX + SKATE_EDGE_MARGIN;
+  const targetHoldX = clampInsideClipX(target, tx, SKATE_EDGE_MARGIN);
+  const gapEndX = targetHoldX;
+  const finalX = targetHoldX;
   const startY = source.boardY;
   const landingY = target.boardY;
   const rollDistance = Math.abs(edgeX - active.fromX);
   const ollyDistance = Math.abs(gapEndX - edgeX);
   const heightDelta = landingY - startY;
-  const peakHeight = Math.max(180, Math.abs(heightDelta) + 120);
+  const peakHeight = Math.max(SKATE_MIN_POP_HEIGHT, Math.abs(heightDelta) + SKATE_CLEARANCE_HEIGHT);
 
-  const naturalMount = 0.3;
-  const naturalRoll = Math.max(0.05, rollDistance / 700);
-  const naturalAir = clamp(0.5 + (ollyDistance / 1400) * 0.3, 0.5, 0.8);
-  const naturalLand = 0.4;
+  const naturalMount = SKATE_MOUNT_SEC;
+  const naturalRoll = Math.max(0.05 * PHASE_TIME_SCALE, rollDistance / SKATE_ROLL_SPEED);
+  const naturalAir = clamp(
+    SKATE_AIR_MIN_SEC + (ollyDistance / 1400) * (SKATE_AIR_MAX_SEC - SKATE_AIR_MIN_SEC),
+    SKATE_AIR_MIN_SEC,
+    SKATE_AIR_MAX_SEC
+  );
+  const naturalLand = SKATE_LAND_SEC;
   const naturalTotal = naturalMount + naturalRoll + naturalAir + naturalLand;
   const duration = Math.max(0.12, active.duration);
 
@@ -773,7 +786,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
   const airStart = mountDur + rollDur;
   const airEnd = airStart + airDur;
   const prepDur = Math.min(
-    0.25,
+    SKATE_PREP_SEC,
     Math.max(0, rollDur),
     rollDistance > 0 ? (Math.min(150, rollDistance) / rollDistance) * rollDur : 0
   );
@@ -799,6 +812,18 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
     mountEnd,
     airStart,
     airEnd,
+  };
+}
+
+function resolvedActionRestPosition(
+  action: ResolvedCharAction,
+  clips: CharSurfaceClip[]
+): { x: number; y: number } {
+  const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips) : null;
+  if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
+  return {
+    x: action.targetX ?? action.fromX,
+    y: action.targetY ?? action.fromY,
   };
 }
 
@@ -840,13 +865,8 @@ function resolveCharActions(
     const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
     result.push(resolvedAction);
     if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
-      const skatePlan = a.type === "skateTo" ? buildSkateToPlan(resolvedAction, clips) : null;
-      if (skatePlan) {
-        x = skatePlan.finalX;
-        y = skatePlan.landingY;
-      } else {
-        x = targetX; y = targetY ?? y;
-      }
+      const rest = resolvedActionRestPosition(resolvedAction, clips);
+      x = rest.x; y = rest.y;
     }
     // pointAt/sitAndWatch/explainGesture/emote/idle don't change position
   }
@@ -1048,6 +1068,8 @@ type CharPoseResult = {
   grappleImpact?: number;
   grappleLauncherVisible?: boolean;
   skateboardVisible?: boolean;
+  skateFootMode?: "both-planted" | "left-push" | "air";
+  skateCrouch?: number;
 };
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
@@ -1099,6 +1121,17 @@ function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addS
     leftForeA: pose.leftForeA,
     rightForeA: pose.rightForeA,
     airY: base.airY + (opts.addAirborne === false ? 0 : pose.airborneY),
+  };
+}
+
+function relaxedSkateArms(pose: Pose | null): Pose | null {
+  if (!pose) return pose;
+  return {
+    ...pose,
+    leftArmA: clamp(pose.leftArmA, 0.04, 0.4),
+    rightArmA: clamp(pose.rightArmA, -0.4, -0.04),
+    leftForeA: clamp(pose.leftForeA, 0.02, 0.32),
+    rightForeA: clamp(pose.rightForeA, -0.32, -0.02),
   };
 }
 
@@ -1161,7 +1194,8 @@ function evalCharAtTime(
       if (end <= time && end > lastEnd) {
         lastEnd = end;
         if (CHAR_TRAVEL_TYPES.has(a.type) && a.targetX !== undefined) {
-          rx = a.targetX; ry = a.targetY ?? ry;
+          const rest = resolvedActionRestPosition(a, clips);
+          rx = rest.x; ry = rest.y;
         } else {
           rx = a.fromX; ry = a.fromY;
         }
@@ -1256,6 +1290,8 @@ function evalCharAtTime(
     let airY = 0;
     let pose: Pose | null = null;
     let skateboardVisible = true;
+    let skateFootMode: CharPoseResult["skateFootMode"] = "both-planted";
+    let skateCrouch = 6;
     const elapsed = progress * active.duration;
 
     if (elapsed < plan.mountEnd) {
@@ -1263,6 +1299,8 @@ function evalCharAtTime(
       bx = plan.startX;
       by = plan.startY;
       pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * 0.16);
+      skateFootMode = "both-planted";
+      skateCrouch = lerp(4, 8, t);
     } else if (elapsed < plan.airStart) {
       const rollElapsed = elapsed - plan.mountEnd;
       const rollT = plan.rollDur > 0 ? clamp(rollElapsed / plan.rollDur, 0, 1) : 1;
@@ -1272,11 +1310,16 @@ function evalCharAtTime(
       if (plan.prepDur > 0 && elapsed >= prepStart) {
         const prepT = clamp((elapsed - prepStart) / plan.prepDur, 0, 1);
         pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0, 0.18, prepT));
+        skateFootMode = "both-planted";
+        skateCrouch = lerp(8, 18, prepT);
       } else {
         const cycleProgress = plan.rollDistance > 0
           ? (Math.abs(bx - plan.startX) / 400)
           : rollT;
         pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, cycleProgress);
+        const cycle = ((cycleProgress % 1) + 1) % 1;
+        skateFootMode = cycle < 0.58 ? "left-push" : "both-planted";
+        skateCrouch = 7;
       }
     } else if (elapsed < plan.airEnd) {
       const t = plan.airDur > 0 ? clamp((elapsed - plan.airStart) / plan.airDur, 0, 1) : 1;
@@ -1284,16 +1327,20 @@ function evalCharAtTime(
       by = lerp(plan.launchY, plan.landingY, t);
       airY = -plan.peakHeight * 4 * t * (1 - t);
       pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.18, 0.84, t));
+      skateFootMode = "air";
+      skateCrouch = lerp(14, 8, Math.sin(Math.PI * t));
     } else {
       const t = plan.landDur > 0 ? clamp((elapsed - plan.airEnd) / plan.landDur, 0, 1) : 1;
-      const rollOutT = clamp(t / 0.65, 0, 1);
-      bx = lerp(plan.gapEndX, plan.finalX, easeOutQuad(rollOutT));
+      bx = plan.finalX;
       by = plan.landingY;
       skateboardVisible = t < 0.62;
       pose = t < 0.62
         ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.62))
         : sampleAnimation(authoredAnimations.idle, 0) ?? null;
+      skateFootMode = "both-planted";
+      skateCrouch = lerp(18, 6, t);
     }
+    pose = relaxedSkateArms(pose);
 
     return applyAuthoredPose({
       boardX: bx, boardY: by, facing: plan.facing,
@@ -1303,6 +1350,8 @@ function evalCharAtTime(
       leftForeA: 0.13, rightForeA: -0.13,
       airY,
       skateboardVisible,
+      skateFootMode,
+      skateCrouch,
     }, pose, { addAirborne: false });
   }
 
@@ -1615,15 +1664,15 @@ function drawCharacterToCanvas(
   const armLen = 32 * S;
   const headR = HEAD_R_RAW * S;
   const bobS = p.headBob * S;
-  const hipY = -HIP_RAW * S + bobS * 0.25;
+  const hipY = (-HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
   const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number } => {
-    const relSY = -torsoLen;
+    const shoulderY = -torsoLen * 0.85;
     const useRight = preferFiring ? facing >= 0 : facing < 0;
-    const sOff = useRight ? 7 * S : -7 * S;
+    const sOff = 0;
     const armA = useRight ? p.rightArmA : p.leftArmA;
     const foreA = useRight ? p.rightForeA : p.leftForeA;
     const shoulderLocalX = sOff;
-    const shoulderLocalY = hipY + relSY;
+    const shoulderLocalY = hipY + shoulderY;
     const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
     const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
     const mountLocalX = elbowLocalX - Math.sin(foreA) * armLen * 0.86;
@@ -1706,32 +1755,63 @@ function drawCharacterToCanvas(
   // Legs (two-segment: thigh + shin with independent shin angle). Local-x sign is negated so that
   // a POSITIVE angle always means "outward from body midline" for both legs — the un-negated form
   // (x = +sin(angle)) makes positive-left/negative-right cross at the ankles instead of spreading.
-  const drawLeg = (thighA: number, shinA: number) => {
+  type LocalPoint = { x: number; y: number };
+  const angledLeg = (thighA: number, shinA: number): { knee: LocalPoint; foot: LocalPoint } => {
     const kx = -Math.sin(thighA) * legLen;
     const ky = hipY + Math.cos(thighA) * legLen;
+    return {
+      knee: { x: kx, y: ky },
+      foot: { x: kx - Math.sin(shinA) * legLen, y: ky + Math.cos(shinA) * legLen },
+    };
+  };
+  const plantedLeg = (side: -1 | 1, footX: number, footY: number): { knee: LocalPoint; foot: LocalPoint } => {
+    const hip: LocalPoint = { x: 0, y: hipY };
+    const dx = footX - hip.x;
+    const dy = footY - hip.y;
+    const maxReach = legLen * 2 - 0.001;
+    const d = clamp(Math.hypot(dx, dy), 0.001, maxReach);
+    const ux = dx / Math.max(0.001, Math.hypot(dx, dy));
+    const uy = dy / Math.max(0.001, Math.hypot(dx, dy));
+    const reachableFoot = {
+      x: hip.x + ux * d,
+      y: hip.y + uy * d,
+    };
+    const mid = { x: (hip.x + reachableFoot.x) / 2, y: (hip.y + reachableFoot.y) / 2 };
+    const h = Math.sqrt(Math.max(0, legLen * legLen - (d / 2) * (d / 2)));
+    const px = -uy;
+    const py = ux;
+    const bendSign = side === -1 ? 1 : -1;
+    return {
+      knee: { x: mid.x + px * h * bendSign, y: mid.y + py * h * bendSign },
+      foot: { x: footX, y: footY },
+    };
+  };
+  const drawLegChain = (leg: { knee: LocalPoint; foot: LocalPoint }) => {
     ctx.beginPath();
     ctx.moveTo(0, hipY);
-    ctx.lineTo(kx, ky);
-    ctx.lineTo(kx - Math.sin(shinA) * legLen, ky + Math.cos(shinA) * legLen);
+    ctx.lineTo(leg.knee.x, leg.knee.y);
+    ctx.lineTo(leg.foot.x, leg.foot.y);
     ctx.stroke();
   };
-  // Shin angle = thigh angle + forearm angle (using leftForeA/rightForeA as shin bend)
-  drawLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
-  drawLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
+  const deckTopY = 0;
+  const leftDeckFootX = -18 * S;
+  const rightDeckFootX = 18 * S;
+  let leftLeg = angledLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
+  let rightLeg = angledLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
+  if (p.skateboardVisible) {
+    if (p.skateFootMode === "left-push") {
+      rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
+    } else {
+      leftLeg = plantedLeg(-1, leftDeckFootX, deckTopY);
+      rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
+    }
+  }
+  drawLegChain(leftLeg);
+  drawLegChain(rightLeg);
 
   if (p.skateboardVisible) {
-    const footPoint = (thighA: number, shinA: number) => {
-      const kx = -Math.sin(thighA) * legLen;
-      const ky = hipY + Math.cos(thighA) * legLen;
-      return {
-        x: kx - Math.sin(shinA) * legLen,
-        y: ky + Math.cos(shinA) * legLen,
-      };
-    };
-    const leftFoot = footPoint(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
-    const rightFoot = footPoint(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
-    const deckCX = (leftFoot.x + rightFoot.x) / 2;
-    const deckCY = Math.max(leftFoot.y, rightFoot.y) + 7 * S;
+    const deckCX = 0;
+    const deckCY = deckTopY;
     const deckW = 70 * S;
     const deckH = 8 * S;
     const upturn = 5 * S;
@@ -1765,13 +1845,14 @@ function drawCharacterToCanvas(
   ctx.rotate(p.bodyLean);
   ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
 
-  const relSY = -torsoLen;
+  const torsoTopY = -torsoLen;
+  const shoulderY = -torsoLen * 0.85;
   let lArmA = p.leftArmA, rArmA = p.rightArmA;
   let lForeA = p.leftForeA, rForeA = p.rightForeA;
 
   // Override pointing arm; other arm hangs relaxed (not tucked inward)
   if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
-    const shoulderBY = p.boardY - (HIP_RAW + TORSO_RAW);
+    const shoulderBY = p.boardY - (HIP_RAW - (p.skateCrouch ?? 0) + TORSO_RAW * 0.85);
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
     const tdyCanvas = p.pointTargetBY - shoulderBY;
     const mag = Math.hypot(tdxLocal, tdyCanvas);
@@ -1790,17 +1871,18 @@ function drawCharacterToCanvas(
     }
   }
 
-  const drawArm = (sOff: number, armA: number, foreA: number) => {
+  const drawArm = (armA: number, foreA: number) => {
+    const sOff = 0;
     const ex = sOff - Math.sin(armA) * armLen;
-    const ey = relSY + Math.cos(armA) * armLen;
+    const ey = shoulderY + Math.cos(armA) * armLen;
     ctx.beginPath();
-    ctx.moveTo(sOff, relSY);
+    ctx.moveTo(sOff, shoulderY);
     ctx.lineTo(ex, ey);
     ctx.lineTo(ex - Math.sin(foreA) * armLen, ey + Math.cos(foreA) * armLen);
     ctx.stroke();
   };
-  drawArm(-7 * S, lArmA, lForeA);
-  drawArm(7 * S, rArmA, rForeA);
+  drawArm(lArmA, lForeA);
+  drawArm(rArmA, rForeA);
 
   // Wrist-mounted launcher, visible only while the active grapple is firing/zipping.
   if (p.grappleLauncherVisible) {
@@ -1818,8 +1900,8 @@ function drawCharacterToCanvas(
   }
 
   // Neck — short segment from shoulder up to where the head sits
-  const neckTopY = relSY - neckLen;
-  ctx.beginPath(); ctx.moveTo(0, relSY); ctx.lineTo(0, neckTopY); ctx.stroke();
+  const neckTopY = torsoTopY - neckLen;
+  ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(0, neckTopY); ctx.stroke();
 
   // Head — blank circle only (no face features), sitting on top of the neck
   const headCY = neckTopY - headR;
@@ -7677,8 +7759,8 @@ export default function Board2Page() {
                               {([
                                 { mode: "walkTo" as const, label: "Walk", title: "Click board to walk to position (1.5s)" },
                                 { mode: "jumpTo" as const, label: "Jump", title: "Click board to jump to position (1.0s)" },
-                                { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (2.5s)" },
-                                { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.5s)" },
+                                { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (3.0s)" },
+                                { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.8s)" },
                                 { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
                                 { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
                             ]).map(({ mode, label, title }) => (
@@ -7834,7 +7916,7 @@ export default function Board2Page() {
                         rawBx >= c.boardX && rawBx <= c.boardX + c.boardW &&
                         rawBy >= c.boardY && rawBy <= c.boardY + c.boardH
                       );
-                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, skateTo: 2.5, grapple: 1.5, pointAt: 2.0 };
+                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, skateTo: 2.5 * PHASE_TIME_SCALE, grapple: GRAPPLE_MANUAL_DURATION_SEC, pointAt: 2.0 };
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
