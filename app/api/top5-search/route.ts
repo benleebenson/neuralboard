@@ -5,17 +5,21 @@ import { authOptions, isUserPro } from "@/lib/auth";
 export const runtime = "nodejs";
 export const maxDuration = 45;
 
-const SYSTEM_PROMPT =
-  "You are helping create a 'Top 5' YouTube video. Given a concept, generate a specific ranked list from #5 (least significant) to #1 (most significant/interesting). For each item, provide:\n" +
-  "- rank (5 to 1)\n" +
-  "- label: a short punchy name for the item (2-6 words)\n" +
-  "- blurb: one sentence describing why this is on the list\n" +
-  "- searchQueries: 2 different YouTube search queries that would find compelling videos about this specific item\n\n" +
-  "Guidelines:\n" +
-  "- Order from LEAST to MOST — save the best for #1\n" +
-  "- Label should be specific and memorable\n" +
-  "- Search queries should differ from each other (one broad, one specific) to get variety\n\n" +
-  'Return valid JSON: { "title": string, "items": [{ "rank": number, "label": string, "blurb": string, "searchQueries": [string, string] }, ...] }';
+function buildSystemPrompt(itemCount: number): string {
+  return (
+    `You are helping create a 'Top ${itemCount}' YouTube video. Given a concept, generate a specific ranked list from #${itemCount} (least significant) to #1 (most significant/interesting). For each item, provide:\n` +
+    "- rank (integer from 1 to " + itemCount + ")\n" +
+    "- label: a short punchy name for the item (2-6 words)\n" +
+    "- blurb: one sentence describing why this is on the list\n" +
+    "- searchQueries: 2 different YouTube search queries that would find compelling videos about this specific item\n\n" +
+    "Guidelines:\n" +
+    "- Generate exactly " + itemCount + " items\n" +
+    "- Order from LEAST to MOST — save the best for #1\n" +
+    "- Label should be specific and memorable\n" +
+    "- Search queries should differ from each other (one broad, one specific) to get variety\n\n" +
+    'Return valid JSON: { "title": string, "items": [{ "rank": number, "label": string, "blurb": string, "searchQueries": [string, string] }, ...] }'
+  );
+}
 
 type RawSearchResult = {
   id?: string;
@@ -54,7 +58,7 @@ function parseDurationSec(d: string | number | undefined): number {
   return parseFloat(d) || 0;
 }
 
-async function generateTop5List(concept: string, openaiKey: string): Promise<Top5Response> {
+async function generateTop5List(concept: string, openaiKey: string, itemCount: number): Promise<Top5Response> {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiKey}` },
@@ -63,7 +67,7 @@ async function generateTop5List(concept: string, openaiKey: string): Promise<Top
       temperature: 0.7,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: buildSystemPrompt(itemCount) },
         { role: "user", content: concept },
       ],
     }),
@@ -92,7 +96,7 @@ async function generateTop5List(concept: string, openaiKey: string): Promise<Top
     searchQueries: Array.isArray(item.searchQueries)
       ? (item.searchQueries as string[]).filter((q): q is string => typeof q === "string").slice(0, 2)
       : [],
-  })).filter((item) => item.rank >= 1 && item.rank <= 5 && item.label);
+  })).filter((item) => item.rank >= 1 && item.rank <= itemCount && item.label);
   if (items.length === 0) throw new Error("AI couldn't generate list items");
   return { title: String(p.title).slice(0, 120), items };
 }
@@ -164,8 +168,10 @@ export async function POST(req: NextRequest) {
     const raw = await req.json();
     const concept = typeof raw.concept === "string" ? raw.concept.trim().slice(0, 2000) : "";
     if (!concept) return NextResponse.json({ error: "Missing concept" }, { status: 400 });
+    const rawItemCount = typeof raw.itemCount === "number" ? raw.itemCount : 5;
+    const itemCount = Math.min(5, Math.max(3, Math.round(rawItemCount)));
 
-    const top5 = await generateTop5List(concept, openaiKey);
+    const top5 = await generateTop5List(concept, openaiKey, itemCount);
 
     // For each item, run both search queries in parallel, then merge per item
     const itemVideoResults = await Promise.all(

@@ -2156,6 +2156,13 @@ export default function Board2Page() {
   const [mobileTop5LoadingRank, setMobileTop5LoadingRank] = useState<number | null>(null);
   const [mobileTop5BuildPhase, setMobileTop5BuildPhase] = useState<string | null>(null);
   const [mobileTop5Error, setMobileTop5Error] = useState("");
+  const [mobileTop5TrimStartInput, setMobileTop5TrimStartInput] = useState("0:00");
+  const [mobileTop5TrimEndInput, setMobileTop5TrimEndInput] = useState("0:30");
+  const [mobileTop5TrimError, setMobileTop5TrimError] = useState("");
+  const [mobileTop5CustomLabels, setMobileTop5CustomLabels] = useState<Map<number, string>>(new Map());
+  const [mobileTop5EditingLabel, setMobileTop5EditingLabel] = useState(false);
+  const [mobileTop5LabelInput, setMobileTop5LabelInput] = useState("");
+  const [mobileTop5ListLength, setMobileTop5ListLength] = useState<3 | 4 | 5>(5);
 
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
@@ -2232,7 +2239,7 @@ export default function Board2Page() {
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const mobileSwipeTouchStartXRef = useRef<number | null>(null);
+  const mobileYtIframeRef = useRef<HTMLIFrameElement | null>(null);
   const mobileBoardPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const mobileGestureRef = useRef<{
     type: "idle" | "deciding" | "pan" | "move" | "pinch";
@@ -3575,6 +3582,60 @@ export default function Board2Page() {
 
   // ─ Mobile Top 5 Tinder flow ──────────────────────────────────────────────
 
+  function parseMobileTrimInput(str: string): number | null {
+    const s = str.trim();
+    if (!s) return null;
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    const m = s.match(/^(\d+):(\d+)$/);
+    if (m) {
+      const secs = parseInt(m[2], 10);
+      if (secs >= 60) return null;
+      return parseInt(m[1], 10) * 60 + secs;
+    }
+    return null;
+  }
+
+  function formatMobileTrimTime(s: number): string {
+    const mins = Math.floor(s / 60);
+    const secs = Math.floor(s % 60);
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  }
+
+  function getMobileRankLabel(rank: number): string {
+    return mobileTop5CustomLabels.get(rank)
+      ?? mobileTop5Data?.items.find((i) => i.rank === rank)?.label
+      ?? `#${rank}`;
+  }
+
+  function setMobileTop5Trim(start: number, end: number) {
+    setMobileTop5TrimStart(start);
+    setMobileTop5TrimEnd(end);
+    setMobileTop5TrimStartInput(formatMobileTrimTime(start));
+    setMobileTop5TrimEndInput(formatMobileTrimTime(end));
+    setMobileTop5TrimError("");
+  }
+
+  function validateMobileTrim(startStr: string, endStr: string, maxDur: number): string {
+    const start = parseMobileTrimInput(startStr);
+    const end = parseMobileTrimInput(endStr);
+    if (start === null) return "Invalid start time (use M:SS)";
+    if (end === null) return "Invalid end time (use M:SS)";
+    if (end <= start) return "End must be after start";
+    if (end - start < 0.5) return "Clip must be at least 0.5 s";
+    if (end - start > 30) return "Max clip length is 30 s";
+    if (maxDur > 0 && end > maxDur + 1) return `End exceeds video duration (${formatMobileTrimTime(maxDur)})`;
+    return "";
+  }
+
+  function seekMobileYtEmbed(seconds: number) {
+    try {
+      mobileYtIframeRef.current?.contentWindow?.postMessage(
+        JSON.stringify({ event: "command", func: "seekTo", args: [seconds, true] }),
+        "*"
+      );
+    } catch {}
+  }
+
   async function runMobileTop5Search() {
     const concept = mobileTop5Concept.trim();
     if (!concept) return;
@@ -3584,7 +3645,7 @@ export default function Board2Page() {
       const res = await fetch("/api/top5-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ concept }),
+        body: JSON.stringify({ concept, itemCount: mobileTop5ListLength }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({})) as { error?: string };
@@ -3604,12 +3665,19 @@ export default function Board2Page() {
       setMobileTop5ResultsByRank(byRank);
       setMobileTop5IndexByRank(idxByRank);
 
-      const firstRankData = data.items.find((i) => i.rank === 5);
+      const topRank = data.items.reduce((mx, item) => Math.max(mx, item.rank), 1);
+      const firstRankData = data.items.find((i) => i.rank === topRank);
       const firstDur = firstRankData?.videos[0]?.durationSec ?? 30;
+      const firstEnd = Math.min(30, firstDur);
       setMobileTop5TrimStart(0);
-      setMobileTop5TrimEnd(Math.min(30, firstDur));
-      setMobileTop5CurrentRank(5);
+      setMobileTop5TrimEnd(firstEnd);
+      setMobileTop5TrimStartInput("0:00");
+      setMobileTop5TrimEndInput(formatMobileTrimTime(firstEnd));
+      setMobileTop5TrimError("");
+      setMobileTop5CurrentRank(topRank);
       setMobileTop5AcceptedByRank(new Map());
+      setMobileTop5CustomLabels(new Map());
+      setMobileTop5EditingLabel(false);
       setMobileTop5Screen("swipe");
     } catch (e) {
       setMobileTop5Error(e instanceof Error ? e.message : "Search failed");
@@ -3629,17 +3697,18 @@ export default function Board2Page() {
       setMobileTop5AcceptedByRank(accepted);
       buildMobileTop5Video(accepted);
     } else {
+      setMobileTop5EditingLabel(false);
       setMobileTop5CurrentRank(nextRank);
       const nextResults = mobileTop5ResultsByRank.get(nextRank) ?? [];
       const nextDur = nextResults[0]?.durationSec ?? 30;
-      setMobileTop5TrimStart(0);
-      setMobileTop5TrimEnd(Math.min(30, nextDur));
+      setMobileTop5Trim(0, Math.min(30, nextDur));
     }
   }
 
   function handleMobileAccept() {
     const video = getMobileCurrentVideo();
-    if (!video || mobileTop5LoadingRank !== null) return;
+    if (!video || mobileTop5LoadingRank !== null || !!mobileTop5TrimError) return;
+    setMobileTop5EditingLabel(false);
     setMobileTop5CardAnim("accept");
     setTimeout(() => {
       setMobileTop5CardAnim(null);
@@ -3658,6 +3727,7 @@ export default function Board2Page() {
   function handleMobileReject() {
     const results = mobileTop5ResultsByRank.get(mobileTop5CurrentRank) ?? [];
     if (mobileTop5LoadingRank !== null) return;
+    setMobileTop5EditingLabel(false);
     setMobileTop5CardAnim("reject");
     setTimeout(() => {
       setMobileTop5CardAnim(null);
@@ -3665,16 +3735,14 @@ export default function Board2Page() {
       const nextIdx = currentIdx + 1;
       if (nextIdx < results.length) {
         const nextDur = results[nextIdx]?.durationSec ?? 30;
-        setMobileTop5TrimStart(0);
-        setMobileTop5TrimEnd(Math.min(30, nextDur));
+        setMobileTop5Trim(0, Math.min(30, nextDur));
         setMobileTop5IndexByRank((prev) => {
           const m = new Map(prev);
           m.set(mobileTop5CurrentRank, nextIdx);
           return m;
         });
       } else {
-        // Exhausted results — fetch more for this rank
-        const label = mobileTop5Data?.items.find((i) => i.rank === mobileTop5CurrentRank)?.label ?? "";
+        const label = getMobileRankLabel(mobileTop5CurrentRank);
         fetchMoreMobileVideos(mobileTop5CurrentRank, label);
       }
     }, 320);
@@ -3718,8 +3786,7 @@ export default function Board2Page() {
           return m;
         });
         const nextDur = newVideos[0]?.durationSec ?? 30;
-        setMobileTop5TrimStart(0);
-        setMobileTop5TrimEnd(Math.min(30, nextDur));
+        setMobileTop5Trim(0, Math.min(30, nextDur));
       }
     } finally {
       setMobileTop5LoadingRank(null);
@@ -3729,6 +3796,8 @@ export default function Board2Page() {
   async function buildMobileTop5Video(accepted: Map<number, { videoId: string; trimStart: number; trimEnd: number; title: string }>) {
     setMobileTop5Screen("build");
     setMobileTop5BuildPhase("Setting up...");
+
+    const topRank = mobileTop5ListLength;
 
     // Set 9:16 canvas
     setCanvasAspect("9:16");
@@ -3743,12 +3812,12 @@ export default function Board2Page() {
     const CLIP_START_X = 150;
     const CLIP_Y = 1280;
 
-    // Add rank label annotations
+    // Add rank label annotations (uses getMobileRankLabel for custom labels)
     const newAnnotations: Annotation[] = [];
-    for (let rank = 5; rank >= 1; rank--) {
-      const i = 5 - rank;
+    for (let rank = topRank; rank >= 1; rank--) {
+      const i = topRank - rank;
       const colX = CLIP_START_X + i * CLIP_STRIDE;
-      const label = mobileTop5Data?.items.find((item) => item.rank === rank)?.label ?? `#${rank}`;
+      const label = getMobileRankLabel(rank);
       newAnnotations.push({
         id: generateId(),
         type: "text",
@@ -3779,17 +3848,16 @@ export default function Board2Page() {
     annotationsRef.current = [...annotationsRef.current, ...newAnnotations];
     setAnnotations((prev) => [...prev, ...newAnnotations]);
 
-    const newClips: Clip[] = [];
-    const ranks = [5, 4, 3, 2, 1];
+    const ranks = Array.from({ length: topRank }, (_, ii) => topRank - ii); // [N, N-1, ..., 1]
     for (let ri = 0; ri < ranks.length; ri++) {
       const rank = ranks[ri];
       const acc = accepted.get(rank);
       if (!acc) continue;
-      const i = 5 - rank;
+      const i = topRank - rank;
       const colX = CLIP_START_X + i * CLIP_STRIDE;
       const startTime = i * 5;
 
-      setMobileTop5BuildPhase(`Downloading #${rank} (${ri + 1}/5)...`);
+      setMobileTop5BuildPhase(`Downloading #${rank} (${ri + 1}/${topRank})...`);
       try {
         const dlRes = await fetch("/api/ytdl", {
           method: "POST",
@@ -3823,8 +3891,6 @@ export default function Board2Page() {
           ytStart: acc.trimStart,
           ytEnd: acc.trimEnd,
         };
-        newClips.push(clip);
-        // Update ref immediately so preview renders each clip as it arrives
         clipsRef.current = [...clipsRef.current, clip];
         setClips((prev) => [...prev, clip]);
       } catch {
@@ -3840,36 +3906,48 @@ export default function Board2Page() {
   }
 
   function renderMobileTop5Flow() {
+    const totalRanks = mobileTop5ListLength;
     const acceptedCount = mobileTop5AcceptedByRank.size;
-    const totalRanks = 5;
     const video = getMobileCurrentVideo();
     const currentResults = mobileTop5ResultsByRank.get(mobileTop5CurrentRank) ?? [];
     const currentIdx = mobileTop5IndexByRank.get(mobileTop5CurrentRank) ?? 0;
     const currentItem = mobileTop5Data?.items.find((i) => i.rank === mobileTop5CurrentRank);
+    const currentLabel = getMobileRankLabel(mobileTop5CurrentRank);
+    const acceptDisabled = !video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null || !!mobileTop5TrimError;
 
     const bg = "#fffdf5";
     const ink = "#2a2a2a";
     const accent = "#c8f135";
 
-    // Card slide animation
+    // Card slide animation (button-triggered only — no swipe handlers)
     let cardTransform = "translateX(0)";
     let cardOpacity = 1;
     if (mobileTop5CardAnim === "accept") { cardTransform = "translateX(110%)"; cardOpacity = 0; }
     if (mobileTop5CardAnim === "reject") { cardTransform = "translateX(-110%)"; cardOpacity = 0; }
 
+    function commitLabelEdit() {
+      if (mobileTop5LabelInput.trim()) {
+        setMobileTop5CustomLabels((prev) => {
+          const m = new Map(prev);
+          m.set(mobileTop5CurrentRank, mobileTop5LabelInput.trim());
+          return m;
+        });
+      }
+      setMobileTop5EditingLabel(false);
+    }
+
     return (
       <div style={{ position: "fixed", inset: 0, background: bg, fontFamily: "monospace", display: "flex", flexDirection: "column", height: "100dvh", overflow: "hidden" }}>
         <style>{`
+          @keyframes m5spin { to { transform: rotate(360deg); } }
           @media (orientation: landscape) {
             .m5-landscape-warn { display: flex !important; }
             .m5-portrait-content { display: none !important; }
           }
-          @supports not (height: 100dvh) {
-            .m5-root { height: 100vh !important; }
-          }
+          @supports not (height: 100dvh) { .m5-root { height: 100vh !important; } }
         `}</style>
 
-        {/* Landscape warning (hidden by default, shown in landscape via CSS) */}
+        {/* Landscape warning */}
         <div className="m5-landscape-warn" style={{ display: "none", position: "fixed", inset: 0, zIndex: 9999, background: bg, flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
           <div style={{ fontSize: 40 }}>↕</div>
           <div style={{ fontWeight: 700, fontSize: 15 }}>Rotate to portrait</div>
@@ -3879,9 +3957,9 @@ export default function Board2Page() {
         <div className="m5-portrait-content" style={{ display: "flex", flexDirection: "column", height: "100dvh", paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
 
           {/* Header */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderBottom: `1.5px dashed rgba(42,42,42,0.25)`, flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderBottom: "1.5px dashed rgba(42,42,42,0.25)", flexShrink: 0 }}>
             <span style={{ fontFamily: "'Caveat', cursive", fontSize: 20, fontWeight: 700, color: ink, flex: 1 }}>
-              {mobileTop5Screen === "swipe" || mobileTop5Screen === "loading" ? "Top 5 Builder" : mobileTop5Screen === "build" || mobileTop5Screen === "done" ? "Building..." : "Top 5 Builder"}
+              Top {totalRanks} Builder
             </span>
             <button
               onClick={() => setMobileDesktopOverride(true)}
@@ -3891,15 +3969,15 @@ export default function Board2Page() {
             </button>
           </div>
 
-          {/* Screen 1: Prompt */}
+          {/* ── Screen 1: Prompt ── */}
           {mobileTop5Screen === "prompt" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: 20, gap: 16, overflowY: "auto" }}>
               <div>
                 <div style={{ fontFamily: "'Caveat', cursive", fontSize: 30, fontWeight: 700, color: ink, lineHeight: 1.2, marginBottom: 8 }}>
-                  What&apos;s your Top 5?
+                  What&apos;s your Top {totalRanks}?
                 </div>
                 <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.5 }}>
-                  Describe your concept and we&apos;ll find video candidates for each rank. Swipe right to keep, left to skip.
+                  Describe your concept. We&apos;ll find video candidates for each rank — tap ✓ to keep, ✕ to skip.
                 </div>
               </div>
               {mobileTop5Error && (
@@ -3912,13 +3990,35 @@ export default function Board2Page() {
                 onChange={(e) => setMobileTop5Concept(e.target.value)}
                 placeholder="e.g. Top 5 conspiracies that turned out to be true"
                 style={{
-                  flex: 1, minHeight: "36dvh", width: "100%", boxSizing: "border-box",
+                  flex: 1, minHeight: "32dvh", width: "100%", boxSizing: "border-box",
                   fontFamily: "monospace", fontSize: 15, lineHeight: 1.6,
-                  border: "1.5px solid #2a2a2a", padding: 14, resize: "none",
-                  background: "#fff",
+                  border: "1.5px solid #2a2a2a", padding: 14, resize: "none", background: "#fff",
                 } as React.CSSProperties}
                 onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) runMobileTop5Search(); }}
               />
+
+              {/* List length segmented control */}
+              <div>
+                <div style={{ fontSize: 9, color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>List length</div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {([3, 4, 5] as const).map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => setMobileTop5ListLength(n)}
+                      style={{
+                        flex: 1, padding: "12px 0", fontFamily: "monospace", fontSize: 18, fontWeight: 700,
+                        background: mobileTop5ListLength === n ? ink : "#fff",
+                        color: mobileTop5ListLength === n ? accent : ink,
+                        border: `1.5px solid ${ink}`,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {n}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <ProGated featureName="Top 5 Neural Search">
                 <button
                   onClick={runMobileTop5Search}
@@ -3938,14 +4038,13 @@ export default function Board2Page() {
             </div>
           )}
 
-          {/* Screen 2: Loading */}
+          {/* ── Screen 2: Loading ── */}
           {mobileTop5Screen === "loading" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 24, padding: 32 }}>
-              <style>{`@keyframes m5spin { to { transform: rotate(360deg); } } @keyframes m5dot { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }`}</style>
               <div style={{ width: 48, height: 48, borderRadius: "50%", border: "3px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
               <div style={{ textAlign: "center" }}>
                 <div style={{ fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink, marginBottom: 6 }}>
-                  {mobileTop5Error || "Generating list..."}
+                  Generating list...
                 </div>
                 <div style={{ fontSize: 11, color: "#6a6a6a" }}>Finding the best video candidates for each rank</div>
               </div>
@@ -3958,16 +4057,38 @@ export default function Board2Page() {
             </div>
           )}
 
-          {/* Screen 3: Swipe */}
+          {/* ── Screen 3: Swipe (buttons only — no touch drag) ── */}
           {mobileTop5Screen === "swipe" && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-              {/* Progress bar */}
+              {/* Progress + editable rank label */}
               <div style={{ padding: "10px 16px 0", flexShrink: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                  <div style={{ fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink }}>
-                    #{mobileTop5CurrentRank} — {currentItem?.label ?? ""}
-                  </div>
-                  <div style={{ fontSize: 11, color: "#6a6a6a" }}>{acceptedCount}/{totalRanks}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontFamily: "'Caveat', cursive", fontSize: 24, fontWeight: 700, color: ink, flexShrink: 0 }}>
+                    #{mobileTop5CurrentRank}
+                  </span>
+                  {mobileTop5EditingLabel ? (
+                    <input
+                      autoFocus
+                      value={mobileTop5LabelInput}
+                      onChange={(e) => setMobileTop5LabelInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === "Escape") commitLabelEdit(); }}
+                      onBlur={commitLabelEdit}
+                      style={{
+                        fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink,
+                        border: "none", borderBottom: "2px solid #2a2a2a", background: "transparent",
+                        outline: "none", flex: 1, minWidth: 0,
+                      } as React.CSSProperties}
+                    />
+                  ) : (
+                    <span
+                      onClick={() => { setMobileTop5LabelInput(currentLabel); setMobileTop5EditingLabel(true); }}
+                      style={{ fontFamily: "'Caveat', cursive", fontSize: 22, fontWeight: 700, color: ink, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, minWidth: 0, flex: 1 }}
+                    >
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentLabel}</span>
+                      <span style={{ fontSize: 13, opacity: 0.4, flexShrink: 0 }}>✎</span>
+                    </span>
+                  )}
+                  <span style={{ fontSize: 11, color: "#6a6a6a", flexShrink: 0 }}>{acceptedCount}/{totalRanks}</span>
                 </div>
                 <div style={{ height: 3, background: "rgba(42,42,42,0.1)", borderRadius: 2 }}>
                   <div style={{ height: "100%", width: `${(acceptedCount / totalRanks) * 100}%`, background: accent, borderRadius: 2, transition: "width 0.3s" }} />
@@ -3978,7 +4099,7 @@ export default function Board2Page() {
               </div>
 
               {/* Card area */}
-              <div style={{ flex: 1, padding: "10px 16px", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+              <div style={{ flex: 1, padding: "8px 16px 0", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
                 {mobileTop5LoadingRank === mobileTop5CurrentRank ? (
                   <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, border: "1.5px solid rgba(42,42,42,0.2)", background: "#fff" }}>
                     <div style={{ width: 32, height: 32, borderRadius: "50%", border: "2.5px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
@@ -3992,22 +4113,13 @@ export default function Board2Page() {
                       transition: mobileTop5CardAnim ? "transform 0.3s ease-in, opacity 0.3s" : "none",
                       overflow: "hidden", minHeight: 0,
                     }}
-                    onTouchStart={(e) => { mobileSwipeTouchStartXRef.current = e.touches[0].clientX; }}
-                    onTouchEnd={(e) => {
-                      const startX = mobileSwipeTouchStartXRef.current;
-                      if (startX === null) return;
-                      const dx = e.changedTouches[0].clientX - startX;
-                      mobileSwipeTouchStartXRef.current = null;
-                      if (Math.abs(dx) < 50) return;
-                      if (dx > 0) handleMobileAccept();
-                      else handleMobileReject();
-                    }}
                   >
-                    {/* YouTube embed */}
-                    <div style={{ aspectRatio: "16/9", flexShrink: 0, background: "#000", position: "relative" }}>
+                    {/* YouTube embed with enablejsapi for seekTo */}
+                    <div style={{ aspectRatio: "16/9", flexShrink: 0, background: "#000" }}>
                       <iframe
                         key={video.videoId}
-                        src={`https://www.youtube.com/embed/${video.videoId}?autoplay=1&mute=1&controls=1&modestbranding=1&rel=0&playsinline=1`}
+                        ref={mobileYtIframeRef}
+                        src={`https://www.youtube.com/embed/${video.videoId}?autoplay=1&mute=1&controls=1&modestbranding=1&rel=0&playsinline=1&enablejsapi=1`}
                         allow="autoplay; encrypted-media"
                         allowFullScreen
                         style={{ width: "100%", height: "100%", border: "none", display: "block" }}
@@ -4015,8 +4127,8 @@ export default function Board2Page() {
                     </div>
 
                     {/* Video info */}
-                    <div style={{ padding: "10px 12px 6px", flexShrink: 0 }}>
-                      <div style={{ fontWeight: 700, fontSize: 13, lineHeight: 1.3, marginBottom: 2, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                    <div style={{ padding: "8px 12px 4px", flexShrink: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, lineHeight: 1.3, marginBottom: 2, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
                         {video.title}
                       </div>
                       <div style={{ fontSize: 10, color: "#6a6a6a" }}>
@@ -4024,35 +4136,66 @@ export default function Board2Page() {
                       </div>
                     </div>
 
-                    {/* Trim slider */}
-                    <div style={{ padding: "4px 12px 10px", flexShrink: 0 }}>
-                      <div style={{ fontSize: 9, color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>
-                        Trim · {Math.floor(mobileTop5TrimStart / 60)}:{String(Math.floor(mobileTop5TrimStart % 60)).padStart(2, "0")} – {Math.floor(mobileTop5TrimEnd / 60)}:{String(Math.floor(mobileTop5TrimEnd % 60)).padStart(2, "0")}
+                    {/* Trim: typed MM:SS fields */}
+                    <div style={{ padding: "6px 12px 10px", flexShrink: 0 }}>
+                      <div style={{ fontSize: 9, color: "#6a6a6a", letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>TRIM</div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: "#aaa", marginBottom: 3 }}>Start</div>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={mobileTop5TrimStartInput}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setMobileTop5TrimStartInput(v);
+                              const parsed = parseMobileTrimInput(v);
+                              if (parsed !== null) setMobileTop5TrimStart(parsed);
+                              setMobileTop5TrimError(validateMobileTrim(v, mobileTop5TrimEndInput, video.durationSec));
+                            }}
+                            onBlur={() => {
+                              const parsed = parseMobileTrimInput(mobileTop5TrimStartInput);
+                              if (parsed !== null) {
+                                setMobileTop5TrimStartInput(formatMobileTrimTime(parsed));
+                                setMobileTop5TrimStart(parsed);
+                                seekMobileYtEmbed(parsed);
+                              }
+                              setMobileTop5TrimError(validateMobileTrim(mobileTop5TrimStartInput, mobileTop5TrimEndInput, video.durationSec));
+                            }}
+                            style={{ width: "100%", fontFamily: "monospace", fontSize: 20, padding: "8px 6px", border: `1.5px solid ${mobileTop5TrimError ? "#cc2200" : "#2a2a2a"}`, boxSizing: "border-box", textAlign: "center", background: "#fff" } as React.CSSProperties}
+                          />
+                        </div>
+                        <div style={{ color: "#aaa", fontSize: 18, paddingTop: 22 }}>–</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: "#aaa", marginBottom: 3 }}>End</div>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={mobileTop5TrimEndInput}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setMobileTop5TrimEndInput(v);
+                              const parsed = parseMobileTrimInput(v);
+                              if (parsed !== null) setMobileTop5TrimEnd(parsed);
+                              setMobileTop5TrimError(validateMobileTrim(mobileTop5TrimStartInput, v, video.durationSec));
+                            }}
+                            onBlur={() => {
+                              const parsed = parseMobileTrimInput(mobileTop5TrimEndInput);
+                              if (parsed !== null) {
+                                setMobileTop5TrimEndInput(formatMobileTrimTime(parsed));
+                                setMobileTop5TrimEnd(parsed);
+                              }
+                              setMobileTop5TrimError(validateMobileTrim(mobileTop5TrimStartInput, mobileTop5TrimEndInput, video.durationSec));
+                            }}
+                            style={{ width: "100%", fontFamily: "monospace", fontSize: 20, padding: "8px 6px", border: `1.5px solid ${mobileTop5TrimError ? "#cc2200" : "#2a2a2a"}`, boxSizing: "border-box", textAlign: "center", background: "#fff" } as React.CSSProperties}
+                          />
+                        </div>
                       </div>
-                      <div style={{ position: "relative", height: 32 }}>
-                        <input
-                          type="range" min={0} max={Math.max(0, Math.min(video.durationSec - 0.5, 30) - 0.5)} step={0.5}
-                          value={mobileTop5TrimStart}
-                          onChange={(e) => {
-                            const v = parseFloat(e.target.value);
-                            setMobileTop5TrimStart(v);
-                            if (mobileTop5TrimEnd - v < 0.5) setMobileTop5TrimEnd(Math.min(v + 0.5, Math.min(video.durationSec, 30)));
-                          }}
-                          style={{ position: "absolute", width: "100%", height: "100%", opacity: 0.5, accentColor: "#cc2200", cursor: "pointer" }}
-                        />
-                        <input
-                          type="range" min={0.5} max={Math.min(video.durationSec, 30)} step={0.5}
-                          value={mobileTop5TrimEnd}
-                          onChange={(e) => {
-                            const v = parseFloat(e.target.value);
-                            setMobileTop5TrimEnd(v);
-                            if (v - mobileTop5TrimStart < 0.5) setMobileTop5TrimStart(Math.max(v - 0.5, 0));
-                          }}
-                          style={{ position: "absolute", width: "100%", height: "100%", accentColor: "#2a2a2a", cursor: "pointer" }}
-                        />
-                      </div>
-                      <div style={{ fontSize: 9, color: "#aaa", textAlign: "right" }}>
-                        {currentIdx + 1} / {currentResults.length} · swipe to choose
+                      {mobileTop5TrimError && (
+                        <div style={{ fontSize: 10, color: "#cc2200", marginTop: 4 }}>{mobileTop5TrimError}</div>
+                      )}
+                      <div style={{ fontSize: 9, color: "#aaa", textAlign: "right", marginTop: 4 }}>
+                        {currentIdx + 1} / {currentResults.length}
                       </div>
                     </div>
                   </div>
@@ -4063,8 +4206,8 @@ export default function Board2Page() {
                 )}
               </div>
 
-              {/* Action buttons */}
-              <div style={{ display: "flex", gap: 16, padding: "10px 20px 16px", flexShrink: 0, paddingBottom: "calc(16px + env(safe-area-inset-bottom))" }}>
+              {/* Action buttons (buttons only, no swipe listeners) */}
+              <div style={{ display: "flex", gap: 16, padding: "10px 20px", flexShrink: 0, paddingBottom: "calc(10px + env(safe-area-inset-bottom))" }}>
                 <button
                   onClick={handleMobileReject}
                   disabled={!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null}
@@ -4079,12 +4222,12 @@ export default function Board2Page() {
                 </button>
                 <button
                   onClick={handleMobileAccept}
-                  disabled={!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null}
+                  disabled={acceptDisabled}
                   style={{
                     flex: 1, minHeight: 60, fontSize: 28, background: ink, color: accent, border: "2px solid #2a2a2a",
                     cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
                     boxShadow: "3px 3px 0 rgba(0,0,0,0.3)",
-                    opacity: (!video || !!mobileTop5CardAnim || mobileTop5LoadingRank !== null) ? 0.4 : 1,
+                    opacity: acceptDisabled ? 0.4 : 1,
                   }}
                 >
                   ✓
@@ -4093,7 +4236,7 @@ export default function Board2Page() {
             </div>
           )}
 
-          {/* Screen 4: Build */}
+          {/* ── Screen 4: Build & Done ── */}
           {(mobileTop5Screen === "build" || mobileTop5Screen === "done") && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: 32, textAlign: "center" }}>
               {mobileTop5Screen === "build" && (
@@ -4101,7 +4244,7 @@ export default function Board2Page() {
                   <div style={{ width: 48, height: 48, borderRadius: "50%", border: "3px solid rgba(42,42,42,0.1)", borderTopColor: ink, animation: "m5spin 0.8s linear infinite" }} />
                   <div>
                     <div style={{ fontFamily: "'Caveat', cursive", fontSize: 24, fontWeight: 700, color: ink, marginBottom: 6 }}>
-                      Building your Top 5...
+                      Building your Top {totalRanks}...
                     </div>
                     <div style={{ fontSize: 12, color: "#6a6a6a" }}>{mobileTop5BuildPhase ?? "Preparing..."}</div>
                   </div>
@@ -4112,10 +4255,10 @@ export default function Board2Page() {
                   <div style={{ fontSize: 56 }}>🏆</div>
                   <div>
                     <div style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: ink, marginBottom: 8 }}>
-                      Your Top 5 is ready!
+                      Your Top {totalRanks} is ready!
                     </div>
                     <div style={{ fontSize: 12, color: "#6a6a6a", lineHeight: 1.6 }}>
-                      5 clips downloaded, labels added, and camera path generated. Tap Preview or Export to finish.
+                      {totalRanks} clips downloaded, labels added, and camera path generated.
                     </div>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%" }}>
@@ -4139,6 +4282,7 @@ export default function Board2Page() {
                         setMobileTop5AcceptedByRank(new Map());
                         setMobileTop5ResultsByRank(new Map());
                         setMobileTop5IndexByRank(new Map());
+                        setMobileTop5CustomLabels(new Map());
                       }}
                       style={{ fontFamily: "monospace", fontSize: 12, background: "transparent", border: "1.5px solid rgba(42,42,42,0.3)", padding: "10px", cursor: "pointer", color: "#6a6a6a" }}
                     >
