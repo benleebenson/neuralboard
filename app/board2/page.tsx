@@ -640,13 +640,175 @@ function snapToClipTop(
   return { x: tx, y: ty };
 }
 
+type CharSurfaceClip = {
+  id?: string;
+  boardX?: number;
+  boardY?: number;
+  boardW?: number;
+  boardH?: number;
+  type?: string;
+};
+
+type RequiredSurfaceClip = CharSurfaceClip & {
+  boardX: number;
+  boardY: number;
+  boardW: number;
+  boardH: number;
+};
+
+type SkateToPlan = {
+  facing: 1 | -1;
+  startX: number;
+  startY: number;
+  edgeX: number;
+  launchY: number;
+  gapEndX: number;
+  landingY: number;
+  finalX: number;
+  rollDistance: number;
+  ollyDistance: number;
+  heightDelta: number;
+  peakHeight: number;
+  mountDur: number;
+  rollDur: number;
+  prepDur: number;
+  airDur: number;
+  landDur: number;
+  mountEnd: number;
+  airStart: number;
+  airEnd: number;
+};
+
+function isBoardSurface(c: CharSurfaceClip): c is RequiredSurfaceClip {
+  return (c.type === "image" || c.type === "video") &&
+    c.boardX !== undefined && c.boardY !== undefined &&
+    c.boardW !== undefined && c.boardH !== undefined;
+}
+
+function findSurfaceAtFeet(x: number, y: number, clips: CharSurfaceClip[]): RequiredSurfaceClip | undefined {
+  const PAD = 40;
+  return clips
+    .filter(isBoardSurface)
+    .filter((c) => x >= c.boardX + PAD && x <= c.boardX + c.boardW - PAD)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+}
+
+function findTargetSurface(active: ResolvedCharAction, tx: number, ty: number, clips: CharSurfaceClip[]): RequiredSurfaceClip | undefined {
+  if (active.targetClipId) {
+    const byId = clips.find((c) => c.id === active.targetClipId);
+    if (byId && isBoardSurface(byId)) return byId;
+  }
+  const PAD = 40;
+  const hit = clips
+    .filter(isBoardSurface)
+    .filter((c) =>
+      tx >= c.boardX && tx <= c.boardX + c.boardW &&
+      ty >= c.boardY - PAD && ty <= c.boardY + c.boardH + PAD
+    )
+    .sort((a, b) => Math.abs(a.boardY - ty) - Math.abs(b.boardY - ty))[0];
+  if (hit) return hit;
+  return clips
+    .filter(isBoardSurface)
+    .filter((c) => tx >= c.boardX + PAD && tx <= c.boardX + c.boardW - PAD)
+    .sort((a, b) => Math.abs(a.boardY - ty) - Math.abs(b.boardY - ty))[0];
+}
+
+function clampInsideClipX(clip: RequiredSurfaceClip, x: number, pad = 50): number {
+  const innerPad = Math.min(pad, Math.max(0, clip.boardW / 2 - 1));
+  return clamp(x, clip.boardX + innerPad, clip.boardX + clip.boardW - innerPad);
+}
+
+function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]): SkateToPlan | null {
+  const tx = active.targetX ?? active.fromX;
+  const ty = active.targetY ?? active.fromY;
+  const source = findSurfaceAtFeet(active.fromX, active.fromY, clips);
+  const target = findTargetSurface(active, tx, ty, clips);
+  if (!source || !target || source === target) return null;
+
+  const sourceCenterX = source.boardX + source.boardW / 2;
+  const targetCenterX = target.boardX + target.boardW / 2;
+  const facing: 1 | -1 = targetCenterX >= sourceCenterX ? 1 : -1;
+  const edgeMargin = 50;
+  const landingInset = 80;
+  const edgeX = facing === 1
+    ? source.boardX + source.boardW - edgeMargin
+    : source.boardX + edgeMargin;
+  const nearTargetEdgeX = facing === 1 ? target.boardX : target.boardX + target.boardW;
+  const gapEndX = clampInsideClipX(target, nearTargetEdgeX + facing * landingInset, edgeMargin);
+  const finalX = clampInsideClipX(target, gapEndX + facing * 60, edgeMargin);
+  const startY = source.boardY;
+  const landingY = target.boardY;
+  const rollDistance = Math.abs(edgeX - active.fromX);
+  const ollyDistance = Math.abs(gapEndX - edgeX);
+  const heightDelta = landingY - startY;
+  const peakHeight = Math.max(180, Math.abs(heightDelta) + 120);
+
+  const naturalMount = 0.3;
+  const naturalRoll = Math.max(0.05, rollDistance / 700);
+  const naturalAir = clamp(0.5 + (ollyDistance / 1400) * 0.3, 0.5, 0.8);
+  const naturalLand = 0.4;
+  const naturalTotal = naturalMount + naturalRoll + naturalAir + naturalLand;
+  const duration = Math.max(0.12, active.duration);
+
+  let mountDur: number;
+  let rollDur: number;
+  let airDur: number;
+  let landDur: number;
+  if (duration >= naturalMount + naturalLand + 0.12) {
+    mountDur = naturalMount;
+    landDur = naturalLand;
+    const variableBudget = Math.max(0.12, duration - mountDur - landDur);
+    const variableNatural = naturalRoll + naturalAir;
+    rollDur = variableBudget * (naturalRoll / variableNatural);
+    airDur = variableBudget * (naturalAir / variableNatural);
+  } else {
+    const scale = duration / naturalTotal;
+    mountDur = naturalMount * scale;
+    rollDur = naturalRoll * scale;
+    airDur = naturalAir * scale;
+    landDur = naturalLand * scale;
+  }
+
+  const mountEnd = mountDur;
+  const airStart = mountDur + rollDur;
+  const airEnd = airStart + airDur;
+  const prepDur = Math.min(
+    0.25,
+    Math.max(0, rollDur),
+    rollDistance > 0 ? (Math.min(150, rollDistance) / rollDistance) * rollDur : 0
+  );
+
+  return {
+    facing,
+    startX: active.fromX,
+    startY,
+    edgeX,
+    launchY: startY,
+    gapEndX,
+    landingY,
+    finalX,
+    rollDistance,
+    ollyDistance,
+    heightDelta,
+    peakHeight,
+    mountDur,
+    rollDur,
+    prepDur,
+    airDur,
+    landDur,
+    mountEnd,
+    airStart,
+    airEnd,
+  };
+}
+
 // Resolve an action's targetClipId to board coordinates, using the clip's CURRENT position —
 // called fresh every resolveCharActions pass so a clip move is reflected on the very next render,
 // never stale. pointAt targets a point inside the clip (to point AT something); every other
 // targeted type targets the clip's top surface (a place to stand).
 function resolveClipTarget(
   action: CharacterAction,
-  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
 ): { x: number; y: number } | undefined {
   if (!action.targetClipId) return undefined;
   const c = clips.find((cl) => cl.id === action.targetClipId);
@@ -662,7 +824,7 @@ function resolveCharActions(
   actions: CharacterAction[],
   initX: number,
   initY: number,
-  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number }[]
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
 ): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
@@ -675,9 +837,16 @@ function resolveCharActions(
     const targetY = a.targetY ?? resolvedTarget?.y;
     // startX/startY (entrance/exit flips) override the chained position for this action only —
     // the chain continues from targetX/targetY afterward, same as any other travel action.
-    result.push({ ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y });
+    const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
+    result.push(resolvedAction);
     if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
-      x = targetX; y = targetY ?? y;
+      const skatePlan = a.type === "skateTo" ? buildSkateToPlan(resolvedAction, clips) : null;
+      if (skatePlan) {
+        x = skatePlan.finalX;
+        y = skatePlan.landingY;
+      } else {
+        x = targetX; y = targetY ?? y;
+      }
     }
     // pointAt/sitAndWatch/explainGesture/emote/idle don't change position
   }
@@ -963,7 +1132,7 @@ function evalCharAtTime(
   resolved: ResolvedCharAction[],
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  clips: CharSurfaceClip[],
   authoredAnimations: Record<string, AuthoredAnimation> = {}
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
@@ -1077,55 +1246,57 @@ function evalCharAtTime(
   }
 
   if (active.type === "skateTo") {
-    const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
-    const landingY = resolveGroundY(tx, ty, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    const dist = Math.hypot(tx - active.fromX, landingY - active.fromY);
-    const cycles = Math.max(1, dist / 450);
-    const preOllyX = tx - facing * Math.min(220, Math.max(120, Math.abs(tx - active.fromX) * 0.22));
-    const preOllyY = resolveGroundY(preOllyX, lerp(active.fromY, landingY, 0.65) + 80, clips);
+    const plan = buildSkateToPlan(active, clips);
+    if (!plan) {
+      return applyAuthoredPose(idlePose(active.fromX, active.fromY), sampleAnimation(authoredAnimations.idle, 0));
+    }
 
-    let bx = active.fromX;
-    let by = resolveGroundY(active.fromX, active.fromY + 80, clips);
+    let bx = plan.startX;
+    let by = plan.startY;
     let airY = 0;
     let pose: Pose | null = null;
-    let skateboardVisible = progress < 0.95;
+    let skateboardVisible = true;
+    const elapsed = progress * active.duration;
 
-    if (progress < 0.1) {
-      const t = progress / 0.1;
-      bx = lerp(active.fromX, active.fromX + (preOllyX - active.fromX) * 0.08, easeOutQuad(t));
-      by = resolveGroundY(bx, active.fromY + 80, clips);
-      pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * 0.22);
-    } else if (progress < 0.55) {
-      const t = (progress - 0.1) / 0.45;
-      bx = lerp(active.fromX, preOllyX, t);
-      const desiredY = lerp(resolveGroundY(active.fromX, active.fromY + 80, clips), preOllyY, easeInOutCubic(t));
-      const groundY = resolveGroundY(bx, desiredY + 80, clips);
-      by = lerp(desiredY, groundY, 0.35);
-      pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * cycles);
-    } else if (progress < 0.65) {
-      const t = (progress - 0.55) / 0.1;
-      bx = preOllyX;
-      by = preOllyY;
-      pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0, 0.18, t));
-    } else if (progress < 0.9) {
-      const t = (progress - 0.65) / 0.25;
-      bx = lerp(preOllyX, tx, easeOutQuad(t));
-      by = lerp(preOllyY, landingY, t);
-      airY = -150 * 4 * t * (1 - t);
-      pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.18, 0.9, t));
+    if (elapsed < plan.mountEnd) {
+      const t = plan.mountDur > 0 ? elapsed / plan.mountDur : 1;
+      bx = plan.startX;
+      by = plan.startY;
+      pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, t * 0.16);
+    } else if (elapsed < plan.airStart) {
+      const rollElapsed = elapsed - plan.mountEnd;
+      const rollT = plan.rollDur > 0 ? clamp(rollElapsed / plan.rollDur, 0, 1) : 1;
+      bx = lerp(plan.startX, plan.edgeX, rollT);
+      by = plan.startY;
+      const prepStart = Math.max(plan.mountEnd, plan.airStart - plan.prepDur);
+      if (plan.prepDur > 0 && elapsed >= prepStart) {
+        const prepT = clamp((elapsed - prepStart) / plan.prepDur, 0, 1);
+        pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0, 0.18, prepT));
+      } else {
+        const cycleProgress = plan.rollDistance > 0
+          ? (Math.abs(bx - plan.startX) / 400)
+          : rollT;
+        pose = sampleAnimation(authoredAnimations["skate-pedal"] ?? FALLBACK_SKATE_PEDAL, cycleProgress);
+      }
+    } else if (elapsed < plan.airEnd) {
+      const t = plan.airDur > 0 ? clamp((elapsed - plan.airStart) / plan.airDur, 0, 1) : 1;
+      bx = lerp(plan.edgeX, plan.gapEndX, easeInOutCubic(t));
+      by = lerp(plan.launchY, plan.landingY, t);
+      airY = -plan.peakHeight * 4 * t * (1 - t);
+      pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.18, 0.84, t));
     } else {
-      const t = (progress - 0.9) / 0.1;
-      bx = tx;
-      by = landingY;
-      skateboardVisible = t < 0.55;
-      pose = t < 0.55
-        ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.9, 1, t / 0.55))
+      const t = plan.landDur > 0 ? clamp((elapsed - plan.airEnd) / plan.landDur, 0, 1) : 1;
+      const rollOutT = clamp(t / 0.65, 0, 1);
+      bx = lerp(plan.gapEndX, plan.finalX, easeOutQuad(rollOutT));
+      by = plan.landingY;
+      skateboardVisible = t < 0.62;
+      pose = t < 0.62
+        ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.62))
         : sampleAnimation(authoredAnimations.idle, 0) ?? null;
     }
 
     return applyAuthoredPose({
-      boardX: bx, boardY: by, facing,
+      boardX: bx, boardY: by, facing: plan.facing,
       headBob: 0, bodyLean: 0,
       leftLegA: 0.12, rightLegA: -0.12,
       leftArmA: 0.08, rightArmA: -0.08,
@@ -1417,7 +1588,7 @@ function drawCharacterToCanvas(
   H: number,
   initX: number,
   initY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  clips: CharSurfaceClip[],
   entranceTime: number,
   authoredAnimations: Record<string, AuthoredAnimation> = {}
 ) {
@@ -6575,7 +6746,9 @@ export default function Board2Page() {
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
       const zipped = zipSync(zipFiles);
-      const dlBlob = new Blob([zipped], { type: "application/zip" });
+      const zippedBytes = new Uint8Array(zipped.byteLength);
+      zippedBytes.set(zipped);
+      const dlBlob = new Blob([zippedBytes.buffer], { type: "application/zip" });
       const url = URL.createObjectURL(dlBlob);
       const a = document.createElement("a");
       a.href = url;
@@ -6618,7 +6791,9 @@ export default function Board2Page() {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.assetFile && files[mc.assetFile]) {
           const data = files[mc.assetFile];
-          const blob = new Blob([data], { type: mc.assetMime || "application/octet-stream" });
+          const assetBytes = new Uint8Array(data.byteLength);
+          assetBytes.set(data);
+          const blob = new Blob([assetBytes.buffer], { type: mc.assetMime || "application/octet-stream" });
           const blobUrl = URL.createObjectURL(blob);
           if (mc.type === "narration") {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
@@ -7653,6 +7828,12 @@ export default function Board2Page() {
                     const rawBy = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
                     // Snap target to top of clip surface if clicked on an image/video
                     const snapped = snapToClipTop(rawBx, rawBy, clipsRef.current);
+                    const clickedSurface = clipsRef.current
+                      .find((c): c is Clip & RequiredSurfaceClip =>
+                        isBoardSurface(c) &&
+                        rawBx >= c.boardX && rawBx <= c.boardX + c.boardW &&
+                        rawBy >= c.boardY && rawBy <= c.boardY + c.boardH
+                      );
                     const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, skateTo: 2.5, grapple: 1.5, pointAt: 2.0 };
                     const newAction: CharacterAction = {
                       id: generateId(),
@@ -7661,6 +7842,7 @@ export default function Board2Page() {
                       duration: durationMap[characterAddMode] ?? 1.5,
                       targetX: Math.round(snapped.x),
                       targetY: Math.round(snapped.y),
+                      ...(characterAddMode === "skateTo" && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
                     };
                     setCharacterActions((prev) => [...prev, newAction]);
                     setCharacterAddMode(null);

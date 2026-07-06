@@ -22,6 +22,7 @@ export type AuthoredAnimation = {
   keyframes: PoseKeyframe[];
   loop: boolean;
   createdAt: string;
+  updatedAt?: string;
 };
 
 export const RESERVED_ANIMATION_NAMES = [
@@ -99,6 +100,7 @@ export function normalizeAnimation(input: unknown): AuthoredAnimation | null {
     keyframes,
     loop: !!value.loop,
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
   };
 }
 
@@ -297,22 +299,23 @@ export const GRAPPLE_ZIP_KEYFRAMES: PoseKeyframe[] = [
 ];
 
 export const SKATE_PEDAL_KEYFRAMES: PoseKeyframe[] = [
-  { t: 0, pose: pose({ leftLegA: -0.2, rightLegA: 0.65, leftArmA: -0.15, rightArmA: 0.35, leftForeA: 0.15, rightForeA: 0.2, bodyLean: -0.15 }) },
-  { t: 0.18, pose: pose({ leftLegA: -0.18, rightLegA: 1.15, leftArmA: 0.1, rightArmA: 0.25, leftForeA: 0.12, rightForeA: 0.3, bodyLean: -0.18 }) },
-  { t: 0.36, pose: pose({ leftLegA: -0.18, rightLegA: 0.55, leftArmA: 0.22, rightArmA: 0.02, leftForeA: 0.1, rightForeA: 0.15, bodyLean: -0.14 }) },
-  { t: 0.54, pose: pose({ leftLegA: -0.22, rightLegA: -0.08, leftArmA: 0.15, rightArmA: -0.1, leftForeA: 0.08, rightForeA: 0.08, bodyLean: -0.12 }) },
-  { t: 0.72, pose: pose({ leftLegA: -0.18, rightLegA: 0.45, leftArmA: -0.05, rightArmA: 0.18, leftForeA: 0.12, rightForeA: 0.18, bodyLean: -0.16 }) },
-  { t: 1, pose: pose({ leftLegA: -0.2, rightLegA: 0.65, leftArmA: -0.15, rightArmA: 0.35, leftForeA: 0.15, rightForeA: 0.2, bodyLean: -0.15 }) },
+  { t: 0, pose: pose({ leftLegA: 0.28, rightLegA: -0.22, leftArmA: -0.32, rightArmA: 0.24, leftForeA: 0.1, rightForeA: -0.08, bodyLean: 0.18 }) },
+  { t: 0.16, pose: pose({ leftLegA: 1.08, rightLegA: -0.23, leftArmA: -0.48, rightArmA: 0.38, leftForeA: 0.35, rightForeA: 0.04, bodyLean: 0.22, headBob: 1 }) },
+  { t: 0.32, pose: pose({ leftLegA: 0.92, rightLegA: -0.24, leftArmA: -0.28, rightArmA: 0.52, leftForeA: 0.18, rightForeA: 0.12, bodyLean: 0.2 }) },
+  { t: 0.5, pose: pose({ leftLegA: 0.08, rightLegA: -0.22, leftArmA: 0.18, rightArmA: 0.24, leftForeA: -0.08, rightForeA: -0.06, bodyLean: 0.17, headBob: -1 }) },
+  { t: 0.66, pose: pose({ leftLegA: 0.34, rightLegA: -0.23, leftArmA: 0.28, rightArmA: -0.16, leftForeA: 0.08, rightForeA: -0.08, bodyLean: 0.18 }) },
+  { t: 0.82, pose: pose({ leftLegA: 0.22, rightLegA: -0.24, leftArmA: 0.08, rightArmA: -0.08, leftForeA: 0.02, rightForeA: -0.05, bodyLean: 0.16 }) },
+  { t: 1, pose: pose({ leftLegA: 0.28, rightLegA: -0.22, leftArmA: -0.32, rightArmA: 0.24, leftForeA: 0.1, rightForeA: -0.08, bodyLean: 0.18 }) },
 ];
 
 export const SKATE_OLLY_KEYFRAMES: PoseKeyframe[] = [
-  { t: 0, pose: pose({ leftLegA: -0.22, rightLegA: -0.08, leftArmA: 0.05, rightArmA: -0.05, leftForeA: 0.25, rightForeA: 0.18, bodyLean: -0.12 }) },
-  { t: 0.18, pose: pose({ leftLegA: -0.95, rightLegA: -0.88, leftArmA: 0.35, rightArmA: 0.28, leftForeA: 1.0, rightForeA: 0.95, bodyLean: -0.28 }) },
-  { t: 0.34, pose: pose({ leftLegA: -0.25, rightLegA: 0.9, leftArmA: -0.65, rightArmA: 0.55, leftForeA: 0.25, rightForeA: 0.4, bodyLean: -0.05, airborneY: -40 }) },
-  { t: 0.52, pose: pose({ leftLegA: -0.7, rightLegA: 0.35, leftArmA: -0.95, rightArmA: 0.85, leftForeA: 0.65, rightForeA: 0.55, bodyLean: -0.08, airborneY: -95 }) },
-  { t: 0.68, pose: pose({ leftLegA: -1.05, rightLegA: -0.95, leftArmA: -1.0, rightArmA: 1.0, leftForeA: 1.1, rightForeA: 1.05, bodyLean: -0.04, airborneY: -120 }) },
-  { t: 0.84, pose: pose({ leftLegA: -0.35, rightLegA: -0.25, leftArmA: -0.9, rightArmA: 0.9, leftForeA: 0.35, rightForeA: 0.3, bodyLean: -0.08, airborneY: -35 }) },
-  { t: 1, pose: pose({ leftLegA: -0.65, rightLegA: -0.55, leftArmA: 0.2, rightArmA: -0.15, leftForeA: 0.8, rightForeA: 0.75, bodyLean: -0.18, airborneY: 0 }) },
+  { t: 0, pose: pose({ leftLegA: 0.28, rightLegA: -0.22, leftArmA: -0.24, rightArmA: 0.18, leftForeA: 0.08, rightForeA: -0.06, bodyLean: 0.18 }) },
+  { t: 0.18, pose: pose({ leftLegA: 0.72, rightLegA: -0.66, leftArmA: -0.62, rightArmA: 0.52, leftForeA: 0.32, rightForeA: -0.26, bodyLean: 0.28, headBob: 2 }) },
+  { t: 0.34, pose: pose({ leftLegA: 1.0, rightLegA: -0.92, leftArmA: 1.15, rightArmA: -1.12, leftForeA: 1.35, rightForeA: -1.35, bodyLean: 0.08, airborneY: -35 }) },
+  { t: 0.52, pose: pose({ leftLegA: 1.08, rightLegA: -1.0, leftArmA: 1.42, rightArmA: -1.42, leftForeA: 1.64, rightForeA: -1.64, bodyLean: 0.04, airborneY: -95 }) },
+  { t: 0.68, pose: pose({ leftLegA: 1.0, rightLegA: -0.95, leftArmA: 1.4, rightArmA: -1.4, leftForeA: 1.62, rightForeA: -1.62, bodyLean: 0.02, airborneY: -120 }) },
+  { t: 0.84, pose: pose({ leftLegA: 0.62, rightLegA: -0.56, leftArmA: 1.0, rightArmA: -1.0, leftForeA: 1.12, rightForeA: -1.12, bodyLean: 0.12, airborneY: -35 }) },
+  { t: 1, pose: pose({ leftLegA: 0.5, rightLegA: -0.46, leftArmA: 0.48, rightArmA: -0.48, leftForeA: 0.64, rightForeA: -0.64, bodyLean: 0.18, airborneY: 0 }) },
 ];
 
 export function starterAnimations(now = new Date().toISOString()): AuthoredAnimation[] {
