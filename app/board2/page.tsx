@@ -586,8 +586,11 @@ const SKATE_AIR_MIN_SEC = 0.5 * PHASE_TIME_SCALE;
 const SKATE_AIR_MAX_SEC = 0.8 * PHASE_TIME_SCALE;
 const SKATE_LAND_SEC = 0.4 * PHASE_TIME_SCALE;
 const SKATE_EDGE_MARGIN = 50;
-const SKATE_MIN_POP_HEIGHT = 120;
-const SKATE_CLEARANCE_HEIGHT = 90;
+const SKATE_MIN_POP_HEIGHT = 80;
+const SKATE_MAX_POP_HEIGHT = 140;
+const SKATE_POP_CLEARANCE = 60;
+const SKATE_AUTO_MAX_HEIGHT_DELTA = 150;
+const SKATE_MANUAL_FALLBACK_HEIGHT_DELTA = 180;
 const GRAPPLE_MANUAL_DURATION_SEC = 1.5 * PHASE_TIME_SCALE;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
@@ -669,6 +672,15 @@ type RequiredSurfaceClip = CharSurfaceClip & {
   boardH: number;
 };
 
+type CameraViewport = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  width: number;
+  height: number;
+};
+
 type SkateToPlan = {
   facing: 1 | -1;
   startX: number;
@@ -682,6 +694,7 @@ type SkateToPlan = {
   ollyDistance: number;
   heightDelta: number;
   peakHeight: number;
+  tooHighTarget: boolean;
   mountDur: number;
   rollDur: number;
   prepDur: number;
@@ -731,6 +744,40 @@ function clampInsideClipX(clip: RequiredSurfaceClip, x: number, pad = 50): numbe
   return clamp(x, clip.boardX + innerPad, clip.boardX + clip.boardW - innerPad);
 }
 
+function cameraViewport(
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  outputW: number,
+  outputH: number
+): CameraViewport {
+  const visibleW = BOARD_W / Math.max(0.05, cam.boardZoom);
+  const visibleH = outputH * BOARD_W / (Math.max(0.05, cam.boardZoom) * outputW);
+  return {
+    left: cam.cameraX - visibleW / 2,
+    right: cam.cameraX + visibleW / 2,
+    top: cam.cameraY - visibleH / 2,
+    bottom: cam.cameraY + visibleH / 2,
+    width: visibleW,
+    height: visibleH,
+  };
+}
+
+function viewportEntranceSpawn(
+  landingX: number,
+  landingY: number,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  outputW: number,
+  outputH: number
+): { x: number; y: number } {
+  const vp = cameraViewport(cam, outputW, outputH);
+  const leftRoom = Math.max(0, landingX - vp.left);
+  const rightRoom = Math.max(0, vp.right - landingX);
+  const side: 1 | -1 = rightRoom > leftRoom ? 1 : -1;
+  return {
+    x: landingX + side * vp.width * 0.35,
+    y: Math.min(landingY - 150, vp.top - 150),
+  };
+}
+
 function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]): SkateToPlan | null {
   const tx = active.targetX ?? active.fromX;
   const ty = active.targetY ?? active.fromY;
@@ -752,7 +799,9 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
   const rollDistance = Math.abs(edgeX - active.fromX);
   const ollyDistance = Math.abs(gapEndX - edgeX);
   const heightDelta = landingY - startY;
-  const peakHeight = Math.max(SKATE_MIN_POP_HEIGHT, Math.abs(heightDelta) + SKATE_CLEARANCE_HEIGHT);
+  const verticalClimb = Math.max(0, startY - landingY);
+  const peakHeight = clamp(verticalClimb + SKATE_POP_CLEARANCE, SKATE_MIN_POP_HEIGHT, SKATE_MAX_POP_HEIGHT);
+  const tooHighTarget = verticalClimb > SKATE_MANUAL_FALLBACK_HEIGHT_DELTA;
 
   const naturalMount = SKATE_MOUNT_SEC;
   const naturalRoll = Math.max(0.05 * PHASE_TIME_SCALE, rollDistance / SKATE_ROLL_SPEED);
@@ -806,6 +855,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
     ollyDistance,
     heightDelta,
     peakHeight,
+    tooHighTarget,
     mountDur,
     rollDur,
     prepDur,
@@ -898,7 +948,9 @@ function deriveAutoCharActions(
   clips: Clip[],
   initX: number,
   initY: number,
-  cameraKeyframes: CameraKeyframe[] = []
+  cameraKeyframes: CameraKeyframe[] = [],
+  outputW = CANVAS_W_LAND,
+  outputH = CANVAS_H_LAND
 ): CharacterAction[] {
   const focusClips = clips
     .filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined))
@@ -943,19 +995,19 @@ function deriveAutoCharActions(
     }
 
     if (!hasEntered) {
-      // Entrance: flip in from offscreen-left, landing exactly as the camera settles into the hold.
-      // Start off to the side and above the clip top so the entrance reads as a down-and-across
-      // side-entry flip, not a rise from below the board.
+      // Entrance: spawn from the visible camera viewport so the flip descends from the top/top-corner
+      // in both landscape and portrait output, instead of using a board-space offscreen guess.
       const startCam = cameraKeyframes.length > 0 ? interpolateCameraKeyframes(cameraKeyframes, travelStart) : null;
-      const visibleBoardW = startCam ? BOARD_W / Math.max(0.05, startCam.boardZoom) : CHAR_OFFSCREEN_PAD * 2;
-      const startX = startCam ? startCam.cameraX - visibleBoardW / 2 - CHAR_OFFSCREEN_PAD * 0.25 : arriveX - CHAR_OFFSCREEN_PAD;
+      const spawn = startCam
+        ? viewportEntranceSpawn(arriveX, arriveY, startCam, outputW, outputH)
+        : { x: arriveX - CHAR_OFFSCREEN_PAD, y: arriveY - CHAR_ENTRANCE_Y_LIFT };
       actions.push({
         id: `auto_${clip.id}_mv`,
         type: "flip",
         startTime: travelStart,
         duration: travelEnd - travelStart,
         targetX: arriveX, targetY: arriveY,
-        startX, startY: arriveY - CHAR_ENTRANCE_Y_LIFT,
+        startX: spawn.x, startY: spawn.y,
         entranceFlip: true,
       });
       hasEntered = true;
@@ -965,7 +1017,7 @@ function deriveAutoCharActions(
       if (dist > 20 && travelEnd - travelStart > 0.1) {
         let moveType: CharacterAction["type"];
         const horizontalDist = Math.abs(dx);
-        const mildHeightChange = Math.abs(dy) <= 300;
+        const mildHeightChange = Math.abs(dy) <= SKATE_AUTO_MAX_HEIGHT_DELTA;
         const skateCandidate = horizontalDist >= 800 && horizontalDist <= 2000 && mildHeightChange;
         if (dy > 300 && Math.abs(dx) > 150) moveType = "zipline";     // big drop — slide down a line
         else if (dy < -300 && dist < CHAR_JUMP_DIST * 1.3) moveType = "wallClimb"; // big climb, short reach
@@ -1034,14 +1086,17 @@ function deriveAutoCharActions(
   // entered (e.g. the timeline is pan-only — nothing to exit from).
   if (prev && hasEntered) {
     const lastTransEnd = prev.startTime + prev.duration;
-    const dir = curX >= initX ? 1 : -1;
+    const exitCam = cameraKeyframes.length > 0 ? interpolateCameraKeyframes(cameraKeyframes, lastTransEnd) : null;
+    const exitTarget = exitCam
+      ? viewportEntranceSpawn(curX, curY, exitCam, outputW, outputH)
+      : { x: curX + CHAR_OFFSCREEN_PAD * (curX >= initX ? 1 : -1), y: curY - CHAR_ENTRANCE_Y_LIFT };
     actions.push({
       id: `auto_exit`,
       type: "flip",
       startTime: lastTransEnd,
       duration: 1.0,
-      targetX: curX + CHAR_OFFSCREEN_PAD * dir,
-      targetY: curY,
+      targetX: exitTarget.x,
+      targetY: exitTarget.y,
     });
   }
 
@@ -1286,6 +1341,26 @@ function evalCharAtTime(
     if (!plan) {
       return applyAuthoredPose(idlePose(active.fromX, active.fromY), sampleAnimation(authoredAnimations.idle, 0));
     }
+    if (plan.tooHighTarget) {
+      const tx = active.targetX ?? active.fromX;
+      const ty = active.targetY ?? active.fromY;
+      const landingY = resolveGroundY(tx, ty, clips);
+      const bx = lerp(active.fromX, tx, progress);
+      const by = lerp(active.fromY, landingY, progress);
+      const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+      const airY = -150 * 4 * progress * (1 - progress);
+      return {
+        boardX: bx, boardY: by, facing,
+        headBob: 0, bodyLean: 0.04 * facing,
+        leftLegA: progress < 0.7 ? -0.5 : 0.25,
+        rightLegA: progress < 0.7 ? -0.42 : 0.15,
+        leftArmA: progress < 0.7 ? -0.45 : 0.35,
+        rightArmA: progress < 0.7 ? -0.45 : -0.35,
+        leftForeA: progress < 0.7 ? -0.2 : 0.05,
+        rightForeA: progress < 0.7 ? -0.2 : -0.05,
+        airY,
+      };
+    }
 
     let bx = plan.startX;
     let by = plan.startY;
@@ -1364,7 +1439,13 @@ function evalCharAtTime(
     const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
     const anchorBY = Math.min(active.fromY, ty) - 380;
     const landingY = resolveGroundY(tx, ty, clips);
-    const zipT = progress <= 0.32 ? 0 : progress >= 0.85 ? 1 : easeInOutCubic((progress - 0.32) / 0.53);
+    const PREP_END = 0.1;
+    const FIRE_END = 0.24;
+    const PULL_START = 0.32;
+    const RELEASE_PREP_START = 0.72;
+    const RELEASE_DETACH = 0.85;
+    const FREEFALL_END = 0.93;
+    const zipT = progress <= PULL_START ? 0 : progress >= RELEASE_DETACH ? 1 : easeInOutCubic((progress - PULL_START) / (RELEASE_DETACH - PULL_START));
     const sag = Math.sin(Math.PI * zipT) * 28;
     let bx = active.fromX;
     let by = active.fromY;
@@ -1394,44 +1475,36 @@ function evalCharAtTime(
       }
     };
 
-    if (progress < 0.08) {
-      const t = progress / 0.08;
-      bodyLean = lerp(0.03, 0.08, t) * facing;
-      setFiringArm(lerp(0.12, 0.62, t), lerp(0.12, 0.45, t));
-      setFreeArm(-0.12, -0.05);
-    } else if (progress < 0.15) {
-      const t = (progress - 0.08) / 0.07;
-      const recoil = Math.max(0, 1 - Math.abs(progress - 0.12) / 0.025) * 0.08;
-      bodyLean = -recoil * facing;
-      setFiringArm(lerp(0.62, aimA, t), lerp(0.45, aimA, t));
-      setFreeArm(lerp(-0.12, 0.45, t), lerp(-0.05, 0.15, t));
+    if (progress < PREP_END) {
+      const t = easeInOutCubic(progress / PREP_END);
+      const torsoLead = clamp((progress + 0.05) / PREP_END, 0, 1);
+      bodyLean = lerp(0.02, 0.1, easeOutQuad(torsoLead)) * facing;
+      setFiringArm(lerp(0.12, 0.72, t), lerp(0.12, 0.52, t));
+      setFreeArm(lerp(-0.12, 0.18, t), lerp(-0.05, 0.08, t));
+    } else if (progress < FIRE_END) {
+      const t = easeOutQuad((progress - PREP_END) / (FIRE_END - PREP_END));
+      bodyLean = lerp(0.1, -0.05, clamp((progress - PREP_END + 0.05) / (FIRE_END - PREP_END), 0, 1)) * facing;
+      setFiringArm(lerp(0.72, aimA, t), lerp(0.52, aimA, t));
+      setFreeArm(lerp(0.18, 0.38, t), lerp(0.08, 0.14, t));
       ropeAlpha = t;
-      hookT = 0.02 + t * 0.1;
-    } else if (progress < 0.28) {
-      const t = (progress - 0.15) / 0.13;
+      hookT = 0.02 + t * 0.18;
+    } else if (progress < PULL_START) {
+      const t = (progress - FIRE_END) / (PULL_START - FIRE_END);
       setFiringArm(aimA, aimA);
       setFreeArm(0.35, 0.12);
       bodyLean = -0.04 * facing;
       ropeAlpha = 1;
       hookT = t;
-    } else if (progress < 0.32) {
-      const t = (progress - 0.28) / 0.04;
-      setFiringArm(aimA, aimA);
-      setFreeArm(0.2, 0.06);
-      bodyLean = lerp(0, -0.22, t) * facing;
-      ropeAlpha = 1;
-      hookT = 1;
-      taut = true;
-    } else if (progress < 0.85) {
+    } else if (progress < RELEASE_DETACH) {
       bx = lerp(active.fromX, tx, zipT);
-      by = lerp(active.fromY, landingY, zipT) + sag;
+      by = lerp(active.fromY, landingY - 60, zipT) + sag;
       const movingAimA = aimAngleFromPoint(bx, by, facing, anchorBX, anchorBY);
       setFiringArm(movingAimA, movingAimA);
       ropeAlpha = 1;
       hookT = 1;
       taut = true;
       if (progress < 0.45) {
-        const t = (progress - 0.32) / 0.13;
+        const t = (progress - PULL_START) / (0.45 - PULL_START);
         bodyLean = lerp(-0.9, -0.72, t) * facing;
         leftLegA = lerp(0.5, 0.65, t); rightLegA = lerp(0.35, 0.52, t);
         setFreeArm(0.75, 0.22);
@@ -1443,31 +1516,33 @@ function evalCharAtTime(
         setFreeArm(lerp(0.75, 0.15, t), lerp(0.22, 0.1, t));
         headBob = -2;
       } else {
-        const t = (progress - 0.7) / 0.15;
-        bodyLean = lerp(-0.35, -0.12, t) * facing;
-        leftLegA = lerp(-0.32, -0.72, t); rightLegA = lerp(0.75, -0.45, t);
-        setFreeArm(lerp(0.15, -0.55, t), lerp(0.1, -0.15, t));
+        const t = clamp((progress - RELEASE_PREP_START) / (RELEASE_DETACH - RELEASE_PREP_START), 0, 1);
+        bodyLean = lerp(-0.35, -0.04, easeOutQuad(t)) * facing;
+        leftLegA = lerp(-0.32, -0.62, t); rightLegA = lerp(0.75, -0.5, t);
+        setFreeArm(lerp(0.15, -0.2, t), lerp(0.1, -0.02, t));
         headBob = -1;
       }
-    } else if (progress < 0.95) {
-      const t = (progress - 0.85) / 0.1;
+    } else if (progress < FREEFALL_END) {
+      const t = (progress - RELEASE_DETACH) / (FREEFALL_END - RELEASE_DETACH);
       bx = tx;
-      by = landingY;
-      bodyLean = lerp(-0.34, -0.18, t) * facing;
-      leftLegA = lerp(-0.95, -0.65, t); rightLegA = lerp(-0.85, -0.55, t);
-      leftForeA = lerp(1.15, 0.8, t); rightForeA = lerp(1.05, 0.75, t);
-      setFiringArm(lerp(-0.4, 0.05, t), lerp(-0.1, 0.1, t));
-      setFreeArm(lerp(-0.9, -0.2, t), lerp(-0.4, -0.1, t));
-      impact = Math.max(0, 1 - t * 1.3);
+      by = lerp(landingY - 60, landingY, easeInQuad(t));
+      ropeAlpha = 0;
+      bodyLean = lerp(-0.04, -0.18, t) * facing;
+      leftLegA = lerp(-0.62, -0.72, t); rightLegA = lerp(-0.5, -0.62, t);
+      leftForeA = lerp(0.8, 0.65, t); rightForeA = lerp(0.75, 0.62, t);
+      setFiringArm(lerp(aimA, 0.05, t), lerp(aimA, 0.1, t));
+      setFreeArm(lerp(-0.2, -0.1, t), lerp(-0.02, 0.02, t));
     } else {
-      const t = (progress - 0.95) / 0.05;
+      const t = (progress - FREEFALL_END) / (1 - FREEFALL_END);
       bx = tx;
       by = landingY;
+      ropeAlpha = 0;
       bodyLean = lerp(-0.18, 0, t) * facing;
-      leftLegA = lerp(-0.65, 0.12, t); rightLegA = lerp(-0.55, -0.12, t);
-      leftForeA = lerp(0.8, 0.13, t); rightForeA = lerp(0.75, -0.13, t);
+      leftLegA = lerp(-0.72, 0.12, t); rightLegA = lerp(-0.62, -0.12, t);
+      leftForeA = lerp(0.65, 0.13, t); rightForeA = lerp(0.62, -0.13, t);
       setFiringArm(lerp(0.05, -0.08, t), lerp(0.1, -0.13, t));
       setFreeArm(lerp(-0.2, 0.08, t), lerp(-0.1, 0.13, t));
+      impact = Math.max(0, 1 - t * 1.3);
     }
 
     return applyAuthoredPose({
@@ -1481,7 +1556,7 @@ function evalCharAtTime(
       grappleHookT: hookT,
       grappleTaut: taut,
       grappleImpact: impact,
-      grappleLauncherVisible: progress < 0.9,
+      grappleLauncherVisible: progress < RELEASE_DETACH,
     }, null);
   }
 
@@ -1609,18 +1684,20 @@ function evalCharAtTime(
   }
 
   if (active.type === "emote") {
-    const hop = Math.sin(Math.PI * Math.min(1, progress * 3)) * -20;
+    const poseIn = clamp(progress / 0.18, 0, 1);
+    const poseOut = progress > 0.82 ? clamp((1 - progress) / 0.18, 0, 1) : 1;
+    const poseT = easeInOutCubic(Math.min(poseIn, poseOut));
     const emojiAlpha = progress <= 0.2
       ? progress / 0.2
       : progress <= 0.8 ? 1
       : Math.max(0, 1 - (progress - 0.8) / 0.2);
     return {
       boardX: active.fromX, boardY: active.fromY, facing: 1,
-      headBob: hop * 0.4, bodyLean: Math.sin(progress * Math.PI * 4) * 0.08,
-      leftLegA: 0, rightLegA: 0,
-      leftArmA: 0.5, rightArmA: -0.5,
-      leftForeA: 0.2, rightForeA: -0.2,
-      airY: hop,
+      headBob: 0, bodyLean: lerp(0, 0.1, poseT),
+      leftLegA: lerp(0.12, 0.18, poseT), rightLegA: lerp(-0.12, -0.08, poseT),
+      leftArmA: lerp(0.08, 0.62, poseT), rightArmA: lerp(-0.08, -1.2, poseT),
+      leftForeA: lerp(0.13, -0.42, poseT), rightForeA: lerp(-0.13, -2.65, poseT),
+      airY: 0,
       emojiText: active.emoji, emojiAlpha,
     };
   }
@@ -2005,6 +2082,7 @@ export default function Board2Page() {
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
+  const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
   const [authoredAnimations, setAuthoredAnimations] = useState<AuthoredAnimation[]>([]);
 
@@ -2178,6 +2256,7 @@ export default function Board2Page() {
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
   const characterActionsRef = useRef<CharacterAction[]>([]);
+  const selectedCharActionIdRef = useRef<string | null>(null);
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
   const authoredAnimationsRef = useRef<Record<string, AuthoredAnimation>>({});
   const charInitXRef = useRef(BOARD_W / 2);
@@ -2213,6 +2292,7 @@ export default function Board2Page() {
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
   useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
+  useEffect(() => { selectedCharActionIdRef.current = selectedCharActionId; }, [selectedCharActionId]);
   useEffect(() => { authoredAnimationsRef.current = animationMap(authoredAnimations); }, [authoredAnimations]);
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
@@ -2223,10 +2303,10 @@ export default function Board2Page() {
   const charInit = useMemo(() => getCharInitPos(clips), [clips]);
   const resolvedCharActions = useMemo(() => {
     const merged = characterMode === "auto"
-      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes), characterActions)
+      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions)
       : characterActions;
     return resolveCharActions(merged, charInit.x, charInit.y, clips);
-  }, [clips, characterActions, characterMode, charInit, cameraKeyframes]);
+  }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
 
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
   // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
@@ -4150,6 +4230,7 @@ export default function Board2Page() {
     selectedClipIdsRef.current = unique;
     setSelectedClipIds(unique);
     setSelectedClipId(unique[unique.length - 1] ?? null);
+    setSelectedCharActionId(null);
     if (unique.length > 0) {
       selectedAnnotationIdsRef.current = [];
       setSelectedAnnotationIds([]);
@@ -4162,6 +4243,7 @@ export default function Board2Page() {
     selectedAnnotationIdsRef.current = unique;
     setSelectedAnnotationIds(unique);
     setSelectedAnnotationId(unique[unique.length - 1] ?? null);
+    setSelectedCharActionId(null);
     if (unique.length > 0) {
       selectedClipIdsRef.current = [];
       setSelectedClipIds([]);
@@ -4178,6 +4260,7 @@ export default function Board2Page() {
     setSelectedAnnotationIds(uniqueAnnotationIds);
     setSelectedClipId(uniqueClipIds[uniqueClipIds.length - 1] ?? null);
     setSelectedAnnotationId(uniqueAnnotationIds.length > 0 && uniqueClipIds.length === 0 ? uniqueAnnotationIds[uniqueAnnotationIds.length - 1] : null);
+    setSelectedCharActionId(null);
   }
 
   function clearBoardSelection() {
@@ -4187,6 +4270,27 @@ export default function Board2Page() {
     setSelectedAnnotationIds([]);
     setSelectedClipId(null);
     setSelectedAnnotationId(null);
+    setSelectedCharActionId(null);
+  }
+
+  function selectCharAction(id: string) {
+    selectedClipIdsRef.current = [];
+    selectedAnnotationIdsRef.current = [];
+    setSelectedClipIds([]);
+    setSelectedAnnotationIds([]);
+    setSelectedClipId(null);
+    setSelectedAnnotationId(null);
+    selectedCharActionIdRef.current = id;
+    setSelectedCharActionId(id);
+  }
+
+  function deleteCharacterAction(id: string) {
+    setCharacterActions((prev) => prev.filter((a) => a.id !== id));
+    if (selectedCharActionIdRef.current === id) {
+      selectedCharActionIdRef.current = null;
+      setSelectedCharActionId(null);
+    }
+    setCharActionContextMenu((prev) => (prev?.actionId === id ? null : prev));
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {
@@ -4785,6 +4889,7 @@ export default function Board2Page() {
     kind: "move" | "resize-left" | "resize-right"
   ) {
     e.stopPropagation();
+    selectCharAction(action.id);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const rect = scrollerRef.current!.getBoundingClientRect();
     const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
@@ -5602,6 +5707,7 @@ export default function Board2Page() {
       if (e.code === "Delete" || e.code === "Backspace") {
         const clipIds = selectedClipIdsRef.current.length > 0 ? selectedClipIdsRef.current : selectedClipId ? [selectedClipId] : [];
         const annotationIds = selectedAnnotationIdsRef.current.length > 0 ? selectedAnnotationIdsRef.current : selectedAnnotationId ? [selectedAnnotationId] : [];
+        const charActionId = selectedCharActionIdRef.current;
         if (clipIds.length > 0) {
           e.preventDefault();
           clipIds.forEach((id) => deleteClip(id));
@@ -5614,6 +5720,9 @@ export default function Board2Page() {
           selectedAnnotationIdsRef.current = [];
           setSelectedAnnotationIds([]);
           setSelectedAnnotationId(null);
+        } else if (charActionId) {
+          e.preventDefault();
+          deleteCharacterAction(charActionId);
         }
       }
       const meta = e.metaKey || e.ctrlKey;
@@ -8467,6 +8576,7 @@ export default function Board2Page() {
                   {/* Character action blocks — show derived auto-actions (dimmed) + manual actions */}
                   {resolvedCharActions.map((action) => {
                     const isAuto = characterMode === "auto" && !characterActions.find((m) => m.id === action.id);
+                    const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
                       walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
@@ -8484,7 +8594,8 @@ export default function Board2Page() {
                           width: actionPx,
                           height: CHARACTER_TRACK_H - 4,
                           background: isAuto ? "rgba(180,220,170,0.45)" : CHARACTER_COLOR,
-                          border: isAuto ? "1px dashed rgba(60,130,60,0.35)" : "1.5px solid rgba(60,130,60,0.5)",
+                          border: selected ? "2px solid #2a2a2a" : isAuto ? "1px dashed rgba(60,130,60,0.35)" : "1.5px solid rgba(60,130,60,0.5)",
+                          boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
                           cursor: isAuto ? "default" : "grab",
                           userSelect: "none",
                           overflow: "hidden",
@@ -8496,8 +8607,10 @@ export default function Board2Page() {
                         onContextMenu={isAuto ? undefined : (e) => {
                           e.preventDefault();
                           e.stopPropagation();
+                          selectCharAction(action.id);
                           setCharActionContextMenu({ x: e.clientX, y: e.clientY, actionId: action.id });
                         }}
+                        onClick={isAuto ? undefined : (e) => { e.stopPropagation(); selectCharAction(action.id); }}
                       >
                         {/* Left resize — manual only */}
                         {!isAuto && (
@@ -8512,6 +8625,31 @@ export default function Board2Page() {
                         {/* AI-choreographed badge — drag/resize/delete work the same as any manual action */}
                         {action.aiGenerated && (
                           <span title="AI-choreographed" style={{ position: "absolute", top: -1, right: 1, fontSize: 8, zIndex: 5, pointerEvents: "none" }}>✨</span>
+                        )}
+                        {!isAuto && (
+                          <button
+                            type="button"
+                            title="Delete action"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); deleteCharacterAction(action.id); }}
+                            style={{
+                              position: "absolute",
+                              right: HANDLE_W + 1,
+                              top: 1,
+                              width: 14,
+                              height: 14,
+                              border: "1px solid rgba(42,42,42,0.55)",
+                              background: "#fffdf5",
+                              color: "#ff5e3a",
+                              fontSize: 9,
+                              lineHeight: 1,
+                              padding: 0,
+                              cursor: "pointer",
+                              zIndex: 8,
+                            }}
+                          >
+                            ×
+                          </button>
                         )}
                         {/* Right resize — manual only */}
                         {!isAuto && (
@@ -8540,7 +8678,7 @@ export default function Board2Page() {
           onPointerDown={(e) => e.stopPropagation()}
         >
           <div
-            onClick={() => { setCharacterActions((prev) => prev.filter((a) => a.id !== charActionContextMenu.actionId)); setCharActionContextMenu(null); }}
+            onClick={() => { deleteCharacterAction(charActionContextMenu.actionId); }}
             style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, color: "#ff5e3a" }}
             onMouseEnter={(e) => (e.currentTarget.style.background = "#ffe5e5")}
             onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
