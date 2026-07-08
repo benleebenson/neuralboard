@@ -114,7 +114,7 @@ function keyframesEqual(a: PoseKeyframe[], b: PoseKeyframe[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-const REFRESHABLE_STARTER_NAMES = new Set(["skate-pedal", "skate-olly", "emote-thinking"]);
+const REFRESHABLE_STARTER_NAMES = new Set(["skate-pedal", "skate-olly", "emote-thinking", "pullups-rep", "mirror-flex"]);
 
 function starterFor(name: string, createdAt: string): AuthoredAnimation | undefined {
   return starterAnimations(createdAt).find((anim) => anim.name === name);
@@ -128,7 +128,7 @@ function isPristineRefreshableSeed(row: AnimationRow): boolean {
 
   const anim = normalizeAnimation({ ...data, id: row.id, name: row.name, createdAt: row.created_at });
   if (!anim) return false;
-  if (row.name === "emote-thinking") return false;
+  if (row.name === "emote-thinking" || row.name === "pullups-rep" || row.name === "mirror-flex") return false;
   const legacy = row.name === "skate-pedal" ? LEGACY_SKATE_PEDAL_KEYFRAMES : LEGACY_SKATE_OLLY_KEYFRAMES;
   return keyframesEqual(anim.keyframes, legacy);
 }

@@ -22,14 +22,16 @@ type CameraFocusEntry = { clipId: string; holdStart: number; holdEnd: number; tr
 
 const VALID_TYPES = new Set([
   "walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb",
-  "sitAndWatch", "pointAt", "emote", "explainGesture",
+  "sitAndWatch", "pointAt", "emote", "explainGesture", "pullUps", "mirrorCheck",
 ]);
-const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb"]);
+const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb", "pullUps", "mirrorCheck"]);
 
 const SYSTEM_PROMPT = `You choreograph a stick-figure explainer character in a video. The character stands on media clips placed on a board while a camera pans between them.
 
-VOCABULARY — output ONLY these action types: walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture.
+VOCABULARY — output ONLY these action types: walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture, pullUps, mirrorCheck.
 - walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb: travel moves. Each MUST include targetClipId — the clip the character moves to. Choose the move by distance/drama: walkTo for short hops, jumpTo for medium gaps, skateTo for medium horizontal travel with mild height changes where a skateboard roll plus olly feels playful, flip for a dramatic entrance/exit or big beat, grapple or zipline for long or dramatic traversals across the board, wallClimb only when the target clip sits well above the current position.
+- pullUps: place the character at a target clip/spot and perform pull-ups on a grounded pull-up bar prop. Requires targetClipId.
+- mirrorCheck: place the character at a target clip/spot to inspect himself in a standing mirror and become jacked from the transform beat onward. Requires targetClipId.
 - sitAndWatch: sit and watch a video clip play. targetClipId = that video clip.
 - pointAt: point at a clip to draw attention to it. targetClipId is REQUIRED.
 - explainGesture: talk with the hands while standing near a clip. targetClipId is optional — omit it to just continue gesturing wherever the character currently is.
@@ -41,6 +43,7 @@ RULES:
 - Respect the camera schedule given in cameraFocusOrder: during a clip's holdStart–holdEnd window the character should be on or near that clip. Travel actions belong in the TRANSITION window — after one clip's holdEnd and before the next clip's transitionEnd — never in the middle of a hold.
 - Stay within totalDurationSec. It's fine to leave a hold with no explicit action — the renderer fills gaps with idle/gesture poses automatically, so only add actions where they add something.
 - If direction text is provided, treat it as the primary source for WHICH moves happen and roughly when. Map it onto the real clip order — e.g. "flips in onto image 1" means the flip should target the first clip in cameraFocusOrder, "the video" means the nearest clip of type video, "the last image" means the last image-type clip. If the direction conflicts with the camera schedule, keep the user's intended move CHOICE but retime it to the nearest matching clip's actual hold/transition windows.
+- Use pullUps and mirrorCheck only when the user explicitly asks for those beats; never invent them from narration sync alone.
 - If a transcript with segment timestamps is provided, add emote actions timed to emotionally salient moments in the narration: a surprising fact → ❗ or 🤯, a question → 🤔, a funny/light moment → 😂, a key insight → 💡. Max roughly one emote per 6 seconds of narration, and only where something genuinely fits — do not force one into every segment.
 - Never invent a clipId that isn't in the provided clip list.
 
@@ -48,7 +51,7 @@ Return ONLY valid JSON, no markdown, no commentary, in this exact schema:
 {
   "actions": [
     {
-      "type": "walkTo" | "jumpTo" | "skateTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture",
+      "type": "walkTo" | "jumpTo" | "skateTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture" | "pullUps" | "mirrorCheck",
       "startTime": number,
       "duration": number,
       "targetClipId": "string (omit for emote)",

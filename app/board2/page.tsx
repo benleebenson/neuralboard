@@ -84,7 +84,7 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 type CharacterAction = {
   id: string;
   type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
-      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "idle";
+      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
@@ -591,7 +591,7 @@ const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these change the character's resting board position
-const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple", "pullUps", "mirrorCheck"]);
 const CHAR_OFFSCREEN_PAD = 900;
 const CHAR_ENTRANCE_Y_LIFT = 600;
 const PHASE_TIME_SCALE = 1.2;
@@ -613,6 +613,12 @@ const CHAR_TORSO_RAW = 53;
 const CHAR_NECK_RAW = 12;
 const CHAR_HEAD_R_RAW = 20;
 const CHAR_ARM_RAW = 32;
+const PULLUP_BAR_WIDTH = 180;
+const PULLUP_BAR_HEIGHT = 230;
+const PULLUP_GRIP_HALF_WIDTH = 32;
+const MIRROR_W = 90;
+const MIRROR_H = 260;
+const MIRROR_OFFSET = 140;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -894,6 +900,12 @@ function resolvedActionRestPosition(
 ): { x: number; y: number } {
   const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips) : null;
   if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
+  if ((action.type === "pullUps" || action.type === "mirrorCheck") && action.targetX !== undefined) {
+    return {
+      x: action.targetX,
+      y: resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips),
+    };
+  }
   return {
     x: action.targetX ?? action.fromX,
     y: action.targetY ?? action.fromY,
@@ -1149,6 +1161,16 @@ type CharPoseResult = {
   skateboardVisible?: boolean;
   skateFootMode?: "both-planted" | "left-push" | "air";
   skateCrouch?: number;
+  pullUpBarAlpha?: number;
+  pullUpBarBX?: number;
+  pullUpBarBY?: number;
+  mirrorAlpha?: number;
+  mirrorBX?: number;
+  mirrorBY?: number;
+  mirrorFacing?: 1 | -1;
+  surpriseAlpha?: number;
+  sparkleAlpha?: number;
+  physiquePulse?: number;
 };
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
@@ -1344,6 +1366,26 @@ function thinkingPoseBase(
   }
 
   return pose;
+}
+
+function physiqueAt(time: number, actions: CharacterAction[]): "slim" | "jacked" {
+  return actions.some((action) =>
+    action.type === "mirrorCheck" &&
+    action.startTime + action.duration * 0.35 <= time
+  ) ? "jacked" : "slim";
+}
+
+function pullUpArmPose(airY: number): Pick<CharPoseResult, "leftArmA" | "rightArmA" | "leftForeA" | "rightForeA"> {
+  const hipYRaw = -CHAR_HIP_RAW;
+  const gripYFromHip = -PULLUP_BAR_HEIGHT - airY - hipYRaw;
+  const left = solveArmToLocalPoint(-PULLUP_GRIP_HALF_WIDTH, gripYFromHip, -1);
+  const right = solveArmToLocalPoint(PULLUP_GRIP_HALF_WIDTH, gripYFromHip, 1);
+  return {
+    leftArmA: left.armA,
+    leftForeA: left.foreA,
+    rightArmA: right.armA,
+    rightForeA: right.foreA,
+  };
 }
 
 function aimAngleFromPoint(
@@ -1806,6 +1848,168 @@ function evalCharAtTime(
     }, authoredPose);
   }
 
+  if (active.type === "pullUps") {
+    const tx = active.targetX ?? active.fromX;
+    const ty = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const APPROACH_END = 0.1;
+    const HANG_END = 0.15;
+    const DISMOUNT_START = 0.9;
+    let bx = tx;
+    let by = ty;
+    let airY = -40;
+    let leftLegA = 0.08, rightLegA = -0.08;
+    let bodyLean = 0;
+    let headBob = 0;
+    let arms = pullUpArmPose(airY);
+    const barAlpha = progress < 0.15 ? progress / 0.15 : progress > 0.92 ? Math.max(0, (1 - progress) / 0.08) : 1;
+
+    if (progress < APPROACH_END) {
+      const t = easeInOutCubic(progress / APPROACH_END);
+      bx = lerp(active.fromX, tx, t);
+      by = lerp(active.fromY, ty, t);
+      airY = 0;
+      const reach = t;
+      leftLegA = Math.sin(t * Math.PI * 2) * 0.25;
+      rightLegA = Math.sin(t * Math.PI * 2 + Math.PI) * 0.25;
+      arms = {
+        leftArmA: lerp(0.08, -0.75, reach),
+        rightArmA: lerp(-0.08, 0.75, reach),
+        leftForeA: lerp(0.13, -0.35, reach),
+        rightForeA: lerp(-0.13, 0.35, reach),
+      };
+    } else if (progress < HANG_END) {
+      const t = easeInOutCubic((progress - APPROACH_END) / (HANG_END - APPROACH_END));
+      airY = lerp(0, -40, t);
+      arms = pullUpArmPose(airY);
+      leftLegA = lerp(0.12, 0.02, t);
+      rightLegA = lerp(-0.12, -0.02, t);
+    } else if (progress < DISMOUNT_START) {
+      const repSpan = DISMOUNT_START - HANG_END;
+      const reps = Math.max(1, Math.round(active.duration / 4 * 3));
+      const loop = ((progress - HANG_END) / repSpan) * reps;
+      const repT = loop - Math.floor(loop);
+      const lift = Math.pow(Math.max(0, Math.sin(Math.PI * repT)), 0.75);
+      airY = lerp(-40, -103, easeInOutCubic(lift));
+      arms = pullUpArmPose(airY);
+      bodyLean = Math.sin(loop * Math.PI * 2 + 0.7) * 0.03;
+      headBob = -lift * 2;
+      const cross = easeInOutCubic(lift);
+      leftLegA = lerp(0.02, 0.45, cross);
+      rightLegA = lerp(-0.02, -0.42, cross);
+    } else {
+      const t = easeInOutCubic((progress - DISMOUNT_START) / (1 - DISMOUNT_START));
+      airY = lerp(-40, 0, t);
+      arms = t < 0.35 ? pullUpArmPose(airY) : {
+        leftArmA: lerp(-0.45, 0.08, (t - 0.35) / 0.65),
+        rightArmA: lerp(0.45, -0.08, (t - 0.35) / 0.65),
+        leftForeA: lerp(-0.2, 0.13, (t - 0.35) / 0.65),
+        rightForeA: lerp(0.2, -0.13, (t - 0.35) / 0.65),
+      };
+      const absorb = Math.sin(Math.PI * t);
+      leftLegA = lerp(0.4, 0.12, t) + absorb * 0.08;
+      rightLegA = lerp(-0.4, -0.12, t) - absorb * 0.08;
+      headBob = absorb * 2;
+    }
+
+    return {
+      boardX: bx, boardY: by, facing,
+      headBob, bodyLean,
+      headTilt: 0,
+      leftLegA, rightLegA,
+      leftArmA: arms.leftArmA, rightArmA: arms.rightArmA,
+      leftForeA: arms.leftForeA, rightForeA: arms.rightForeA,
+      airY,
+      pullUpBarAlpha: barAlpha,
+      pullUpBarBX: tx,
+      pullUpBarBY: ty,
+    };
+  }
+
+  if (active.type === "mirrorCheck") {
+    const tx = active.targetX ?? active.fromX;
+    const ty = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    let pose = standingCharPose(tx, ty, facing, time);
+    let surpriseAlpha = 0;
+    let sparkleAlpha = 0;
+    let physiquePulse = 0;
+
+    if (progress < 0.15) {
+      const t = progress / 0.15;
+      const bx = lerp(active.fromX, tx, easeInOutCubic(t));
+      const rawBy = lerp(active.fromY, ty, easeInOutCubic(t));
+      const phase = t * Math.PI * 2;
+      pose = {
+        ...standingCharPose(bx, rawBy, facing, time),
+        headBob: Math.sin(phase * 2) * 1.5,
+        bodyLean: Math.sin(phase) * 0.04,
+        leftLegA: Math.sin(phase) * 0.35,
+        rightLegA: Math.sin(phase + Math.PI) * 0.35,
+        leftArmA: Math.sin(phase + Math.PI) * 0.24,
+        rightArmA: Math.sin(phase) * 0.24,
+        leftForeA: Math.sin(phase + Math.PI) * 0.1,
+        rightForeA: Math.sin(phase) * 0.1,
+      };
+    } else if (progress < 0.35) {
+      const t = (progress - 0.15) / 0.2;
+      surpriseAlpha = Math.max(0, 1 - Math.abs(t - 0.35) / 0.35);
+      pose.headTilt = lerp(0, 0.13, easeOutQuad(t));
+      pose.headBob = -Math.sin(Math.PI * t) * 4;
+      pose.leftArmA = lerp(0.08, 0.28, t);
+      pose.rightArmA = lerp(-0.08, -0.28, t);
+      pose.leftForeA = lerp(0.13, 0.28, t);
+      pose.rightForeA = lerp(-0.13, -0.28, t);
+    } else if (progress < 0.55) {
+      const t = (progress - 0.35) / 0.2;
+      pose = thinkingPoseBase(tx, ty, facing, time, active.id, time - active.startTime, "hold");
+      pose.headTilt = lerp(-0.06, 0.18, easeInOutCubic(t));
+      physiquePulse = Math.max(0, 1 - Math.abs(t - 0.28) / 0.28);
+    } else if (progress < 0.8) {
+      const t = (progress - 0.55) / 0.25;
+      const tremble = Math.sin(time * 42 + seededRandom(`${active.id}:flex`) * 10) * 0.02;
+      pose.bodyLean = Math.sin(time * 11) * 0.015;
+      pose.headTilt = 0.08;
+      pose.leftArmA = 1.18 + tremble;
+      pose.rightArmA = -1.18 - tremble;
+      pose.leftForeA = 2.15 - tremble;
+      pose.rightForeA = -2.15 + tremble;
+      pose.leftLegA = 0.18;
+      pose.rightLegA = -0.18;
+      sparkleAlpha = Math.min(1, t * 2);
+    } else {
+      const t = (progress - 0.8) / 0.2;
+      sparkleAlpha = Math.max(0, 1 - t * 0.4);
+      pose.headTilt = 0.08;
+      pose.leftLegA = 0.22;
+      pose.rightLegA = -0.22;
+      if (t < 0.5) {
+        pose.leftArmA = lerp(1.18, 0.8, t * 2);
+        pose.rightArmA = lerp(-1.18, -0.8, t * 2);
+        pose.leftForeA = lerp(2.15, 1.05, t * 2);
+        pose.rightForeA = lerp(-2.15, -1.05, t * 2);
+      } else {
+        const q = (t - 0.5) / 0.5;
+        pose.leftArmA = lerp(0.8, 1.15, q);
+        pose.leftForeA = lerp(1.05, 2.05, q);
+        pose.rightArmA = lerp(-0.8, -0.35, q);
+        pose.rightForeA = lerp(-1.05, -0.65, q);
+      }
+    }
+
+    return {
+      ...pose,
+      airY: 0,
+      mirrorAlpha: progress < 0.12 ? progress / 0.12 : progress > 0.94 ? Math.max(0, (1 - progress) / 0.06) : 1,
+      mirrorBX: tx + facing * MIRROR_OFFSET,
+      mirrorBY: ty,
+      mirrorFacing: facing,
+      surpriseAlpha,
+      sparkleAlpha,
+      physiquePulse,
+    };
+  }
+
   if (active.type === "pointAt") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = (tx - active.fromX) >= 0 ? 1 : -1;
@@ -1894,6 +2098,8 @@ function drawCharacterToCanvas(
   if (!showChar || time < entranceTime) return;
   const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations);
   const { facing } = p;
+  const physique = physiqueAt(time, resolved);
+  const isJacked = physique === "jacked";
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
   const sy = (p.boardY - cam.cameraY) * sf + H / 2;
@@ -1977,6 +2183,104 @@ function drawCharacterToCanvas(
     ctx.beginPath();
     ctx.arc(anchorSX, anchorSY, 3 * S, 0, Math.PI * 2);
     ctx.fill();
+    ctx.restore();
+  }
+
+  if (p.pullUpBarAlpha && p.pullUpBarAlpha > 0) {
+    const baseX = (((p.pullUpBarBX ?? p.boardX) - cam.cameraX) * sf + W / 2);
+    const baseY = (((p.pullUpBarBY ?? p.boardY) - cam.cameraY) * sf + H / 2);
+    const postHalf = (PULLUP_BAR_WIDTH / 2) * S;
+    const topY = baseY - PULLUP_BAR_HEIGHT * S;
+    ctx.save();
+    ctx.globalAlpha = p.pullUpBarAlpha;
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.fillStyle = "#f5ecd8";
+    ctx.lineWidth = Math.max(1, 2.2 * S);
+    ctx.lineCap = "round";
+    for (const x of [baseX - postHalf, baseX + postHalf]) {
+      ctx.beginPath();
+      ctx.moveTo(x, baseY);
+      ctx.lineTo(x, topY);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - 22 * S, baseY);
+      ctx.lineTo(x + 22 * S, baseY);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(baseX - postHalf, topY);
+    ctx.lineTo(baseX + postHalf, topY);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (p.mirrorAlpha && p.mirrorAlpha > 0) {
+    const mirrorFacing = p.mirrorFacing ?? facing;
+    const mirrorBaseBX = p.mirrorBX ?? (p.boardX + mirrorFacing * MIRROR_OFFSET);
+    const mirrorBaseSX = (mirrorBaseBX - cam.cameraX) * sf + W / 2;
+    const mirrorBaseSY = ((p.mirrorBY ?? p.boardY) - cam.cameraY) * sf + H / 2;
+    const mw = MIRROR_W * S;
+    const mh = MIRROR_H * S;
+    const mx = mirrorBaseSX - mw / 2;
+    const my = mirrorBaseSY - mh;
+    ctx.save();
+    ctx.globalAlpha = p.mirrorAlpha;
+    ctx.translate(mirrorBaseSX, mirrorBaseSY);
+    ctx.rotate(-0.08 * mirrorFacing);
+    ctx.translate(-mirrorBaseSX, -mirrorBaseSY);
+    ctx.fillStyle = "#eaf2f4";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 2 * S);
+    ctx.beginPath();
+    ctx.roundRect(mx, my, mw, mh, 12 * S);
+    ctx.fill();
+    ctx.stroke();
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(mx + 6 * S, my + 8 * S, mw - 12 * S, mh - 18 * S, 8 * S);
+    ctx.clip();
+    ctx.globalAlpha *= 0.42;
+    const rx = mirrorBaseSX;
+    const ry = mirrorBaseSY - 54 * S;
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.fillStyle = isJacked ? "#e6ddcf" : "transparent";
+    ctx.lineWidth = Math.max(1, 1.5 * S);
+    ctx.save();
+    ctx.translate(rx, ry);
+    ctx.scale(-0.85 * mirrorFacing, 0.85);
+    ctx.beginPath();
+    ctx.arc(0, -118 * S, 15 * S, 0, Math.PI * 2);
+    ctx.stroke();
+    if (isJacked) {
+      ctx.beginPath();
+      ctx.moveTo(-24 * S, -95 * S);
+      ctx.quadraticCurveTo(-19 * S, -62 * S, -10 * S, -35 * S);
+      ctx.lineTo(10 * S, -35 * S);
+      ctx.quadraticCurveTo(19 * S, -62 * S, 24 * S, -95 * S);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(0, -100 * S);
+      ctx.lineTo(0, -35 * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.restore();
+    ctx.strokeStyle = "rgba(255,255,255,0.7)";
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    for (const off of [-12, 10, 29]) {
+      ctx.beginPath();
+      ctx.moveTo(mx + 22 * S, my + (45 + off) * S);
+      ctx.lineTo(mx + 58 * S, my + (20 + off) * S);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(mirrorBaseSX, mirrorBaseSY);
+    ctx.lineTo(mirrorBaseSX - mirrorFacing * 34 * S, mirrorBaseSY + 36 * S);
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -2089,7 +2393,33 @@ function drawCharacterToCanvas(
   ctx.save();
   ctx.translate(0, hipY);
   ctx.rotate(p.bodyLean);
-  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
+  const jackedPulse = isJacked ? 1 + (p.physiquePulse ?? 0) * 0.16 : 1;
+  if (isJacked) {
+    const waistHalf = 11 * S;
+    const chestHalf = 27.5 * S * jackedPulse;
+    ctx.fillStyle = "#e8dfd1";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = lw;
+    ctx.beginPath();
+    ctx.moveTo(-waistHalf, 0);
+    ctx.quadraticCurveTo(-chestHalf * 0.72, -torsoLen * 0.45, -chestHalf, -torsoLen * 0.84);
+    ctx.quadraticCurveTo(-chestHalf * 0.35, -torsoLen * 1.02, 0, -torsoLen);
+    ctx.quadraticCurveTo(chestHalf * 0.35, -torsoLen * 1.02, chestHalf, -torsoLen * 0.84);
+    ctx.quadraticCurveTo(chestHalf * 0.72, -torsoLen * 0.45, waistHalf, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    for (const y of [-torsoLen * 0.35, -torsoLen * 0.5, -torsoLen * 0.65]) {
+      ctx.beginPath();
+      ctx.moveTo(-8 * S, y);
+      ctx.lineTo(8 * S, y);
+      ctx.stroke();
+    }
+    ctx.lineWidth = lw;
+  } else {
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
+  }
 
   const torsoTopY = -torsoLen;
   const shoulderY = -torsoLen * 0.85;
@@ -2117,15 +2447,42 @@ function drawCharacterToCanvas(
     }
   }
 
+  const drawMuscleSegment = (a: LocalPoint, b: LocalPoint, width: number) => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.max(0.001, Math.hypot(dx, dy));
+    const nx = -dy / len;
+    const ny = dx / len;
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    const endW = Math.max(1.5 * S, width * 0.28);
+    ctx.fillStyle = "#e8dfd1";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.beginPath();
+    ctx.moveTo(a.x + nx * endW, a.y + ny * endW);
+    ctx.quadraticCurveTo(mid.x + nx * width, mid.y + ny * width, b.x + nx * endW, b.y + ny * endW);
+    ctx.lineTo(b.x - nx * endW, b.y - ny * endW);
+    ctx.quadraticCurveTo(mid.x - nx * width, mid.y - ny * width, a.x - nx * endW, a.y - ny * endW);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  };
+
   const drawArm = (armA: number, foreA: number) => {
     const sOff = 0;
     const ex = sOff - Math.sin(armA) * armLen;
     const ey = shoulderY + Math.cos(armA) * armLen;
-    ctx.beginPath();
-    ctx.moveTo(sOff, shoulderY);
-    ctx.lineTo(ex, ey);
-    ctx.lineTo(ex - Math.sin(foreA) * armLen, ey + Math.cos(foreA) * armLen);
-    ctx.stroke();
+    const hx = ex - Math.sin(foreA) * armLen;
+    const hy = ey + Math.cos(foreA) * armLen;
+    if (isJacked) {
+      drawMuscleSegment({ x: sOff, y: shoulderY }, { x: ex, y: ey }, 7 * S * jackedPulse);
+      drawMuscleSegment({ x: ex, y: ey }, { x: hx, y: hy }, 5.8 * S * jackedPulse);
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(sOff, shoulderY);
+      ctx.lineTo(ex, ey);
+      ctx.lineTo(hx, hy);
+      ctx.stroke();
+    }
   };
   drawArm(lArmA, lForeA);
   drawArm(rArmA, rForeA);
@@ -2165,6 +2522,39 @@ function drawCharacterToCanvas(
     ctx.textBaseline = "bottom";
     ctx.scale(1 / facing, 1);
     ctx.fillText(p.emojiText, headCX * facing, headCY - headR - 12 * S);
+    ctx.restore();
+  }
+
+  if (p.surpriseAlpha && p.surpriseAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = p.surpriseAlpha;
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 1.5 * S);
+    for (const [x, y] of [[-22, -12], [0, -22], [22, -12]] as const) {
+      ctx.beginPath();
+      ctx.moveTo(headCX + x * S * 0.6, headCY - headR + y * S);
+      ctx.lineTo(headCX + x * S, headCY - headR + (y - 16) * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  if (p.sparkleAlpha && p.sparkleAlpha > 0) {
+    const drawStar = (x: number, y: number, r: number) => {
+      ctx.beginPath();
+      ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+      ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+      ctx.moveTo(x - r * 0.65, y - r * 0.65); ctx.lineTo(x + r * 0.65, y + r * 0.65);
+      ctx.moveTo(x - r * 0.65, y + r * 0.65); ctx.lineTo(x + r * 0.65, y - r * 0.65);
+      ctx.stroke();
+    };
+    ctx.save();
+    ctx.globalAlpha = p.sparkleAlpha;
+    ctx.strokeStyle = "#c8a200";
+    ctx.lineWidth = Math.max(1, 1.4 * S);
+    drawStar(-34 * S, shoulderY - 10 * S, 6 * S);
+    drawStar(34 * S, shoulderY - 16 * S, 7 * S);
+    drawStar(18 * S, shoulderY - 42 * S, 5 * S);
     ctx.restore();
   }
 
@@ -2257,7 +2647,7 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
-  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | null>(null);
+  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
@@ -2454,7 +2844,7 @@ export default function Board2Page() {
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
-  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | null>(null);
+  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
 
@@ -8392,6 +8782,8 @@ export default function Board2Page() {
                                 { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (3.0s)" },
                                 { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.8s)" },
                                 { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
+                                { mode: "pullUps" as const, label: "Pull-ups", title: "Click board to place a grounded pull-up bar action (4.0s)" },
+                                { mode: "mirrorCheck" as const, label: "Mirror", title: "Click board to place a mirror-check transformation action (5.0s)" },
                                 { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
                             ]).map(({ mode, label, title }) => (
                               <button
@@ -8546,7 +8938,15 @@ export default function Board2Page() {
                         rawBx >= c.boardX && rawBx <= c.boardX + c.boardW &&
                         rawBy >= c.boardY && rawBy <= c.boardY + c.boardH
                       );
-                    const durationMap: Record<string, number> = { walkTo: 1.5, jumpTo: 1.0, skateTo: 2.5 * PHASE_TIME_SCALE, grapple: GRAPPLE_MANUAL_DURATION_SEC, pointAt: 2.0 };
+                    const durationMap: Record<string, number> = {
+                      walkTo: 1.5,
+                      jumpTo: 1.0,
+                      skateTo: 2.5 * PHASE_TIME_SCALE,
+                      grapple: GRAPPLE_MANUAL_DURATION_SEC,
+                      pointAt: 2.0,
+                      pullUps: 4.0,
+                      mirrorCheck: 5.0,
+                    };
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
@@ -9072,7 +9472,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (

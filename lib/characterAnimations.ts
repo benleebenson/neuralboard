@@ -34,6 +34,8 @@ export const RESERVED_ANIMATION_NAMES = [
   "idle",
   "explain",
   "emote-thinking",
+  "pullups-rep",
+  "mirror-flex",
   "sit",
   "climb",
   "skate-pedal",
@@ -423,6 +425,32 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
       loop: false,
       createdAt: now,
       keyframes: THINKING_EMOTE_KEYFRAMES,
+    },
+    {
+      id: "starter_pullups_rep",
+      name: "pullups-rep",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftArmA: -0.85, rightArmA: 0.85, leftForeA: -0.32, rightForeA: 0.32, leftLegA: 0.02, rightLegA: -0.02, airborneY: -40 }) },
+        { t: 0.32, pose: pose({ leftArmA: -1.08, rightArmA: 1.08, leftForeA: 0.95, rightForeA: -0.95, leftLegA: 0.36, rightLegA: -0.34, airborneY: -82, bodyLean: 0.02 }) },
+        { t: 0.5, pose: pose({ leftArmA: -1.18, rightArmA: 1.18, leftForeA: 1.45, rightForeA: -1.45, leftLegA: 0.48, rightLegA: -0.46, airborneY: -103, headBob: -2 }) },
+        { t: 0.78, pose: pose({ leftArmA: -1.0, rightArmA: 1.0, leftForeA: 0.65, rightForeA: -0.65, leftLegA: 0.3, rightLegA: -0.28, airborneY: -64 }) },
+        { t: 1, pose: pose({ leftArmA: -0.85, rightArmA: 0.85, leftForeA: -0.32, rightForeA: 0.32, leftLegA: 0.02, rightLegA: -0.02, airborneY: -40 }) },
+      ],
+    },
+    {
+      id: "starter_mirror_flex",
+      name: "mirror-flex",
+      loop: false,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftArmA: 0.08, rightArmA: -0.08, leftForeA: 0.13, rightForeA: -0.13, headTilt: 0 }) },
+        { t: 0.25, pose: pose({ leftArmA: 0.62, rightArmA: -0.62, leftForeA: 0.8, rightForeA: -0.8, headTilt: 0.08, bodyLean: 0.02 }) },
+        { t: 0.55, pose: pose({ leftArmA: 1.18, rightArmA: -1.18, leftForeA: 2.15, rightForeA: -2.15, leftLegA: 0.18, rightLegA: -0.18, headTilt: 0.08 }) },
+        { t: 0.82, pose: pose({ leftArmA: 0.8, rightArmA: -0.8, leftForeA: 1.05, rightForeA: -1.05, leftLegA: 0.22, rightLegA: -0.22, headTilt: 0.08 }) },
+        { t: 1, pose: pose({ leftArmA: 1.15, rightArmA: -0.35, leftForeA: 2.05, rightForeA: -0.65, leftLegA: 0.22, rightLegA: -0.22, headTilt: 0.08 }) },
+      ],
     },
   ];
 }
