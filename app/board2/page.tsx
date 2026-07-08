@@ -600,9 +600,8 @@ const PHASE_TIME_SCALE = 1.2;
 const SKATE_ROLL_SPEED = 560; // board px/sec
 const SKATE_MOUNT_SEC = 0.3 * PHASE_TIME_SCALE;
 const SKATE_PREP_SEC = 0.25 * PHASE_TIME_SCALE;
-const SKATE_AIR_MIN_SEC = 0.5 * PHASE_TIME_SCALE;
-const SKATE_AIR_MAX_SEC = 0.8 * PHASE_TIME_SCALE;
 const SKATE_LAND_SEC = 0.4 * PHASE_TIME_SCALE;
+const SKATE_LANDING_ROLLOUT_PX = 90;
 const SKATE_EDGE_MARGIN = 50;
 const SKATE_MIN_POP_HEIGHT = 80;
 const SKATE_MAX_POP_HEIGHT = 140;
@@ -621,6 +620,51 @@ const PULLUP_GRIP_HALF_WIDTH = 32;
 const MIRROR_W = 90;
 const MIRROR_H = 260;
 const MIRROR_OFFSET = 140;
+
+type JackedPathCmd =
+  | { kind: "M"; x: number; y: number }
+  | { kind: "L"; x: number; y: number }
+  | { kind: "Q"; cpx: number; cpy: number; x: number; y: number }
+  | { kind: "C"; cp1x: number; cp1y: number; cp2x: number; cp2y: number; x: number; y: number };
+
+// Jacked v3 vector skin. These authored coordinates are deliberate design-iteration targets:
+// tune these path constants from screenshots instead of changing the animation skeleton.
+const JACKED_TORSO_PATH: JackedPathCmd[] = [
+  { kind: "M", x: -8, y: 0 },
+  { kind: "C", cp1x: -18, cp1y: -16, cp2x: -30, cp2y: -32, x: -35, y: -45 },
+  { kind: "C", cp1x: -30, cp1y: -56, cp2x: -16, cp2y: -60, x: 0, y: -54 },
+  { kind: "C", cp1x: 16, cp1y: -60, cp2x: 30, cp2y: -56, x: 35, y: -45 },
+  { kind: "C", cp1x: 30, cp1y: -32, cp2x: 18, cp2y: -16, x: 8, y: 0 },
+  { kind: "Q", cpx: 0, cpy: 4, x: -8, y: 0 },
+];
+const JACKED_SHOULDER_CAP_PATH: JackedPathCmd[] = [
+  { kind: "M", x: -17, y: 2 },
+  { kind: "C", cp1x: -18, cp1y: -11, cp2x: -8, cp2y: -21, x: 5, y: -21 },
+  { kind: "C", cp1x: 18, cp1y: -20, cp2x: 24, cp2y: -7, x: 18, y: 5 },
+  { kind: "C", cp1x: 9, cp1y: 12, cp2x: -6, cp2y: 12, x: -17, y: 2 },
+];
+const JACKED_UPPER_ARM_PATH: JackedPathCmd[] = [
+  { kind: "M", x: -9, y: 0 },
+  { kind: "C", cp1x: -18, cp1y: 11, cp2x: -16, cp2y: 25, x: -7, y: 34 },
+  { kind: "C", cp1x: -2, cp1y: 39, cp2x: 8, cp2y: 39, x: 10, y: 33 },
+  { kind: "C", cp1x: 14, cp1y: 21, cp2x: 15, cp2y: 8, x: 8, y: 0 },
+  { kind: "C", cp1x: 4, cp1y: -4, cp2x: -5, cp2y: -4, x: -9, y: 0 },
+];
+const JACKED_FOREARM_PATH: JackedPathCmd[] = [
+  { kind: "M", x: -7, y: 0 },
+  { kind: "C", cp1x: -11, cp1y: 10, cp2x: -9, cp2y: 24, x: -4, y: 33 },
+  { kind: "C", cp1x: 0, cp1y: 36, cp2x: 6, cp2y: 35, x: 7, y: 31 },
+  { kind: "C", cp1x: 10, cp1y: 20, cp2x: 9, cp2y: 8, x: 6, y: 0 },
+  { kind: "C", cp1x: 3, cp1y: -3, cp2x: -4, cp2y: -3, x: -7, y: 0 },
+];
+const JACKED_LEFT_PEC_DETAIL: JackedPathCmd[] = [
+  { kind: "M", x: -26, y: -38 },
+  { kind: "Q", cpx: -15, cpy: -28, x: -3, y: -32 },
+];
+const JACKED_RIGHT_PEC_DETAIL: JackedPathCmd[] = [
+  { kind: "M", x: 26, y: -38 },
+  { kind: "Q", cpx: 15, cpy: -28, x: 3, y: -32 },
+];
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -719,6 +763,7 @@ type SkateToPlan = {
   gapEndX: number;
   landingY: number;
   finalX: number;
+  rolloutDistance: number;
   rollDistance: number;
   ollyDistance: number;
   heightDelta: number;
@@ -821,8 +866,10 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
     ? source.boardX + source.boardW - SKATE_EDGE_MARGIN
     : source.boardX + SKATE_EDGE_MARGIN;
   const targetHoldX = clampInsideClipX(target, tx, SKATE_EDGE_MARGIN);
-  const gapEndX = targetHoldX;
-  const finalX = targetHoldX;
+  const desiredLandingX = targetHoldX - facing * SKATE_LANDING_ROLLOUT_PX;
+  const gapEndX = clampInsideClipX(target, desiredLandingX, SKATE_EDGE_MARGIN);
+  const finalX = clampInsideClipX(target, gapEndX + facing * SKATE_LANDING_ROLLOUT_PX, SKATE_EDGE_MARGIN);
+  const rolloutDistance = Math.abs(finalX - gapEndX);
   const startY = source.boardY;
   const landingY = target.boardY;
   const rollDistance = Math.abs(edgeX - active.fromX);
@@ -834,11 +881,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
 
   const naturalMount = SKATE_MOUNT_SEC;
   const naturalRoll = Math.max(0.05 * PHASE_TIME_SCALE, rollDistance / SKATE_ROLL_SPEED);
-  const naturalAir = clamp(
-    SKATE_AIR_MIN_SEC + (ollyDistance / 1400) * (SKATE_AIR_MAX_SEC - SKATE_AIR_MIN_SEC),
-    SKATE_AIR_MIN_SEC,
-    SKATE_AIR_MAX_SEC
-  );
+  const naturalAir = Math.max(0.08 * PHASE_TIME_SCALE, ollyDistance / SKATE_ROLL_SPEED);
   const naturalLand = SKATE_LAND_SEC;
   const naturalTotal = naturalMount + naturalRoll + naturalAir + naturalLand;
   const duration = Math.max(0.12, active.duration);
@@ -868,7 +911,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
   const prepDur = Math.min(
     SKATE_PREP_SEC,
     Math.max(0, rollDur),
-    rollDistance > 0 ? (Math.min(150, rollDistance) / rollDistance) * rollDur : 0
+    rollDistance > 0 ? (Math.min(120, rollDistance) / rollDistance) * rollDur : 0
   );
 
   return {
@@ -880,6 +923,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
     gapEndX,
     landingY,
     finalX,
+    rolloutDistance,
     rollDistance,
     ollyDistance,
     heightDelta,
@@ -1164,6 +1208,9 @@ type CharPoseResult = {
   skateboardVisible?: boolean;
   skateFootMode?: "both-planted" | "left-push" | "air";
   skateCrouch?: number;
+  skateboardTilt?: number;
+  skateSparkAlpha?: number;
+  skateMotionAlpha?: number;
   pullUpBarAlpha?: number;
   pullUpBarBX?: number;
   pullUpBarBY?: number;
@@ -1558,6 +1605,10 @@ function evalCharAtTime(
     let skateboardVisible = true;
     let skateFootMode: CharPoseResult["skateFootMode"] = "both-planted";
     let skateCrouch = 6;
+    let skateBodyLean = 0;
+    let skateboardTilt = 0;
+    let skateSparkAlpha = 0;
+    let skateMotionAlpha = 0;
     const elapsed = progress * active.duration;
 
     if (elapsed < plan.mountEnd) {
@@ -1578,6 +1629,9 @@ function evalCharAtTime(
         pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0, 0.18, prepT));
         skateFootMode = "both-planted";
         skateCrouch = lerp(8, 18, prepT);
+        skateBodyLean = 0.15 * plan.facing * prepT;
+        skateboardTilt = -0.45 * easeInOutCubic(Math.max(0, (prepT - 0.62) / 0.38));
+        skateSparkAlpha = Math.max(0, (prepT - 0.78) / 0.22);
       } else {
         const cycleProgress = plan.rollDistance > 0
           ? (Math.abs(bx - plan.startX) / 400)
@@ -1588,29 +1642,43 @@ function evalCharAtTime(
         skateCrouch = 7;
       }
     } else if (elapsed < plan.airEnd) {
-      const t = plan.airDur > 0 ? clamp((elapsed - plan.airStart) / plan.airDur, 0, 1) : 1;
-      bx = lerp(plan.edgeX, plan.gapEndX, easeInOutCubic(t));
-      by = lerp(plan.launchY, plan.landingY, t);
-      airY = -plan.peakHeight * 4 * t * (1 - t);
+      const airElapsed = Math.max(0, elapsed - plan.airStart);
+      const T = Math.max(0.001, plan.airDur);
+      const t = clamp(airElapsed / T, 0, 1);
+      const H = Math.max(1, plan.peakHeight);
+      const D = plan.heightDelta;
+      const g = Math.pow((Math.sqrt(2 * H) + Math.sqrt(Math.max(0.001, 2 * (H + D)))) / T, 2);
+      const v0 = -Math.sqrt(2 * g * H);
+      bx = plan.edgeX + (plan.gapEndX - plan.edgeX) * t;
+      by = plan.launchY;
+      airY = v0 * airElapsed + 0.5 * g * airElapsed * airElapsed;
       pose = sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.18, 0.84, t));
       skateFootMode = "air";
       skateCrouch = lerp(14, 8, Math.sin(Math.PI * t));
+      skateBodyLean = plan.facing * lerp(0.15, -0.1, t);
+      skateboardTilt = t < 0.35 ? lerp(-0.45, 0, easeInOutCubic(t / 0.35)) : 0;
+      skateSparkAlpha = Math.max(0, 1 - t / 0.16);
+      skateMotionAlpha = Math.max(0, 1 - Math.abs(t - 0.52) / 0.25);
     } else {
       const t = plan.landDur > 0 ? clamp((elapsed - plan.airEnd) / plan.landDur, 0, 1) : 1;
-      bx = plan.finalX;
+      const rolloutT = clamp(t / 0.68, 0, 1);
+      bx = plan.gapEndX + (plan.finalX - plan.gapEndX) * rolloutT;
       by = plan.landingY;
-      skateboardVisible = t < 0.62;
-      pose = t < 0.62
-        ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.62))
+      skateboardVisible = t < 0.72;
+      pose = t < 0.68
+        ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.68))
         : sampleAnimation(authoredAnimations.idle, 0) ?? null;
       skateFootMode = "both-planted";
-      skateCrouch = lerp(18, 6, t);
+      skateCrouch = t < 0.68 ? lerp(18, 7, rolloutT) : lerp(7, 0, (t - 0.68) / 0.32);
+      skateBodyLean = plan.facing * lerp(-0.08, 0, t);
+      skateboardTilt = lerp(-0.08, 0, Math.min(1, t * 2));
     }
     pose = relaxedSkateArms(pose);
+    if (pose) pose = { ...pose, bodyLean: pose.bodyLean + skateBodyLean };
 
     return applyAuthoredPose({
       boardX: bx, boardY: by, facing: plan.facing,
-      headBob: 0, bodyLean: 0,
+      headBob: 0, bodyLean: skateBodyLean,
       leftLegA: 0.12, rightLegA: -0.12,
       leftArmA: 0.08, rightArmA: -0.08,
       leftForeA: 0.13, rightForeA: -0.13,
@@ -1618,6 +1686,9 @@ function evalCharAtTime(
       skateboardVisible,
       skateFootMode,
       skateCrouch,
+      skateboardTilt,
+      skateSparkAlpha,
+      skateMotionAlpha,
     }, pose, { addAirborne: false });
   }
 
@@ -1918,9 +1989,21 @@ function evalCharAtTime(
         rightForeA: lerp(0.2, -0.13, (t - 0.35) / 0.65),
       };
       const absorb = Math.sin(Math.PI * t);
-      leftLegA = lerp(0.4, 0.12, t) + absorb * 0.08;
-      rightLegA = lerp(-0.4, -0.12, t) - absorb * 0.08;
-      legBackBend = lerp(0.25, 0.08, t);
+      if (t < 0.58) {
+        const dropT = t / 0.58;
+        leftLegA = lerp(0.07, 0.04, dropT);
+        rightLegA = lerp(-0.05, -0.04, dropT);
+        legBackBend = lerp(0.25, 0.08, dropT);
+        leftShinA = lerp(-0.25, -0.04, dropT);
+        rightShinA = lerp(0.25, 0.04, dropT);
+      } else {
+        const landT = (t - 0.58) / 0.42;
+        leftLegA = lerp(0.04, 0.12, landT) + absorb * 0.03;
+        rightLegA = lerp(-0.04, -0.12, landT) - absorb * 0.03;
+        legBackBend = lerp(0.08, 0.02, landT);
+        leftShinA = lerp(-0.04, 0.02, landT);
+        rightShinA = lerp(0.04, -0.02, landT);
+      }
       headBob = absorb * 2;
     }
     if (progress < DISMOUNT_START) {
@@ -2389,6 +2472,7 @@ function drawCharacterToCanvas(
     const upturn = 5 * S;
     ctx.save();
     ctx.translate(deckCX, deckCY);
+    ctx.rotate(p.skateboardTilt ?? 0);
     ctx.fillStyle = "#f5ecd8";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = Math.max(1, 2 * S);
@@ -2408,6 +2492,32 @@ function drawCharacterToCanvas(
       ctx.arc(wx, deckH + 5 * S, 4 * S, 0, Math.PI * 2);
       ctx.fill();
     });
+    if (p.skateSparkAlpha && p.skateSparkAlpha > 0) {
+      ctx.save();
+      ctx.globalAlpha = p.skateSparkAlpha;
+      ctx.strokeStyle = "#ffbf2f";
+      ctx.lineWidth = Math.max(1, 1.6 * S);
+      for (const [dx, dy] of [[-42, 8], [-48, 1], [-38, 16]] as const) {
+        ctx.beginPath();
+        ctx.moveTo(-deckW / 2 - 2 * S, deckH + 4 * S);
+        ctx.lineTo(-deckW / 2 + dx * S * 0.32, deckH + dy * S * 0.65);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    if (p.skateMotionAlpha && p.skateMotionAlpha > 0) {
+      ctx.save();
+      ctx.globalAlpha = p.skateMotionAlpha;
+      ctx.strokeStyle = "rgba(42,42,42,0.45)";
+      ctx.lineWidth = Math.max(1, 1.2 * S);
+      for (const y of [-14, 16]) {
+        ctx.beginPath();
+        ctx.moveTo(-28 * S, y * S);
+        ctx.lineTo(-48 * S, (y + 4) * S);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
     ctx.restore();
   }
 
@@ -2415,34 +2525,6 @@ function drawCharacterToCanvas(
   ctx.save();
   ctx.translate(0, hipY);
   ctx.rotate(p.bodyLean);
-  if (isJacked) {
-    const waistHalf = 9 * S;
-    const shoulderHalf = 35 * S * jackedPulse;
-    const deltR = 14 * S * jackedPulse;
-    ctx.fillStyle = "#e8dfd1";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = lw;
-    ctx.beginPath();
-    ctx.moveTo(-waistHalf, 0);
-    ctx.quadraticCurveTo(-shoulderHalf * 0.55, -torsoLen * 0.48, -shoulderHalf, -torsoLen * 0.86);
-    ctx.quadraticCurveTo(-shoulderHalf * 0.3, -torsoLen * 1.02, 0, -torsoLen);
-    ctx.quadraticCurveTo(shoulderHalf * 0.3, -torsoLen * 1.02, shoulderHalf, -torsoLen * 0.86);
-    ctx.quadraticCurveTo(shoulderHalf * 0.55, -torsoLen * 0.48, waistHalf, 0);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(-shoulderHalf, -torsoLen * 0.84, deltR, Math.PI * 0.52, Math.PI * 1.48);
-    ctx.fill();
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(shoulderHalf, -torsoLen * 0.84, deltR, -Math.PI * 0.48, Math.PI * 0.48);
-    ctx.fill();
-    ctx.stroke();
-    ctx.lineWidth = lw;
-  } else {
-    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
-  }
 
   const torsoTopY = -torsoLen;
   const shoulderY = -torsoLen * 0.85;
@@ -2479,26 +2561,42 @@ function drawCharacterToCanvas(
     if (rArmA < 0 && rArmA > -jackedTorsoClearance) rArmA = -jackedTorsoClearance;
   }
 
-  const drawMuscleSegment = (a: LocalPoint, b: LocalPoint, width: number, bias = 0) => {
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const len = Math.max(0.001, Math.hypot(dx, dy));
-    const nx = -dy / len;
-    const ny = dx / len;
-    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-    const endW = Math.max(1.5 * S, width * 0.28);
-    const bulgeA = width * (bias >= 0 ? 1 : 0.42);
-    const bulgeB = width * (bias <= 0 ? 1 : 0.42);
-    ctx.fillStyle = "#e8dfd1";
-    ctx.strokeStyle = "#2a2a2a";
+  const fillJackedPath = (path: JackedPathCmd[], mirror = false, scale = S) => {
     ctx.beginPath();
-    ctx.moveTo(a.x + nx * endW, a.y + ny * endW);
-    ctx.quadraticCurveTo(mid.x + nx * bulgeA, mid.y + ny * bulgeA, b.x + nx * endW, b.y + ny * endW);
-    ctx.lineTo(b.x - nx * endW, b.y - ny * endW);
-    ctx.quadraticCurveTo(mid.x - nx * bulgeB, mid.y - ny * bulgeB, a.x - nx * endW, a.y - ny * endW);
+    for (const cmd of path) {
+      const x = (mirror ? -("x" in cmd ? cmd.x : 0) : ("x" in cmd ? cmd.x : 0)) * scale;
+      const y = ("y" in cmd ? cmd.y : 0) * scale;
+      if (cmd.kind === "M") ctx.moveTo(x, y);
+      else if (cmd.kind === "L") ctx.lineTo(x, y);
+      else if (cmd.kind === "Q") ctx.quadraticCurveTo((mirror ? -cmd.cpx : cmd.cpx) * scale, cmd.cpy * scale, x, y);
+      else ctx.bezierCurveTo((mirror ? -cmd.cp1x : cmd.cp1x) * scale, cmd.cp1y * scale, (mirror ? -cmd.cp2x : cmd.cp2x) * scale, cmd.cp2y * scale, x, y);
+    }
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
+  };
+  const strokeJackedPath = (path: JackedPathCmd[], scale = S) => {
+    ctx.beginPath();
+    for (const cmd of path) {
+      if (cmd.kind === "M") ctx.moveTo(cmd.x * scale, cmd.y * scale);
+      else if (cmd.kind === "L") ctx.lineTo(cmd.x * scale, cmd.y * scale);
+      else if (cmd.kind === "Q") ctx.quadraticCurveTo(cmd.cpx * scale, cmd.cpy * scale, cmd.x * scale, cmd.y * scale);
+      else ctx.bezierCurveTo(cmd.cp1x * scale, cmd.cp1y * scale, cmd.cp2x * scale, cmd.cp2y * scale, cmd.x * scale, cmd.y * scale);
+    }
+    ctx.stroke();
+  };
+  const drawJackedBonePath = (start: LocalPoint, end: LocalPoint, path: JackedPathCmd[], pathLen: number) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const len = Math.max(0.001, Math.hypot(dx, dy));
+    const ux = dx / len;
+    const uy = dy / len;
+    const nx = -uy;
+    const ny = ux;
+    ctx.save();
+    ctx.transform(nx * S, ny * S, ux * (len / pathLen), uy * (len / pathLen), start.x, start.y);
+    fillJackedPath(path, false, 1);
+    ctx.restore();
   };
 
   const drawArm = (armA: number, foreA: number) => {
@@ -2507,39 +2605,58 @@ function drawCharacterToCanvas(
     const ey = shoulderY + Math.cos(armA) * armLen;
     const hx = ex - Math.sin(foreA) * armLen;
     const hy = ey + Math.cos(foreA) * armLen;
-    if (isJacked) {
-      const elbowBend = Math.abs(foreA - armA);
-      if (elbowBend > 0.6) {
-        const bicepBias = armA >= 0 ? -1 : 1;
-        drawMuscleSegment({ x: sOff, y: shoulderY }, { x: ex, y: ey }, 10 * S * jackedPulse, bicepBias);
-        drawMuscleSegment({ x: ex, y: ey }, { x: hx, y: hy }, 5.8 * S * jackedPulse, 0);
-      } else {
-        ctx.save();
-        ctx.lineWidth = Math.max(lw, 6 * S);
-        ctx.beginPath();
-        ctx.moveTo(sOff, shoulderY);
-        ctx.lineTo(ex, ey);
-        ctx.lineTo(hx, hy);
-        ctx.stroke();
-        ctx.lineWidth = Math.max(1, 2 * S);
-        ctx.strokeStyle = "rgba(255,253,245,0.55)";
-        ctx.beginPath();
-        ctx.moveTo(sOff, shoulderY);
-        ctx.lineTo(ex, ey);
-        ctx.lineTo(hx, hy);
-        ctx.stroke();
-        ctx.restore();
-      }
-    } else {
-      ctx.beginPath();
-      ctx.moveTo(sOff, shoulderY);
-      ctx.lineTo(ex, ey);
-      ctx.lineTo(hx, hy);
-      ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(sOff, shoulderY);
+    ctx.lineTo(ex, ey);
+    ctx.lineTo(hx, hy);
+    ctx.stroke();
+  };
+  const drawJackedArm = (side: -1 | 1, armA: number, foreA: number) => {
+    const shoulderAnchor = { x: side * 29 * S * jackedPulse, y: shoulderY - 2 * S };
+    const elbow = { x: -Math.sin(armA) * armLen, y: shoulderY + Math.cos(armA) * armLen };
+    const hand = { x: elbow.x - Math.sin(foreA) * armLen, y: elbow.y + Math.cos(foreA) * armLen };
+    drawJackedBonePath(shoulderAnchor, elbow, JACKED_UPPER_ARM_PATH, 34);
+    drawJackedBonePath(elbow, hand, JACKED_FOREARM_PATH, 33);
+  };
+  const drawJackedTorso = () => {
+    ctx.fillStyle = "#e4d6c4";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = lw;
+    fillJackedPath(JACKED_TORSO_PATH, false);
+    ctx.save();
+    ctx.strokeStyle = "rgba(42,42,42,0.65)";
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    strokeJackedPath(JACKED_LEFT_PEC_DETAIL);
+    strokeJackedPath(JACKED_RIGHT_PEC_DETAIL);
+    ctx.restore();
+  };
+  const drawJackedShoulderCaps = () => {
+    ctx.fillStyle = "#e4d6c4";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = lw;
+    for (const side of [-1, 1] as const) {
+      ctx.save();
+      ctx.translate(side * 34 * S * jackedPulse, shoulderY - 4 * S);
+      fillJackedPath(JACKED_SHOULDER_CAP_PATH, side === -1);
+      ctx.restore();
     }
   };
-  drawArm(lArmA, lForeA);
-  drawArm(rArmA, rForeA);
+
+  if (isJacked) {
+    ctx.fillStyle = "#e4d6c4";
+    ctx.strokeStyle = "#2a2a2a";
+    const frontIsRight = facing >= 0;
+    if (frontIsRight) drawJackedArm(-1, lArmA, lForeA);
+    else drawJackedArm(1, rArmA, rForeA);
+    drawJackedTorso();
+    drawJackedShoulderCaps();
+    if (frontIsRight) drawJackedArm(1, rArmA, rForeA);
+    else drawJackedArm(-1, lArmA, lForeA);
+  } else {
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
+    drawArm(lArmA, lForeA);
+    drawArm(rArmA, rForeA);
+  }
 
   // Wrist-mounted launcher, visible only while the active grapple is firing/zipping.
   if (p.grappleLauncherVisible) {
