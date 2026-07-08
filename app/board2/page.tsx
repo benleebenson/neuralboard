@@ -102,6 +102,8 @@ type CharacterAction = {
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
 };
 
+type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
+
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
 
 type CharTimelineDrag = {
@@ -1144,6 +1146,7 @@ type CharPoseResult = {
   headTilt?: number;
   spinAngle?: number; // full-body rotation around the torso center (flip only) — separate from bodyLean's upper-body-only lean
   leftLegA: number; rightLegA: number;
+  leftShinA?: number; rightShinA?: number;
   leftArmA: number; rightArmA: number;
   leftForeA: number; rightForeA: number;
   airY: number;
@@ -1261,6 +1264,8 @@ function lerpCharPose(a: CharPoseResult, b: CharPoseResult, t: number): CharPose
     headTilt: lerp(a.headTilt ?? 0, b.headTilt ?? 0, e),
     leftLegA: lerp(a.leftLegA, b.leftLegA, e),
     rightLegA: lerp(a.rightLegA, b.rightLegA, e),
+    leftShinA: lerp(a.leftShinA ?? (a.leftLegA + a.leftForeA * 0.5), b.leftShinA ?? (b.leftLegA + b.leftForeA * 0.5), e),
+    rightShinA: lerp(a.rightShinA ?? (a.rightLegA + a.rightForeA * 0.5), b.rightShinA ?? (b.rightLegA + b.rightForeA * 0.5), e),
     leftArmA: lerp(a.leftArmA, b.leftArmA, e),
     rightArmA: lerp(a.rightArmA, b.rightArmA, e),
     leftForeA: lerp(a.leftForeA, b.leftForeA, e),
@@ -1859,6 +1864,9 @@ function evalCharAtTime(
     let by = ty;
     let airY = -40;
     let leftLegA = 0.08, rightLegA = -0.08;
+    let leftShinA: number | undefined;
+    let rightShinA: number | undefined;
+    let legBackBend = 0.25;
     let bodyLean = 0;
     let headBob = 0;
     let arms = pullUpArmPose(airY);
@@ -1870,8 +1878,9 @@ function evalCharAtTime(
       by = lerp(active.fromY, ty, t);
       airY = 0;
       const reach = t;
-      leftLegA = Math.sin(t * Math.PI * 2) * 0.25;
-      rightLegA = Math.sin(t * Math.PI * 2 + Math.PI) * 0.25;
+      leftLegA = Math.sin(t * Math.PI * 2) * 0.2;
+      rightLegA = Math.sin(t * Math.PI * 2 + Math.PI) * 0.2;
+      legBackBend = lerp(0.1, 0.25, reach);
       arms = {
         leftArmA: lerp(0.08, -0.75, reach),
         rightArmA: lerp(-0.08, 0.75, reach),
@@ -1882,8 +1891,9 @@ function evalCharAtTime(
       const t = easeInOutCubic((progress - APPROACH_END) / (HANG_END - APPROACH_END));
       airY = lerp(0, -40, t);
       arms = pullUpArmPose(airY);
-      leftLegA = lerp(0.12, 0.02, t);
-      rightLegA = lerp(-0.12, -0.02, t);
+      leftLegA = lerp(0.12, 0.07, t);
+      rightLegA = lerp(-0.12, -0.05, t);
+      legBackBend = 0.25;
     } else if (progress < DISMOUNT_START) {
       const repSpan = DISMOUNT_START - HANG_END;
       const reps = Math.max(1, Math.round(active.duration / 4 * 3));
@@ -1894,9 +1904,10 @@ function evalCharAtTime(
       arms = pullUpArmPose(airY);
       bodyLean = Math.sin(loop * Math.PI * 2 + 0.7) * 0.03;
       headBob = -lift * 2;
-      const cross = easeInOutCubic(lift);
-      leftLegA = lerp(0.02, 0.45, cross);
-      rightLegA = lerp(-0.02, -0.42, cross);
+      const kneeEase = easeInOutCubic(Math.min(1, lift * 1.2));
+      leftLegA = lerp(0.07, 0.11, kneeEase);
+      rightLegA = lerp(-0.05, -0.08, kneeEase);
+      legBackBend = 0.25 + lift * 0.04;
     } else {
       const t = easeInOutCubic((progress - DISMOUNT_START) / (1 - DISMOUNT_START));
       airY = lerp(-40, 0, t);
@@ -1909,7 +1920,12 @@ function evalCharAtTime(
       const absorb = Math.sin(Math.PI * t);
       leftLegA = lerp(0.4, 0.12, t) + absorb * 0.08;
       rightLegA = lerp(-0.4, -0.12, t) - absorb * 0.08;
+      legBackBend = lerp(0.25, 0.08, t);
       headBob = absorb * 2;
+    }
+    if (progress < DISMOUNT_START) {
+      leftShinA = -legBackBend;
+      rightShinA = legBackBend;
     }
 
     return {
@@ -1917,6 +1933,7 @@ function evalCharAtTime(
       headBob, bodyLean,
       headTilt: 0,
       leftLegA, rightLegA,
+      leftShinA, rightShinA,
       leftArmA: arms.leftArmA, rightArmA: arms.rightArmA,
       leftForeA: arms.leftForeA, rightForeA: arms.rightForeA,
       airY,
@@ -2105,13 +2122,16 @@ function drawCharacterToCanvas(
   const sy = (p.boardY - cam.cameraY) * sf + H / 2;
   const S = sf;
   const lw = Math.max(1, 3 * S);
+  const jackedPulse = isJacked ? 1 + (p.physiquePulse ?? 0) * 0.16 : 1;
+  const standingish = !p.skateboardVisible && !p.grappleRopeAlpha && !p.pullUpBarAlpha && !p.mirrorAlpha && !p.spinAngle;
+  const jackedRestPose = isJacked && standingish && Math.abs(p.airY) < 0.001;
 
   // Raw (unscaled) body proportions — single source of truth reused below for both the S-scaled
   // draw geometry and the raw board-space magic numbers (grapple hand height, pointAt shoulder
   // height) that need to stay in sync with them.
   const legLen = 38 * S;
   const torsoLen = CHAR_TORSO_RAW * S;
-  const neckLen = CHAR_NECK_RAW * S;
+  const neckLen = CHAR_NECK_RAW * S * (isJacked ? 0.72 : 1);
   const armLen = CHAR_ARM_RAW * S;
   const headR = CHAR_HEAD_R_RAW * S;
   const bobS = p.headBob * S;
@@ -2346,8 +2366,10 @@ function drawCharacterToCanvas(
   const deckTopY = 0;
   const leftDeckFootX = -18 * S;
   const rightDeckFootX = 18 * S;
-  let leftLeg = angledLeg(p.leftLegA, p.leftLegA + p.leftForeA * 0.5);
-  let rightLeg = angledLeg(p.rightLegA, p.rightLegA + p.rightForeA * 0.5);
+  const effectiveLeftLegA = jackedRestPose ? Math.max(p.leftLegA, 0.18) : p.leftLegA;
+  const effectiveRightLegA = jackedRestPose ? Math.min(p.rightLegA, -0.18) : p.rightLegA;
+  let leftLeg = angledLeg(effectiveLeftLegA, p.leftShinA ?? (effectiveLeftLegA + p.leftForeA * 0.5));
+  let rightLeg = angledLeg(effectiveRightLegA, p.rightShinA ?? (effectiveRightLegA + p.rightForeA * 0.5));
   if (p.skateboardVisible) {
     if (p.skateFootMode === "left-push") {
       rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
@@ -2393,29 +2415,30 @@ function drawCharacterToCanvas(
   ctx.save();
   ctx.translate(0, hipY);
   ctx.rotate(p.bodyLean);
-  const jackedPulse = isJacked ? 1 + (p.physiquePulse ?? 0) * 0.16 : 1;
   if (isJacked) {
-    const waistHalf = 11 * S;
-    const chestHalf = 27.5 * S * jackedPulse;
+    const waistHalf = 9 * S;
+    const shoulderHalf = 35 * S * jackedPulse;
+    const deltR = 14 * S * jackedPulse;
     ctx.fillStyle = "#e8dfd1";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = lw;
     ctx.beginPath();
     ctx.moveTo(-waistHalf, 0);
-    ctx.quadraticCurveTo(-chestHalf * 0.72, -torsoLen * 0.45, -chestHalf, -torsoLen * 0.84);
-    ctx.quadraticCurveTo(-chestHalf * 0.35, -torsoLen * 1.02, 0, -torsoLen);
-    ctx.quadraticCurveTo(chestHalf * 0.35, -torsoLen * 1.02, chestHalf, -torsoLen * 0.84);
-    ctx.quadraticCurveTo(chestHalf * 0.72, -torsoLen * 0.45, waistHalf, 0);
+    ctx.quadraticCurveTo(-shoulderHalf * 0.55, -torsoLen * 0.48, -shoulderHalf, -torsoLen * 0.86);
+    ctx.quadraticCurveTo(-shoulderHalf * 0.3, -torsoLen * 1.02, 0, -torsoLen);
+    ctx.quadraticCurveTo(shoulderHalf * 0.3, -torsoLen * 1.02, shoulderHalf, -torsoLen * 0.86);
+    ctx.quadraticCurveTo(shoulderHalf * 0.55, -torsoLen * 0.48, waistHalf, 0);
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
-    ctx.lineWidth = Math.max(1, 1.2 * S);
-    for (const y of [-torsoLen * 0.35, -torsoLen * 0.5, -torsoLen * 0.65]) {
-      ctx.beginPath();
-      ctx.moveTo(-8 * S, y);
-      ctx.lineTo(8 * S, y);
-      ctx.stroke();
-    }
+    ctx.beginPath();
+    ctx.arc(-shoulderHalf, -torsoLen * 0.84, deltR, Math.PI * 0.52, Math.PI * 1.48);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(shoulderHalf, -torsoLen * 0.84, deltR, -Math.PI * 0.48, Math.PI * 0.48);
+    ctx.fill();
+    ctx.stroke();
     ctx.lineWidth = lw;
   } else {
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
@@ -2446,8 +2469,17 @@ function drawCharacterToCanvas(
       }
     }
   }
+  if (jackedRestPose && p.pointTargetBX === undefined) {
+    lArmA = Math.max(lArmA, 0.35);
+    rArmA = Math.min(rArmA, -0.35);
+  }
+  const jackedTorsoClearance = 0.28;
+  if (isJacked) {
+    if (lArmA > 0 && lArmA < jackedTorsoClearance) lArmA = jackedTorsoClearance;
+    if (rArmA < 0 && rArmA > -jackedTorsoClearance) rArmA = -jackedTorsoClearance;
+  }
 
-  const drawMuscleSegment = (a: LocalPoint, b: LocalPoint, width: number) => {
+  const drawMuscleSegment = (a: LocalPoint, b: LocalPoint, width: number, bias = 0) => {
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const len = Math.max(0.001, Math.hypot(dx, dy));
@@ -2455,13 +2487,15 @@ function drawCharacterToCanvas(
     const ny = dx / len;
     const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
     const endW = Math.max(1.5 * S, width * 0.28);
+    const bulgeA = width * (bias >= 0 ? 1 : 0.42);
+    const bulgeB = width * (bias <= 0 ? 1 : 0.42);
     ctx.fillStyle = "#e8dfd1";
     ctx.strokeStyle = "#2a2a2a";
     ctx.beginPath();
     ctx.moveTo(a.x + nx * endW, a.y + ny * endW);
-    ctx.quadraticCurveTo(mid.x + nx * width, mid.y + ny * width, b.x + nx * endW, b.y + ny * endW);
+    ctx.quadraticCurveTo(mid.x + nx * bulgeA, mid.y + ny * bulgeA, b.x + nx * endW, b.y + ny * endW);
     ctx.lineTo(b.x - nx * endW, b.y - ny * endW);
-    ctx.quadraticCurveTo(mid.x - nx * width, mid.y - ny * width, a.x - nx * endW, a.y - ny * endW);
+    ctx.quadraticCurveTo(mid.x - nx * bulgeB, mid.y - ny * bulgeB, a.x - nx * endW, a.y - ny * endW);
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
@@ -2474,8 +2508,28 @@ function drawCharacterToCanvas(
     const hx = ex - Math.sin(foreA) * armLen;
     const hy = ey + Math.cos(foreA) * armLen;
     if (isJacked) {
-      drawMuscleSegment({ x: sOff, y: shoulderY }, { x: ex, y: ey }, 7 * S * jackedPulse);
-      drawMuscleSegment({ x: ex, y: ey }, { x: hx, y: hy }, 5.8 * S * jackedPulse);
+      const elbowBend = Math.abs(foreA - armA);
+      if (elbowBend > 0.6) {
+        const bicepBias = armA >= 0 ? -1 : 1;
+        drawMuscleSegment({ x: sOff, y: shoulderY }, { x: ex, y: ey }, 10 * S * jackedPulse, bicepBias);
+        drawMuscleSegment({ x: ex, y: ey }, { x: hx, y: hy }, 5.8 * S * jackedPulse, 0);
+      } else {
+        ctx.save();
+        ctx.lineWidth = Math.max(lw, 6 * S);
+        ctx.beginPath();
+        ctx.moveTo(sOff, shoulderY);
+        ctx.lineTo(ex, ey);
+        ctx.lineTo(hx, hy);
+        ctx.stroke();
+        ctx.lineWidth = Math.max(1, 2 * S);
+        ctx.strokeStyle = "rgba(255,253,245,0.55)";
+        ctx.beginPath();
+        ctx.moveTo(sOff, shoulderY);
+        ctx.lineTo(ex, ey);
+        ctx.lineTo(hx, hy);
+        ctx.stroke();
+        ctx.restore();
+      }
     } else {
       ctx.beginPath();
       ctx.moveTo(sOff, shoulderY);
@@ -2506,7 +2560,10 @@ function drawCharacterToCanvas(
   // remains a plain circle, but the neck/head center shifts so the upward-thinking pose reads.
   const neckTopX = -Math.sin(headTilt) * neckLen;
   const neckTopY = torsoTopY - Math.cos(headTilt) * neckLen;
+  ctx.save();
+  if (isJacked) ctx.lineWidth = Math.max(lw * 1.6, 5 * S);
   ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(neckTopX, neckTopY); ctx.stroke();
+  ctx.restore();
 
   // Head — blank circle only (no face features), sitting on the tilted neck chain
   const headCX = neckTopX - Math.sin(headTilt) * headR * 0.35;
@@ -2647,11 +2704,13 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
-  const [characterAddMode, setCharacterAddMode] = useState<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | null>(null);
+  const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
+  const [characterPanelOpen, setCharacterPanelOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
+  const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
   const [authoredAnimations, setAuthoredAnimations] = useState<AuthoredAnimation[]>([]);
 
@@ -2739,6 +2798,7 @@ export default function Board2Page() {
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
+  const selectedCharAction = characterActions.find((a) => a.id === selectedCharActionId) ?? null;
   const timelineDuration = Math.max(10, ...clips.map((c) => c.startTime + c.duration + 2));
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
@@ -2844,7 +2904,7 @@ export default function Board2Page() {
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
-  const characterAddModeRef = useRef<"walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | null>(null);
+  const characterAddModeRef = useRef<CharacterAddMode | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
 
@@ -5110,6 +5170,7 @@ export default function Board2Page() {
     setSelectedClipIds(unique);
     setSelectedClipId(unique[unique.length - 1] ?? null);
     setSelectedCharActionId(null);
+    if (unique.length > 0) setCharacterPanelOpen(false);
     if (unique.length > 0) {
       selectedAnnotationIdsRef.current = [];
       setSelectedAnnotationIds([]);
@@ -5123,6 +5184,7 @@ export default function Board2Page() {
     setSelectedAnnotationIds(unique);
     setSelectedAnnotationId(unique[unique.length - 1] ?? null);
     setSelectedCharActionId(null);
+    if (unique.length > 0) setCharacterPanelOpen(false);
     if (unique.length > 0) {
       selectedClipIdsRef.current = [];
       setSelectedClipIds([]);
@@ -5140,6 +5202,7 @@ export default function Board2Page() {
     setSelectedClipId(uniqueClipIds[uniqueClipIds.length - 1] ?? null);
     setSelectedAnnotationId(uniqueAnnotationIds.length > 0 && uniqueClipIds.length === 0 ? uniqueAnnotationIds[uniqueAnnotationIds.length - 1] : null);
     setSelectedCharActionId(null);
+    if (uniqueClipIds.length > 0 || uniqueAnnotationIds.length > 0) setCharacterPanelOpen(false);
   }
 
   function clearBoardSelection() {
@@ -5150,6 +5213,7 @@ export default function Board2Page() {
     setSelectedClipId(null);
     setSelectedAnnotationId(null);
     setSelectedCharActionId(null);
+    setRetargetCharActionId(null);
   }
 
   function selectCharAction(id: string) {
@@ -5161,6 +5225,20 @@ export default function Board2Page() {
     setSelectedAnnotationId(null);
     selectedCharActionIdRef.current = id;
     setSelectedCharActionId(id);
+    setCharacterPanelOpen(true);
+  }
+
+  function openCharacterPanel() {
+    selectedClipIdsRef.current = [];
+    selectedAnnotationIdsRef.current = [];
+    setSelectedClipIds([]);
+    setSelectedAnnotationIds([]);
+    setSelectedClipId(null);
+    setSelectedAnnotationId(null);
+    setSelectedCharActionId(null);
+    selectedCharActionIdRef.current = null;
+    setCharacterPanelOpen(true);
+    setCharacterToolbarOpen(false);
   }
 
   function deleteCharacterAction(id: string) {
@@ -5169,6 +5247,7 @@ export default function Board2Page() {
       selectedCharActionIdRef.current = null;
       setSelectedCharActionId(null);
     }
+    setRetargetCharActionId((prev) => (prev === id ? null : prev));
     setCharActionContextMenu((prev) => (prev?.actionId === id ? null : prev));
   }
 
@@ -8719,20 +8798,20 @@ export default function Board2Page() {
                 <ProGated featureName="Character">
                   <>
                     <button
-                      onClick={(e) => { e.stopPropagation(); setCharacterToolbarOpen((v) => !v); }}
+                      onClick={(e) => { e.stopPropagation(); openCharacterPanel(); }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
                         padding: "5px 12px", border: "1.5px solid #2a2a2a",
-                        background: characterToolbarOpen ? "#2a2a2a" : "#fffdf5",
-                        color: characterToolbarOpen ? CHARACTER_COLOR : "#2a2a2a",
+                        background: characterPanelOpen ? "#2a2a2a" : "#fffdf5",
+                        color: characterPanelOpen ? CHARACTER_COLOR : "#2a2a2a",
                         cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
                         whiteSpace: "nowrap",
                         marginTop: annotationToolbarOpen ? 0 : 36,
                       }}
                     >
-                      🧍 Character {characterToolbarOpen ? "▲" : "▼"}
+                      🧍 Character
                     </button>
-                    {characterToolbarOpen && (
+                    {false && characterToolbarOpen && (
                       <div style={{
                         display: "flex", alignItems: "center", gap: 4,
                         background: "#fffdf5", border: "1.5px solid #2a2a2a",
@@ -8920,8 +8999,8 @@ export default function Board2Page() {
                 </ProGated>
               </div>
 
-              {/* Character placement overlay — captures board click when characterAddMode is set */}
-              {showCharacter && characterAddMode && characterAddMode !== "emote" && (
+              {/* Character placement overlay — captures board click when characterAddMode or retargeting is set */}
+              {showCharacter && ((characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
                 <div
                   style={{ position: "absolute", inset: 0, cursor: "crosshair", zIndex: 28 }}
                   onClick={(e) => {
@@ -8946,7 +9025,22 @@ export default function Board2Page() {
                       pointAt: 2.0,
                       pullUps: 4.0,
                       mirrorCheck: 5.0,
+                      flip: 1.2,
+                      zipline: 2.0,
+                      wallClimb: 2.0,
+                      sitAndWatch: 2.0,
                     };
+                    if (retargetCharActionId) {
+                      setCharacterActions((prev) => prev.map((a) => a.id === retargetCharActionId ? {
+                        ...a,
+                        targetX: Math.round(snapped.x),
+                        targetY: Math.round(snapped.y),
+                        ...(a.type === "skateTo" && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
+                      } : a));
+                      setRetargetCharActionId(null);
+                      return;
+                    }
+                    if (!characterAddMode || characterAddMode === "emote") return;
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
@@ -9034,9 +9128,221 @@ export default function Board2Page() {
 
           {/* ── Right: properties panel (no keyframes) ── */}
           <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
-            <div style={panelLabelStyle}>Properties</div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <div style={panelLabelStyle}>Properties</div>
+              <button
+                type="button"
+                onClick={openCharacterPanel}
+                style={{ ...miniButton, padding: "3px 7px", background: characterPanelOpen || !!selectedCharAction ? "#2a2a2a" : "transparent", color: characterPanelOpen || !!selectedCharAction ? CHARACTER_COLOR : "#2a2a2a" }}
+              >
+                Character
+              </button>
+            </div>
 
-            {(() => {
+            {(selectedCharAction || characterPanelOpen) && (() => {
+              const actionIcons: Record<string, string> = {
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", pullUps: "💪", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
+                flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬", idle: "⏸",
+              };
+              const targetableAction = selectedCharAction && !["emote", "idle", "explainGesture"].includes(selectedCharAction.type);
+              const addButtons: Array<{ mode: CharacterAddMode; label: string; title: string }> = [
+                { mode: "walkTo", label: "Walk", title: "Click board to walk to a position" },
+                { mode: "jumpTo", label: "Jump", title: "Click board to jump to a position" },
+                { mode: "flip", label: "Flip", title: "Click board to flip to a position" },
+                { mode: "grapple", label: "Grapple", title: "Click board to grapple-hook to a position" },
+                { mode: "zipline", label: "Zipline", title: "Click board to zipline to a position" },
+                { mode: "wallClimb", label: "Climb", title: "Click board to climb to a position" },
+                { mode: "skateTo", label: "Skate", title: "Click a target image/video to skate there" },
+                { mode: "sitAndWatch", label: "Sit & Watch", title: "Click board to sit and watch" },
+                { mode: "pointAt", label: "Point", title: "Click board to point at a position" },
+                { mode: "emote", label: "Emote", title: "Choose an emoji and place it at the playhead" },
+                { mode: "pullUps", label: "Pull-ups", title: "Click board to place a grounded pull-up bar" },
+                { mode: "mirrorCheck", label: "Mirror Check", title: "Click board to place a mirror-check transformation" },
+              ];
+              return (
+                <>
+                  {selectedCharAction && (
+                    <div style={{ border: "1.5px solid rgba(42,42,42,0.28)", background: "#fffdf5", padding: 9, display: "flex", flexDirection: "column", gap: 8 }}>
+                      <div style={{ ...panelLabelStyle, marginBottom: -2 }}>Action</div>
+                      <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700 }}>
+                        {actionIcons[selectedCharAction.type] ?? "•"} {selectedCharAction.type}{selectedCharAction.aiGenerated ? " ✨" : ""}
+                      </div>
+                      <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "monospace", fontSize: 9, color: "#6a6a6a" }}>
+                        Start time
+                        <input
+                          type="number"
+                          min={0}
+                          step={0.05}
+                          value={Number.isFinite(selectedCharAction.startTime) ? selectedCharAction.startTime.toFixed(2) : "0.00"}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (!Number.isFinite(v)) return;
+                            setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, startTime: Math.max(0, v) } : a));
+                          }}
+                          style={{ width: "100%", fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
+                        />
+                      </label>
+                      <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "monospace", fontSize: 9, color: "#6a6a6a" }}>
+                        Duration
+                        <input
+                          type="number"
+                          min={0.1}
+                          step={0.05}
+                          value={Number.isFinite(selectedCharAction.duration) ? selectedCharAction.duration.toFixed(2) : "1.00"}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (!Number.isFinite(v)) return;
+                            setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, duration: Math.max(0.1, v) } : a));
+                          }}
+                          style={{ width: "100%", fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
+                        />
+                      </label>
+                      {targetableAction && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowCharacter(true);
+                            setRetargetCharActionId(selectedCharAction.id);
+                            setCharacterAddMode(null);
+                          }}
+                          style={{ ...miniButton, background: retargetCharActionId === selectedCharAction.id ? "#2a2a2a" : "transparent", color: retargetCharActionId === selectedCharAction.id ? CHARACTER_COLOR : "#2a2a2a" }}
+                        >
+                          {retargetCharActionId === selectedCharAction.id ? "Click board..." : "Re-pick target"}
+                        </button>
+                      )}
+                      {selectedCharAction.type === "emote" && (
+                        <div>
+                          <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Emoji</div>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 24px)", gap: 2 }}>
+                            {EMOJI_SET.map((em) => (
+                              <button
+                                key={em}
+                                type="button"
+                                onClick={() => setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, emoji: em } : a))}
+                                style={{ width: 24, height: 24, border: "none", padding: 0, background: selectedCharAction.emoji === em ? CHARACTER_COLOR : "transparent", cursor: "pointer", fontSize: 15 }}
+                              >
+                                {em}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const id = selectedCharAction.id;
+                          setCharacterActions((prev) => prev.filter((a) => a.id !== id));
+                          selectedCharActionIdRef.current = null;
+                          setSelectedCharActionId(null);
+                          setRetargetCharActionId((prev) => (prev === id ? null : prev));
+                          setCharActionContextMenu((prev) => (prev?.actionId === id ? null : prev));
+                        }}
+                        style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
+                      >
+                        ✕ Delete action
+                      </button>
+                    </div>
+                  )}
+
+                  <ProGated featureName="Character">
+                    <div style={{ border: "1.5px solid rgba(42,42,42,0.18)", background: "rgba(255,253,245,0.82)", padding: 9, display: "flex", flexDirection: "column", gap: 8 }}>
+                      <div style={{ ...panelLabelStyle, marginBottom: -2 }}>Character</div>
+                      <button
+                        type="button"
+                        onClick={() => setShowCharacter((v) => !v)}
+                        style={{ ...miniButton, background: showCharacter ? CHARACTER_COLOR : "transparent", color: "#2a2a2a" }}
+                      >
+                        {showCharacter ? "● Show Character" : "○ Show Character"}
+                      </button>
+                      <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
+                        {(["auto", "manual"] as const).map((m) => (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => setCharacterMode(m)}
+                            style={{ flex: 1, padding: "5px 6px", fontFamily: "monospace", fontSize: 10, cursor: "pointer", border: "none", borderRight: m === "auto" ? "1px solid rgba(42,42,42,0.35)" : "none", background: characterMode === m ? "#2a2a2a" : "transparent", color: characterMode === m ? CHARACTER_COLOR : "#2a2a2a", fontWeight: characterMode === m ? 700 : 400 }}
+                          >
+                            {m === "auto" ? "Auto" : "Manual"}
+                          </button>
+                        ))}
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                        {addButtons.map(({ mode, label, title }) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            title={title}
+                            onClick={() => {
+                              setShowCharacter(true);
+                              setCharacterMode("manual");
+                              setRetargetCharActionId(null);
+                              if (mode === "emote") {
+                                setCharacterEmojiPickerOpen((v) => !v);
+                                setCharacterAddMode("emote");
+                              } else {
+                                setCharacterEmojiPickerOpen(false);
+                                setCharacterAddMode((prev) => (prev === mode ? null : mode));
+                              }
+                            }}
+                            style={{ ...miniButton, padding: "4px 6px", background: characterAddMode === mode ? "#2a2a2a" : "transparent", color: characterAddMode === mode ? CHARACTER_COLOR : "#2a2a2a" }}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      {characterAddMode && characterAddMode !== "emote" && (
+                        <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>Click the board to place {characterAddMode}.</div>
+                      )}
+                      {characterEmojiPickerOpen && (
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 24px)", gap: 2 }}>
+                          {EMOJI_SET.map((em) => (
+                            <button
+                              key={em}
+                              type="button"
+                              onClick={() => {
+                                setCharacterEmoji(em);
+                                setCharacterEmojiPickerOpen(false);
+                                const newAction: CharacterAction = { id: generateId(), type: "emote", startTime: playheadRef.current, duration: 2.0, emoji: em };
+                                setCharacterActions((prev) => [...prev, newAction]);
+                                setCharacterAddMode(null);
+                              }}
+                              style={{ width: 24, height: 24, border: "none", padding: 0, background: characterEmoji === em ? CHARACTER_COLOR : "transparent", cursor: "pointer", fontSize: 15 }}
+                            >
+                              {em}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                        <ProGated featureName="Pose Lab">
+                          <button type="button" onClick={() => { window.location.href = "/board2/poselab"; }} style={{ ...miniButton, padding: "4px 6px" }}>🎭 Pose Lab</button>
+                        </ProGated>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDirectCharacterOpen((v) => {
+                              const next = !v;
+                              if (next) setSyncEmotesToNarration(clipsRef.current.some((c) => c.type === "narration"));
+                              return next;
+                            });
+                          }}
+                          style={{ ...miniButton, padding: "4px 6px", background: directCharacterOpen ? "#2a2a2a" : "transparent", color: directCharacterOpen ? CHARACTER_COLOR : "#2a2a2a" }}
+                        >
+                          ✨ Direct
+                        </button>
+                        {characterActions.some((a) => a.aiGenerated) && (
+                          <button type="button" onClick={() => setCharacterActions((prev) => prev.filter((a) => !a.aiGenerated))} style={{ ...miniButton, padding: "4px 6px" }}>
+                            🧹 Clear AI
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </ProGated>
+                </>
+              );
+            })()}
+
+            {!(selectedCharAction || characterPanelOpen) && (() => {
               const selectedAnnotation = annotations.find((a) => a.id === selectedAnnotationId) ?? null;
               if (selectedAnnotation) return (
                 <>
@@ -9081,7 +9387,7 @@ export default function Board2Page() {
               return null;
             })()}
 
-            {!selectedClip ? (
+            {!(selectedCharAction || characterPanelOpen) && (!selectedClip ? (
               !selectedAnnotationId ? (
                 <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: 0 }}>
                   Select a clip or annotation to view its properties.
@@ -9196,7 +9502,7 @@ export default function Board2Page() {
                   </button>
                 </div>
               </>
-            )}
+            ))}
           </div>
         </div>
 
