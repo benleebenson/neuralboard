@@ -420,6 +420,19 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
       ],
     },
     {
+      id: "starter_sit",
+      name: "sit",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftLegA: -1.25, rightLegA: -1.25, leftArmA: -0.2, rightArmA: 0.18, leftForeA: -0.25, rightForeA: 0.2, bodyLean: -0.08, headTilt: 0.03, headBob: 0 }) },
+        { t: 0.24, pose: pose({ leftLegA: -1.25, rightLegA: -1.25, leftArmA: -0.18, rightArmA: 0.48, leftForeA: -0.22, rightForeA: 0.86, bodyLean: -0.07, headTilt: 0.04, headBob: 0.5 }) },
+        { t: 0.52, pose: pose({ leftLegA: -1.25, rightLegA: -1.25, leftArmA: -0.2, rightArmA: -0.72, leftForeA: -0.25, rightForeA: -1.55, bodyLean: -0.08, headTilt: 0.06, headBob: -0.5 }) },
+        { t: 0.7, pose: pose({ leftLegA: -1.25, rightLegA: -1.25, leftArmA: -0.2, rightArmA: -0.28, leftForeA: -0.25, rightForeA: -0.6, bodyLean: -0.08, headTilt: 0.04, headBob: 0.8 }) },
+        { t: 1, pose: pose({ leftLegA: -1.25, rightLegA: -1.25, leftArmA: -0.2, rightArmA: 0.18, leftForeA: -0.25, rightForeA: 0.2, bodyLean: -0.08, headTilt: 0.03, headBob: 0 }) },
+      ],
+    },
+    {
       id: "starter_emote_thinking",
       name: "emote-thinking",
       loop: false,
