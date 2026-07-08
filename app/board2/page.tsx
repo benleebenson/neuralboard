@@ -621,47 +621,6 @@ const MIRROR_W = 90;
 const MIRROR_H = 260;
 const MIRROR_OFFSET = 140;
 
-type JackedPathCmd =
-  | { kind: "M"; x: number; y: number }
-  | { kind: "L"; x: number; y: number }
-  | { kind: "Q"; cpx: number; cpy: number; x: number; y: number }
-  | { kind: "C"; cp1x: number; cp1y: number; cp2x: number; cp2y: number; x: number; y: number };
-
-// Jacked v3 vector skin. These authored coordinates are deliberate design-iteration targets:
-// tune these path constants from screenshots instead of changing the animation skeleton.
-const JACKED_TORSO_PATH: JackedPathCmd[] = [
-  { kind: "M", x: -0.13, y: 0 },
-  { kind: "C", cp1x: -0.2, cp1y: 0.18, cp2x: -0.48, cp2y: 0.52, x: -0.52, y: 0.75 },
-  { kind: "C", cp1x: -0.48, cp1y: 0.9, cp2x: -0.34, cp2y: 1.02, x: -0.28, y: 1.02 },
-  { kind: "Q", cpx: 0, cpy: 1.08, x: 0.28, y: 1.02 },
-  { kind: "C", cp1x: 0.34, cp1y: 1.02, cp2x: 0.48, cp2y: 0.9, x: 0.52, y: 0.75 },
-  { kind: "C", cp1x: 0.48, cp1y: 0.52, cp2x: 0.2, cp2y: 0.18, x: 0.13, y: 0 },
-  { kind: "Q", cpx: 0, cpy: -0.04, x: -0.13, y: 0 },
-];
-const JACKED_SHOULDER_CAP = { centerX: 0.48, centerY: 0.88, r: 0.14 };
-const JACKED_UPPER_ARM_PATH: JackedPathCmd[] = [
-  { kind: "M", x: -0.16, y: 0 },
-  { kind: "C", cp1x: -0.21, cp1y: 0.22, cp2x: -0.18, cp2y: 0.62, x: -0.09, y: 1 },
-  { kind: "C", cp1x: -0.02, cp1y: 1.08, cp2x: 0.08, cp2y: 1.06, x: 0.09, y: 1 },
-  { kind: "C", cp1x: 0.18, cp1y: 0.66, cp2x: 0.21, cp2y: 0.24, x: 0.16, y: 0 },
-  { kind: "Q", cpx: 0, cpy: -0.05, x: -0.16, y: 0 },
-];
-const JACKED_FOREARM_PATH: JackedPathCmd[] = [
-  { kind: "M", x: -0.1, y: 0 },
-  { kind: "C", cp1x: -0.12, cp1y: 0.22, cp2x: -0.09, cp2y: 0.72, x: -0.05, y: 1 },
-  { kind: "C", cp1x: -0.01, cp1y: 1.06, cp2x: 0.04, cp2y: 1.04, x: 0.05, y: 1 },
-  { kind: "C", cp1x: 0.09, cp1y: 0.72, cp2x: 0.12, cp2y: 0.22, x: 0.1, y: 0 },
-  { kind: "Q", cpx: 0, cpy: -0.03, x: -0.1, y: 0 },
-];
-const JACKED_LEFT_PEC_DETAIL: JackedPathCmd[] = [
-  { kind: "M", x: 0, y: 0.85 },
-  { kind: "Q", cpx: -0.2, cpy: 0.7, x: -0.38, y: 0.68 },
-];
-const JACKED_RIGHT_PEC_DETAIL: JackedPathCmd[] = [
-  { kind: "M", x: 0, y: 0.85 },
-  { kind: "Q", cpx: 0.2, cpy: 0.7, x: 0.38, y: 0.68 },
-];
-
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
 function seededRandom(seed: string): number {
@@ -1214,6 +1173,7 @@ type CharPoseResult = {
   sitChairBX?: number;
   sitChairBY?: number;
   sitChairFacing?: 1 | -1;
+  sitSeated?: boolean;
   popcornAlpha?: number;
   popcornX?: number;
   popcornY?: number;
@@ -1891,7 +1851,8 @@ function evalCharAtTime(
     const STEP_END = 0.12;
     const LOWER_END = 0.25;
     const STAND_START = 0.9;
-    const seatedBoardY = groundY + 24;
+    const seatHeight = 55;
+    const seatedBoardY = groundY + CHAR_HIP_RAW - seatHeight;
     const chairX = active.fromX + facing * 18;
     const jitter = seededRandom(active.id + ":popcorn") * 0.34;
     const eatingCycle = ((time + jitter) / 2.2) % 1;
@@ -1909,6 +1870,7 @@ function evalCharAtTime(
     let leftForeA = 0.13;
     let rightForeA = -0.13;
     let popcornAlpha = 0;
+    let sitSeated = false;
 
     const seatedPose = (aliveT: number) => {
       const lap = solveArmToLocalPoint(10, -18, -1);
@@ -1952,12 +1914,14 @@ function evalCharAtTime(
       rightArmA = lerp(-0.08, -0.28, t);
       rightForeA = lerp(-0.13, -0.1, t);
       popcornAlpha = t;
+      sitSeated = t > 0.72;
     } else if (progress < STAND_START) {
       by = seatedBoardY;
       leftLegA = -1.25;
       rightLegA = -1.25;
       leftShinA = 0;
       rightShinA = 0;
+      sitSeated = true;
       seatedPose(eatingCycle);
     } else {
       const t = easeInOutCubic((progress - STAND_START) / (1 - STAND_START));
@@ -1972,6 +1936,7 @@ function evalCharAtTime(
       leftForeA = lerp(-0.1, 0.13, t);
       rightForeA = lerp(0.1, -0.13, t);
       popcornAlpha = Math.max(0, 1 - t * 1.4);
+      sitSeated = t < 0.18;
     }
 
     const chairAlpha = progress < 0.04 ? progress / 0.04 : progress > 0.96 ? Math.max(0, (1 - progress) / 0.04) : 1;
@@ -1988,6 +1953,7 @@ function evalCharAtTime(
       sitChairBX: chairX,
       sitChairBY: groundY,
       sitChairFacing: facing,
+      sitSeated,
       popcornAlpha,
       popcornX: 19,
       popcornY: -18,
@@ -2601,8 +2567,31 @@ function drawCharacterToCanvas(
       rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
     }
   }
+  if (p.sitSeated) {
+    const groundLocalY = ((p.sitChairBY ?? p.boardY) - p.boardY) * S;
+    const kneeY = hipY + 1.5 * S;
+    const nearKneeX = 36 * S;
+    const farKneeX = 30 * S;
+    leftLeg = {
+      knee: { x: farKneeX, y: kneeY + 3 * S },
+      foot: { x: farKneeX, y: groundLocalY },
+    };
+    rightLeg = {
+      knee: { x: nearKneeX, y: kneeY },
+      foot: { x: nearKneeX, y: groundLocalY },
+    };
+  }
   drawLegChain(leftLeg);
   drawLegChain(rightLeg);
+  if (p.sitSeated) {
+    const footStroke = 11 * S;
+    for (const foot of [leftLeg.foot, rightLeg.foot]) {
+      ctx.beginPath();
+      ctx.moveTo(foot.x - 2 * S, foot.y);
+      ctx.lineTo(foot.x + footStroke, foot.y);
+      ctx.stroke();
+    }
+  }
 
   if (p.skateboardVisible) {
     const deckCX = 0;
@@ -2701,61 +2690,6 @@ function drawCharacterToCanvas(
     if (rArmA < 0 && rArmA > -jackedTorsoClearance) rArmA = -jackedTorsoClearance;
   }
 
-  const traceJackedPath = (path: JackedPathCmd[], mirror = false, scale = 1) => {
-    ctx.beginPath();
-    for (const cmd of path) {
-      const x = (mirror ? -("x" in cmd ? cmd.x : 0) : ("x" in cmd ? cmd.x : 0)) * scale;
-      const y = ("y" in cmd ? cmd.y : 0) * scale;
-      if (cmd.kind === "M") ctx.moveTo(x, y);
-      else if (cmd.kind === "L") ctx.lineTo(x, y);
-      else if (cmd.kind === "Q") ctx.quadraticCurveTo((mirror ? -cmd.cpx : cmd.cpx) * scale, cmd.cpy * scale, x, y);
-      else ctx.bezierCurveTo((mirror ? -cmd.cp1x : cmd.cp1x) * scale, cmd.cp1y * scale, (mirror ? -cmd.cp2x : cmd.cp2x) * scale, cmd.cp2y * scale, x, y);
-    }
-  };
-  const fillJackedUnitPath = (path: JackedPathCmd[], mirror = false) => {
-    traceJackedPath(path, mirror, 1);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  };
-  const fillJackedTorsoPath = (path: JackedPathCmd[], mirror = false) => {
-    ctx.beginPath();
-    for (const cmd of path) {
-      const x = (mirror ? -("x" in cmd ? cmd.x : 0) : ("x" in cmd ? cmd.x : 0)) * torsoLen;
-      const y = -("y" in cmd ? cmd.y : 0) * torsoLen;
-      if (cmd.kind === "M") ctx.moveTo(x, y);
-      else if (cmd.kind === "L") ctx.lineTo(x, y);
-      else if (cmd.kind === "Q") ctx.quadraticCurveTo((mirror ? -cmd.cpx : cmd.cpx) * torsoLen, -cmd.cpy * torsoLen, x, y);
-      else ctx.bezierCurveTo((mirror ? -cmd.cp1x : cmd.cp1x) * torsoLen, -cmd.cp1y * torsoLen, (mirror ? -cmd.cp2x : cmd.cp2x) * torsoLen, -cmd.cp2y * torsoLen, x, y);
-    }
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  };
-  const strokeJackedTorsoPath = (path: JackedPathCmd[]) => {
-    ctx.beginPath();
-    for (const cmd of path) {
-      if (cmd.kind === "M") ctx.moveTo(cmd.x * torsoLen, -cmd.y * torsoLen);
-      else if (cmd.kind === "L") ctx.lineTo(cmd.x * torsoLen, -cmd.y * torsoLen);
-      else if (cmd.kind === "Q") ctx.quadraticCurveTo(cmd.cpx * torsoLen, -cmd.cpy * torsoLen, cmd.x * torsoLen, -cmd.y * torsoLen);
-      else ctx.bezierCurveTo(cmd.cp1x * torsoLen, -cmd.cp1y * torsoLen, cmd.cp2x * torsoLen, -cmd.cp2y * torsoLen, cmd.x * torsoLen, -cmd.y * torsoLen);
-    }
-    ctx.stroke();
-  };
-  const drawJackedBonePath = (start: LocalPoint, end: LocalPoint, path: JackedPathCmd[]) => {
-    const dx = end.x - start.x;
-    const dy = end.y - start.y;
-    const len = Math.max(0.001, Math.hypot(dx, dy));
-    const ux = dx / len;
-    const uy = dy / len;
-    const nx = -uy;
-    const ny = ux;
-    ctx.save();
-    ctx.transform(nx * len, ny * len, ux * len, uy * len, start.x, start.y);
-    fillJackedUnitPath(path, false);
-    ctx.restore();
-  };
-
   const drawArm = (armA: number, foreA: number) => {
     const sOff = 0;
     const ex = sOff - Math.sin(armA) * armLen;
@@ -2768,37 +2702,116 @@ function drawCharacterToCanvas(
     ctx.lineTo(hx, hy);
     ctx.stroke();
   };
-  const drawJackedArm = (side: -1 | 1, armA: number, foreA: number) => {
-    const shoulderAnchor = { x: side * JACKED_SHOULDER_CAP.centerX * torsoLen * jackedPulse, y: -JACKED_SHOULDER_CAP.centerY * torsoLen };
-    const elbow = { x: shoulderAnchor.x - Math.sin(armA) * armLen, y: shoulderAnchor.y + Math.cos(armA) * armLen };
-    const hand = { x: elbow.x - Math.sin(foreA) * armLen, y: elbow.y + Math.cos(foreA) * armLen };
-    drawJackedBonePath(shoulderAnchor, elbow, JACKED_UPPER_ARM_PATH);
-    drawJackedBonePath(elbow, hand, JACKED_FOREARM_PATH);
+
+  const addP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x + b.x, y: a.y + b.y });
+  const subP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x - b.x, y: a.y - b.y });
+  const mulP = (a: LocalPoint, n: number): LocalPoint => ({ x: a.x * n, y: a.y * n });
+  const armVector = (angle: number, len: number): LocalPoint => ({ x: -Math.sin(angle) * len, y: Math.cos(angle) * len });
+  const normalOf = (start: LocalPoint, end: LocalPoint): LocalPoint => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const len = Math.max(0.001, Math.hypot(dx, dy));
+    return { x: -dy / len, y: dx / len };
   };
-  const drawJackedTorso = () => {
+  const buildJackedJoints = () => {
+    const hipP: LocalPoint = { x: 0, y: 0 };
+    const neckP: LocalPoint = { x: 0, y: torsoTopY };
+    const axis = subP(neckP, hipP);
+    const axisLen = Math.max(0.001, Math.hypot(axis.x, axis.y));
+    const axisUnit = { x: axis.x / axisLen, y: axis.y / axisLen };
+    const U = { x: -axisUnit.y, y: axisUnit.x };
+    const L = Math.max(axisLen, headR * 6) * jackedPulse;
+    const at = (t: number) => addP(hipP, mulP(axis, t));
+    const shoulderCenter = at(0.88);
+    const shoulderL = addP(shoulderCenter, mulP(U, -0.48 * L));
+    const shoulderR = addP(shoulderCenter, mulP(U, 0.48 * L));
+    const elbowL = addP(shoulderL, armVector(lArmA, armLen));
+    const handL = addP(elbowL, armVector(lForeA, armLen));
+    const elbowR = addP(shoulderR, armVector(rArmA, armLen));
+    const handR = addP(elbowR, armVector(rForeA, armLen));
+    return { hipP, neckP, axis, axisUnit, U, L, at, shoulderL, shoulderR, elbowL, elbowR, handL, handR };
+  };
+  const drawJackedTaperedSegment = (start: LocalPoint, end: LocalPoint, startW: number, endW: number) => {
+    const n = normalOf(start, end);
+    const s = startW / 2;
+    const e = endW / 2;
+    const p1 = addP(start, mulP(n, s));
+    const p2 = addP(end, mulP(n, e));
+    const p3 = addP(end, mulP(n, -e));
+    const p4 = addP(start, mulP(n, -s));
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.quadraticCurveTo(end.x, end.y, p3.x, p3.y);
+    ctx.lineTo(p4.x, p4.y);
+    ctx.quadraticCurveTo(start.x, start.y, p1.x, p1.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  };
+  const drawJackedArmWorld = (side: "left" | "right", joints: ReturnType<typeof buildJackedJoints>) => {
+    const shoulder = side === "left" ? joints.shoulderL : joints.shoulderR;
+    const elbow = side === "left" ? joints.elbowL : joints.elbowR;
+    const hand = side === "left" ? joints.handL : joints.handR;
+    drawJackedTaperedSegment(shoulder, elbow, 0.15 * joints.L, 0.09 * joints.L);
+    drawJackedTaperedSegment(elbow, hand, 0.1 * joints.L, 0.05 * joints.L);
+  };
+  const drawJackedTorsoWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
+    const { hipP, neckP, axis, axisUnit, U, L, at } = joints;
+    const waistL = addP(hipP, mulP(U, 0.13 * L));
+    const waistR = addP(hipP, mulP(U, -0.13 * L));
+    const latL = addP(at(0.72), mulP(U, 0.5 * L));
+    const latR = addP(at(0.72), mulP(U, -0.5 * L));
+    const trapL = addP(neckP, mulP(U, 0.26 * L));
+    const trapR = addP(neckP, mulP(U, -0.26 * L));
+    const top = addP(neckP, mulP(axisUnit, 0.07 * L));
+    const lBow1 = addP(at(0.2), mulP(U, 0.26 * L));
+    const lBow2 = addP(at(0.55), mulP(U, 0.55 * L));
+    const lTrap1 = addP(at(0.9), mulP(U, 0.47 * L));
+    const lTrap2 = addP(neckP, mulP(U, 0.36 * L));
+    const rTrap2 = addP(neckP, mulP(U, -0.36 * L));
+    const rTrap1 = addP(at(0.9), mulP(U, -0.47 * L));
+    const rBow2 = addP(at(0.55), mulP(U, -0.55 * L));
+    const rBow1 = addP(at(0.2), mulP(U, -0.26 * L));
+    const waistCtrl = addP(hipP, mulP(axis, -0.03));
     ctx.fillStyle = "#e4d6c4";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = lw;
-    fillJackedTorsoPath(JACKED_TORSO_PATH, false);
+    ctx.beginPath();
+    ctx.moveTo(waistL.x, waistL.y);
+    ctx.bezierCurveTo(lBow1.x, lBow1.y, lBow2.x, lBow2.y, latL.x, latL.y);
+    ctx.bezierCurveTo(lTrap1.x, lTrap1.y, lTrap2.x, lTrap2.y, trapL.x, trapL.y);
+    ctx.quadraticCurveTo(top.x, top.y, trapR.x, trapR.y);
+    ctx.bezierCurveTo(rTrap2.x, rTrap2.y, rTrap1.x, rTrap1.y, latR.x, latR.y);
+    ctx.bezierCurveTo(rBow2.x, rBow2.y, rBow1.x, rBow1.y, waistR.x, waistR.y);
+    ctx.quadraticCurveTo(waistCtrl.x, waistCtrl.y, waistL.x, waistL.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
     ctx.save();
     ctx.strokeStyle = "rgba(42,42,42,0.65)";
     ctx.lineWidth = Math.max(1, 1.2 * S);
-    strokeJackedTorsoPath(JACKED_LEFT_PEC_DETAIL);
-    strokeJackedTorsoPath(JACKED_RIGHT_PEC_DETAIL);
+    const midChest = at(0.82);
+    const pecDrop = mulP(axisUnit, -0.11 * L);
+    for (const side of [1, -1] as const) {
+      const pecCtrl = addP(addP(midChest, mulP(U, side * 0.18 * L)), pecDrop);
+      const pecEnd = addP(addP(at(0.66), mulP(U, side * 0.36 * L)), pecDrop);
+      ctx.beginPath();
+      ctx.moveTo(midChest.x, midChest.y);
+      ctx.quadraticCurveTo(pecCtrl.x, pecCtrl.y, pecEnd.x, pecEnd.y);
+      ctx.stroke();
+    }
     ctx.restore();
   };
-  const drawJackedShoulderCaps = () => {
+  const drawJackedShoulderCapsWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
     ctx.fillStyle = "#e4d6c4";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = lw;
-    for (const side of [-1, 1] as const) {
-      ctx.save();
-      ctx.translate(side * JACKED_SHOULDER_CAP.centerX * torsoLen * jackedPulse, -JACKED_SHOULDER_CAP.centerY * torsoLen);
+    for (const shoulder of [joints.shoulderL, joints.shoulderR]) {
       ctx.beginPath();
-      ctx.arc(0, 0, JACKED_SHOULDER_CAP.r * torsoLen, 0, Math.PI * 2);
+      ctx.arc(shoulder.x, shoulder.y, 0.13 * joints.L, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-      ctx.restore();
     }
   };
 
@@ -2806,12 +2819,13 @@ function drawCharacterToCanvas(
     ctx.fillStyle = "#e4d6c4";
     ctx.strokeStyle = "#2a2a2a";
     const frontIsRight = facing >= 0;
-    if (frontIsRight) drawJackedArm(-1, lArmA, lForeA);
-    else drawJackedArm(1, rArmA, rForeA);
-    drawJackedTorso();
-    drawJackedShoulderCaps();
-    if (frontIsRight) drawJackedArm(1, rArmA, rForeA);
-    else drawJackedArm(-1, lArmA, lForeA);
+    const joints = buildJackedJoints();
+    if (frontIsRight) drawJackedArmWorld("left", joints);
+    else drawJackedArmWorld("right", joints);
+    drawJackedTorsoWorld(joints);
+    drawJackedShoulderCapsWorld(joints);
+    if (frontIsRight) drawJackedArmWorld("right", joints);
+    else drawJackedArmWorld("left", joints);
   } else {
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
     drawArm(lArmA, lForeA);
