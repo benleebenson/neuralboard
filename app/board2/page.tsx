@@ -608,6 +608,11 @@ const SKATE_POP_CLEARANCE = 60;
 const SKATE_AUTO_MAX_HEIGHT_DELTA = 150;
 const SKATE_MANUAL_FALLBACK_HEIGHT_DELTA = 180;
 const GRAPPLE_MANUAL_DURATION_SEC = 1.5 * PHASE_TIME_SCALE;
+const CHAR_HIP_RAW = 76;
+const CHAR_TORSO_RAW = 53;
+const CHAR_NECK_RAW = 12;
+const CHAR_HEAD_R_RAW = 20;
+const CHAR_ARM_RAW = 32;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -1124,6 +1129,7 @@ type CharPoseResult = {
   facing: 1 | -1;
   headBob: number;
   bodyLean: number;
+  headTilt?: number;
   spinAngle?: number; // full-body rotation around the torso center (flip only) — separate from bodyLean's upper-body-only lean
   leftLegA: number; rightLegA: number;
   leftArmA: number; rightArmA: number;
@@ -1186,6 +1192,7 @@ function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addS
     ...base,
     headBob: pose.headBob,
     bodyLean: pose.bodyLean,
+    headTilt: pose.headTilt,
     spinAngle: (base.spinAngle ?? 0) + (opts.addSpin ? pose.poseRotation * base.facing : 0),
     leftLegA: pose.leftLegA,
     rightLegA: pose.rightLegA,
@@ -1218,6 +1225,125 @@ function authoredProgressForAction(active: ResolvedCharAction, progress: number)
     return progress * Math.max(1, dist / 220);
   }
   return progress;
+}
+
+function lerpCharPose(a: CharPoseResult, b: CharPoseResult, t: number): CharPoseResult {
+  const e = easeInOutCubic(clamp(t, 0, 1));
+  return {
+    ...b,
+    boardX: lerp(a.boardX, b.boardX, e),
+    boardY: lerp(a.boardY, b.boardY, e),
+    facing: b.facing,
+    headBob: lerp(a.headBob, b.headBob, e),
+    bodyLean: lerp(a.bodyLean, b.bodyLean, e),
+    headTilt: lerp(a.headTilt ?? 0, b.headTilt ?? 0, e),
+    leftLegA: lerp(a.leftLegA, b.leftLegA, e),
+    rightLegA: lerp(a.rightLegA, b.rightLegA, e),
+    leftArmA: lerp(a.leftArmA, b.leftArmA, e),
+    rightArmA: lerp(a.rightArmA, b.rightArmA, e),
+    leftForeA: lerp(a.leftForeA, b.leftForeA, e),
+    rightForeA: lerp(a.rightForeA, b.rightForeA, e),
+    airY: lerp(a.airY, b.airY, e),
+  };
+}
+
+function thinkingChinPoint(headTilt: number, visibleSide: -1 | 1): { x: number; y: number } {
+  const torsoTopY = -CHAR_TORSO_RAW;
+  const neckTopX = -Math.sin(headTilt) * CHAR_NECK_RAW;
+  const neckTopY = torsoTopY - Math.cos(headTilt) * CHAR_NECK_RAW;
+  const headCX = neckTopX - Math.sin(headTilt) * CHAR_HEAD_R_RAW * 0.35;
+  const headCY = neckTopY - Math.cos(headTilt) * CHAR_HEAD_R_RAW;
+  return {
+    x: headCX + visibleSide * 4,
+    y: headCY + CHAR_HEAD_R_RAW * 0.92,
+  };
+}
+
+function solveArmToLocalPoint(targetX: number, targetY: number, side: -1 | 1): { armA: number; foreA: number } {
+  const shoulderX = 0;
+  const shoulderY = -CHAR_TORSO_RAW * 0.85;
+  const dx = targetX - shoulderX;
+  const dy = targetY - shoulderY;
+  const rawD = Math.hypot(dx, dy);
+  const d = clamp(rawD, 2, CHAR_ARM_RAW * 2 - 0.001);
+  const ux = dx / Math.max(0.001, rawD);
+  const uy = dy / Math.max(0.001, rawD);
+  const reachable = { x: shoulderX + ux * d, y: shoulderY + uy * d };
+  const mid = { x: (shoulderX + reachable.x) / 2, y: (shoulderY + reachable.y) / 2 };
+  const h = Math.sqrt(Math.max(0, CHAR_ARM_RAW * CHAR_ARM_RAW - (d / 2) * (d / 2)));
+  const px = -uy;
+  const py = ux;
+  const elbow = { x: mid.x + px * h * side, y: mid.y + py * h * side };
+  const upperDx = elbow.x - shoulderX;
+  const upperDy = elbow.y - shoulderY;
+  const foreDx = reachable.x - elbow.x;
+  const foreDy = reachable.y - elbow.y;
+  return {
+    armA: Math.atan2(-upperDx, upperDy),
+    foreA: Math.atan2(-foreDx, foreDy),
+  };
+}
+
+function standingCharPose(boardX: number, boardY: number, facing: 1 | -1, time: number): CharPoseResult {
+  return {
+    boardX, boardY, facing,
+    headBob: Math.sin(time * 2) * 2,
+    bodyLean: 0,
+    headTilt: 0,
+    leftLegA: 0.12,
+    rightLegA: -0.12,
+    leftArmA: 0.08,
+    rightArmA: -0.08,
+    leftForeA: 0.13,
+    rightForeA: -0.13,
+    airY: 0,
+  };
+}
+
+function thinkingPoseBase(
+  boardX: number,
+  boardY: number,
+  facing: 1 | -1,
+  time: number,
+  actionId: string,
+  elapsed: number,
+  phase: "lift" | "bend" | "chin" | "hold" | "release"
+): CharPoseResult {
+  const thinkingSide: -1 | 1 = facing >= 0 ? 1 : -1;
+  const s0 = seededRandom(`${actionId}:head`);
+  const s1 = seededRandom(`${actionId}:weight`);
+  const s2 = seededRandom(`${actionId}:hand`);
+  const s3 = seededRandom(`${actionId}:free`);
+  const headMicro = phase === "hold" ? Math.sin((elapsed / 3) * Math.PI * 2 + s0 * Math.PI * 2) * 0.03 : 0;
+  const weight = phase === "hold" ? Math.sin((elapsed / 4) * Math.PI * 2 + s1 * Math.PI * 2) : 0;
+  const handPulse = phase === "hold"
+    ? Math.pow(Math.max(0, Math.sin((elapsed / 2.5) * Math.PI * 2 + s2 * Math.PI * 2)), 6) * 0.05
+    : 0;
+  const freeSway = phase === "hold" ? Math.sin((elapsed / 3.7) * Math.PI * 2 + s3 * Math.PI * 2) * 0.04 : 0;
+  const headTilt = phase === "lift" ? 0 : phase === "bend" ? 0.08 : 0.15 + headMicro;
+  const chin = thinkingChinPoint(headTilt, thinkingSide);
+  const solved = solveArmToLocalPoint(chin.x, chin.y, thinkingSide);
+  const pose = standingCharPose(boardX + weight * 3 * facing, boardY, facing, time);
+
+  pose.headBob = Math.sin(time * 2) * 2;
+  pose.headTilt = headTilt;
+  pose.bodyLean = (phase === "lift" ? 0.015 : 0.035) + weight * 0.015;
+  pose.leftLegA = 0.12 + Math.max(0, weight) * 0.04;
+  pose.rightLegA = -0.12 + Math.min(0, weight) * 0.04;
+
+  if (thinkingSide === 1) {
+    pose.leftArmA = 0.25 + freeSway;
+    pose.leftForeA = 0.18 + freeSway * 0.5;
+    pose.rightArmA = phase === "lift" ? -0.5 : phase === "bend" ? -0.66 : solved.armA;
+    pose.rightForeA = phase === "lift" ? -0.35 : phase === "bend" ? -1.35 : solved.foreA - handPulse;
+  } else {
+    pose.rightArmA = -0.25 - freeSway;
+    pose.rightForeA = -0.18 - freeSway * 0.5;
+    pose.leftArmA = phase === "lift" ? 0.5 : phase === "bend" ? 0.66 : solved.armA;
+    pose.leftForeA = phase === "lift" ? 0.35 : phase === "bend" ? 1.35 : solved.foreA + handPulse;
+  }
+
+  return pose;
 }
 
 function aimAngleFromPoint(
@@ -1700,19 +1826,48 @@ function evalCharAtTime(
   }
 
   if (active.type === "emote") {
-    const poseIn = clamp(progress / 0.18, 0, 1);
-    const poseOut = progress > 0.82 ? clamp((1 - progress) / 0.18, 0, 1) : 1;
-    const poseT = easeInOutCubic(Math.min(poseIn, poseOut));
+    const elapsed = time - active.startTime;
+    const transitionScale = Math.min(1, Math.max(0.35, active.duration / 2));
+    const liftEnd = 0.2 * transitionScale;
+    const bendEnd = liftEnd + 0.24 * transitionScale;
+    const chinEnd = bendEnd + 0.16 * transitionScale;
+    const releaseDur = 0.2 * transitionScale;
+    const releaseStart = Math.max(chinEnd, active.duration - releaseDur);
+    const priorPose = evalCharAtTime(
+      active.startTime,
+      resolved.filter((a) => a.id !== active.id),
+      initX,
+      initY,
+      clips,
+      authoredAnimations
+    );
+    const facing = priorPose.facing ?? 1;
+    const standing = standingCharPose(active.fromX, active.fromY, facing, time);
+    const liftPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "lift");
+    const bendPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "bend");
+    const chinPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "chin");
+    const holdPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "hold");
+    let pose: CharPoseResult;
+
+    if (elapsed < liftEnd) {
+      pose = lerpCharPose(priorPose, liftPose, liftEnd > 0 ? elapsed / liftEnd : 1);
+    } else if (elapsed < bendEnd) {
+      pose = lerpCharPose(liftPose, bendPose, (elapsed - liftEnd) / Math.max(0.001, bendEnd - liftEnd));
+    } else if (elapsed < chinEnd) {
+      pose = lerpCharPose(bendPose, chinPose, (elapsed - bendEnd) / Math.max(0.001, chinEnd - bendEnd));
+    } else if (elapsed < releaseStart) {
+      pose = holdPose;
+    } else {
+      const releaseT = easeOutQuad((elapsed - releaseStart) / Math.max(0.001, active.duration - releaseStart));
+      pose = lerpCharPose(holdPose, standing, releaseT);
+    }
+
     const emojiAlpha = progress <= 0.2
       ? progress / 0.2
       : progress <= 0.8 ? 1
       : Math.max(0, 1 - (progress - 0.8) / 0.2);
     return {
-      boardX: active.fromX, boardY: active.fromY, facing: 1,
-      headBob: 0, bodyLean: lerp(0, 0.1, poseT),
-      leftLegA: lerp(0.12, 0.18, poseT), rightLegA: lerp(-0.12, -0.08, poseT),
-      leftArmA: lerp(0.08, 0.62, poseT), rightArmA: lerp(-0.08, -1.2, poseT),
-      leftForeA: lerp(0.13, -0.42, poseT), rightForeA: lerp(-0.13, -2.65, poseT),
+      ...pose,
       airY: 0,
       emojiText: active.emoji, emojiAlpha,
     };
@@ -1748,18 +1903,14 @@ function drawCharacterToCanvas(
   // Raw (unscaled) body proportions — single source of truth reused below for both the S-scaled
   // draw geometry and the raw board-space magic numbers (grapple hand height, pointAt shoulder
   // height) that need to stay in sync with them.
-  const HIP_RAW = 76;
-  const TORSO_RAW = 53;     // shortened by NECK_RAW from the original 65 so total height is unchanged
-  const NECK_RAW = 12;
-  const HEAD_R_RAW = 20;
-
   const legLen = 38 * S;
-  const torsoLen = TORSO_RAW * S;
-  const neckLen = NECK_RAW * S;
-  const armLen = 32 * S;
-  const headR = HEAD_R_RAW * S;
+  const torsoLen = CHAR_TORSO_RAW * S;
+  const neckLen = CHAR_NECK_RAW * S;
+  const armLen = CHAR_ARM_RAW * S;
+  const headR = CHAR_HEAD_R_RAW * S;
   const bobS = p.headBob * S;
-  const hipY = (-HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
+  const headTilt = p.headTilt ?? 0;
+  const hipY = (-CHAR_HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
   const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number } => {
     const shoulderY = -torsoLen * 0.85;
     const useRight = preferFiring ? facing >= 0 : facing < 0;
@@ -1947,7 +2098,7 @@ function drawCharacterToCanvas(
 
   // Override pointing arm; other arm hangs relaxed (not tucked inward)
   if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
-    const shoulderBY = p.boardY - (HIP_RAW - (p.skateCrouch ?? 0) + TORSO_RAW * 0.85);
+    const shoulderBY = p.boardY - (CHAR_HIP_RAW - (p.skateCrouch ?? 0) + CHAR_TORSO_RAW * 0.85);
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
     const tdyCanvas = p.pointTargetBY - shoulderBY;
     const mag = Math.hypot(tdxLocal, tdyCanvas);
@@ -1994,13 +2145,16 @@ function drawCharacterToCanvas(
     ctx.restore();
   }
 
-  // Neck — short segment from shoulder up to where the head sits
-  const neckTopY = torsoTopY - neckLen;
-  ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(0, neckTopY); ctx.stroke();
+  // Neck/head chain. Positive headTilt angles the head back/up from the neck joint; the head
+  // remains a plain circle, but the neck/head center shifts so the upward-thinking pose reads.
+  const neckTopX = -Math.sin(headTilt) * neckLen;
+  const neckTopY = torsoTopY - Math.cos(headTilt) * neckLen;
+  ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(neckTopX, neckTopY); ctx.stroke();
 
-  // Head — blank circle only (no face features), sitting on top of the neck
-  const headCY = neckTopY - headR;
-  ctx.beginPath(); ctx.arc(0, headCY, headR, 0, Math.PI * 2); ctx.stroke();
+  // Head — blank circle only (no face features), sitting on the tilted neck chain
+  const headCX = neckTopX - Math.sin(headTilt) * headR * 0.35;
+  const headCY = neckTopY - Math.cos(headTilt) * headR;
+  ctx.beginPath(); ctx.arc(headCX, headCY, headR, 0, Math.PI * 2); ctx.stroke();
 
   // Emoji emote
   if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
@@ -2010,7 +2164,7 @@ function drawCharacterToCanvas(
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
     ctx.scale(1 / facing, 1);
-    ctx.fillText(p.emojiText, 0, headCY - headR - 12 * S);
+    ctx.fillText(p.emojiText, headCX * facing, headCY - headR - 12 * S);
     ctx.restore();
   }
 

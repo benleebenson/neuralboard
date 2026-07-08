@@ -6,6 +6,7 @@ export type Pose = {
   leftForeA: number;
   rightForeA: number;
   bodyLean: number;
+  headTilt: number;
   headBob: number;
   poseRotation: number;
   airborneY: number;
@@ -32,6 +33,7 @@ export const RESERVED_ANIMATION_NAMES = [
   "flip",
   "idle",
   "explain",
+  "emote-thinking",
   "sit",
   "climb",
   "skate-pedal",
@@ -49,6 +51,7 @@ export const DEFAULT_POSE: Pose = {
   leftForeA: 0.13,
   rightForeA: -0.13,
   bodyLean: 0,
+  headTilt: 0,
   headBob: 0,
   poseRotation: 0,
   airborneY: 0,
@@ -71,6 +74,7 @@ function lerpPose(a: Pose, b: Pose, t: number): Pose {
     leftForeA: lerp(a.leftForeA, b.leftForeA, t),
     rightForeA: lerp(a.rightForeA, b.rightForeA, t),
     bodyLean: lerp(a.bodyLean, b.bodyLean, t),
+    headTilt: lerp(a.headTilt, b.headTilt, t),
     headBob: lerp(a.headBob, b.headBob, t),
     poseRotation: lerp(a.poseRotation, b.poseRotation, t),
     airborneY: lerp(a.airborneY, b.airborneY, t),
@@ -318,6 +322,15 @@ export const SKATE_OLLY_KEYFRAMES: PoseKeyframe[] = [
   { t: 1, pose: pose({ leftLegA: 0.5, rightLegA: -0.5, leftArmA: 0.18, rightArmA: -0.18, leftForeA: 0.1, rightForeA: -0.1, bodyLean: 0.16 }) },
 ];
 
+export const THINKING_EMOTE_KEYFRAMES: PoseKeyframe[] = [
+  { t: 0, pose: pose({ leftLegA: 0.12, rightLegA: -0.12, leftArmA: 0.08, rightArmA: -0.08, leftForeA: 0.13, rightForeA: -0.13, headTilt: 0, bodyLean: 0 }) },
+  { t: 0.1, pose: pose({ leftLegA: 0.12, rightLegA: -0.12, leftArmA: 0.25, rightArmA: -0.5, leftForeA: 0.16, rightForeA: -0.35, headTilt: 0, bodyLean: 0.02 }) },
+  { t: 0.22, pose: pose({ leftLegA: 0.13, rightLegA: -0.12, leftArmA: 0.25, rightArmA: -0.66, leftForeA: 0.16, rightForeA: -1.55, headTilt: 0.08, bodyLean: 0.03 }) },
+  { t: 0.3, pose: pose({ leftLegA: 0.14, rightLegA: -0.12, leftArmA: 0.25, rightArmA: -0.72, leftForeA: 0.16, rightForeA: -2.18, headTilt: 0.15, bodyLean: 0.03 }) },
+  { t: 0.9, pose: pose({ leftLegA: 0.16, rightLegA: -0.1, leftArmA: 0.25, rightArmA: -0.72, leftForeA: 0.18, rightForeA: -2.12, headTilt: 0.15, headBob: 1, bodyLean: 0.04 }) },
+  { t: 1, pose: pose({ leftLegA: 0.12, rightLegA: -0.12, leftArmA: 0.08, rightArmA: -0.08, leftForeA: 0.13, rightForeA: -0.13, headTilt: 0, bodyLean: 0 }) },
+];
+
 export function starterAnimations(now = new Date().toISOString()): AuthoredAnimation[] {
   return [
     {
@@ -403,6 +416,13 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
         { t: 0.78, pose: pose({ leftArmA: 0.25, rightArmA: -0.35, leftForeA: 0.1, rightForeA: -0.12, bodyLean: 0.03 }) },
         { t: 1, pose: pose({ leftArmA: 0.15, rightArmA: -0.15, leftForeA: 0.15, rightForeA: -0.15 }) },
       ],
+    },
+    {
+      id: "starter_emote_thinking",
+      name: "emote-thinking",
+      loop: false,
+      createdAt: now,
+      keyframes: THINKING_EMOTE_KEYFRAMES,
     },
   ];
 }

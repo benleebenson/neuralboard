@@ -61,7 +61,7 @@ export async function GET() {
     });
   }
 
-  const rows = await refreshPristineSkateSeeds(data ?? [], session.user.email);
+  const rows = await refreshPristineStarterSeeds(data ?? [], session.user.email);
   return NextResponse.json(rows.map(rowToAnimation));
 }
 
@@ -114,30 +114,34 @@ function keyframesEqual(a: PoseKeyframe[], b: PoseKeyframe[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function skateStarterFor(name: string, createdAt: string): AuthoredAnimation | undefined {
+const REFRESHABLE_STARTER_NAMES = new Set(["skate-pedal", "skate-olly", "emote-thinking"]);
+
+function starterFor(name: string, createdAt: string): AuthoredAnimation | undefined {
   return starterAnimations(createdAt).find((anim) => anim.name === name);
 }
 
-function isPristineSkateSeed(row: AnimationRow): boolean {
-  if (row.name !== "skate-pedal" && row.name !== "skate-olly") return false;
+function isPristineRefreshableSeed(row: AnimationRow): boolean {
+  if (!REFRESHABLE_STARTER_NAMES.has(row.name)) return false;
   const data = (row.data ?? {}) as Record<string, unknown>;
   const updatedAt = typeof data.updatedAt === "string" ? data.updatedAt : undefined;
   if (updatedAt) return updatedAt === row.created_at;
 
   const anim = normalizeAnimation({ ...data, id: row.id, name: row.name, createdAt: row.created_at });
   if (!anim) return false;
+  if (row.name === "emote-thinking") return false;
   const legacy = row.name === "skate-pedal" ? LEGACY_SKATE_PEDAL_KEYFRAMES : LEGACY_SKATE_OLLY_KEYFRAMES;
   return keyframesEqual(anim.keyframes, legacy);
 }
 
-async function refreshPristineSkateSeeds(rows: AnimationRow[], email: string): Promise<AnimationRow[]> {
+async function refreshPristineStarterSeeds(rows: AnimationRow[], email: string): Promise<AnimationRow[]> {
   const refreshed: AnimationRow[] = [];
+  const seen = new Set(rows.map((row) => row.name));
   for (const row of rows) {
-    if (!isPristineSkateSeed(row)) {
+    if (!isPristineRefreshableSeed(row)) {
       refreshed.push(row);
       continue;
     }
-    const starter = skateStarterFor(row.name, row.created_at);
+    const starter = starterFor(row.name, row.created_at);
     if (!starter) {
       refreshed.push(row);
       continue;
@@ -152,6 +156,20 @@ async function refreshPristineSkateSeeds(rows: AnimationRow[], email: string): P
       .select("id,name,data,created_at")
       .single();
     refreshed.push(!error && data ? data : row);
+  }
+  const seedTime = new Date().toISOString();
+  for (const starter of starterAnimations(seedTime)) {
+    if (!REFRESHABLE_STARTER_NAMES.has(starter.name) || seen.has(starter.name)) continue;
+    const { data, error } = await supabase
+      .from("character_animations")
+      .insert({
+        email,
+        name: starter.name,
+        data: { ...starter, id: undefined, updatedAt: starter.createdAt },
+      })
+      .select("id,name,data,created_at")
+      .single();
+    if (!error && data) refreshed.push(data);
   }
   return refreshed;
 }

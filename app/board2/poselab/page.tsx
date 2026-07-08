@@ -71,8 +71,9 @@ function segment(parent: Point, angle: number, len: number): Point {
 function rigFromPose(p: Pose): Rig {
   const hip = { x: SVG_W / 2, y: HIP_Y + p.airborneY };
   const shoulder = { x: hip.x + Math.sin(p.bodyLean) * TORSO, y: hip.y - Math.cos(p.bodyLean) * TORSO };
-  const neck = { x: shoulder.x + Math.sin(p.bodyLean) * NECK, y: shoulder.y - Math.cos(p.bodyLean) * NECK };
-  const head = { x: neck.x + Math.sin(p.bodyLean) * HEAD_R, y: neck.y - Math.cos(p.bodyLean) * HEAD_R };
+  const headLean = p.bodyLean + p.headTilt;
+  const neck = { x: shoulder.x - Math.sin(headLean) * NECK, y: shoulder.y - Math.cos(headLean) * NECK };
+  const head = { x: neck.x - Math.sin(headLean) * HEAD_R * 0.35, y: neck.y - Math.cos(headLean) * HEAD_R };
   const leftShoulder = { x: shoulder.x - 18, y: shoulder.y };
   const rightShoulder = { x: shoulder.x + 18, y: shoulder.y };
   const leftElbow = segment(leftShoulder, p.leftArmA, LIMB);
@@ -333,7 +334,7 @@ export default function PoseLabPage() {
                 <div style={{ position: "absolute", left: `${selectedT * 100}%`, top: 0, bottom: 0, width: 2, background: "#cc2200" }} />
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginTop: 10 }}>
-                {(["bodyLean", "poseRotation", "airborneY"] as const).map((key) => (
+                {(["bodyLean", "headTilt", "poseRotation", "airborneY"] as const).map((key) => (
                   <label key={key} style={labelStyle}>{key}
                     <input type="range" min={key === "airborneY" ? -180 : -1.5} max={key === "airborneY" ? 80 : 1.5} step="0.01" value={pose[key]}
                       onChange={(e) => setPose((p) => ({ ...p, [key]: Number(e.target.value) }))} onPointerUp={() => captureKeyframe(selectedT)} />
