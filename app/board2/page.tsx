@@ -47,6 +47,16 @@ type Clip = {
   needsRedownload?: boolean;
 };
 
+type VideoPlaybackMode = "active" | "ambient" | "dormant";
+
+type VideoPlaybackRuntime = {
+  state: VideoPlaybackMode;
+  lastInViewportAt: number;
+  lastTransitionLogAt: number;
+  lastRestartAt: number;
+  reason: string;
+};
+
 type Annotation = {
   id: string;
   type: "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
@@ -212,6 +222,12 @@ const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
 const EXPORT_FPS = 60;
+const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
+const AMBIENT_BUDGET = 4;
+const AMBIENT_STATE_EVAL_INTERVAL_MS = 100;
+const AMBIENT_VIEWPORT_EXPAND = 0.25;
+const AMBIENT_DORMANT_HYSTERESIS_MS = 500;
+const AMBIENT_CENSUS_INTERVAL_MS = 5000;
 const PREVIEW_DEFAULT_H_PX = 135;
 const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
@@ -2035,6 +2051,15 @@ export default function Board2Page() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
+  const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
+    if (typeof window === "undefined") return true;
+    try {
+      const saved = window.localStorage.getItem(AMBIENT_VIDEO_STORAGE_KEY);
+      return saved === null ? true : saved !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [boardZoom, setBoardZoom] = useState(0.18);
@@ -2217,6 +2242,12 @@ export default function Board2Page() {
   const videoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map()); // clip.id → HTMLVideoElement
   const videoRangeStateRef = useRef<Map<string, boolean>>(new Map()); // clip.id → wasInRange (previous frame)
   const videoStuckFrameCountRef = useRef<Map<string, number>>(new Map()); // clip.id → consecutive failed-draw frames while active
+  const videoPlaybackStateRef = useRef<Map<string, VideoPlaybackRuntime>>(new Map()); // clip.id → active/ambient/dormant runtime state
+  const ambientVideoEnabledRef = useRef(ambientVideoEnabled);
+  const ambientCandidateIdsRef = useRef<Set<string>>(new Set());
+  const lastAmbientEvalAtRef = useRef(0);
+  const lastAmbientCensusAtRef = useRef(0);
+  const drawableFailureCountRef = useRef(0);
   const hasPrewarmedRef = useRef(false); // first-play autoplay unlock, once per session
   const thumbnailImagesRef = useRef<Map<string, HTMLImageElement | null>>(new Map()); // clip.id → pre-loaded thumbnail image (null = capture failed)
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
@@ -2279,6 +2310,10 @@ export default function Board2Page() {
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => {
+    ambientVideoEnabledRef.current = ambientVideoEnabled;
+    try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
+  }, [ambientVideoEnabled]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
@@ -2481,15 +2516,21 @@ export default function Board2Page() {
         const vid = videoElsRef.current.get(clip.id);
         const thumbEl = thumbnailImagesRef.current.get(clip.id);
         let drewLive = false;
-        // readyState >= 3 (HAVE_FUTURE_DATA) + currentTime > 0.05 = a decoded frame actually
-        // exists to draw — readyState >= 2 alone can be true before the first frame is decoded,
-        // which showed the thumbnail-frozen-while-audio-plays bug on a clip's first playthrough.
-        if (vid && vid.readyState >= 3 && !vid.paused && !vid.ended && vid.currentTime > 0.05) {
+        const playbackRuntime = videoPlaybackStateRef.current.get(clip.id);
+        const playbackMode = playbackRuntime?.state ?? "dormant";
+        const justRestartedActive = playbackMode === "active" && playbackRuntime ? performance.now() - playbackRuntime.lastRestartAt < 250 : false;
+        // Ambient clips can wrap through currentTime=0 while looping, so drawable state is based
+        // primarily on decoded future data + actually playing. The currentTime guard only applies
+        // immediately after an active-range restart to avoid the first-play thumbnail/audio race.
+        if (vid && vid.readyState >= 3 && !vid.paused && !vid.ended && (!justRestartedActive || vid.currentTime > 0.05)) {
           try { ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh); drewLive = true; } catch { drewLive = false; }
         }
         if (drewLive) {
           videoStuckFrameCountRef.current.set(clip.id, 0);
-        } else if (vid && !vid.paused && time >= clip.startTime && time < clip.startTime + clip.duration) {
+        } else if (playbackMode === "active" || playbackMode === "ambient") {
+          drawableFailureCountRef.current++;
+        }
+        if (!drewLive && playbackMode === "active" && vid && !vid.paused) {
           // Clip should be actively playing but produced no drawable frame this render — track
           // consecutive misses and nudge playback if it's stuck for a few frames in a row.
           const misses = (videoStuckFrameCountRef.current.get(clip.id) ?? 0) + 1;
@@ -2589,6 +2630,16 @@ export default function Board2Page() {
     }
   }
 
+  function setVideoGain(clipId: string, vid: HTMLVideoElement, gain: number) {
+    const nodes = videoAudioNodesRef.current.get(clipId);
+    if (nodes) {
+      nodes.gainNode.gain.value = gain;
+    } else {
+      vid.muted = false;
+      vid.volume = gain;
+    }
+  }
+
   // Pure play/pause mechanics shared by the preview RAF loop, togglePlay, and the export loop
   // so entry/exit behavior can't silently diverge between them. These never touch audio —
   // export schedules its own audio separately and must not un-silence the preview gain nodes.
@@ -2601,23 +2652,172 @@ export default function Board2Page() {
     vid.currentTime = 0;
   }
 
-  // Switch ON: entry into a clip's active range (or resuming into one), for the live preview.
-  function switchVideoOn(clip: Clip, vid: HTMLVideoElement, offsetSec: number) {
-    restartAndPlay(vid, offsetSec);
-    updateVideoVolume(clip, vid);
-  }
-
-  // Silences a clip's audio path (gain node if it exists, else native mute) — the "off" state
+  // Silences a clip's audio path (gain node if it exists, else native volume fallback) — the "off" state
   // shared by switchVideoOff and pre-warming.
   function setClipAudioOff(clipId: string, vid: HTMLVideoElement) {
-    const nodes = videoAudioNodesRef.current.get(clipId);
-    if (nodes) nodes.gainNode.gain.value = 0; else vid.muted = true;
+    setVideoGain(clipId, vid, 0);
   }
 
   // Switch OFF: exit from a clip's active range, for the live preview.
   function switchVideoOff(clip: Clip, vid: HTMLVideoElement) {
     setClipAudioOff(clip.id, vid);
     pauseAndReset(vid);
+  }
+
+  function videoRuntimeFor(clipId: string): VideoPlaybackRuntime {
+    let runtime = videoPlaybackStateRef.current.get(clipId);
+    if (!runtime) {
+      runtime = { state: "dormant", lastInViewportAt: 0, lastTransitionLogAt: 0, lastRestartAt: 0, reason: "init" };
+      videoPlaybackStateRef.current.set(clipId, runtime);
+    }
+    return runtime;
+  }
+
+  function logVideoStateTransition(clipId: string, runtime: VideoPlaybackRuntime, state: VideoPlaybackMode, reason: string, now: number) {
+    if (runtime.state === state && runtime.reason === reason) return;
+    if (runtime.state !== state && now - runtime.lastTransitionLogAt > 250) {
+      console.log(`[ambient] clip ${clipId} ${state} (${reason})`);
+      runtime.lastTransitionLogAt = now;
+    }
+    runtime.state = state;
+    runtime.reason = reason;
+  }
+
+  function videoViewportInfo(
+    clip: Clip,
+    cam: { cameraX: number; cameraY: number; boardZoom: number },
+    W: number,
+    H: number,
+    now: number
+  ): { candidate: boolean; distance: number; reason: string } {
+    if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) {
+      return { candidate: false, distance: Number.POSITIVE_INFINITY, reason: "no-board-rect" };
+    }
+    const vp = cameraViewport(cam, W, H);
+    const mx = vp.width * AMBIENT_VIEWPORT_EXPAND;
+    const my = vp.height * AMBIENT_VIEWPORT_EXPAND;
+    const left = vp.left - mx;
+    const right = vp.right + mx;
+    const top = vp.top - my;
+    const bottom = vp.bottom + my;
+    const clipLeft = clip.boardX;
+    const clipRight = clip.boardX + clip.boardW;
+    const clipTop = clip.boardY;
+    const clipBottom = clip.boardY + clip.boardH;
+    const intersects = clipRight >= left && clipLeft <= right && clipBottom >= top && clipTop <= bottom;
+    const runtime = videoRuntimeFor(clip.id);
+    if (intersects) runtime.lastInViewportAt = now;
+    const withinHysteresis = runtime.state === "ambient" && now - runtime.lastInViewportAt <= AMBIENT_DORMANT_HYSTERESIS_MS;
+    const cx = clip.boardX + clip.boardW / 2;
+    const cy = clip.boardY + clip.boardH / 2;
+    const distance = Math.hypot(cx - (vp.left + vp.width / 2), cy - (vp.top + vp.height / 2));
+    if (intersects) return { candidate: true, distance, reason: "in-expanded-viewport" };
+    if (withinHysteresis) return { candidate: true, distance, reason: "hysteresis" };
+    return { candidate: false, distance, reason: "off-viewport" };
+  }
+
+  function evaluateVideoPlaybackStates(
+    time: number,
+    currentClips: Clip[],
+    currentCameraKeyframes: CameraKeyframe[],
+    W: number,
+    H: number,
+    options: { force?: boolean; audioMode?: "preview" | "silent" } = {}
+  ) {
+    // eslint-disable-next-line react-hooks/purity
+    const now = performance.now();
+    const videoClips = currentClips.filter((clip) => clip.type === "video");
+    const activeIds = new Set(
+      videoClips
+        .filter((clip) => time >= clip.startTime && time < clip.startTime + clip.duration)
+        .map((clip) => clip.id)
+    );
+
+    if (options.force || now - lastAmbientEvalAtRef.current >= AMBIENT_STATE_EVAL_INTERVAL_MS) {
+      lastAmbientEvalAtRef.current = now;
+      if (!ambientVideoEnabledRef.current) {
+        ambientCandidateIdsRef.current = new Set();
+      } else {
+        const cam = interpolateCameraKeyframes(currentCameraKeyframes, time);
+        const ambientSlots = Math.max(0, AMBIENT_BUDGET - activeIds.size);
+        const candidates = videoClips
+          .filter((clip) => !activeIds.has(clip.id))
+          .map((clip) => ({ clip, ...videoViewportInfo(clip, cam, W, H, now) }))
+          .filter((item) => item.candidate)
+          .sort((a, b) => {
+            const dist = a.distance - b.distance;
+            if (Math.abs(dist) > 0.001) return dist;
+            const aUpcoming = a.clip.startTime >= time ? a.clip.startTime - time : Number.MAX_SAFE_INTEGER + a.clip.startTime;
+            const bUpcoming = b.clip.startTime >= time ? b.clip.startTime - time : Number.MAX_SAFE_INTEGER + b.clip.startTime;
+            return aUpcoming - bUpcoming;
+          });
+        ambientCandidateIdsRef.current = new Set(candidates.slice(0, ambientSlots).map((item) => item.clip.id));
+      }
+    }
+
+    let activeCount = 0;
+    let ambientCount = 0;
+    let dormantCount = 0;
+    const liveClipIds = new Set(videoClips.map((clip) => clip.id));
+
+    for (const staleId of [...videoPlaybackStateRef.current.keys()]) {
+      if (!liveClipIds.has(staleId)) videoPlaybackStateRef.current.delete(staleId);
+    }
+
+    for (const clip of videoClips) {
+      const vid = videoElsRef.current.get(clip.id);
+      if (!vid) continue;
+      ensureVideoAudioNodes(clip.id, vid);
+      const runtime = videoRuntimeFor(clip.id);
+      const isActive = activeIds.has(clip.id);
+      const isAmbient = !isActive && ambientVideoEnabledRef.current && ambientCandidateIdsRef.current.has(clip.id);
+      const desired: VideoPlaybackMode = isActive ? "active" : isAmbient ? "ambient" : "dormant";
+      const reason = isActive
+        ? "timeline-active"
+        : !ambientVideoEnabledRef.current
+          ? "ambient-disabled"
+          : isAmbient
+            ? "viewport-budget"
+            : "off-viewport-or-over-budget";
+      const previousState = runtime.state;
+
+      logVideoStateTransition(clip.id, runtime, desired, reason, now);
+
+      if (desired === "active") {
+        activeCount++;
+        vid.loop = false;
+        const expected = Math.max(0, time - clip.startTime);
+        if (previousState !== "active" || vid.paused || vid.ended) {
+          restartAndPlay(vid, expected);
+          runtime.lastRestartAt = now;
+          console.log("[video] clip", clip.id, "entered — restart + play");
+        } else if (Math.abs(vid.currentTime - expected) > 0.3) {
+          vid.currentTime = expected;
+        }
+        if (options.audioMode === "silent") setClipAudioOff(clip.id, vid); else updateVideoVolume(clip, vid);
+        videoRangeStateRef.current.set(clip.id, true);
+      } else if (desired === "ambient") {
+        ambientCount++;
+        vid.loop = true;
+        setClipAudioOff(clip.id, vid);
+        if (vid.paused || vid.ended) {
+          if (vid.ended) vid.currentTime = 0;
+          vid.play().catch(() => {});
+        }
+        videoRangeStateRef.current.set(clip.id, false);
+      } else {
+        dormantCount++;
+        if (!vid.paused || vid.currentTime !== 0) switchVideoOff(clip, vid);
+        vid.loop = false;
+        videoRangeStateRef.current.set(clip.id, false);
+      }
+    }
+
+    if ((isPlayingRef.current || isExportingRef.current) && now - lastAmbientCensusAtRef.current >= AMBIENT_CENSUS_INTERVAL_MS) {
+      console.log(`[ambient] census active ${activeCount} / ambient ${ambientCount} / dormant ${dormantCount} / drawable-failures ${drawableFailureCountRef.current}`);
+      drawableFailureCountRef.current = 0;
+      lastAmbientCensusAtRef.current = now;
+    }
   }
 
   // Warms up a freshly created video element's decoder with a silent play()→pause() cycle so
@@ -2658,15 +2858,16 @@ export default function Board2Page() {
       if (next >= maxEnd) {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
         isPlayingRef.current = false;
-        // Switch off any clip still active — timeline ended mid-clip
+        // Switch off any clip still active or ambient — timeline ended mid-clip
         for (const clip of clipsRef.current) {
           if (clip.type !== "video") continue;
           const vid = videoElsRef.current.get(clip.id);
           if (!vid) continue;
-          if (videoRangeStateRef.current.get(clip.id)) {
-            switchVideoOff(clip, vid);
-            videoRangeStateRef.current.set(clip.id, false);
-          }
+          switchVideoOff(clip, vid);
+          videoRangeStateRef.current.set(clip.id, false);
+          const runtime = videoRuntimeFor(clip.id);
+          runtime.state = "dormant";
+          runtime.reason = "playback-ended";
         }
         for (const clipId of [...activeNarrationRef.current.keys()]) {
           const entry = activeNarrationRef.current.get(clipId);
@@ -2681,30 +2882,7 @@ export default function Board2Page() {
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
     prevPlayheadRef.current = t;
-    // Switch-based per-clip video playback: entry restarts from 0 + plays, exit pauses + resets to 0
-    for (const clip of clipsRef.current) {
-      if (clip.type !== "video") continue;
-      const vid = videoElsRef.current.get(clip.id);
-      if (!vid) continue;
-      const isInRange = t >= clip.startTime && t < clip.startTime + clip.duration;
-      const wasInRange = videoRangeStateRef.current.get(clip.id) ?? false;
-      ensureVideoAudioNodes(clip.id, vid);
-      if (isInRange && !wasInRange) {
-        // Just entered: restart from beginning of blob (blob is pre-trimmed for YouTube; uploaded clips start at 0)
-        switchVideoOn(clip, vid, 0);
-        console.log("[video] clip", clip.id, "entered — restart + play");
-      } else if (!isInRange && wasInRange) {
-        // Just exited: switch off
-        switchVideoOff(clip, vid);
-        console.log("[video] clip", clip.id, "exited — pause");
-      } else if (isInRange) {
-        updateVideoVolume(clip, vid);
-        // Drift correction: if the element's own clock diverges from the timeline, resync
-        const expected = t - clip.startTime;
-        if (Math.abs(vid.currentTime - expected) > 0.3) vid.currentTime = expected;
-      }
-      videoRangeStateRef.current.set(clip.id, isInRange);
-    }
+    evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
     // Narration audio: spawn on entry, stop on exit
     for (const clip of clipsRef.current) {
       if (clip.type !== "narration") continue;
@@ -2786,7 +2964,17 @@ export default function Board2Page() {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
       // Switch off every clip's video (paused clips render their frozen thumbnail)
       for (const nodes of videoAudioNodesRef.current.values()) { try { nodes.gainNode.gain.value = 0; } catch {} }
-      for (const vid of videoElsRef.current.values()) { vid.pause(); }
+      for (const clip of clipsRef.current) {
+        if (clip.type !== "video") continue;
+        const vid = videoElsRef.current.get(clip.id);
+        if (!vid) continue;
+        switchVideoOff(clip, vid);
+        const runtime = videoRuntimeFor(clip.id);
+        runtime.state = "dormant";
+        runtime.reason = "playback-paused";
+        videoRangeStateRef.current.set(clip.id, false);
+      }
+      ambientCandidateIdsRef.current = new Set();
       // Stop all active narration audio
       for (const clipId of [...activeNarrationRef.current.keys()]) {
         const entry = activeNarrationRef.current.get(clipId);
@@ -2891,6 +3079,7 @@ export default function Board2Page() {
     videoElsRef.current.set(clipId, vid);
     videoRangeStateRef.current.set(clipId, false);
     videoStuckFrameCountRef.current.set(clipId, 0);
+    videoPlaybackStateRef.current.set(clipId, { state: "dormant", lastInViewportAt: 0, lastTransitionLogAt: 0, lastRestartAt: 0, reason: "created" });
     // Warm the decoder now (silent play→pause) so the element's first real entry has a
     // drawable frame ready instead of showing the thumbnail while its audio already plays.
     // Also covers autoplay unlock for elements created after the session's first Play click
@@ -2970,6 +3159,8 @@ export default function Board2Page() {
     }
     videoRangeStateRef.current.delete(clipId);
     videoStuckFrameCountRef.current.delete(clipId);
+    videoPlaybackStateRef.current.delete(clipId);
+    ambientCandidateIdsRef.current.delete(clipId);
     const audioNodes = videoAudioNodesRef.current.get(clipId);
     if (audioNodes) {
       try { audioNodes.gainNode.gain.value = 0; audioNodes.sourceNode.disconnect(); audioNodes.gainNode.disconnect(); } catch {}
@@ -5196,27 +5387,26 @@ export default function Board2Page() {
 
     // First-play unlock: every element gets a play() call inside this synchronous click-gesture
     // callback so the browser grants autoplay permission for later programmatic play() calls
-    // this session. The clip(s) about to become active are unlocked via switchVideoOn below
-    // (not here) — running a play()-then-pause() on them too would race switchVideoOn's own
-    // play() and could pause the clip right after it starts.
+    // this session. The promise only pauses clips that the state machine did not keep live.
     const firstPlay = !hasPrewarmedRef.current;
     hasPrewarmedRef.current = true;
 
-    // Switch on whichever clip(s) the playhead currently sits inside; switch off the rest
+    // Unlock video elements once inside the click gesture; the state machine below decides
+    // which clips stay active/ambient after these promises settle.
     for (const clip of clipsRef.current) {
       if (clip.type !== "video") continue;
       const vid = videoElsRef.current.get(clip.id);
       if (!vid) continue;
       const isInRange = startPh >= clip.startTime && startPh < clip.startTime + clip.duration;
-      if (isInRange) {
-        switchVideoOn(clip, vid, startPh - clip.startTime);
-      } else if (firstPlay) {
-        vid.play().then(() => vid.pause()).catch(() => {});
-      } else {
-        switchVideoOff(clip, vid);
+      if (firstPlay && !isInRange) {
+        setClipAudioOff(clip.id, vid);
+        vid.play().then(() => {
+          const state = videoPlaybackStateRef.current.get(clip.id)?.state ?? "dormant";
+          if (state !== "ambient" && state !== "active") vid.pause();
+        }).catch(() => {});
       }
-      videoRangeStateRef.current.set(clip.id, isInRange);
     }
+    evaluateVideoPlaybackStates(startPh, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { force: true });
     setIsPlaying(true);
   }
 
@@ -5719,6 +5909,9 @@ export default function Board2Page() {
       vid.pause();
       vid.currentTime = 0;
     }
+    ambientCandidateIdsRef.current = new Set();
+    lastAmbientEvalAtRef.current = 0;
+    drawableFailureCountRef.current = 0;
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
 
@@ -5791,7 +5984,11 @@ export default function Board2Page() {
         const vid = videoElsRef.current.get(clip.id);
         if (vid) pauseAndReset(vid);
         videoRangeStateRef.current.set(clip.id, false);
+        const runtime = videoRuntimeFor(clip.id);
+        runtime.state = "dormant";
+        runtime.reason = "export-ended";
       }
+      ambientCandidateIdsRef.current = new Set();
     }
 
     // eslint-disable-next-line react-hooks/purity
@@ -5809,21 +6006,7 @@ export default function Board2Page() {
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
-      // Same switch model as preview: entry restarts from 0 + plays, exit pauses + resets to 0
-      // (audio is intentionally untouched here — it's scheduled separately below, and the
-      // preview's Web Audio gain nodes were silenced above so they don't double up)
-      for (const clip of currentClips) {
-        if (clip.type !== "video") continue;
-        const vid = videoElsRef.current.get(clip.id);
-        if (!vid) continue;
-        const isActive = elapsed >= clip.startTime && elapsed < clip.startTime + clip.duration;
-        const wasActive = prevExportElapsed >= clip.startTime && prevExportElapsed < clip.startTime + clip.duration;
-        if (isActive && (!wasActive || vid.paused)) {
-          restartAndPlay(vid, 0);
-        } else if (!isActive && wasActive) {
-          pauseAndReset(vid);
-        }
-      }
+      evaluateVideoPlaybackStates(elapsed, currentClips, currentCameraKeyframes, W, H, { force: prevExportElapsed < 0, audioMode: "silent" });
       prevExportElapsed = elapsed;
       renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations);
       exportRafRef.current = requestAnimationFrame(exportFrame);
@@ -8506,6 +8689,18 @@ export default function Board2Page() {
                   </button>
                 ))}
               </div>
+              <label
+                title="Keep visible off-timeline videos looping silently while the camera passes them."
+                style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, fontFamily: "monospace", color: "#2a2a2a", whiteSpace: "nowrap", userSelect: "none" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={ambientVideoEnabled}
+                  onChange={(e) => setAmbientVideoEnabled(e.target.checked)}
+                  style={{ width: 12, height: 12, margin: 0, accentColor: "#c8f135" }}
+                />
+                Ambient video
+              </label>
             </div>
           </div>
 
