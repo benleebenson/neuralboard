@@ -1159,7 +1159,6 @@ type CharPoseResult = {
   grappleHookT?: number;
   grappleTaut?: boolean;
   grappleImpact?: number;
-  grappleLauncherVisible?: boolean;
   skateboardVisible?: boolean;
   skateFootMode?: "both-planted" | "left-push" | "air";
   skateCrouch?: number;
@@ -1169,10 +1168,6 @@ type CharPoseResult = {
   pullUpBarAlpha?: number;
   pullUpBarBX?: number;
   pullUpBarBY?: number;
-  sitChairAlpha?: number;
-  sitChairBX?: number;
-  sitChairBY?: number;
-  sitChairFacing?: 1 | -1;
   sitSeated?: boolean;
   popcornAlpha?: number;
   popcornX?: number;
@@ -1231,6 +1226,8 @@ function applyAuthoredPose(base: CharPoseResult, pose: Pose | null, opts: { addS
     spinAngle: (base.spinAngle ?? 0) + (opts.addSpin ? pose.poseRotation * base.facing : 0),
     leftLegA: pose.leftLegA,
     rightLegA: pose.rightLegA,
+    leftShinA: pose.leftShinA,
+    rightShinA: pose.rightShinA,
     leftArmA: pose.leftArmA,
     rightArmA: pose.rightArmA,
     leftForeA: pose.leftForeA,
@@ -1662,8 +1659,8 @@ function evalCharAtTime(
     const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
     const anchorBY = Math.min(active.fromY, ty) - 380;
     const landingY = resolveGroundY(tx, ty, clips);
-    const PREP_END = 0.1;
-    const FIRE_END = 0.24;
+    const PREP_END = 0.12;
+    const FIRE_END = 0.22;
     const PULL_START = 0.32;
     const RELEASE_PREP_START = 0.72;
     const RELEASE_DETACH = 0.85;
@@ -1700,15 +1697,15 @@ function evalCharAtTime(
 
     if (progress < PREP_END) {
       const t = easeInOutCubic(progress / PREP_END);
-      const torsoLead = clamp((progress + 0.05) / PREP_END, 0, 1);
-      bodyLean = lerp(0.02, 0.1, easeOutQuad(torsoLead)) * facing;
-      setFiringArm(lerp(0.12, 0.72, t), lerp(0.12, 0.52, t));
-      setFreeArm(lerp(-0.12, 0.18, t), lerp(-0.05, 0.08, t));
+      bodyLean = lerp(0.02, -0.08, easeOutQuad(t)) * facing;
+      setFiringArm(lerp(0.08, aimA, t), lerp(0.13, aimA, t));
+      setFreeArm(lerp(-0.12, 0.34, t), lerp(-0.05, 0.14, t));
     } else if (progress < FIRE_END) {
       const t = easeOutQuad((progress - PREP_END) / (FIRE_END - PREP_END));
-      bodyLean = lerp(0.1, -0.05, clamp((progress - PREP_END + 0.05) / (FIRE_END - PREP_END), 0, 1)) * facing;
-      setFiringArm(lerp(0.72, aimA, t), lerp(0.52, aimA, t));
-      setFreeArm(lerp(0.18, 0.38, t), lerp(0.08, 0.14, t));
+      const recoil = Math.sin(t * Math.PI) * 0.18;
+      bodyLean = lerp(-0.08, -0.03, t) * facing;
+      setFiringArm(aimA - recoil * 0.35, aimA + recoil);
+      setFreeArm(lerp(0.34, 0.42, t), lerp(0.14, 0.18, t));
       ropeAlpha = t;
       hookT = 0.02 + t * 0.18;
     } else if (progress < PULL_START) {
@@ -1779,7 +1776,6 @@ function evalCharAtTime(
       grappleHookT: hookT,
       grappleTaut: taut,
       grappleImpact: impact,
-      grappleLauncherVisible: progress < RELEASE_DETACH,
     }, null);
   }
 
@@ -1849,11 +1845,9 @@ function evalCharAtTime(
     const groundY = resolveGroundY(active.fromX, active.targetY ?? active.fromY, clips);
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
     const STEP_END = 0.12;
-    const LOWER_END = 0.25;
+    const LOWER_END = 0.3;
     const STAND_START = 0.9;
-    const seatHeight = 55;
-    const seatedBoardY = groundY + CHAR_HIP_RAW - seatHeight;
-    const chairX = active.fromX + facing * 18;
+    const seatedBoardY = groundY + CHAR_HIP_RAW;
     const jitter = seededRandom(active.id + ":popcorn") * 0.34;
     const eatingCycle = ((time + jitter) / 2.2) % 1;
     let bx = active.fromX;
@@ -1870,11 +1864,13 @@ function evalCharAtTime(
     let leftForeA = 0.13;
     let rightForeA = -0.13;
     let popcornAlpha = 0;
+    let popcornX = 40;
+    let popcornY = 72;
     let sitSeated = false;
 
     const seatedPose = (aliveT: number) => {
-      const lap = solveArmToLocalPoint(10, -18, -1);
-      const bucket = solveArmToLocalPoint(18, -18, 1);
+      const lap = solveArmToLocalPoint(8, 8, -1);
+      const bucket = solveArmToLocalPoint(16, 8, 1);
       const mouth = solveArmToLocalPoint(8, -104, 1);
       const downToBucket = clamp(aliveT / 0.24, 0, 1);
       const upToMouth = clamp((aliveT - 0.24) / 0.28, 0, 1);
@@ -1888,58 +1884,69 @@ function evalCharAtTime(
       rightForeA = lerp(bucket.foreA, mouth.foreA, lift) + Math.sin((time + jitter) * 8.1) * 0.035 * reach;
       headBob = Math.sin((time + jitter) * 2.6) * 0.9 + (aliveT >= 0.52 && aliveT < 0.7 ? Math.sin(chew * Math.PI * 3) * 0.8 : 0);
       headTilt = 0.03 + Math.sin((time + jitter) * 1.3) * 0.035;
-      bodyLean = -0.08 + Math.sin((time + jitter) * 0.9) * 0.015;
+      bodyLean = 0.08 + Math.sin((time + jitter) * 0.9) * 0.015;
       popcornAlpha = 1;
+      popcornX = 16;
+      popcornY = 8;
     };
 
     if (progress < STEP_END) {
       const t = easeInOutCubic(progress / STEP_END);
-      bx = lerp(active.fromX - facing * 22, active.fromX, t);
-      bodyLean = 0.08 * facing;
-      leftLegA = Math.sin(t * Math.PI) * 0.28 + 0.12;
-      rightLegA = -0.12 - Math.sin(t * Math.PI + 0.6) * 0.2;
+      bx = active.fromX;
+      bodyLean = lerp(0, 0.12, t);
+      leftLegA = lerp(0.12, 0.32, t);
+      rightLegA = lerp(-0.12, -0.32, t);
+      leftShinA = lerp(0.18, 0.42, t);
+      rightShinA = lerp(-0.18, -0.42, t);
       leftArmA = 0.08;
       rightArmA = -0.08;
+      popcornAlpha = t;
+      popcornX = 40;
+      popcornY = 72;
     } else if (progress < LOWER_END) {
       const t = easeInOutCubic((progress - STEP_END) / (LOWER_END - STEP_END));
       by = lerp(groundY, seatedBoardY, t);
-      bodyLean = lerp(0.16, -0.08, t);
-      leftLegA = lerp(0.12, -1.25, t);
-      rightLegA = lerp(-0.12, -1.25, t);
-      leftShinA = lerp(0.18, 0, t);
-      rightShinA = lerp(-0.18, 0, t);
-      const reachBack = solveArmToLocalPoint(-20, -32, -1);
+      bodyLean = lerp(0.16, 0.08, t);
+      leftLegA = lerp(0.32, 1.08, t);
+      rightLegA = lerp(-0.32, -1.02, t);
+      leftShinA = lerp(0.42, -0.88, t);
+      rightShinA = lerp(-0.42, 0.82, t);
+      const reachBack = solveArmToLocalPoint(-24, 22, -1);
       leftArmA = lerp(0.08, reachBack.armA, t);
       leftForeA = lerp(0.13, reachBack.foreA, t);
       rightArmA = lerp(-0.08, -0.28, t);
       rightForeA = lerp(-0.13, -0.1, t);
-      popcornAlpha = t;
+      popcornAlpha = 1;
+      popcornX = lerp(40, 16, t);
+      popcornY = lerp(72, 8, t);
       sitSeated = t > 0.72;
     } else if (progress < STAND_START) {
       by = seatedBoardY;
-      leftLegA = -1.25;
-      rightLegA = -1.25;
-      leftShinA = 0;
-      rightShinA = 0;
+      leftLegA = 1.08;
+      rightLegA = -1.02;
+      leftShinA = -0.88;
+      rightShinA = 0.82;
       sitSeated = true;
       seatedPose(eatingCycle);
     } else {
       const t = easeInOutCubic((progress - STAND_START) / (1 - STAND_START));
       by = lerp(seatedBoardY, groundY, t);
       bodyLean = lerp(0.16, 0, t);
-      leftLegA = lerp(-1.25, 0.12, t);
-      rightLegA = lerp(-1.25, -0.12, t);
-      leftShinA = lerp(0, 0.12, t);
-      rightShinA = lerp(0, -0.12, t);
-      leftArmA = lerp(-0.4, 0.08, t);
+      leftLegA = lerp(1.08, 0.12, t);
+      rightLegA = lerp(-1.02, -0.12, t);
+      leftShinA = lerp(-0.88, 0.12, t);
+      rightShinA = lerp(0.82, -0.12, t);
+      const pushHand = solveArmToLocalPoint(-24, 22, -1);
+      leftArmA = lerp(pushHand.armA, 0.08, t);
       rightArmA = lerp(0.2, -0.08, t);
-      leftForeA = lerp(-0.1, 0.13, t);
+      leftForeA = lerp(pushHand.foreA, 0.13, t);
       rightForeA = lerp(0.1, -0.13, t);
       popcornAlpha = Math.max(0, 1 - t * 1.4);
+      popcornX = lerp(16, 40, t);
+      popcornY = lerp(8, 72, t);
       sitSeated = t < 0.18;
     }
 
-    const chairAlpha = progress < 0.04 ? progress / 0.04 : progress > 0.96 ? Math.max(0, (1 - progress) / 0.04) : 1;
     return {
       boardX: bx, boardY: by, facing,
       headBob, bodyLean,
@@ -1949,14 +1956,10 @@ function evalCharAtTime(
       leftArmA, rightArmA,
       leftForeA, rightForeA,
       airY: 0,
-      sitChairAlpha: chairAlpha,
-      sitChairBX: chairX,
-      sitChairBY: groundY,
-      sitChairFacing: facing,
       sitSeated,
       popcornAlpha,
-      popcornX: 19,
-      popcornY: -18,
+      popcornX,
+      popcornY,
     };
   }
 
@@ -2296,8 +2299,8 @@ function drawCharacterToCanvas(
     const shoulderLocalY = hipY + shoulderY;
     const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
     const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
-    const mountLocalX = elbowLocalX - Math.sin(foreA) * armLen * 0.86;
-    const mountLocalY = elbowLocalY + Math.cos(foreA) * armLen * 0.86;
+    const mountLocalX = elbowLocalX - Math.sin(foreA) * armLen;
+    const mountLocalY = elbowLocalY + Math.cos(foreA) * armLen;
     const relX = mountLocalX;
     const relY = mountLocalY - hipY;
     const leanCos = Math.cos(p.bodyLean);
@@ -2453,46 +2456,6 @@ function drawCharacterToCanvas(
     ctx.restore();
   }
 
-  if (p.sitChairAlpha && p.sitChairAlpha > 0) {
-    const chairBX = p.sitChairBX ?? p.boardX;
-    const chairBY = p.sitChairBY ?? p.boardY;
-    const chairSX = (chairBX - cam.cameraX) * sf + W / 2;
-    const chairSY = (chairBY - cam.cameraY) * sf + H / 2;
-    const chairFacing = p.sitChairFacing ?? facing;
-    ctx.save();
-    ctx.globalAlpha = p.sitChairAlpha;
-    ctx.translate(chairSX, chairSY);
-    ctx.scale(chairFacing, 1);
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = "#f5ecd8";
-    ctx.lineWidth = Math.max(1, 2 * S);
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    const seatY = -55 * S;
-    const seatX = -28 * S;
-    const seatW = 55 * S;
-    const seatH = 6 * S;
-    ctx.beginPath();
-    ctx.rect(seatX, seatY, seatW, seatH);
-    ctx.fill();
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.rect(seatX - 4 * S, seatY - 70 * S, 7 * S, 72 * S);
-    ctx.fill();
-    ctx.stroke();
-    for (const x of [seatX + 6 * S, seatX + seatW - 10 * S]) {
-      ctx.beginPath();
-      ctx.moveTo(x, seatY + seatH);
-      ctx.lineTo(x + 6 * S, 0);
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.moveTo(seatX - 8 * S, 0);
-    ctx.lineTo(seatX + seatW + 8 * S, 0);
-    ctx.stroke();
-    ctx.restore();
-  }
-
   ctx.save();
   ctx.translate(sx, sy + p.airY * S);
   ctx.scale(facing, 1);
@@ -2568,17 +2531,14 @@ function drawCharacterToCanvas(
     }
   }
   if (p.sitSeated) {
-    const groundLocalY = ((p.sitChairBY ?? p.boardY) - p.boardY) * S;
-    const kneeY = hipY + 1.5 * S;
-    const nearKneeX = 36 * S;
-    const farKneeX = 30 * S;
+    const foldY = hipY + 12 * S;
     leftLeg = {
-      knee: { x: farKneeX, y: kneeY + 3 * S },
-      foot: { x: farKneeX, y: groundLocalY },
+      knee: { x: 18 * S, y: hipY + 7 * S },
+      foot: { x: 44 * S, y: foldY },
     };
     rightLeg = {
-      knee: { x: nearKneeX, y: kneeY },
-      foot: { x: nearKneeX, y: groundLocalY },
+      knee: { x: 42 * S, y: hipY + 9 * S },
+      foot: { x: 10 * S, y: foldY + 2 * S },
     };
   }
   drawLegChain(leftLeg);
@@ -2713,6 +2673,11 @@ function drawCharacterToCanvas(
     const len = Math.max(0.001, Math.hypot(dx, dy));
     return { x: -dy / len, y: dx / len };
   };
+  const unitP = (pnt: LocalPoint): LocalPoint => {
+    const len = Math.max(0.001, Math.hypot(pnt.x, pnt.y));
+    return { x: pnt.x / len, y: pnt.y / len };
+  };
+  const dotP = (a: LocalPoint, b: LocalPoint) => a.x * b.x + a.y * b.y;
   const buildJackedJoints = () => {
     const hipP: LocalPoint = { x: 0, y: 0 };
     const neckP: LocalPoint = { x: 0, y: torsoTopY };
@@ -2731,30 +2696,44 @@ function drawCharacterToCanvas(
     const handR = addP(elbowR, armVector(rForeA, armLen));
     return { hipP, neckP, axis, axisUnit, U, L, at, shoulderL, shoulderR, elbowL, elbowR, handL, handR };
   };
-  const drawJackedTaperedSegment = (start: LocalPoint, end: LocalPoint, startW: number, endW: number) => {
-    const n = normalOf(start, end);
-    const s = startW / 2;
-    const e = endW / 2;
-    const p1 = addP(start, mulP(n, s));
-    const p2 = addP(end, mulP(n, e));
-    const p3 = addP(end, mulP(n, -e));
-    const p4 = addP(start, mulP(n, -s));
-    ctx.beginPath();
-    ctx.moveTo(p1.x, p1.y);
-    ctx.lineTo(p2.x, p2.y);
-    ctx.quadraticCurveTo(end.x, end.y, p3.x, p3.y);
-    ctx.lineTo(p4.x, p4.y);
-    ctx.quadraticCurveTo(start.x, start.y, p1.x, p1.y);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  };
   const drawJackedArmWorld = (side: "left" | "right", joints: ReturnType<typeof buildJackedJoints>) => {
     const shoulder = side === "left" ? joints.shoulderL : joints.shoulderR;
     const elbow = side === "left" ? joints.elbowL : joints.elbowR;
     const hand = side === "left" ? joints.handL : joints.handR;
-    drawJackedTaperedSegment(shoulder, elbow, 0.15 * joints.L, 0.09 * joints.L);
-    drawJackedTaperedSegment(elbow, hand, 0.1 * joints.L, 0.05 * joints.L);
+    const armA = side === "left" ? lArmA : rArmA;
+    const foreA = side === "left" ? lForeA : rForeA;
+    const away = unitP(subP(shoulder, joints.at(0.82)));
+    const upperN0 = normalOf(shoulder, elbow);
+    const foreN0 = normalOf(elbow, hand);
+    const upperN = dotP(upperN0, away) >= 0 ? upperN0 : mulP(upperN0, -1);
+    const foreN = dotP(foreN0, away) >= 0 ? foreN0 : mulP(foreN0, -1);
+    const shoulderW = 0.2 * joints.L;
+    const elbowW = 0.13 * joints.L;
+    const wristW = 0.05 * joints.L;
+    const bend = Math.abs(foreA - armA);
+    const peak = bend > 0.7 ? clamp((bend - 0.7) / 1.0, 0, 1) * 0.04 * joints.L : 0;
+    const shoulderOuter = addP(shoulder, mulP(upperN, shoulderW / 2));
+    const elbowOuter = addP(elbow, mulP(upperN, elbowW / 2));
+    const wristOuter = addP(hand, mulP(foreN, wristW / 2));
+    const wristInner = addP(hand, mulP(foreN, -wristW / 2));
+    const elbowInner = addP(elbow, mulP(upperN, -elbowW * 0.43));
+    const shoulderInner = addP(shoulder, mulP(upperN, -shoulderW / 2));
+    const upperMid = addP(mulP(shoulderOuter, 0.5), mulP(elbowOuter, 0.5));
+    const bicepPeak = addP(upperMid, mulP(upperN, peak));
+    const foreOuterCtrl = addP(mulP(elbowOuter, 0.52), mulP(wristOuter, 0.48));
+    const foreInnerCtrl = addP(mulP(elbowInner, 0.52), mulP(wristInner, 0.48));
+    const upperInnerCtrl = addP(mulP(shoulderInner, 0.5), mulP(elbowInner, 0.5));
+    ctx.beginPath();
+    ctx.moveTo(shoulderOuter.x, shoulderOuter.y);
+    ctx.quadraticCurveTo(bicepPeak.x, bicepPeak.y, elbowOuter.x, elbowOuter.y);
+    ctx.quadraticCurveTo(foreOuterCtrl.x, foreOuterCtrl.y, wristOuter.x, wristOuter.y);
+    ctx.quadraticCurveTo(hand.x, hand.y, wristInner.x, wristInner.y);
+    ctx.quadraticCurveTo(foreInnerCtrl.x, foreInnerCtrl.y, elbowInner.x, elbowInner.y);
+    ctx.quadraticCurveTo(upperInnerCtrl.x, upperInnerCtrl.y, shoulderInner.x, shoulderInner.y);
+    ctx.quadraticCurveTo(shoulder.x, shoulder.y, shoulderOuter.x, shoulderOuter.y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
   };
   const drawJackedTorsoWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
     const { hipP, neckP, axis, axisUnit, U, L, at } = joints;
@@ -2762,9 +2741,10 @@ function drawCharacterToCanvas(
     const waistR = addP(hipP, mulP(U, -0.13 * L));
     const latL = addP(at(0.72), mulP(U, 0.5 * L));
     const latR = addP(at(0.72), mulP(U, -0.5 * L));
-    const trapL = addP(neckP, mulP(U, 0.26 * L));
-    const trapR = addP(neckP, mulP(U, -0.26 * L));
-    const top = addP(neckP, mulP(axisUnit, 0.07 * L));
+    const trapDrop = mulP(axisUnit, -0.04 * L);
+    const trapL = addP(addP(neckP, mulP(U, 0.22 * L)), trapDrop);
+    const trapR = addP(addP(neckP, mulP(U, -0.22 * L)), trapDrop);
+    const top = addP(neckP, trapDrop);
     const lBow1 = addP(at(0.2), mulP(U, 0.26 * L));
     const lBow2 = addP(at(0.55), mulP(U, 0.55 * L));
     const lTrap1 = addP(at(0.9), mulP(U, 0.47 * L));
@@ -2789,10 +2769,10 @@ function drawCharacterToCanvas(
     ctx.fill();
     ctx.stroke();
     ctx.save();
-    ctx.strokeStyle = "rgba(42,42,42,0.65)";
-    ctx.lineWidth = Math.max(1, 1.2 * S);
+    ctx.strokeStyle = "rgba(42,42,42,0.58)";
+    ctx.lineWidth = Math.max(1, 1.45 * S);
     const midChest = at(0.82);
-    const pecDrop = mulP(axisUnit, -0.11 * L);
+    const pecDrop = mulP(axisUnit, -0.15 * L);
     for (const side of [1, -1] as const) {
       const pecCtrl = addP(addP(midChest, mulP(U, side * 0.18 * L)), pecDrop);
       const pecEnd = addP(addP(at(0.66), mulP(U, side * 0.36 * L)), pecDrop);
@@ -2801,6 +2781,24 @@ function drawCharacterToCanvas(
       ctx.quadraticCurveTo(pecCtrl.x, pecCtrl.y, pecEnd.x, pecEnd.y);
       ctx.stroke();
     }
+    ctx.strokeStyle = "rgba(42,42,42,0.42)";
+    ctx.lineWidth = Math.max(1, 1.05 * S);
+    const absYs = [0.55, 0.42, 0.3];
+    for (const t of absYs) {
+      const center = at(t);
+      const left = addP(center, mulP(U, -0.07 * L));
+      const right = addP(center, mulP(U, 0.07 * L));
+      ctx.beginPath();
+      ctx.moveTo(left.x, left.y);
+      ctx.lineTo(right.x, right.y);
+      ctx.stroke();
+    }
+    const midlineTop = at(0.62);
+    const midlineBottom = at(0.24);
+    ctx.beginPath();
+    ctx.moveTo(midlineTop.x, midlineTop.y);
+    ctx.lineTo(midlineBottom.x, midlineBottom.y);
+    ctx.stroke();
     ctx.restore();
   };
   const drawJackedShoulderCapsWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
@@ -2809,7 +2807,7 @@ function drawCharacterToCanvas(
     ctx.lineWidth = lw;
     for (const shoulder of [joints.shoulderL, joints.shoulderR]) {
       ctx.beginPath();
-      ctx.arc(shoulder.x, shoulder.y, 0.13 * joints.L, 0, Math.PI * 2);
+      ctx.arc(shoulder.x, shoulder.y, 0.1 * joints.L, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
     }
@@ -2865,20 +2863,18 @@ function drawCharacterToCanvas(
     ctx.restore();
   }
 
-  // Wrist-mounted launcher, visible only while the active grapple is firing/zipping.
-  if (p.grappleLauncherVisible) {
-    ctx.save();
-    ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
-    ctx.rotate(launcherMount.angle * facing);
-    ctx.fillStyle = "#8B5A2B";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 1.4 * S);
-    ctx.beginPath();
-    ctx.rect(-9 * S, -5 * S, 18 * S, 10 * S);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-  }
+  // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
+  ctx.save();
+  ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
+  ctx.rotate(launcherMount.angle * facing);
+  ctx.fillStyle = "#8B5A2B";
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = Math.max(1, 1.3 * S);
+  ctx.beginPath();
+  ctx.roundRect(-11 * S, -4 * S, 14 * S, 8 * S, 2 * S);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
 
   // Neck/head chain. Positive headTilt angles the head back/up from the neck joint; the head
   // remains a plain circle, but the neck/head center shifts so the upward-thinking pose reads.
