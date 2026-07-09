@@ -19,7 +19,7 @@ type CameraKeyframe = {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "narration";
+  type: "image" | "video" | "pan" | "characterZoom" | "narration";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -46,6 +46,13 @@ type Clip = {
   ytEnd?: number;
   needsRedownload?: boolean;
 };
+
+type CharacterFaceSettings = {
+  faceBlobUrl: string;
+  faceAspect: number;
+};
+
+type FaceCropCorner = "nw" | "ne" | "sw" | "se";
 
 type VideoPlaybackMode = "active" | "ambient" | "dormant";
 
@@ -220,6 +227,7 @@ const MAGNETIC_SNAP_PX = 10;
 const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
+const CHARACTER_ZOOM_CLIP_COLOR = "#c9d4ff";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -988,7 +996,7 @@ function deriveAutoCharActions(
   outputH = CANVAS_H_LAND
 ): CharacterAction[] {
   const focusClips = clips
-    .filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined))
+    .filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined))
     .sort((a, b) => a.startTime - b.startTime);
   if (focusClips.length === 0) return [];
 
@@ -1001,7 +1009,7 @@ function deriveAutoCharActions(
     const holdStart = clip.startTime;
     const holdEnd = clip.startTime + clip.duration * hf;
     const transEnd = clip.startTime + clip.duration;
-    const isPan = clip.type === "pan";
+    const isPan = clip.type === "pan" || clip.type === "characterZoom";
 
     if (isPan) {
       // Character is either not on yet (handled by characterEntranceTime hiding him) or idling in
@@ -2298,7 +2306,8 @@ function drawCharacterToCanvas(
   initY: number,
   clips: CharSurfaceClip[],
   entranceTime: number,
-  authoredAnimations: Record<string, AuthoredAnimation> = {}
+  authoredAnimations: Record<string, AuthoredAnimation> = {},
+  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null
 ) {
   if (!showChar || time < entranceTime) return;
   const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations);
@@ -2321,11 +2330,12 @@ function drawCharacterToCanvas(
   const torsoLen = CHAR_TORSO_RAW * S;
   const neckLen = CHAR_NECK_RAW * S * (isJacked ? 0.72 : 1);
   const armLen = CHAR_ARM_RAW * S;
-  const headR = CHAR_HEAD_R_RAW * S;
+  const hasFace = !!characterFace?.image;
+  const headR = CHAR_HEAD_R_RAW * S * (hasFace ? 1.15 : 1);
   const bobS = p.headBob * S;
   const headTilt = p.headTilt ?? 0;
   const hipY = (-CHAR_HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
-  const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number } => {
+  const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number; w: number; h: number } => {
     const shoulderY = -torsoLen * 0.85;
     const useRight = preferFiring ? facing >= 0 : facing < 0;
     const sOff = 0;
@@ -2345,10 +2355,14 @@ function drawCharacterToCanvas(
     const perpX = -forearmUY;
     const perpY = forearmUX;
     const surfaceSign = useRight ? 1 : -1;
-    const mountLocalX = wristLocalX - forearmUX * 10 * S + perpX * surfaceSign * 4 * S;
-    const mountLocalY = wristLocalY - forearmUY * 10 * S + perpY * surfaceSign * 4 * S;
-    const tipLocalX = mountLocalX + forearmUX * 7 * S;
-    const tipLocalY = mountLocalY + forearmUY * 7 * S;
+    const muscleL = Math.max(torsoLen, headR * 6) * jackedPulse;
+    const launcherW = (isJacked ? 20 : 14) * S;
+    const launcherH = (isJacked ? 11 : 8) * S;
+    const surfaceOffset = isJacked ? 0.05 * muscleL + 2 * S : 4 * S;
+    const mountLocalX = wristLocalX - forearmUX * 10 * S + perpX * surfaceSign * surfaceOffset;
+    const mountLocalY = wristLocalY - forearmUY * 10 * S + perpY * surfaceSign * surfaceOffset;
+    const tipLocalX = mountLocalX + forearmUX * (launcherW / 2);
+    const tipLocalY = mountLocalY + forearmUY * (launcherW / 2);
     const relX = tipLocalX;
     const relY = tipLocalY - hipY;
     const leanCos = Math.cos(p.bodyLean);
@@ -2362,6 +2376,8 @@ function drawCharacterToCanvas(
       angle,
       localX: mountLocalX,
       localY: mountLocalY,
+      w: launcherW,
+      h: launcherH,
     };
   };
   const launcherMount = getForearmMount(true);
@@ -2854,19 +2870,29 @@ function drawCharacterToCanvas(
     ctx.save();
     ctx.strokeStyle = "rgba(42,42,42,0.58)";
     ctx.lineWidth = Math.max(1, 1.45 * S);
-    const midChest = at(0.82);
-    const pecDrop = mulP(axisUnit, -0.15 * L);
+    const pecGapTop = at(0.88);
+    const pecGapBottom = at(0.72);
+    ctx.beginPath();
+    ctx.moveTo(pecGapTop.x, pecGapTop.y);
+    ctx.lineTo(pecGapBottom.x, pecGapBottom.y);
+    ctx.stroke();
     for (const side of [1, -1] as const) {
-      const pecCtrl = addP(addP(midChest, mulP(U, side * 0.18 * L)), pecDrop);
-      const pecEnd = addP(addP(at(0.66), mulP(U, side * 0.36 * L)), pecDrop);
+      const topInner = addP(at(0.9), mulP(U, side * 0.08 * L));
+      const topOuter = addP(at(0.86), mulP(U, side * 0.3 * L));
+      const bottomOuter = addP(at(0.7), mulP(U, side * 0.3 * L));
+      const bottomInner = addP(at(0.7), mulP(U, side * 0.07 * L));
+      const outerBow = addP(at(0.78), mulP(U, side * 0.34 * L));
+      const bottomCtrl = addP(at(0.69), mulP(U, side * 0.18 * L));
       ctx.beginPath();
-      ctx.moveTo(midChest.x, midChest.y);
-      ctx.quadraticCurveTo(pecCtrl.x, pecCtrl.y, pecEnd.x, pecEnd.y);
+      ctx.moveTo(topInner.x, topInner.y);
+      ctx.quadraticCurveTo(topOuter.x, topOuter.y, outerBow.x, outerBow.y);
+      ctx.quadraticCurveTo(bottomOuter.x, bottomOuter.y, bottomOuter.x, bottomOuter.y);
+      ctx.quadraticCurveTo(bottomCtrl.x, bottomCtrl.y, bottomInner.x, bottomInner.y);
       ctx.stroke();
     }
     ctx.strokeStyle = "rgba(42,42,42,0.42)";
     ctx.lineWidth = Math.max(1, 1.05 * S);
-    const sternumTop = at(0.7);
+    const sternumTop = pecGapBottom;
     const sternumBottom = at(0.58);
     ctx.beginPath();
     ctx.moveTo(sternumTop.x, sternumTop.y);
@@ -2962,7 +2988,7 @@ function drawCharacterToCanvas(
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = Math.max(1, 1.3 * S);
     ctx.beginPath();
-    ctx.roundRect(-11 * S, -4 * S, 14 * S, 8 * S, 2 * S);
+    ctx.roundRect(-launcherMount.w * 0.78, -launcherMount.h / 2, launcherMount.w, launcherMount.h, 2 * S);
     ctx.fill();
     ctx.stroke();
     ctx.restore();
@@ -2977,10 +3003,23 @@ function drawCharacterToCanvas(
   ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(neckTopX, neckTopY); ctx.stroke();
   ctx.restore();
 
-  // Head — blank circle only (no face features), sitting on the tilted neck chain
+  // Head — blank circle by default; optional cropped face image clips into the same tilted head.
   const headCX = neckTopX - Math.sin(headTilt) * headR * 0.35;
   const headCY = neckTopY - Math.cos(headTilt) * headR;
-  ctx.beginPath(); ctx.arc(headCX, headCY, headR, 0, Math.PI * 2); ctx.stroke();
+  const faceAspect = clamp(characterFace?.aspect ?? 1, 0.55, 1.8);
+  const headRX = hasFace ? headR * Math.sqrt(faceAspect) : headR;
+  const headRY = hasFace ? headR / Math.sqrt(faceAspect) : headR;
+  if (hasFace && characterFace?.image) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.translate(headCX, headCY);
+    if (facing < 0) ctx.scale(-1, 1);
+    ctx.drawImage(characterFace.image, -headRX, -headRY, headRX * 2, headRY * 2);
+    ctx.restore();
+  }
+  ctx.beginPath(); ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2); ctx.stroke();
 
   // Emoji emote
   if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
@@ -3121,6 +3160,10 @@ export default function Board2Page() {
   const [characterPanelOpen, setCharacterPanelOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
+  const [characterFace, setCharacterFace] = useState<CharacterFaceSettings | null>(null);
+  const [facePickerOpen, setFacePickerOpen] = useState(false);
+  const [faceCropSource, setFaceCropSource] = useState<{ url: string; name: string } | null>(null);
+  const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
@@ -3309,6 +3352,9 @@ export default function Board2Page() {
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
+  const characterFaceRef = useRef<CharacterFaceSettings | null>(null);
+  const characterFaceImageRef = useRef<HTMLImageElement | null>(null);
+  const drawFrameRef = useRef<(time: number) => void>(() => {});
   const characterActionsRef = useRef<CharacterAction[]>([]);
   const selectedCharActionIdRef = useRef<string | null>(null);
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
@@ -3319,6 +3365,7 @@ export default function Board2Page() {
   const characterAddModeRef = useRef<CharacterAddMode | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
+  const faceCropDragRef = useRef<{ mode: "move" | "resize"; corner?: FaceCropCorner; startX: number; startY: number; orig: typeof faceCrop; rectW: number; rectH: number } | null>(null);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
@@ -3349,6 +3396,28 @@ export default function Board2Page() {
   }, [editingAnnotationId]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
   useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
+  useEffect(() => { characterFaceRef.current = characterFace; }, [characterFace]);
+  useEffect(() => {
+    characterFaceImageRef.current = null;
+    if (!characterFace?.faceBlobUrl) {
+      drawFrameRef.current(playheadRef.current);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      characterFaceImageRef.current = img;
+      drawFrameRef.current(playheadRef.current);
+    };
+    img.onerror = () => {
+      if (cancelled) return;
+      characterFaceImageRef.current = null;
+      drawFrameRef.current(playheadRef.current);
+    };
+    img.src = characterFace.faceBlobUrl;
+    return () => { cancelled = true; };
+  }, [characterFace?.faceBlobUrl]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
   useEffect(() => { selectedCharActionIdRef.current = selectedCharActionId; }, [selectedCharActionId]);
   useEffect(() => { authoredAnimationsRef.current = animationMap(authoredAnimations); }, [authoredAnimations]);
@@ -3371,8 +3440,8 @@ export default function Board2Page() {
   // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.boardX !== undefined));
-    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
+    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined));
+    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan" || c.type === "characterZoom")) return Infinity;
     const entrance = resolvedCharActions.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
   }, [characterMode, clips, resolvedCharActions]);
@@ -3579,7 +3648,10 @@ export default function Board2Page() {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
-        clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current
+        clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
+        characterFaceRef.current && characterFaceImageRef.current
+          ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+          : null
       );
     }
     if (currentAnnotations.length > 0) {
@@ -3596,6 +3668,8 @@ export default function Board2Page() {
     ctx.imageSmoothingQuality = "high";
     renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current);
   }, [renderToCtx]);
+
+  useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
 
   // ─ Video audio routing ────────────────────────────────────────────────────
 
@@ -4213,6 +4287,131 @@ export default function Board2Page() {
     setClips((prev) => [...prev, clip]);
     setSelectedClipId(id);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function addCharacterZoomClip(atTime?: number) {
+    const id = generateId();
+    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+    const clip: Clip = { id, type: "characterZoom", name: "Character Zoom", sourceUrl: "", startTime, duration: 3, holdFraction: 0.65, layer: 1 };
+    setClips((prev) => [...prev, clip]);
+    setSelectedClipId(id);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function openFaceCropFromSource(url: string, name: string) {
+    setFaceCropSource({ url, name });
+    setFaceCrop({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
+    setFacePickerOpen(false);
+  }
+
+  function handleFaceUpload(file: File | null) {
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setToast("Choose an image for the face");
+      return;
+    }
+    openFaceCropFromSource(URL.createObjectURL(file), file.name || "Uploaded face");
+  }
+
+  function clampFaceCrop(next: typeof faceCrop): typeof faceCrop {
+    const minW = 0.08;
+    const minH = 0.08;
+    const w = clamp(next.w, minW, 1);
+    const h = clamp(next.h, minH, 1);
+    return {
+      x: clamp(next.x, 0, 1 - w),
+      y: clamp(next.y, 0, 1 - h),
+      w,
+      h,
+    };
+  }
+
+  function handleFaceCropPointerDown(e: React.PointerEvent, mode: "move" | "resize", corner?: FaceCropCorner) {
+    e.preventDefault();
+    e.stopPropagation();
+    const measurementEl = mode === "resize"
+      ? (e.currentTarget.parentElement?.parentElement as HTMLElement | null)
+      : (e.currentTarget.parentElement as HTMLElement | null);
+    const rect = measurementEl?.getBoundingClientRect();
+    if (!rect) return;
+    faceCropDragRef.current = { mode, corner, startX: e.clientX, startY: e.clientY, orig: faceCrop, rectW: rect.width || 1, rectH: rect.height || 1 };
+    const onMove = (ev: PointerEvent) => {
+      const drag = faceCropDragRef.current;
+      if (!drag) return;
+      const dx = (ev.clientX - drag.startX) / drag.rectW;
+      const dy = (ev.clientY - drag.startY) / drag.rectH;
+      if (drag.mode === "move") {
+        setFaceCrop(clampFaceCrop({ ...drag.orig, x: drag.orig.x + dx, y: drag.orig.y + dy }));
+        return;
+      }
+      let { x, y, w, h } = drag.orig;
+      if (drag.corner?.includes("e")) w = drag.orig.w + dx;
+      if (drag.corner?.includes("s")) h = drag.orig.h + dy;
+      if (drag.corner?.includes("w")) { x = drag.orig.x + dx; w = drag.orig.w - dx; }
+      if (drag.corner?.includes("n")) { y = drag.orig.y + dy; h = drag.orig.h - dy; }
+      setFaceCrop(clampFaceCrop({ x, y, w, h }));
+    };
+    const onUp = () => {
+      faceCropDragRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+
+  async function confirmFaceCrop() {
+    if (!faceCropSource) return;
+    try {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Face image failed to load"));
+        img.src = faceCropSource.url;
+      });
+      const aspect = clamp(faceCrop.w / Math.max(0.001, faceCrop.h), 0.55, 1.8);
+      const outW = 512;
+      const outH = Math.round(outW / aspect);
+      const canvas = document.createElement("canvas");
+      canvas.width = outW;
+      canvas.height = outH;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Could not create face crop");
+      ctx.clearRect(0, 0, outW, outH);
+      ctx.save();
+      ctx.beginPath();
+      ctx.ellipse(outW / 2, outH / 2, outW / 2, outH / 2, 0, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(
+        img,
+        faceCrop.x * img.naturalWidth,
+        faceCrop.y * img.naturalHeight,
+        faceCrop.w * img.naturalWidth,
+        faceCrop.h * img.naturalHeight,
+        0,
+        0,
+        outW,
+        outH
+      );
+      ctx.restore();
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Face crop failed")), "image/png");
+      });
+      const faceBlobUrl = URL.createObjectURL(blob);
+      if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
+      setCharacterFace({ faceBlobUrl, faceAspect: aspect });
+      setFaceCropSource(null);
+      setToast("Face added");
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Could not add face");
+    }
+  }
+
+  function removeCharacterFace() {
+    if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
+    setCharacterFace(null);
+    setToast("Face removed");
   }
 
   function copyClip(clipId: string) {
@@ -6512,7 +6711,7 @@ export default function Board2Page() {
 
   function generateCameraKeyframes() {
     const allClipsSorted = clipsRef.current
-      .filter((c) => c.boardX !== undefined || c.type === "pan")
+      .filter((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom")
       .sort((a, b) => a.startTime - b.startTime);
 
     if (allClipsSorted.length === 0) {
@@ -6554,6 +6753,23 @@ export default function Board2Page() {
     const panCamY = (bboxMinY + bboxMaxY) / 2;
     const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
     const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
+    const characterZoomStopAt = (t: number): Stop => {
+      if (!showCharacterRef.current || t < characterEntranceTimeRef.current) {
+        console.warn("Character zoom fell back to Frame All: character disabled or not entered yet", { time: t });
+        return frameAllStop;
+      }
+      const pose = evalCharAtTime(
+        t,
+        resolvedCharActionsRef.current,
+        charInitXRef.current,
+        charInitYRef.current,
+        clipsRef.current,
+        authoredAnimationsRef.current
+      );
+      const targetCharHeight = 170;
+      const zoom = clamp(0.55 * H * BOARD_W / (W * targetCharHeight), 1.1, 8);
+      return { camX: pose.boardX, camY: pose.boardY - 70, zoom };
+    };
 
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const holdStartStops: Stop[] = allClipsSorted.map((c) => {
@@ -6562,6 +6778,7 @@ export default function Board2Page() {
           ? { camX: panStartX, camY: panCamY, zoom: panZoom }
           : frameAllStop;
       }
+      if (c.type === "characterZoom") return characterZoomStopAt(c.startTime);
       const bw = c.boardW!, bh = c.boardH!;
       const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
       return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * BOARD_W / W };
@@ -6588,6 +6805,13 @@ export default function Board2Page() {
         events.push({ absTime: holdStart, stop: { camX: panStartX, camY: panCamY, zoom: panZoom }, easing: 'ease-in-out' });
         events.push({ absTime: holdEnd,   stop: { camX: panEndX,   camY: panCamY, zoom: panZoom }, easing: 'linear' });
         events.push({ absTime: transEnd,  stop: nextStop,                                           easing: 'ease-in-out' });
+      } else if (c.type === "characterZoom") {
+        events.push({ absTime: holdStart, stop: characterZoomStopAt(holdStart), easing: 'ease-in-out' });
+        for (let t = holdStart + 0.25; t < holdEnd - 0.001; t += 0.25) {
+          events.push({ absTime: t, stop: characterZoomStopAt(t), easing: 'linear' });
+        }
+        events.push({ absTime: holdEnd, stop: characterZoomStopAt(holdEnd), easing: 'linear' });
+        events.push({ absTime: transEnd, stop: nextStop, easing: 'ease-in-out' });
       } else {
         events.push({ absTime: holdStart, stop: holdStartStops[i], easing: 'ease-in-out' });
         events.push({ absTime: holdEnd,   stop: holdStartStops[i], easing: 'ease-in-out' });
@@ -7609,9 +7833,9 @@ export default function Board2Page() {
           >{isPlaying ? "⏸" : "▶"}</button>
           <button
             onClick={generateCameraKeyframes}
-            disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan")}
+            disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom")}
             title="Generate camera keyframes"
-            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? 1 : 0.35, flexShrink: 0 }}
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom") ? 1 : 0.35, flexShrink: 0 }}
           >⬡</button>
           <button
             onClick={isExporting ? cancelExport : startExport}
@@ -7858,7 +8082,7 @@ export default function Board2Page() {
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -7883,7 +8107,7 @@ export default function Board2Page() {
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.name}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -7945,6 +8169,9 @@ export default function Board2Page() {
                     <button onClick={() => { addPanClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: PAN_CLIP_COLOR }}>
                       ⟷  Add pan clip
                     </button>
+                    <button onClick={() => { addCharacterZoomClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_ZOOM_CLIP_COLOR }}>
+                      ◎  Zoom on character
+                    </button>
                     <ProGated featureName="Neural Search">
                       <button
                         onClick={() => { setNeuralModalOpen(true); setNeuralConcept(""); setNeuralError(""); setNeuralPhase(null); setMobileDrawer(null); }}
@@ -7995,7 +8222,7 @@ export default function Board2Page() {
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     <div>
@@ -8295,12 +8522,17 @@ export default function Board2Page() {
         assetFile?: string;
         assetMime?: string;
       };
+      type ManifestFace = {
+        faceAspect: number;
+        assetFile: string;
+        assetMime: string;
+      };
       const manifestClips: ManifestClip[] = [];
       const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
 
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-        if (clip.type === "pan") {
+        if (clip.type === "pan" || clip.type === "characterZoom") {
           manifestClips.push(rest);
         } else if (clip.youtubeId) {
           manifestClips.push({ ...rest, needsRedownload: true });
@@ -8321,6 +8553,19 @@ export default function Board2Page() {
         }
       }
 
+      let manifestFace: ManifestFace | null = null;
+      if (characterFaceRef.current?.faceBlobUrl) {
+        const blob = await fetch(characterFaceRef.current.faceBlobUrl).then((r) => r.blob());
+        const buf = await blob.arrayBuffer();
+        const assetFile = "assets/character-face.png";
+        zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
+        manifestFace = {
+          faceAspect: characterFaceRef.current.faceAspect,
+          assetFile,
+          assetMime: blob.type || "image/png",
+        };
+      }
+
       const manifest = {
         version: 1,
         name: saveName,
@@ -8335,6 +8580,7 @@ export default function Board2Page() {
         characterActions: characterActionsRef.current,
         showCharacter: showCharacterRef.current,
         characterMode: characterModeRef.current,
+        characterFace: manifestFace,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
@@ -8371,6 +8617,7 @@ export default function Board2Page() {
       for (const clip of clipsRef.current) {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
       }
+      if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
       // Clean up all video elements
       for (const vid of videoElsRef.current.values()) { vid.pause(); vid.src = ""; }
       videoElsRef.current.clear();
@@ -8378,7 +8625,7 @@ export default function Board2Page() {
 
       const loadedClips: Clip[] = [];
       for (const mc of (manifest.clips ?? [])) {
-        if (mc.type === "pan") {
+        if (mc.type === "pan" || mc.type === "characterZoom") {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.needsRedownload) {
           loadedClips.push({ ...mc, sourceUrl: "" });
@@ -8413,6 +8660,18 @@ export default function Board2Page() {
       if (manifest.characterActions) setCharacterActions(manifest.characterActions);
       if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
       if (manifest.characterMode) setCharacterMode(manifest.characterMode);
+      if (manifest.characterFace?.assetFile && files[manifest.characterFace.assetFile]) {
+        const faceData = files[manifest.characterFace.assetFile];
+        const faceBytes = new Uint8Array(faceData.byteLength);
+        faceBytes.set(faceData);
+        const faceBlob = new Blob([faceBytes.buffer], { type: manifest.characterFace.assetMime || "image/png" });
+        setCharacterFace({
+          faceBlobUrl: URL.createObjectURL(faceBlob),
+          faceAspect: manifest.characterFace.faceAspect ?? 1,
+        });
+      } else {
+        setCharacterFace(null);
+      }
       setToast(`Loaded "${manifest.name ?? "board"}"`);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
@@ -8462,16 +8721,16 @@ export default function Board2Page() {
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               onClick={generateCameraKeyframes}
-              disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan")}
-              title={clips.some((c) => c.boardX !== undefined || c.type === "pan")
+              disabled={!clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom")}
+              title={clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom")
                 ? "Generate camera keyframe sequence from board positions and timeline"
                 : "Upload media first"}
               style={{
                 ...sketchButton,
                 padding: "4px 10px",
                 fontSize: 11,
-                opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? 1 : 0.45,
-                cursor: clips.some((c) => c.boardX !== undefined || c.type === "pan") ? "pointer" : "not-allowed",
+                opacity: clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom") ? 1 : 0.45,
+                cursor: clips.some((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom") ? "pointer" : "not-allowed",
               }}
             >
               ⬡ Generate camera keyframes
@@ -8515,6 +8774,13 @@ export default function Board2Page() {
               title="Add a pan clip that sweeps across all board images"
             >
               ⟷ Add pan clip
+            </button>
+            <button
+              onClick={() => addCharacterZoomClip()}
+              style={{ ...sketchButton, background: CHARACTER_ZOOM_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
+              title="Add a camera clip that follows and zooms on the character"
+            >
+              ◎ Zoom on character
             </button>
             <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); }}
@@ -9669,6 +9935,24 @@ export default function Board2Page() {
                       >
                         {showCharacter ? "● Show Character" : "○ Show Character"}
                       </button>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          type="button"
+                          onClick={() => setFacePickerOpen(true)}
+                          style={{ ...miniButton, flex: 1, padding: "5px 6px", background: characterFace ? "#e8f0ff" : "transparent" }}
+                        >
+                          {characterFace ? "Change Face" : "Add Face"}
+                        </button>
+                        {characterFace && (
+                          <button
+                            type="button"
+                            onClick={removeCharacterFace}
+                            style={{ ...miniButton, padding: "5px 6px", color: "#ff5e3a", borderColor: "#ff5e3a" }}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
                       <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
                         {(["auto", "manual"] as const).map((m) => (
                           <button
@@ -9811,11 +10095,16 @@ export default function Board2Page() {
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Sweeps across all board images
+                  </div>
+                )}
+                {selectedClip.type === "characterZoom" && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#4a4a7a", background: CHARACTER_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+                    Camera follows and zooms on the character
                   </div>
                 )}
                 {selectedClip.type === "narration" && (
@@ -10059,7 +10348,7 @@ export default function Board2Page() {
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const hf = clip.holdFraction ?? HOLD_FRACTION;
@@ -10114,7 +10403,7 @@ export default function Board2Page() {
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
@@ -10347,6 +10636,12 @@ export default function Board2Page() {
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
                 ⟷ Add pan here
               </div>
+              <div onClick={() => { addCharacterZoomClip(contextMenu.timeSec); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = CHARACTER_ZOOM_CLIP_COLOR)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ◎ Zoom on character
+              </div>
               {clipboardReady && (
                 <div onClick={() => { pasteClip(); setContextMenu(null); }}
                   style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11 }}
@@ -10364,6 +10659,138 @@ export default function Board2Page() {
       {dividerTooltip && (
         <div style={{ position: "fixed", left: dividerTooltip.x + 12, top: dividerTooltip.y - 32, background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 10, padding: "3px 8px", border: "1px solid #c8f135", pointerEvents: "none", zIndex: 9999, whiteSpace: "nowrap" }}>
           {dividerTooltip.label}
+        </div>
+      )}
+
+      {/* Character face picker */}
+      {facePickerOpen && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setFacePickerOpen(false); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.58)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ width: 520, maxWidth: "92vw", maxHeight: "82vh", overflow: "hidden", background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", fontFamily: "monospace", display: "flex", flexDirection: "column" }}>
+            <div style={{ padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <strong style={{ fontSize: 13 }}>ADD CHARACTER FACE</strong>
+              <button type="button" onClick={() => setFacePickerOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+            </div>
+            <div style={{ padding: 14, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
+              <label style={{ ...sketchButton, display: "block", textAlign: "center", cursor: "pointer" }}>
+                ↑ Upload new image
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] ?? null;
+                    e.currentTarget.value = "";
+                    handleFaceUpload(file);
+                  }}
+                />
+              </label>
+              <div style={{ ...panelLabelStyle }}>Images on board</div>
+              {clips.filter((c) => c.type === "image" && c.sourceUrl).length === 0 ? (
+                <div style={{ fontSize: 10, color: "#7a7a7a", border: "1px dashed rgba(42,42,42,0.28)", padding: 10 }}>
+                  No image clips yet. Upload an image above.
+                </div>
+              ) : (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                  {clips.filter((c) => c.type === "image" && c.sourceUrl).map((clip) => (
+                    <button
+                      key={clip.id}
+                      type="button"
+                      onClick={() => openFaceCropFromSource(clip.sourceUrl, clip.name)}
+                      style={{ border: "1.5px solid rgba(42,42,42,0.35)", background: "#fff", padding: 4, cursor: "pointer", textAlign: "left" }}
+                    >
+                      <img src={clip.sourceUrl} alt={clip.name} style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover", display: "block", background: "#ddd" }} />
+                      <div style={{ marginTop: 4, fontFamily: "monospace", fontSize: 9, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{clip.name}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Character face cropper */}
+      {faceCropSource && (
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setFaceCropSource(null); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.64)", zIndex: 1001, display: "flex", alignItems: "center", justifyContent: "center" }}
+        >
+          <div style={{ width: 700, maxWidth: "94vw", maxHeight: "92vh", overflow: "hidden", background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", fontFamily: "monospace", display: "flex", flexDirection: "column" }}>
+            <div style={{ padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+              <strong style={{ fontSize: 13 }}>CROP FACE — {faceCropSource.name.slice(0, 42)}</strong>
+              <button type="button" onClick={() => setFaceCropSource(null)} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+            </div>
+            <div style={{ padding: 14, overflowY: "auto", display: "grid", gridTemplateColumns: "1fr 120px", gap: 14, alignItems: "start" }}>
+              <div style={{ border: "1.5px solid rgba(42,42,42,0.35)", background: "#1a1a1a", padding: 8 }}>
+                <div style={{ position: "relative", width: "100%", userSelect: "none", touchAction: "none" }}>
+                  <img src={faceCropSource.url} alt={faceCropSource.name} draggable={false} style={{ display: "block", width: "100%", height: "auto" }} />
+                  <div
+                    onPointerDown={(e) => handleFaceCropPointerDown(e, "move")}
+                    style={{
+                      position: "absolute",
+                      left: `${faceCrop.x * 100}%`,
+                      top: `${faceCrop.y * 100}%`,
+                      width: `${faceCrop.w * 100}%`,
+                      height: `${faceCrop.h * 100}%`,
+                      border: "2px dotted #fff",
+                      borderRadius: "50%",
+                      boxShadow: "0 0 0 9999px rgba(0,0,0,0.36)",
+                      cursor: "move",
+                    }}
+                  >
+                    {(["nw", "ne", "sw", "se"] as FaceCropCorner[]).map((corner) => (
+                      <div
+                        key={corner}
+                        onPointerDown={(e) => handleFaceCropPointerDown(e, "resize", corner)}
+                        style={{
+                          position: "absolute",
+                          width: 12,
+                          height: 12,
+                          border: "2px solid #2a2a2a",
+                          background: "#c8f135",
+                          left: corner.includes("w") ? -7 : "auto",
+                          right: corner.includes("e") ? -7 : "auto",
+                          top: corner.includes("n") ? -7 : "auto",
+                          bottom: corner.includes("s") ? -7 : "auto",
+                          cursor: `${corner}-resize`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
+                <div style={{ ...panelLabelStyle, alignSelf: "stretch" }}>Preview</div>
+                <div style={{ width: 86, height: 86, borderRadius: "50%", overflow: "hidden", border: "2px solid #2a2a2a", background: "#fff", position: "relative" }}>
+                  <img
+                    src={faceCropSource.url}
+                    alt=""
+                    draggable={false}
+                    style={{
+                      position: "absolute",
+                      left: `${-(faceCrop.x / Math.max(faceCrop.w, 0.001)) * 100}%`,
+                      top: `${-(faceCrop.y / Math.max(faceCrop.h, 0.001)) * 100}%`,
+                      width: `${(1 / Math.max(faceCrop.w, 0.001)) * 100}%`,
+                      height: `${(1 / Math.max(faceCrop.h, 0.001)) * 100}%`,
+                      objectFit: "fill",
+                    }}
+                  />
+                </div>
+                <div style={{ fontSize: 9, color: "#6a6a6a", textAlign: "center", lineHeight: 1.45 }}>
+                  Drag the oval to move it. Drag a corner to resize.
+                </div>
+                <button type="button" onClick={confirmFaceCrop} style={{ ...sketchButton, width: "100%", background: "#c8f135", fontWeight: 700 }}>
+                  Use Face
+                </button>
+                <button type="button" onClick={() => setFaceCropSource(null)} style={{ ...miniButton, width: "100%" }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
