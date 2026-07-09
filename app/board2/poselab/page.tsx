@@ -39,7 +39,7 @@ function makeDraft(name = "walk"): AuthoredAnimation {
   return {
     id: `draft_${Date.now()}`,
     name,
-    loop: name === "walk" || name === "idle" || name === "explain",
+    loop: name === "walk" || name === "idle" || name === "explain" || name === "dance",
     createdAt: now,
     keyframes: [
       { t: 0, pose: DEFAULT_POSE },

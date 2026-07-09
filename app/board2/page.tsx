@@ -84,7 +84,7 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 type CharacterAction = {
   id: string;
   type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
-      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "idle";
+      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "dance" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
@@ -102,7 +102,7 @@ type CharacterAction = {
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
 };
 
-type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
+type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
 
@@ -593,7 +593,7 @@ const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these change the character's resting board position
-const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple", "pullUps", "mirrorCheck"]);
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple", "pullUps", "mirrorCheck", "dance"]);
 const CHAR_OFFSCREEN_PAD = 900;
 const CHAR_ENTRANCE_Y_LIFT = 600;
 const PHASE_TIME_SCALE = 1.2;
@@ -620,6 +620,7 @@ const PULLUP_GRIP_HALF_WIDTH = 32;
 const MIRROR_W = 90;
 const MIRROR_H = 260;
 const MIRROR_OFFSET = 140;
+const LAUNCHER_ALWAYS_VISIBLE = true;
 
 // Deterministic pseudo-random in [0,1) seeded by a string (clip.id) — same seed always
 // yields the same value, so regenerating the auto-choreography doesn't reshuffle emotes.
@@ -1169,6 +1170,9 @@ type CharPoseResult = {
   pullUpBarBX?: number;
   pullUpBarBY?: number;
   sitSeated?: boolean;
+  danceFootPlant?: boolean;
+  danceHipOffset?: number;
+  danceMotionAlpha?: number;
   popcornAlpha?: number;
   popcornX?: number;
   popcornY?: number;
@@ -2179,6 +2183,38 @@ function evalCharAtTime(
     };
   }
 
+  if (active.type === "dance") {
+    const tx = active.targetX ?? active.fromX;
+    const groundY = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
+    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const elapsed = Math.max(0, time - active.startTime);
+    const edge = Math.min(1, elapsed / 0.22, (active.duration - elapsed) / 0.22);
+    const phase = (elapsed / 0.9) * Math.PI * 2;
+    const hipWave = Math.sin(phase) * clamp(edge, 0, 1);
+    const hit = Math.pow(Math.abs(Math.sin(phase)), 1.7) * clamp(edge, 0, 1);
+    const hipOffset = hipWave * 14;
+    return {
+      boardX: tx + hipOffset * facing,
+      boardY: groundY,
+      facing,
+      headBob: -hit * 3,
+      bodyLean: 0.12 - hipWave * 0.1,
+      headTilt: -hipWave * 0.04,
+      leftLegA: 0.46,
+      rightLegA: -0.46,
+      leftShinA: 0.18,
+      rightShinA: -0.18,
+      leftArmA: 0.72 - hipWave * 0.28,
+      rightArmA: -0.72 - hipWave * 0.28,
+      leftForeA: 1.02 - hipWave * 0.18,
+      rightForeA: -1.02 - hipWave * 0.18,
+      airY: 0,
+      danceFootPlant: true,
+      danceHipOffset: hipOffset,
+      danceMotionAlpha: Math.max(0, (Math.abs(hipWave) - 0.58) / 0.42),
+    };
+  }
+
   if (active.type === "pointAt") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = (tx - active.fromX) >= 0 ? 1 : -1;
@@ -2299,18 +2335,27 @@ function drawCharacterToCanvas(
     const shoulderLocalY = hipY + shoulderY;
     const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
     const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
-    const mountLocalX = elbowLocalX - Math.sin(foreA) * armLen;
-    const mountLocalY = elbowLocalY + Math.cos(foreA) * armLen;
-    const relX = mountLocalX;
-    const relY = mountLocalY - hipY;
+    const wristLocalX = elbowLocalX - Math.sin(foreA) * armLen;
+    const wristLocalY = elbowLocalY + Math.cos(foreA) * armLen;
+    const forearmX = wristLocalX - elbowLocalX;
+    const forearmY = wristLocalY - elbowLocalY;
+    const forearmLen = Math.max(0.001, Math.hypot(forearmX, forearmY));
+    const forearmUX = forearmX / forearmLen;
+    const forearmUY = forearmY / forearmLen;
+    const perpX = -forearmUY;
+    const perpY = forearmUX;
+    const surfaceSign = useRight ? 1 : -1;
+    const mountLocalX = wristLocalX - forearmUX * 10 * S + perpX * surfaceSign * 4 * S;
+    const mountLocalY = wristLocalY - forearmUY * 10 * S + perpY * surfaceSign * 4 * S;
+    const tipLocalX = mountLocalX + forearmUX * 7 * S;
+    const tipLocalY = mountLocalY + forearmUY * 7 * S;
+    const relX = tipLocalX;
+    const relY = tipLocalY - hipY;
     const leanCos = Math.cos(p.bodyLean);
     const leanSin = Math.sin(p.bodyLean);
     const leanedX = relX * leanCos - relY * leanSin;
     const leanedY = relX * leanSin + relY * leanCos;
-    const angle = Math.atan2(
-      -Math.sin(foreA) * facing,
-      Math.cos(foreA)
-    );
+    const angle = Math.atan2(forearmUY, forearmUX);
     return {
       x: sx + leanedX * facing,
       y: sy + p.airY * S + hipY + leanedY,
@@ -2530,6 +2575,11 @@ function drawCharacterToCanvas(
       rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
     }
   }
+  if (p.danceFootPlant) {
+    const hipOffset = p.danceHipOffset ?? 0;
+    leftLeg = plantedLeg(-1, (-28 - hipOffset) * S, 0);
+    rightLeg = plantedLeg(1, (28 - hipOffset) * S, 0);
+  }
   if (p.sitSeated) {
     const foldY = hipY + 12 * S;
     leftLeg = {
@@ -2543,6 +2593,20 @@ function drawCharacterToCanvas(
   }
   drawLegChain(leftLeg);
   drawLegChain(rightLeg);
+  if (p.danceMotionAlpha && p.danceMotionAlpha > 0) {
+    const side = (p.danceHipOffset ?? 0) >= 0 ? -1 : 1;
+    ctx.save();
+    ctx.globalAlpha = p.danceMotionAlpha;
+    ctx.strokeStyle = "rgba(42,42,42,0.55)";
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    for (const [dx, dy, len] of [[18, -2, 13], [24, 8, 16], [16, 18, 11]] as const) {
+      ctx.beginPath();
+      ctx.moveTo(side * dx * S, hipY + dy * S);
+      ctx.quadraticCurveTo(side * (dx + 8) * S, hipY + (dy - 4) * S, side * (dx + len) * S, hipY + (dy + 2) * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
   if (p.sitSeated) {
     const footStroke = 11 * S;
     for (const foot of [leftLeg.foot, rightLeg.foot]) {
@@ -2688,8 +2752,8 @@ function drawCharacterToCanvas(
     const L = Math.max(axisLen, headR * 6) * jackedPulse;
     const at = (t: number) => addP(hipP, mulP(axis, t));
     const shoulderCenter = at(0.88);
-    const shoulderL = addP(shoulderCenter, mulP(U, -0.48 * L));
-    const shoulderR = addP(shoulderCenter, mulP(U, 0.48 * L));
+    const shoulderL = addP(shoulderCenter, mulP(U, -0.28 * L));
+    const shoulderR = addP(shoulderCenter, mulP(U, 0.28 * L));
     const elbowL = addP(shoulderL, armVector(lArmA, armLen));
     const handL = addP(elbowL, armVector(lForeA, armLen));
     const elbowR = addP(shoulderR, armVector(rArmA, armLen));
@@ -2712,11 +2776,12 @@ function drawCharacterToCanvas(
     const wristW = 0.05 * joints.L;
     const bend = Math.abs(foreA - armA);
     const peak = bend > 0.7 ? clamp((bend - 0.7) / 1.0, 0, 1) * 0.04 * joints.L : 0;
+    const elbowNotch = 0.025 * joints.L;
     const shoulderOuter = addP(shoulder, mulP(upperN, shoulderW / 2));
-    const elbowOuter = addP(elbow, mulP(upperN, elbowW / 2));
+    const elbowOuter = addP(elbow, mulP(upperN, elbowW / 2 - elbowNotch));
     const wristOuter = addP(hand, mulP(foreN, wristW / 2));
     const wristInner = addP(hand, mulP(foreN, -wristW / 2));
-    const elbowInner = addP(elbow, mulP(upperN, -elbowW * 0.43));
+    const elbowInner = addP(elbow, mulP(upperN, -elbowW * 0.43 - elbowNotch));
     const shoulderInner = addP(shoulder, mulP(upperN, -shoulderW / 2));
     const upperMid = addP(mulP(shoulderOuter, 0.5), mulP(elbowOuter, 0.5));
     const bicepPeak = addP(upperMid, mulP(upperN, peak));
@@ -2734,39 +2799,57 @@ function drawCharacterToCanvas(
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
+    ctx.save();
+    ctx.strokeStyle = "rgba(42,42,42,0.72)";
+    ctx.lineWidth = Math.max(1, 1.15 * S);
+    const notchStart = addP(addP(shoulder, mulP(upperN, shoulderW * 0.34)), mulP(unitP(subP(elbow, shoulder)), 0.03 * joints.L));
+    const notchMid = addP(addP(shoulder, mulP(upperN, shoulderW * 0.22)), mulP(unitP(subP(elbow, shoulder)), 0.095 * joints.L));
+    const notchEnd = addP(addP(shoulder, mulP(upperN, shoulderW * 0.37)), mulP(unitP(subP(elbow, shoulder)), 0.16 * joints.L));
+    ctx.beginPath();
+    ctx.moveTo(notchStart.x, notchStart.y);
+    ctx.quadraticCurveTo(notchMid.x, notchMid.y, notchEnd.x, notchEnd.y);
+    ctx.stroke();
+    ctx.restore();
   };
   const drawJackedTorsoWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
     const { hipP, neckP, axis, axisUnit, U, L, at } = joints;
     const waistL = addP(hipP, mulP(U, 0.13 * L));
     const waistR = addP(hipP, mulP(U, -0.13 * L));
-    const latL = addP(at(0.72), mulP(U, 0.5 * L));
-    const latR = addP(at(0.72), mulP(U, -0.5 * L));
+    const cutL = addP(at(0.35), mulP(U, 0.19 * L));
+    const cutR = addP(at(0.35), mulP(U, -0.19 * L));
+    const latL = addP(at(0.72), mulP(U, 0.36 * L));
+    const latR = addP(at(0.72), mulP(U, -0.36 * L));
     const trapDrop = mulP(axisUnit, -0.04 * L);
-    const trapL = addP(addP(neckP, mulP(U, 0.22 * L)), trapDrop);
-    const trapR = addP(addP(neckP, mulP(U, -0.22 * L)), trapDrop);
+    const trapL = addP(addP(neckP, mulP(U, 0.18 * L)), trapDrop);
+    const trapR = addP(addP(neckP, mulP(U, -0.18 * L)), trapDrop);
     const top = addP(neckP, trapDrop);
-    const lBow1 = addP(at(0.2), mulP(U, 0.26 * L));
-    const lBow2 = addP(at(0.55), mulP(U, 0.55 * L));
-    const lTrap1 = addP(at(0.9), mulP(U, 0.47 * L));
-    const lTrap2 = addP(neckP, mulP(U, 0.36 * L));
-    const rTrap2 = addP(neckP, mulP(U, -0.36 * L));
-    const rTrap1 = addP(at(0.9), mulP(U, -0.47 * L));
-    const rBow2 = addP(at(0.55), mulP(U, -0.55 * L));
-    const rBow1 = addP(at(0.2), mulP(U, -0.26 * L));
+    const trapPeakL = addP(addP(neckP, mulP(U, 0.08 * L)), mulP(axisUnit, 0.02 * L));
+    const trapPeakR = addP(addP(neckP, mulP(U, -0.08 * L)), mulP(axisUnit, 0.02 * L));
+    const lBow1 = addP(at(0.2), mulP(U, 0.18 * L));
+    const lBow2 = addP(at(0.55), mulP(U, 0.34 * L));
+    const lTrap1 = addP(at(0.9), mulP(U, 0.3 * L));
+    const lTrap2 = addP(neckP, mulP(U, 0.24 * L));
+    const rTrap2 = addP(neckP, mulP(U, -0.24 * L));
+    const rTrap1 = addP(at(0.9), mulP(U, -0.3 * L));
+    const rBow2 = addP(at(0.55), mulP(U, -0.34 * L));
+    const rBow1 = addP(at(0.2), mulP(U, -0.18 * L));
     const waistCtrl = addP(hipP, mulP(axis, -0.03));
     ctx.fillStyle = "#e4d6c4";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = lw;
     ctx.beginPath();
     ctx.moveTo(waistL.x, waistL.y);
-    ctx.bezierCurveTo(lBow1.x, lBow1.y, lBow2.x, lBow2.y, latL.x, latL.y);
+    ctx.quadraticCurveTo(lBow1.x, lBow1.y, cutL.x, cutL.y);
+    ctx.bezierCurveTo(lBow2.x, lBow2.y, addP(at(0.66), mulP(U, 0.38 * L)).x, addP(at(0.66), mulP(U, 0.38 * L)).y, latL.x, latL.y);
     ctx.bezierCurveTo(lTrap1.x, lTrap1.y, lTrap2.x, lTrap2.y, trapL.x, trapL.y);
-    ctx.quadraticCurveTo(top.x, top.y, trapR.x, trapR.y);
+    ctx.lineTo(trapPeakL.x, trapPeakL.y);
+    ctx.quadraticCurveTo(top.x, top.y, trapPeakR.x, trapPeakR.y);
+    ctx.lineTo(trapR.x, trapR.y);
     ctx.bezierCurveTo(rTrap2.x, rTrap2.y, rTrap1.x, rTrap1.y, latR.x, latR.y);
-    ctx.bezierCurveTo(rBow2.x, rBow2.y, rBow1.x, rBow1.y, waistR.x, waistR.y);
+    ctx.bezierCurveTo(addP(at(0.66), mulP(U, -0.38 * L)).x, addP(at(0.66), mulP(U, -0.38 * L)).y, rBow2.x, rBow2.y, cutR.x, cutR.y);
+    ctx.quadraticCurveTo(rBow1.x, rBow1.y, waistR.x, waistR.y);
     ctx.quadraticCurveTo(waistCtrl.x, waistCtrl.y, waistL.x, waistL.y);
     ctx.closePath();
-    ctx.fill();
     ctx.stroke();
     ctx.save();
     ctx.strokeStyle = "rgba(42,42,42,0.58)";
@@ -2783,17 +2866,24 @@ function drawCharacterToCanvas(
     }
     ctx.strokeStyle = "rgba(42,42,42,0.42)";
     ctx.lineWidth = Math.max(1, 1.05 * S);
-    const absYs = [0.55, 0.42, 0.3];
+    const sternumTop = at(0.7);
+    const sternumBottom = at(0.58);
+    ctx.beginPath();
+    ctx.moveTo(sternumTop.x, sternumTop.y);
+    ctx.lineTo(sternumBottom.x, sternumBottom.y);
+    ctx.stroke();
+    const absYs = [0.52, 0.42, 0.32];
     for (const t of absYs) {
       const center = at(t);
-      const left = addP(center, mulP(U, -0.07 * L));
-      const right = addP(center, mulP(U, 0.07 * L));
+      const left = addP(center, mulP(U, -0.08 * L));
+      const right = addP(center, mulP(U, 0.08 * L));
+      const sag = addP(center, mulP(axisUnit, -0.018 * L));
       ctx.beginPath();
       ctx.moveTo(left.x, left.y);
-      ctx.lineTo(right.x, right.y);
+      ctx.quadraticCurveTo(sag.x, sag.y, right.x, right.y);
       ctx.stroke();
     }
-    const midlineTop = at(0.62);
+    const midlineTop = at(0.6);
     const midlineBottom = at(0.24);
     ctx.beginPath();
     ctx.moveTo(midlineTop.x, midlineTop.y);
@@ -2864,17 +2954,19 @@ function drawCharacterToCanvas(
   }
 
   // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
-  ctx.save();
-  ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
-  ctx.rotate(launcherMount.angle * facing);
-  ctx.fillStyle = "#8B5A2B";
-  ctx.strokeStyle = "#2a2a2a";
-  ctx.lineWidth = Math.max(1, 1.3 * S);
-  ctx.beginPath();
-  ctx.roundRect(-11 * S, -4 * S, 14 * S, 8 * S, 2 * S);
-  ctx.fill();
-  ctx.stroke();
-  ctx.restore();
+  if (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0)) {
+    ctx.save();
+    ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
+    ctx.rotate(launcherMount.angle);
+    ctx.fillStyle = "#8B5A2B";
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.lineWidth = Math.max(1, 1.3 * S);
+    ctx.beginPath();
+    ctx.roundRect(-11 * S, -4 * S, 14 * S, 8 * S, 2 * S);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Neck/head chain. Positive headTilt angles the head back/up from the neck joint; the head
   // remains a plain circle, but the neck/head center shifts so the upward-thinking pose reads.
@@ -9181,6 +9273,7 @@ export default function Board2Page() {
                                 { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (3.0s)" },
                                 { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.8s)" },
                                 { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
+                                { mode: "dance" as const, label: "Dance", title: "Click board to place a hip-shake dance action (2.5s)" },
                                 { mode: "pullUps" as const, label: "Pull-ups", title: "Click board to place a grounded pull-up bar action (4.0s)" },
                                 { mode: "mirrorCheck" as const, label: "Mirror", title: "Click board to place a mirror-check transformation action (5.0s)" },
                                 { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
@@ -9343,6 +9436,7 @@ export default function Board2Page() {
                       skateTo: 2.5 * PHASE_TIME_SCALE,
                       grapple: GRAPPLE_MANUAL_DURATION_SEC,
                       pointAt: 2.0,
+                      dance: 2.5,
                       pullUps: 4.0,
                       mirrorCheck: 5.0,
                       flip: 1.2,
@@ -9461,7 +9555,7 @@ export default function Board2Page() {
 
             {(selectedCharAction || characterPanelOpen) && (() => {
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", pullUps: "💪", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
                 flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬", idle: "⏸",
               };
               const targetableAction = selectedCharAction && !["emote", "idle", "explainGesture"].includes(selectedCharAction.type);
@@ -9475,6 +9569,7 @@ export default function Board2Page() {
                 { mode: "skateTo", label: "Skate", title: "Click a target image/video to skate there" },
                 { mode: "sitAndWatch", label: "Sit & Watch", title: "Click board to sit and watch" },
                 { mode: "pointAt", label: "Point", title: "Click board to point at a position" },
+                { mode: "dance", label: "Dance", title: "Click board to place a hip-shake dance loop" },
                 { mode: "emote", label: "Emote", title: "Choose an emoji and place it at the playhead" },
                 { mode: "pullUps", label: "Pull-ups", title: "Click board to place a grounded pull-up bar" },
                 { mode: "mirrorCheck", label: "Mirror Check", title: "Click board to place a mirror-check transformation" },
@@ -10098,7 +10193,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (

@@ -38,6 +38,7 @@ export const RESERVED_ANIMATION_NAMES = [
   "emote-thinking",
   "pullups-rep",
   "mirror-flex",
+  "dance",
   "sit",
   "climb",
   "skate-pedal",
@@ -467,6 +468,19 @@ export function starterAnimations(now = new Date().toISOString()): AuthoredAnima
         { t: 0.55, pose: pose({ leftArmA: 1.18, rightArmA: -1.18, leftForeA: 2.15, rightForeA: -2.15, leftLegA: 0.18, rightLegA: -0.18, headTilt: 0.08 }) },
         { t: 0.82, pose: pose({ leftArmA: 0.8, rightArmA: -0.8, leftForeA: 1.05, rightForeA: -1.05, leftLegA: 0.22, rightLegA: -0.22, headTilt: 0.08 }) },
         { t: 1, pose: pose({ leftArmA: 1.15, rightArmA: -0.35, leftForeA: 2.05, rightForeA: -0.65, leftLegA: 0.22, rightLegA: -0.22, headTilt: 0.08 }) },
+      ],
+    },
+    {
+      id: "starter_dance",
+      name: "dance",
+      loop: true,
+      createdAt: now,
+      keyframes: [
+        { t: 0, pose: pose({ leftLegA: 0.46, rightLegA: -0.46, leftShinA: 0.18, rightShinA: -0.18, leftArmA: 0.72, rightArmA: -0.72, leftForeA: 1.02, rightForeA: -1.02, bodyLean: 0.12, headBob: 0 }) },
+        { t: 0.25, pose: pose({ leftLegA: 0.52, rightLegA: -0.4, leftShinA: 0.14, rightShinA: -0.2, leftArmA: 0.44, rightArmA: -1.0, leftForeA: 0.84, rightForeA: -1.2, bodyLean: 0.02, headTilt: -0.04, headBob: -3 }) },
+        { t: 0.5, pose: pose({ leftLegA: 0.46, rightLegA: -0.46, leftShinA: 0.18, rightShinA: -0.18, leftArmA: 0.72, rightArmA: -0.72, leftForeA: 1.02, rightForeA: -1.02, bodyLean: 0.12, headBob: 0 }) },
+        { t: 0.75, pose: pose({ leftLegA: 0.4, rightLegA: -0.52, leftShinA: 0.2, rightShinA: -0.14, leftArmA: 1.0, rightArmA: -0.44, leftForeA: 1.2, rightForeA: -0.84, bodyLean: 0.22, headTilt: 0.04, headBob: -3 }) },
+        { t: 1, pose: pose({ leftLegA: 0.46, rightLegA: -0.46, leftShinA: 0.18, rightShinA: -0.18, leftArmA: 0.72, rightArmA: -0.72, leftForeA: 1.02, rightForeA: -1.02, bodyLean: 0.12, headBob: 0 }) },
       ],
     },
   ];

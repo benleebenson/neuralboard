@@ -22,16 +22,17 @@ type CameraFocusEntry = { clipId: string; holdStart: number; holdEnd: number; tr
 
 const VALID_TYPES = new Set([
   "walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb",
-  "sitAndWatch", "pointAt", "emote", "explainGesture", "pullUps", "mirrorCheck",
+  "sitAndWatch", "pointAt", "emote", "explainGesture", "pullUps", "mirrorCheck", "dance",
 ]);
-const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb", "pullUps", "mirrorCheck"]);
+const TRAVEL_TYPES = new Set(["walkTo", "jumpTo", "skateTo", "flip", "grapple", "zipline", "wallClimb", "pullUps", "mirrorCheck", "dance"]);
 
 const SYSTEM_PROMPT = `You choreograph a stick-figure explainer character in a video. The character stands on media clips placed on a board while a camera pans between them.
 
-VOCABULARY — output ONLY these action types: walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture, pullUps, mirrorCheck.
+VOCABULARY — output ONLY these action types: walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb, sitAndWatch, pointAt, emote, explainGesture, pullUps, mirrorCheck, dance.
 - walkTo, jumpTo, skateTo, flip, grapple, zipline, wallClimb: travel moves. Each MUST include targetClipId — the clip the character moves to. Choose the move by distance/drama: walkTo for short hops, jumpTo for medium gaps, skateTo for medium horizontal travel with mild height changes where a skateboard roll plus olly feels playful, flip for a dramatic entrance/exit or big beat, grapple or zipline for long or dramatic traversals across the board, wallClimb only when the target clip sits well above the current position.
 - pullUps: place the character at a target clip/spot and perform pull-ups on a grounded pull-up bar prop. Requires targetClipId.
 - mirrorCheck: place the character at a target clip/spot to inspect himself in a standing mirror and become jacked from the transform beat onward. Requires targetClipId.
+- dance: place the character at a target clip/spot and perform a short hip-shake dance loop. Requires targetClipId. Use only when the user asks for a dance/groove/celebration or the direction text clearly calls for a playful beat.
 - sitAndWatch: sit and watch a video clip play. targetClipId = that video clip.
 - pointAt: point at a clip to draw attention to it. targetClipId is REQUIRED.
 - explainGesture: talk with the hands while standing near a clip. targetClipId is optional — omit it to just continue gesturing wherever the character currently is.
@@ -51,7 +52,7 @@ Return ONLY valid JSON, no markdown, no commentary, in this exact schema:
 {
   "actions": [
     {
-      "type": "walkTo" | "jumpTo" | "skateTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture" | "pullUps" | "mirrorCheck",
+      "type": "walkTo" | "jumpTo" | "skateTo" | "flip" | "grapple" | "zipline" | "wallClimb" | "sitAndWatch" | "pointAt" | "emote" | "explainGesture" | "pullUps" | "mirrorCheck" | "dance",
       "startTime": number,
       "duration": number,
       "targetClipId": "string (omit for emote)",
