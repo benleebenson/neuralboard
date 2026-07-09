@@ -52,6 +52,18 @@ type CharacterFaceSettings = {
   faceAspect: number;
 };
 
+type CharacterId = "c1" | "c2";
+
+type CharacterInstance = {
+  id: CharacterId;
+  enabled: boolean;
+  accentColor: string;
+  mode: "auto" | "manual";
+  actions: CharacterAction[];
+  faceBlobUrl?: string;
+  faceAspect?: number;
+};
+
 type FaceCropCorner = "nw" | "ne" | "sw" | "se";
 
 type VideoPlaybackMode = "active" | "ambient" | "dormant";
@@ -112,6 +124,13 @@ type CharacterAction = {
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
+
+type CharacterBlockerTimeline = {
+  resolved: ResolvedCharAction[];
+  initX: number;
+  initY: number;
+  entranceTime: number;
+};
 
 type CharTimelineDrag = {
   kind: "move" | "resize-left" | "resize-right";
@@ -782,6 +801,64 @@ function clampInsideClipX(clip: RequiredSurfaceClip, x: number, pad = 50): numbe
   return clamp(x, clip.boardX + innerPad, clip.boardX + clip.boardW - innerPad);
 }
 
+function findStandingSurfaceForTarget(
+  x: number,
+  y: number,
+  targetClipId: string | undefined,
+  clips: CharSurfaceClip[]
+): RequiredSurfaceClip | undefined {
+  if (targetClipId) {
+    const byId = clips.find((c) => c.id === targetClipId);
+    if (byId && isBoardSurface(byId)) return byId;
+  }
+  const hit = clips
+    .filter(isBoardSurface)
+    .filter((c) => x >= c.boardX && x <= c.boardX + c.boardW && y >= c.boardY - 60 && y <= c.boardY + c.boardH + 60)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+  if (hit) return hit;
+  return clips
+    .filter(isBoardSurface)
+    .filter((c) => x >= c.boardX && x <= c.boardX + c.boardW)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+}
+
+function resolveStandingSlot(
+  desiredX: number,
+  desiredY: number,
+  timeStart: number,
+  timeEnd: number,
+  targetClipId: string | undefined,
+  clips: CharSurfaceClip[],
+  blockers: CharacterBlockerTimeline[] = [],
+  laneBias = 0
+): { x: number; y: number } {
+  const surface = findStandingSurfaceForTarget(desiredX, desiredY, targetClipId, clips);
+  const groundY = surface ? surface.boardY : resolveGroundY(desiredX, desiredY, clips);
+  const baseX = surface ? clampInsideClipX(surface, desiredX + laneBias, 50) : desiredX + laneBias;
+  const offsets = [0, 70, -70, 140, -140];
+  const minSeps = [90, 55];
+
+  const occupied = (candidateX: number, minSep: number) => blockers.some((blocker) => {
+    const sampleStart = Math.max(timeStart, blocker.entranceTime);
+    const sampleEnd = Math.max(sampleStart, timeEnd);
+    for (let t = sampleStart; t <= sampleEnd + 0.001; t += 0.25) {
+      const pose = evalCharAtTime(t, blocker.resolved, blocker.initX, blocker.initY, clips);
+      const sameSurface = Math.abs(resolveGroundY(pose.boardX, pose.boardY, clips) - groundY) < 8 || Math.abs(pose.boardY - groundY) < 8;
+      if (sameSurface && Math.abs(pose.boardX - candidateX) < minSep) return true;
+    }
+    return false;
+  });
+
+  for (const minSep of minSeps) {
+    for (const offset of offsets) {
+      const candidateX = surface ? clampInsideClipX(surface, baseX + offset, 50) : baseX + offset;
+      if (!occupied(candidateX, minSep)) return { x: candidateX, y: groundY };
+    }
+  }
+
+  return { x: baseX, y: groundY };
+}
+
 function cameraViewport(
   cam: { cameraX: number; cameraY: number; boardZoom: number },
   outputW: number,
@@ -944,7 +1021,9 @@ function resolveCharActions(
   actions: CharacterAction[],
   initX: number,
   initY: number,
-  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  blockers: CharacterBlockerTimeline[] = [],
+  laneBias = 0
 ): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
@@ -953,8 +1032,13 @@ function resolveCharActions(
     // Explicit targetX/Y (manual placement) always wins; otherwise resolve targetClipId against
     // the clip's current position (AI-choreographed actions).
     const resolvedTarget = resolveClipTarget(a, clips);
-    const targetX = a.targetX ?? resolvedTarget?.x;
-    const targetY = a.targetY ?? resolvedTarget?.y;
+    let targetX = a.targetX ?? resolvedTarget?.x;
+    let targetY = a.targetY ?? resolvedTarget?.y;
+    if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
+      const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0);
+      targetX = slot.x;
+      targetY = slot.y;
+    }
     // startX/startY (entrance/exit flips) override the chained position for this action only —
     // the chain continues from targetX/targetY afterward, same as any other travel action.
     const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
@@ -2307,7 +2391,8 @@ function drawCharacterToCanvas(
   clips: CharSurfaceClip[],
   entranceTime: number,
   authoredAnimations: Record<string, AuthoredAnimation> = {},
-  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null
+  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
+  accentColor = "#2a2a2a"
 ) {
   if (!showChar || time < entranceTime) return;
   const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations);
@@ -2946,6 +3031,17 @@ function drawCharacterToCanvas(
     drawArm(rArmA, rForeA);
   }
 
+  if (accentColor !== "#2a2a2a") {
+    ctx.save();
+    ctx.strokeStyle = accentColor;
+    ctx.lineWidth = Math.max(2, 3 * S);
+    ctx.beginPath();
+    ctx.moveTo(-10 * S, -torsoLen * 0.52);
+    ctx.lineTo(10 * S, -torsoLen * 0.52);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   if (p.popcornAlpha && p.popcornAlpha > 0) {
     const bucketX = (p.popcornX ?? 18) * S;
     const bucketY = (p.popcornY ?? -18) * S;
@@ -3155,12 +3251,17 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
+  const [showCharacter2, setShowCharacter2] = useState(false);
+  const [characterActions2, setCharacterActions2] = useState<CharacterAction[]>([]);
+  const [characterMode2, setCharacterMode2] = useState<"auto" | "manual">("auto");
+  const [activeCharacterId, setActiveCharacterId] = useState<CharacterId>("c1");
   const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterPanelOpen, setCharacterPanelOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
   const [characterFace, setCharacterFace] = useState<CharacterFaceSettings | null>(null);
+  const [characterFace2, setCharacterFace2] = useState<CharacterFaceSettings | null>(null);
   const [facePickerOpen, setFacePickerOpen] = useState(false);
   const [faceCropSource, setFaceCropSource] = useState<{ url: string; name: string } | null>(null);
   const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
@@ -3253,7 +3354,19 @@ export default function Board2Page() {
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
-  const selectedCharAction = characterActions.find((a) => a.id === selectedCharActionId) ?? null;
+  const selectedCharActionOwner: CharacterId | null = characterActions.some((a) => a.id === selectedCharActionId)
+    ? "c1"
+    : characterActions2.some((a) => a.id === selectedCharActionId)
+      ? "c2"
+      : null;
+  const selectedCharAction = selectedCharActionOwner === "c1"
+    ? characterActions.find((a) => a.id === selectedCharActionId) ?? null
+    : selectedCharActionOwner === "c2"
+      ? characterActions2.find((a) => a.id === selectedCharActionId) ?? null
+      : null;
+  const activeCharacter: CharacterInstance = activeCharacterId === "c2"
+    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect }
+    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect };
   const timelineDuration = Math.max(10, ...clips.map((c) => c.startTime + c.duration + 2));
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
@@ -3352,18 +3465,26 @@ export default function Board2Page() {
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
+  const showCharacter2Ref = useRef(false);
   const characterFaceRef = useRef<CharacterFaceSettings | null>(null);
+  const characterFace2Ref = useRef<CharacterFaceSettings | null>(null);
   const characterFaceImageRef = useRef<HTMLImageElement | null>(null);
+  const characterFace2ImageRef = useRef<HTMLImageElement | null>(null);
   const drawFrameRef = useRef<(time: number) => void>(() => {});
   const characterActionsRef = useRef<CharacterAction[]>([]);
+  const characterActions2Ref = useRef<CharacterAction[]>([]);
   const selectedCharActionIdRef = useRef<string | null>(null);
   const resolvedCharActionsRef = useRef<ResolvedCharAction[]>([]);
+  const resolvedCharActions2Ref = useRef<ResolvedCharAction[]>([]);
   const authoredAnimationsRef = useRef<Record<string, AuthoredAnimation>>({});
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
+  const characterEntranceTime2Ref = useRef(-Infinity);
   const characterAddModeRef = useRef<CharacterAddMode | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
+  const characterMode2Ref = useRef<"auto" | "manual">("auto");
+  const activeCharacterIdRef = useRef<CharacterId>("c1");
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
   const faceCropDragRef = useRef<{ mode: "move" | "resize"; corner?: FaceCropCorner; startX: number; startY: number; orig: typeof faceCrop; rectW: number; rectH: number } | null>(null);
 
@@ -3396,7 +3517,9 @@ export default function Board2Page() {
   }, [editingAnnotationId]);
   useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
   useEffect(() => { showCharacterRef.current = showCharacter; }, [showCharacter]);
+  useEffect(() => { showCharacter2Ref.current = showCharacter2; }, [showCharacter2]);
   useEffect(() => { characterFaceRef.current = characterFace; }, [characterFace]);
+  useEffect(() => { characterFace2Ref.current = characterFace2; }, [characterFace2]);
   useEffect(() => {
     characterFaceImageRef.current = null;
     if (!characterFace?.faceBlobUrl) {
@@ -3418,10 +3541,34 @@ export default function Board2Page() {
     img.src = characterFace.faceBlobUrl;
     return () => { cancelled = true; };
   }, [characterFace?.faceBlobUrl]);
+  useEffect(() => {
+    characterFace2ImageRef.current = null;
+    if (!characterFace2?.faceBlobUrl) {
+      drawFrameRef.current(playheadRef.current);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      characterFace2ImageRef.current = img;
+      drawFrameRef.current(playheadRef.current);
+    };
+    img.onerror = () => {
+      if (cancelled) return;
+      characterFace2ImageRef.current = null;
+      drawFrameRef.current(playheadRef.current);
+    };
+    img.src = characterFace2.faceBlobUrl;
+    return () => { cancelled = true; };
+  }, [characterFace2?.faceBlobUrl]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
+  useEffect(() => { characterActions2Ref.current = characterActions2; }, [characterActions2]);
   useEffect(() => { selectedCharActionIdRef.current = selectedCharActionId; }, [selectedCharActionId]);
   useEffect(() => { authoredAnimationsRef.current = animationMap(authoredAnimations); }, [authoredAnimations]);
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
+  useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
+  useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
@@ -3434,10 +3581,6 @@ export default function Board2Page() {
       : characterActions;
     return resolveCharActions(merged, charInit.x, charInit.y, clips);
   }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
-
-  // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
-  // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
-  // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
     const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined));
@@ -3445,14 +3588,40 @@ export default function Board2Page() {
     const entrance = resolvedCharActions.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
   }, [characterMode, clips, resolvedCharActions]);
+  const resolvedCharActions2 = useMemo(() => {
+    const merged = characterMode2 === "auto"
+      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x + 60, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions2)
+      : characterActions2;
+    return resolveCharActions(
+      merged,
+      charInit.x + 60,
+      charInit.y,
+      clips,
+      showCharacter ? [{ resolved: resolvedCharActions, initX: charInit.x, initY: charInit.y, entranceTime: characterEntranceTime }] : [],
+      characterMode2 === "auto" ? 60 : 0
+    );
+  }, [clips, characterActions2, characterMode2, charInit, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
+
+  // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
+  // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
+  // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
+  const characterEntranceTime2 = useMemo(() => {
+    if (characterMode2 !== "auto") return -Infinity;
+    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined));
+    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan" || c.type === "characterZoom")) return Infinity;
+    const entrance = resolvedCharActions2.find((a) => a.entranceFlip);
+    return entrance ? entrance.startTime : -Infinity;
+  }, [characterMode2, clips, resolvedCharActions2]);
 
   // Mirror the memoized result into refs for the RAF draw loop (which must avoid stale closures)
   useEffect(() => {
     charInitXRef.current = charInit.x;
     charInitYRef.current = charInit.y;
     resolvedCharActionsRef.current = resolvedCharActions;
+    resolvedCharActions2Ref.current = resolvedCharActions2;
     characterEntranceTimeRef.current = characterEntranceTime;
-  }, [charInit, resolvedCharActions, characterEntranceTime]);
+    characterEntranceTime2Ref.current = characterEntranceTime2;
+  }, [charInit, resolvedCharActions, resolvedCharActions2, characterEntranceTime, characterEntranceTime2]);
 
   useEffect(() => {
     const check = () => {
@@ -3651,7 +3820,19 @@ export default function Board2Page() {
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
-          : null
+          : null,
+        "#2a2a2a"
+      );
+    }
+    if (showCharacter2Ref.current) {
+      drawCharacterToCanvas(
+        ctx, time, resolvedCharActions2Ref.current, showCharacter2Ref.current,
+        cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
+        clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
+        characterFace2Ref.current && characterFace2ImageRef.current
+          ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
+          : null,
+        "#3a3a5a"
       );
     }
     if (currentAnnotations.length > 0) {
@@ -4399,8 +4580,10 @@ export default function Board2Page() {
         canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Face crop failed")), "image/png");
       });
       const faceBlobUrl = URL.createObjectURL(blob);
-      if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
-      setCharacterFace({ faceBlobUrl, faceAspect: aspect });
+      const activeFace = activeCharacterIdRef.current === "c2" ? characterFace2Ref.current : characterFaceRef.current;
+      if (activeFace?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(activeFace.faceBlobUrl);
+      if (activeCharacterIdRef.current === "c2") setCharacterFace2({ faceBlobUrl, faceAspect: aspect });
+      else setCharacterFace({ faceBlobUrl, faceAspect: aspect });
       setFaceCropSource(null);
       setToast("Face added");
     } catch (err) {
@@ -4409,8 +4592,10 @@ export default function Board2Page() {
   }
 
   function removeCharacterFace() {
-    if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
-    setCharacterFace(null);
+    const activeFace = activeCharacterIdRef.current === "c2" ? characterFace2Ref.current : characterFaceRef.current;
+    if (activeFace?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(activeFace.faceBlobUrl);
+    if (activeCharacterIdRef.current === "c2") setCharacterFace2(null);
+    else setCharacterFace(null);
     setToast("Face removed");
   }
 
@@ -5836,6 +6021,7 @@ export default function Board2Page() {
     setSelectedAnnotationId(null);
     selectedCharActionIdRef.current = id;
     setSelectedCharActionId(id);
+    setActiveCharacterId(characterActions2Ref.current.some((a) => a.id === id) ? "c2" : "c1");
     setCharacterPanelOpen(true);
   }
 
@@ -5853,13 +6039,22 @@ export default function Board2Page() {
   }
 
   function deleteCharacterAction(id: string) {
-    setCharacterActions((prev) => prev.filter((a) => a.id !== id));
+    if (characterActions2Ref.current.some((a) => a.id === id)) {
+      setCharacterActions2((prev) => prev.filter((a) => a.id !== id));
+    } else {
+      setCharacterActions((prev) => prev.filter((a) => a.id !== id));
+    }
     if (selectedCharActionIdRef.current === id) {
       selectedCharActionIdRef.current = null;
       setSelectedCharActionId(null);
     }
     setRetargetCharActionId((prev) => (prev === id ? null : prev));
     setCharActionContextMenu((prev) => (prev?.actionId === id ? null : prev));
+  }
+
+  function updateCharacterActionsFor(id: CharacterId, updater: (prev: CharacterAction[]) => CharacterAction[]) {
+    if (id === "c2") setCharacterActions2(updater);
+    else setCharacterActions(updater);
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {
@@ -6458,6 +6653,7 @@ export default function Board2Page() {
     kind: "move" | "resize-left" | "resize-right"
   ) {
     e.stopPropagation();
+    const owner: CharacterId = characterActions2Ref.current.some((a) => a.id === action.id) ? "c2" : "c1";
     selectCharAction(action.id);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const rect = scrollerRef.current!.getBoundingClientRect();
@@ -6472,7 +6668,7 @@ export default function Board2Page() {
       const drag = charActionDragRef.current;
       if (!drag) return;
       const cursorSec = (ev.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
-      setCharacterActions((prev) =>
+      updateCharacterActionsFor(owner, (prev) =>
         prev.map((a) => {
           if (a.id !== drag.actionId) return a;
           if (drag.kind === "move") {
@@ -6754,14 +6950,17 @@ export default function Board2Page() {
     const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
     const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
     const characterZoomStopAt = (t: number): Stop => {
-      if (!showCharacterRef.current || t < characterEntranceTimeRef.current) {
+      const useC2 = activeCharacterIdRef.current === "c2" && showCharacter2Ref.current;
+      const enabled = useC2 ? showCharacter2Ref.current : showCharacterRef.current;
+      const entranceTime = useC2 ? characterEntranceTime2Ref.current : characterEntranceTimeRef.current;
+      if (!enabled || t < entranceTime) {
         console.warn("Character zoom fell back to Frame All: character disabled or not entered yet", { time: t });
         return frameAllStop;
       }
       const pose = evalCharAtTime(
         t,
-        resolvedCharActionsRef.current,
-        charInitXRef.current,
+        useC2 ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
+        useC2 ? charInitXRef.current + 60 : charInitXRef.current,
         charInitYRef.current,
         clipsRef.current,
         authoredAnimationsRef.current
@@ -7121,7 +7320,8 @@ export default function Board2Page() {
     // enforce no-overlap across the whole character row: later-starting action wins, the one
     // that starts earlier gets truncated to make room (matches the drag/resize invariant that
     // no two blocks on this row ever overlap).
-    setCharacterActions((prev) => {
+    const targetCharacterId = activeCharacterIdRef.current;
+    updateCharacterActionsFor(targetCharacterId, (prev) => {
       const handPlaced = prev.filter((a) => !a.aiGenerated);
       const combined = [...handPlaced, ...cleaned].sort((a, b) => a.startTime - b.startTime);
       for (let i = 0; i < combined.length - 1; i++) {
@@ -8527,6 +8727,9 @@ export default function Board2Page() {
         assetFile: string;
         assetMime: string;
       };
+      type ManifestCharacter = Omit<CharacterInstance, "faceBlobUrl" | "faceAspect"> & {
+        face?: ManifestFace | null;
+      };
       const manifestClips: ManifestClip[] = [];
       const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
 
@@ -8553,18 +8756,23 @@ export default function Board2Page() {
         }
       }
 
-      let manifestFace: ManifestFace | null = null;
-      if (characterFaceRef.current?.faceBlobUrl) {
-        const blob = await fetch(characterFaceRef.current.faceBlobUrl).then((r) => r.blob());
+      const saveFaceAsset = async (face: CharacterFaceSettings | null, assetFile: string): Promise<ManifestFace | null> => {
+        if (!face?.faceBlobUrl) return null;
+        const blob = await fetch(face.faceBlobUrl).then((r) => r.blob());
         const buf = await blob.arrayBuffer();
-        const assetFile = "assets/character-face.png";
         zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
-        manifestFace = {
-          faceAspect: characterFaceRef.current.faceAspect,
+        return {
+          faceAspect: face.faceAspect,
           assetFile,
           assetMime: blob.type || "image/png",
         };
-      }
+      };
+      const manifestFace = await saveFaceAsset(characterFaceRef.current, "assets/character-face-c1.png");
+      const manifestFace2 = await saveFaceAsset(characterFace2Ref.current, "assets/character-face-c2.png");
+      const manifestCharacters: ManifestCharacter[] = [
+        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, actions: characterActionsRef.current, face: manifestFace },
+        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, actions: characterActions2Ref.current, face: manifestFace2 },
+      ];
 
       const manifest = {
         version: 1,
@@ -8581,6 +8789,7 @@ export default function Board2Page() {
         showCharacter: showCharacterRef.current,
         characterMode: characterModeRef.current,
         characterFace: manifestFace,
+        characters: manifestCharacters,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
@@ -8608,6 +8817,11 @@ export default function Board2Page() {
     setIsLoadingProject(true);
     setToast("Loading project…");
     try {
+      type ManifestFace = {
+        faceAspect: number;
+        assetFile: string;
+        assetMime: string;
+      };
       const buffer = await file.arrayBuffer();
       const files = unzipSync(new Uint8Array(buffer));
       if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
@@ -8618,6 +8832,7 @@ export default function Board2Page() {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
       }
       if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
+      if (characterFace2Ref.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFace2Ref.current.faceBlobUrl);
       // Clean up all video elements
       for (const vid of videoElsRef.current.values()) { vid.pause(); vid.src = ""; }
       videoElsRef.current.clear();
@@ -8657,20 +8872,40 @@ export default function Board2Page() {
       if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
       if (manifest.boardPan) { boardPanRef.current = manifest.boardPan; setBoardPan(manifest.boardPan); }
       if (manifest.name) setSaveName(manifest.name);
-      if (manifest.characterActions) setCharacterActions(manifest.characterActions);
-      if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
-      if (manifest.characterMode) setCharacterMode(manifest.characterMode);
-      if (manifest.characterFace?.assetFile && files[manifest.characterFace.assetFile]) {
-        const faceData = files[manifest.characterFace.assetFile];
+      const loadFace = (face: ManifestFace | null | undefined): CharacterFaceSettings | null => {
+        if (!face?.assetFile || !files[face.assetFile]) return null;
+        const faceData = files[face.assetFile];
         const faceBytes = new Uint8Array(faceData.byteLength);
         faceBytes.set(faceData);
-        const faceBlob = new Blob([faceBytes.buffer], { type: manifest.characterFace.assetMime || "image/png" });
-        setCharacterFace({
+        const faceBlob = new Blob([faceBytes.buffer], { type: face.assetMime || "image/png" });
+        return {
           faceBlobUrl: URL.createObjectURL(faceBlob),
-          faceAspect: manifest.characterFace.faceAspect ?? 1,
-        });
+          faceAspect: face.faceAspect ?? 1,
+        };
+      };
+      if (Array.isArray(manifest.characters)) {
+        const c1 = manifest.characters.find((c: CharacterInstance) => c.id === "c1");
+        const c2 = manifest.characters.find((c: CharacterInstance) => c.id === "c2");
+        setCharacterActions(c1?.actions ?? []);
+        setShowCharacter(c1?.enabled ?? false);
+        setCharacterMode(c1?.mode ?? "auto");
+        setCharacterFace(loadFace(c1?.face));
+        setCharacterActions2(c2?.actions ?? []);
+        setShowCharacter2(c2?.enabled ?? false);
+        setCharacterMode2(c2?.mode ?? "auto");
+        setCharacterFace2(loadFace(c2?.face));
       } else {
-        setCharacterFace(null);
+        if (manifest.characterActions) setCharacterActions(manifest.characterActions);
+        else setCharacterActions([]);
+        if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
+        else setShowCharacter(false);
+        if (manifest.characterMode) setCharacterMode(manifest.characterMode);
+        else setCharacterMode("auto");
+        setCharacterFace(loadFace(manifest.characterFace));
+        setCharacterActions2([]);
+        setShowCharacter2(false);
+        setCharacterMode2("auto");
+        setCharacterFace2(null);
       }
       setToast(`Loaded "${manifest.name ?? "board"}"`);
     } catch (err) {
@@ -9679,7 +9914,7 @@ export default function Board2Page() {
               </div>
 
               {/* Character placement overlay — captures board click when characterAddMode or retargeting is set */}
-              {showCharacter && ((characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
+              {activeCharacter.enabled && ((characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
                 <div
                   style={{ position: "absolute", inset: 0, cursor: "crosshair", zIndex: 28 }}
                   onClick={(e) => {
@@ -9711,7 +9946,8 @@ export default function Board2Page() {
                       sitAndWatch: 2.0,
                     };
                     if (retargetCharActionId) {
-                      setCharacterActions((prev) => prev.map((a) => a.id === retargetCharActionId ? {
+                      const owner: CharacterId = characterActions2Ref.current.some((a) => a.id === retargetCharActionId) ? "c2" : "c1";
+                      updateCharacterActionsFor(owner, (prev) => prev.map((a) => a.id === retargetCharActionId ? {
                         ...a,
                         targetX: Math.round(snapped.x),
                         targetY: Math.round(snapped.y),
@@ -9730,7 +9966,7 @@ export default function Board2Page() {
                       targetY: Math.round(snapped.y),
                       ...(characterAddMode === "skateTo" && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
                     };
-                    setCharacterActions((prev) => [...prev, newAction]);
+                    updateCharacterActionsFor(activeCharacterIdRef.current, (prev) => [...prev, newAction]);
                     setCharacterAddMode(null);
                   }}
                 />
@@ -9858,7 +10094,7 @@ export default function Board2Page() {
                           onChange={(e) => {
                             const v = parseFloat(e.target.value);
                             if (!Number.isFinite(v)) return;
-                            setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, startTime: Math.max(0, v) } : a));
+                            updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, startTime: Math.max(0, v) } : a));
                           }}
                           style={{ width: "100%", fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
                         />
@@ -9873,7 +10109,7 @@ export default function Board2Page() {
                           onChange={(e) => {
                             const v = parseFloat(e.target.value);
                             if (!Number.isFinite(v)) return;
-                            setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, duration: Math.max(0.1, v) } : a));
+                            updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, duration: Math.max(0.1, v) } : a));
                           }}
                           style={{ width: "100%", fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
                         />
@@ -9882,7 +10118,9 @@ export default function Board2Page() {
                         <button
                           type="button"
                           onClick={() => {
-                            setShowCharacter(true);
+                            if ((selectedCharActionOwner ?? activeCharacterId) === "c2") setShowCharacter2(true);
+                            else setShowCharacter(true);
+                            setActiveCharacterId(selectedCharActionOwner ?? activeCharacterId);
                             setRetargetCharActionId(selectedCharAction.id);
                             setCharacterAddMode(null);
                           }}
@@ -9899,7 +10137,7 @@ export default function Board2Page() {
                               <button
                                 key={em}
                                 type="button"
-                                onClick={() => setCharacterActions((prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, emoji: em } : a))}
+                                onClick={() => updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, emoji: em } : a))}
                                 style={{ width: 24, height: 24, border: "none", padding: 0, background: selectedCharAction.emoji === em ? CHARACTER_COLOR : "transparent", cursor: "pointer", fontSize: 15 }}
                               >
                                 {em}
@@ -9912,11 +10150,7 @@ export default function Board2Page() {
                         type="button"
                         onClick={() => {
                           const id = selectedCharAction.id;
-                          setCharacterActions((prev) => prev.filter((a) => a.id !== id));
-                          selectedCharActionIdRef.current = null;
-                          setSelectedCharActionId(null);
-                          setRetargetCharActionId((prev) => (prev === id ? null : prev));
-                          setCharActionContextMenu((prev) => (prev?.actionId === id ? null : prev));
+                          deleteCharacterAction(id);
                         }}
                         style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
                       >
@@ -9927,23 +10161,59 @@ export default function Board2Page() {
 
                   <ProGated featureName="Character">
                     <div style={{ border: "1.5px solid rgba(42,42,42,0.18)", background: "rgba(255,253,245,0.82)", padding: 9, display: "flex", flexDirection: "column", gap: 8 }}>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {(["c1", "c2"] as CharacterId[]).map((id) => (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => setActiveCharacterId(id)}
+                            style={{ ...miniButton, flex: 1, padding: "4px 5px", background: activeCharacterId === id ? "#2a2a2a" : "transparent", color: activeCharacterId === id ? (id === "c2" ? "#dcd6ff" : CHARACTER_COLOR) : "#2a2a2a" }}
+                          >
+                            Character {id === "c1" ? "1" : "2"}
+                          </button>
+                        ))}
+                      </div>
+                      {!showCharacter2 && activeCharacterId === "c2" && (
+                        <button
+                          type="button"
+                          onClick={() => setShowCharacter2(true)}
+                          style={{ ...miniButton, background: "#e7ddff", fontWeight: 700 }}
+                        >
+                          + Add second character
+                        </button>
+                      )}
+                      {showCharacter2 && activeCharacterId === "c2" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!window.confirm("Remove Character 2 and delete its actions?")) return;
+                            setShowCharacter2(false);
+                            setCharacterActions2([]);
+                            setCharacterFace2(null);
+                            setSelectedCharActionId(null);
+                          }}
+                          style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
+                        >
+                          Remove Character 2
+                        </button>
+                      )}
                       <div style={{ ...panelLabelStyle, marginBottom: -2 }}>Character</div>
                       <button
                         type="button"
-                        onClick={() => setShowCharacter((v) => !v)}
-                        style={{ ...miniButton, background: showCharacter ? CHARACTER_COLOR : "transparent", color: "#2a2a2a" }}
+                        onClick={() => activeCharacterId === "c2" ? setShowCharacter2((v) => !v) : setShowCharacter((v) => !v)}
+                        style={{ ...miniButton, background: activeCharacter.enabled ? (activeCharacterId === "c2" ? "#dcd6ff" : CHARACTER_COLOR) : "transparent", color: "#2a2a2a" }}
                       >
-                        {showCharacter ? "● Show Character" : "○ Show Character"}
+                        {activeCharacter.enabled ? "● Show Character" : "○ Show Character"}
                       </button>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button
                           type="button"
                           onClick={() => setFacePickerOpen(true)}
-                          style={{ ...miniButton, flex: 1, padding: "5px 6px", background: characterFace ? "#e8f0ff" : "transparent" }}
+                          style={{ ...miniButton, flex: 1, padding: "5px 6px", background: activeCharacter.faceBlobUrl ? "#e8f0ff" : "transparent" }}
                         >
-                          {characterFace ? "Change Face" : "Add Face"}
+                          {activeCharacter.faceBlobUrl ? "Change Face" : "Add Face"}
                         </button>
-                        {characterFace && (
+                        {activeCharacter.faceBlobUrl && (
                           <button
                             type="button"
                             onClick={removeCharacterFace}
@@ -9958,8 +10228,8 @@ export default function Board2Page() {
                           <button
                             key={m}
                             type="button"
-                            onClick={() => setCharacterMode(m)}
-                            style={{ flex: 1, padding: "5px 6px", fontFamily: "monospace", fontSize: 10, cursor: "pointer", border: "none", borderRight: m === "auto" ? "1px solid rgba(42,42,42,0.35)" : "none", background: characterMode === m ? "#2a2a2a" : "transparent", color: characterMode === m ? CHARACTER_COLOR : "#2a2a2a", fontWeight: characterMode === m ? 700 : 400 }}
+                            onClick={() => activeCharacterId === "c2" ? setCharacterMode2(m) : setCharacterMode(m)}
+                            style={{ flex: 1, padding: "5px 6px", fontFamily: "monospace", fontSize: 10, cursor: "pointer", border: "none", borderRight: m === "auto" ? "1px solid rgba(42,42,42,0.35)" : "none", background: activeCharacter.mode === m ? "#2a2a2a" : "transparent", color: activeCharacter.mode === m ? (activeCharacterId === "c2" ? "#dcd6ff" : CHARACTER_COLOR) : "#2a2a2a", fontWeight: activeCharacter.mode === m ? 700 : 400 }}
                           >
                             {m === "auto" ? "Auto" : "Manual"}
                           </button>
@@ -9972,8 +10242,13 @@ export default function Board2Page() {
                             type="button"
                             title={title}
                             onClick={() => {
-                              setShowCharacter(true);
-                              setCharacterMode("manual");
+                              if (activeCharacterId === "c2") {
+                                setShowCharacter2(true);
+                                setCharacterMode2("manual");
+                              } else {
+                                setShowCharacter(true);
+                                setCharacterMode("manual");
+                              }
                               setRetargetCharActionId(null);
                               if (mode === "emote") {
                                 setCharacterEmojiPickerOpen((v) => !v);
@@ -10001,8 +10276,8 @@ export default function Board2Page() {
                               onClick={() => {
                                 setCharacterEmoji(em);
                                 setCharacterEmojiPickerOpen(false);
-                                const newAction: CharacterAction = { id: generateId(), type: "emote", startTime: playheadRef.current, duration: 2.0, emoji: em };
-                                setCharacterActions((prev) => [...prev, newAction]);
+                                const newAction: CharacterAction = { id: generateId(), type: "emote", startTime: playhead, duration: 2.0, emoji: em };
+                                updateCharacterActionsFor(activeCharacterId, (prev) => [...prev, newAction]);
                                 setCharacterAddMode(null);
                               }}
                               style={{ width: 24, height: 24, border: "none", padding: 0, background: characterEmoji === em ? CHARACTER_COLOR : "transparent", cursor: "pointer", fontSize: 15 }}
@@ -10029,8 +10304,8 @@ export default function Board2Page() {
                         >
                           ✨ Direct
                         </button>
-                        {characterActions.some((a) => a.aiGenerated) && (
-                          <button type="button" onClick={() => setCharacterActions((prev) => prev.filter((a) => !a.aiGenerated))} style={{ ...miniButton, padding: "4px 6px" }}>
+                        {activeCharacter.actions.some((a) => a.aiGenerated) && (
+                          <button type="button" onClick={() => updateCharacterActionsFor(activeCharacterId, (prev) => prev.filter((a) => !a.aiGenerated))} style={{ ...miniButton, padding: "4px 6px" }}>
                             🧹 Clear AI
                           </button>
                         )}
@@ -10282,7 +10557,7 @@ export default function Board2Page() {
           {/* Track — 5 visual layers above, narration audio row below */}
           <div
             ref={scrollerRef}
-            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 16, position: "relative", overflowX: "auto", overflowY: "hidden" }}
+            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 16, position: "relative", overflowX: "auto", overflowY: "hidden" }}
             onScroll={(e) => {
               const sl = (e.target as HTMLDivElement).scrollLeft;
               timelineScrollRef.current = sl;
@@ -10300,7 +10575,7 @@ export default function Board2Page() {
               setContextMenu({ x: e.clientX, y: e.clientY, timeSec, clipId });
             }}
           >
-            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 12 }}>
+            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 12 }}>
               {/* Layer row backgrounds (L0–L4) */}
               {Array.from({ length: N_LAYERS }, (_, i) => (
                 <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * LAYER_H, height: LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.08)", borderTop: i === 0 ? "1px solid rgba(42,42,42,0.08)" : "1px solid rgba(42,42,42,0.05)" }} />
@@ -10474,7 +10749,7 @@ export default function Board2Page() {
                 <>
                   <div style={{ position: "absolute", left: 0, right: 0, top: TRACK_H + NARRATION_TRACK_H + 8, height: CHARACTER_TRACK_H, background: "rgba(100,200,100,0.06)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
                   <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + NARRATION_TRACK_H + 10, pointerEvents: "none", zIndex: 15 }}>
-                    <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(60,130,60,0.6)", letterSpacing: 0.5, textTransform: "uppercase" }}>char</span>
+                    <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(60,130,60,0.6)", letterSpacing: 0.5, textTransform: "uppercase" }}>char 1</span>
                   </div>
                   {/* Character action blocks — show derived auto-actions (dimmed) + manual actions */}
                   {resolvedCharActions.map((action) => {
@@ -10555,6 +10830,86 @@ export default function Board2Page() {
                           </button>
                         )}
                         {/* Right resize — manual only */}
+                        {!isAuto && (
+                          <div
+                            style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                            onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-right")}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+
+              {/* Character 2 row background */}
+              {showCharacter2 && (
+                <>
+                  <div style={{ position: "absolute", left: 0, right: 0, top: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 8, height: CHARACTER_TRACK_H, background: "rgba(150,130,220,0.08)", borderTop: "1px dashed rgba(58,58,90,0.22)" }} />
+                  <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 10, pointerEvents: "none", zIndex: 15 }}>
+                    <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(58,58,90,0.68)", letterSpacing: 0.5, textTransform: "uppercase" }}>char 2</span>
+                  </div>
+                  {resolvedCharActions2.map((action) => {
+                    const isAuto = characterMode2 === "auto" && !characterActions2.find((m) => m.id === action.id);
+                    const selected = selectedCharActionId === action.id;
+                    const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
+                    const icons: Record<string, string> = {
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
+                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
+                    };
+                    return (
+                      <div
+                        key={action.id}
+                        data-charaction
+                        data-actionid={action.id}
+                        style={{
+                          position: "absolute",
+                          left: action.startTime * pxPerSec,
+                          top: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H + 10,
+                          width: actionPx,
+                          height: CHARACTER_TRACK_H - 4,
+                          background: isAuto ? "rgba(190,180,235,0.45)" : "#dcd6ff",
+                          border: selected ? "2px solid #2a2a2a" : isAuto ? "1px dashed rgba(58,58,90,0.35)" : "1.5px solid rgba(58,58,90,0.5)",
+                          boxShadow: selected ? "2px 2px 0 #2a2a2a" : "none",
+                          cursor: isAuto ? "default" : "grab",
+                          userSelect: "none",
+                          overflow: "hidden",
+                          display: "flex",
+                          alignItems: "center",
+                          opacity: isAuto ? 0.7 : 1,
+                        }}
+                        onPointerDown={isAuto ? undefined : (e) => handleCharActionPointerDown(e, action, "move")}
+                        onContextMenu={isAuto ? undefined : (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          selectCharAction(action.id);
+                          setCharActionContextMenu({ x: e.clientX, y: e.clientY, actionId: action.id });
+                        }}
+                        onClick={isAuto ? undefined : (e) => { e.stopPropagation(); selectCharAction(action.id); }}
+                      >
+                        {!isAuto && (
+                          <div
+                            style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
+                            onPointerDown={(e) => handleCharActionPointerDown(e, action, "resize-left")}
+                          />
+                        )}
+                        <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#303052", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
+                          {icons[action.type]} {action.type}
+                        </span>
+                        {action.aiGenerated && (
+                          <span title="AI-choreographed" style={{ position: "absolute", top: -1, right: 1, fontSize: 8, zIndex: 5, pointerEvents: "none" }}>✨</span>
+                        )}
+                        {!isAuto && (
+                          <button
+                            type="button"
+                            title="Delete action"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); deleteCharacterAction(action.id); }}
+                            style={{ position: "absolute", right: HANDLE_W + 1, top: 1, width: 14, height: 14, border: "1px solid rgba(42,42,42,0.55)", background: "#fffdf5", color: "#ff5e3a", fontSize: 9, lineHeight: 1, padding: 0, cursor: "pointer", zIndex: 8 }}
+                          >
+                            ×
+                          </button>
+                        )}
                         {!isAuto && (
                           <div
                             style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
