@@ -1,4 +1,4 @@
-// Shared types, constants, and pure utilities used by both /editor and /board.
+// Shared timeline types, constants, and pure utilities.
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

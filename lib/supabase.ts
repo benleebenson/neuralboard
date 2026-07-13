@@ -1,9 +1,16 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const url = process.env.SUPABASE_URL!;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+let supabaseClient: SupabaseClient | null = null;
 
-export const supabase = createClient(url, key);
+export function getSupabase(): SupabaseClient {
+  if (!supabaseClient) {
+    supabaseClient = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+  }
+  return supabaseClient;
+}
 
 export async function upsertUser(
   email: string,
@@ -11,6 +18,7 @@ export async function upsertUser(
   image?: string | null,
   isAdmin?: boolean
 ) {
+  const supabase = getSupabase();
   const row: Record<string, unknown> = { email, name, image, last_seen: new Date().toISOString() };
   if (isAdmin) row.is_admin = true;
   console.log("UPSERT: called with email =", email, "| isAdmin =", isAdmin, "| row =", JSON.stringify(row));
@@ -27,6 +35,7 @@ export async function logEvent(
   durationSeconds?: number | null,
   meta: Record<string, unknown> = {}
 ) {
+  const supabase = getSupabase();
   const { error } = await supabase.from("nb_events").insert({
     email,
     event: eventType,
@@ -37,6 +46,7 @@ export async function logEvent(
 }
 
 export async function getRenderCount(email: string): Promise<number> {
+  const supabase = getSupabase();
   const { count } = await supabase
     .from("nb_events")
     .select("*", { count: "exact", head: true })
@@ -47,6 +57,7 @@ export async function getRenderCount(email: string): Promise<number> {
 }
 
 export async function getDownloadCount(email: string): Promise<number> {
+  const supabase = getSupabase();
   const { count } = await supabase
     .from("nb_events")
     .select("*", { count: "exact", head: true })
@@ -56,6 +67,7 @@ export async function getDownloadCount(email: string): Promise<number> {
 }
 
 export async function getAllUsers() {
+  const supabase = getSupabase();
   const { data } = await supabase
     .from("nb_users")
     .select("*")
@@ -64,6 +76,7 @@ export async function getAllUsers() {
 }
 
 export async function getRecentEvents(limit = 200) {
+  const supabase = getSupabase();
   const { data } = await supabase
     .from("nb_events")
     .select("*")
@@ -75,6 +88,7 @@ export async function getRecentEvents(limit = 200) {
 // ── Subscriptions ───────────────────────────────────────────────────
 
 export async function getSubscriptionStatus(email: string) {
+  const supabase = getSupabase();
   const { data } = await supabase
     .from("nb_users")
     .select("subscription_status, subscription_period_end")
@@ -95,6 +109,7 @@ export async function updateSubscriptionByEmail(
     subscriptionPeriodEnd?: Date | null;
   }
 ) {
+  const supabase = getSupabase();
   const patch: Record<string, unknown> = {};
   if (updates.stripeCustomerId !== undefined) patch.stripe_customer_id = updates.stripeCustomerId;
   if (updates.stripeSubscriptionId !== undefined) patch.stripe_subscription_id = updates.stripeSubscriptionId;
@@ -105,6 +120,7 @@ export async function updateSubscriptionByEmail(
 }
 
 export async function findUserByStripeCustomerId(customerId: string) {
+  const supabase = getSupabase();
   const { data } = await supabase
     .from("nb_users")
     .select("email")
@@ -121,6 +137,7 @@ export async function logApiCost(
   costUsd: number,
   meta: { model?: string; units?: number } = {}
 ) {
+  const supabase = getSupabase();
   await supabase.from("nb_api_costs").insert({
     email,
     api,
@@ -131,6 +148,7 @@ export async function logApiCost(
 }
 
 export async function getTotalCostPerUser(): Promise<Record<string, number>> {
+  const supabase = getSupabase();
   const { data } = await supabase.from("nb_api_costs").select("email, cost_usd");
   const totals: Record<string, number> = {};
   for (const row of data ?? []) {
@@ -140,6 +158,7 @@ export async function getTotalCostPerUser(): Promise<Record<string, number>> {
 }
 
 export async function getRecentApiCosts(limit = 200) {
+  const supabase = getSupabase();
   const { data } = await supabase
     .from("nb_api_costs")
     .select("*")

@@ -12,13 +12,14 @@ export default function UpgradePage() {
 
   useEffect(() => {
     if (status === "loading") return;
-    if (!session) { setLoading(false); return; }
+    if (!session) return;
     fetch("/api/usage/check")
       .then((r) => r.json())
       .then((d) => { setIsSubscribed(!!d.isSubscribed || !!d.isAdmin); })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [session, status]);
+  const isLoading = status === "loading" || (!!session && loading);
 
   async function handleCheckout() {
     setWorking(true);
@@ -67,7 +68,7 @@ export default function UpgradePage() {
             ))}
           </ul>
 
-          {loading ? (
+          {isLoading ? (
             <div style={{ textAlign: "center", fontSize: 12, color: "#6a6a6a" }}>loading...</div>
           ) : !session ? (
             <button onClick={() => signIn("google")} style={btnStyle}>
@@ -94,8 +95,8 @@ export default function UpgradePage() {
         </p>
 
         <div style={{ textAlign: "center", marginTop: 20 }}>
-          <a href="/editor" style={{ fontSize: 11, color: "#2a2a2a", textDecoration: "underline" }}>
-            ← back to editor
+          <a href="/board2" style={{ fontSize: 11, color: "#2a2a2a", textDecoration: "underline" }}>
+            ← back to board
           </a>
         </div>
       </div>

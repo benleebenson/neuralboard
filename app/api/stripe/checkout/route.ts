@@ -2,12 +2,12 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { updateSubscriptionByEmail } from "@/lib/supabase";
-import Stripe from "stripe";
+import { getStripe } from "@/lib/stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const APP_URL = process.env.NEXTAUTH_URL ?? "https://neuralboard-zeta.vercel.app";
 
 export async function POST() {
+  const stripe = getStripe();
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -27,7 +27,7 @@ export async function POST() {
     customer: customerId,
     mode: "subscription",
     line_items: [{ price: process.env.STRIPE_PRICE_ID!, quantity: 1 }],
-    success_url: `${APP_URL}/editor?upgraded=1`,
+    success_url: `${APP_URL}/board2?upgraded=1`,
     cancel_url: `${APP_URL}/upgrade`,
     metadata: { email },
   });

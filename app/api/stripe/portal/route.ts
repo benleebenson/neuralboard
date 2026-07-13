@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
-import { supabase } from "@/lib/supabase";
-import Stripe from "stripe";
+import { getSupabase } from "@/lib/supabase";
+import { getStripe } from "@/lib/stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const APP_URL = process.env.NEXTAUTH_URL ?? "https://neuralboard-zeta.vercel.app";
 
 export async function POST() {
+  const stripe = getStripe();
+  const supabase = getSupabase();
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

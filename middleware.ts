@@ -4,7 +4,7 @@ import type { NextRequest } from "next/server";
 export function middleware(req: NextRequest) {
   if (req.nextUrl.pathname === "/builder") {
     const url = req.nextUrl.clone();
-    url.pathname = "/editor";
+    url.pathname = "/board2";
     return NextResponse.redirect(url);
   }
   return NextResponse.next();

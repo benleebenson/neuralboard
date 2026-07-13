@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isUserPro } from "@/lib/auth";
-import { supabase } from "@/lib/supabase";
+import { getSupabase } from "@/lib/supabase";
 import { AuthoredAnimation, PoseKeyframe, normalizeAnimation, starterAnimations } from "@/lib/characterAnimations";
 
 type AnimationRow = { id: string; name: string; data: unknown; created_at: string };
@@ -26,6 +26,7 @@ const LEGACY_SKATE_OLLY_KEYFRAMES = normalizeLegacyKeyframes("skate-olly", false
 ]);
 
 export async function GET() {
+  const supabase = getSupabase();
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   if (!(await isUserPro(session))) return NextResponse.json({ error: "Pro required" }, { status: 403 });
@@ -66,6 +67,7 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const supabase = getSupabase();
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   if (!(await isUserPro(session))) return NextResponse.json({ error: "Pro required" }, { status: 403 });
@@ -91,6 +93,7 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
+  const supabase = getSupabase();
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   if (!(await isUserPro(session))) return NextResponse.json({ error: "Pro required" }, { status: 403 });
@@ -134,6 +137,7 @@ function isPristineRefreshableSeed(row: AnimationRow): boolean {
 }
 
 async function refreshPristineStarterSeeds(rows: AnimationRow[], email: string): Promise<AnimationRow[]> {
+  const supabase = getSupabase();
   const refreshed: AnimationRow[] = [];
   const seen = new Set(rows.map((row) => row.name));
   for (const row of rows) {

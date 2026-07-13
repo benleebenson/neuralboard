@@ -38,8 +38,8 @@ No test suite exists. Verify changes by running the dev server.
 app/
   layout.tsx          — root layout, wraps everything in <SessionProvider>
   providers.tsx       — NextAuth SessionProvider
-  page.tsx            — redirects to /editor
-  editor/page.tsx     — the entire editor (client component, ~3100 lines)
+  page.tsx            — redirects to /board2
+  board2/page.tsx     — the complete board/editor product (client component)
   admin/page.tsx      — admin dashboard (server component, guarded to ADMIN_EMAIL)
   upgrade/page.tsx    — Stripe subscription page
   api/
@@ -62,9 +62,9 @@ lib/
 
 `@/` resolves to the project root (configured in `tsconfig.json`). Use `@/lib/...`, `@/app/...` etc.
 
-### Editor (`app/editor/page.tsx`)
+### Board (`app/board2/page.tsx`)
 
-The entire editor is a single large client component (~3150 lines). Key subsystems:
+The complete product is a single large client component. Key subsystems:
 
 - **Timeline**: canvas-like div layout; clips have `startTime`, `layer`, `durationSec`. Drag/resize uses pointer capture. Grid snap (`SNAP = 0.1s`) + magnetic snap to clip edges and playhead (`MAGNETIC_SNAP_PX = 10`).
 - **Clip types**: `audio | video | image | text`. Text clips render via canvas `drawTextClip`.
@@ -94,7 +94,7 @@ The `/api/arrange` route uses Claude (`claude-sonnet-4-6`) to position beat card
 - Google OAuth only. `ADMIN_EMAIL = "bbtvhq@gmail.com"` in `lib/auth.ts`.
 - Non-admin users get **1 free render**: gating logic is `renderCount > 0 && !isSubscribed` → 403. The first render is free; all subsequent ones require a subscription.
 - Subscription status stored in `nb_users.subscription_status` + `subscription_period_end`.
-- Middleware at `middleware.ts` only handles `/builder` → `/editor` redirect.
+- `/editor` and `/builder` permanently redirect to `/board2`.
 
 ### Database (Supabase)
 

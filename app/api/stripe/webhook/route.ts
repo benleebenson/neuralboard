@@ -1,12 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { findUserByStripeCustomerId, updateSubscriptionByEmail } from "@/lib/supabase";
+import { getStripe } from "@/lib/stripe";
 import Stripe from "stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-
-export const config = { api: { bodyParser: false } };
-
 export async function POST(req: NextRequest) {
+  const stripe = getStripe();
   const sig = req.headers.get("stripe-signature");
   if (!sig) return NextResponse.json({ error: "No signature" }, { status: 400 });
 
