@@ -722,6 +722,11 @@ const TAKEOFF_VY_THRESHOLD = -180;
 const LANDING_VY_THRESHOLD = 220;
 const TRAVEL_ACCEL_PX = 120;
 const TRAVEL_DECEL_PX = 140;
+const PLAY_WALK_RADIUS_PX = 260;
+const PLAY_JUMP_CURSOR_PX = 85;
+const PLAY_STEER_INTERVAL_MS = 140;
+const PLAY_WALK_SPEED = 360;
+const PLAY_RUN_SPEED = 760;
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these are movement primitives from the prior resolved position.
@@ -892,6 +897,17 @@ function findSurfaceAtFeet(x: number, y: number, clips: CharSurfaceClip[]): Requ
   return clips
     .filter(isBoardSurface)
     .filter((c) => x >= c.boardX + PAD && x <= c.boardX + c.boardW - PAD)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+}
+
+function nearestPlayableSurface(x: number, y: number, clips: CharSurfaceClip[]): RequiredSurfaceClip | undefined {
+  const surfaces = clips.filter(isBoardSurface);
+  const directlyHit = surfaces
+    .filter((c) => x >= c.boardX && x <= c.boardX + c.boardW && y >= c.boardY - 30 && y <= c.boardY + c.boardH)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+  if (directlyHit) return directlyHit;
+  return surfaces
+    .filter((c) => x >= c.boardX && x <= c.boardX + c.boardW)
     .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
 }
 
@@ -1772,19 +1788,22 @@ function travelPoseBetween(
   const rawBy = lerp(fromY, targetY, travelProgress);
   const by = resolveGroundY(bx, rawBy, clips);
   const facing: 1 | -1 = targetX >= fromX ? 1 : -1;
-  const stepFreq = Math.max(running ? 7 : 4, distance * (running ? 0.022 : 0.015));
-  const phase = travelProgress * stepFreq * Math.PI * 2;
-  const swing = running ? 0.72 : 0.5;
+  const stridePx = running ? 180 : 145;
+  const phase = travelProgress * Math.max(1, distance / stridePx) * Math.PI * 2;
+  const swing = running ? 0.82 : 0.56;
+  const leftPlant = Math.max(0, Math.sin(phase));
+  const rightPlant = Math.max(0, Math.sin(phase + Math.PI));
+  const bounce = Math.abs(Math.sin(phase)) * (running ? 5 : 2.5);
   return {
     boardX: bx, boardY: by, facing,
-    headBob: Math.sin(phase * 2) * (running ? 3 : 2),
-    bodyLean: (running ? 0.12 : 0.04) * facing + Math.sin(phase) * 0.04,
-    leftLegA: Math.sin(phase) * swing,
-    rightLegA: Math.sin(phase + Math.PI) * swing,
-    leftArmA: Math.sin(phase + Math.PI) * (running ? 0.5 : 0.35),
-    rightArmA: Math.sin(phase) * (running ? 0.5 : 0.35),
-    leftForeA: Math.sin(phase + Math.PI) * (running ? 0.24 : 0.15),
-    rightForeA: Math.sin(phase) * (running ? 0.24 : 0.15),
+    headBob: -bounce,
+    bodyLean: (running ? 0.16 : 0.055) * facing,
+    leftLegA: Math.sin(phase) * swing - leftPlant * 0.08,
+    rightLegA: Math.sin(phase + Math.PI) * swing - rightPlant * 0.08,
+    leftArmA: Math.sin(phase + Math.PI) * (running ? 0.62 : 0.4),
+    rightArmA: Math.sin(phase) * (running ? 0.62 : 0.4),
+    leftForeA: 0.1 + leftPlant * (running ? 0.48 : 0.28),
+    rightForeA: -0.1 - rightPlant * (running ? 0.48 : 0.28),
     airY: 0,
   };
 }
@@ -1858,7 +1877,8 @@ function evalCharPoseRaw(
 
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
-    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips), authoredPose);
+    const speed = Math.hypot(tx - active.fromX, ty - active.fromY) / Math.max(0.001, active.duration);
+    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips, speed > 520), authoredPose);
   }
 
   if (active.type === "jumpTo") {
@@ -3940,6 +3960,7 @@ export default function Board2Page() {
   const playResolvedActionsRef = useRef<ResolvedCharAction[]>([]);
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
   const playHeldKeysRef = useRef(new Set<string>());
+  const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
@@ -8573,7 +8594,19 @@ export default function Board2Page() {
   function enterPlayMode() {
     editorPlayheadBeforePlayRef.current = playheadRef.current;
     const sourcePose = evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current);
-    playInitRef.current = { x: sourcePose.boardX, y: resolveGroundY(sourcePose.boardX, sourcePose.boardY, clipsRef.current) };
+    const startSurface = findSurfaceAtFeet(sourcePose.boardX, sourcePose.boardY, clipsRef.current)
+      ?? clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip)).sort((a, b) => {
+        const ax = clampInsideClipX(a, sourcePose.boardX);
+        const bx = clampInsideClipX(b, sourcePose.boardX);
+        return Math.hypot(ax - sourcePose.boardX, a.boardY - sourcePose.boardY) - Math.hypot(bx - sourcePose.boardX, b.boardY - sourcePose.boardY);
+      })[0];
+    if (!startSurface) {
+      setToast("Add an image or video to the board before entering Play Mode");
+      return;
+    }
+    const startX = clampInsideClipX(startSurface, sourcePose.boardX);
+    const startY = startSurface.boardY;
+    playInitRef.current = { x: startX, y: startY };
     playResolvedActionsRef.current = [];
     playTimeRef.current = 0;
     playWallStartRef.current = 0;
@@ -8586,12 +8619,13 @@ export default function Board2Page() {
   function exitPlayMode() {
     setPlayMode(false);
     playHeldKeysRef.current.clear();
+    playPointerRef.current = null;
     setPlayhead(editorPlayheadBeforePlayRef.current);
     playheadRef.current = editorPlayheadBeforePlayRef.current;
     requestAnimationFrame(() => drawFrameRef.current(editorPlayheadBeforePlayRef.current));
   }
 
-  function queuePlayAction(type: CharacterAction["type"], target?: { x: number; y: number; clipId?: string }) {
+  function queuePlayAction(type: CharacterAction["type"], target?: { x: number; y: number; clipId?: string }, travelSpeed?: number) {
     const now = playTimeRef.current;
     const current = evalCharAtTime(now, playResolvedActionsRef.current, playInitRef.current.x, playInitRef.current.y, clipsRef.current, authoredAnimationsRef.current);
     const groundedY = resolveGroundY(current.boardX, current.boardY, clipsRef.current);
@@ -8602,7 +8636,9 @@ export default function Board2Page() {
       sitAndWatch: 2.5, explainGesture: 2, idle: 1.5, grapple: GRAPPLE_MANUAL_DURATION_SEC,
       wallClimb: 2, skateTo: 2.5 * PHASE_TIME_SCALE, jumpTo: 1.05,
     };
-    const duration = type === "walkTo" ? clamp(distance / 760 + 0.35, 0.55, 4) : durationByType[type] ?? clamp(distance / 900, 0.7, 2.5);
+    const duration = type === "walkTo"
+      ? clamp(distance / (travelSpeed ?? PLAY_RUN_SPEED), 0.22, 4)
+      : durationByType[type] ?? clamp(distance / 900, 0.7, 2.5);
     const action: CharacterAction = {
       id: `play_${generateId()}`, type, startTime: now, duration,
       ...(target ? { targetX: Math.round(target.x), targetY: Math.round(target.y) } : {}),
@@ -8611,24 +8647,53 @@ export default function Board2Page() {
     playResolvedActionsRef.current = resolveCharActions([action], playInitRef.current.x, playInitRef.current.y, clipsRef.current);
   }
 
-  function handlePlayClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    const rect = e.currentTarget.getBoundingClientRect();
+  function steerPlayCharacter(clientX: number, clientY: number, canvas: HTMLCanvasElement) {
+    const rect = canvas.getBoundingClientRect();
     const cam = playCameraRef.current;
     const sf = cam.boardZoom * rect.width / BOARD_W;
-    const rawX = (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
-    const rawY = (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
-    const snapped = snapToClipTop(rawX, rawY, clipsRef.current);
-    const clickedSurface = clipsRef.current.find((c): c is Clip & RequiredSurfaceClip => isBoardSurface(c) && rawX >= c.boardX && rawX <= c.boardX + c.boardW && rawY >= c.boardY && rawY <= c.boardY + c.boardH);
+    const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
+    const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
+    const clickedSurface = nearestPlayableSurface(rawX, rawY, clipsRef.current);
+    if (!clickedSurface) return;
     const current = evalCharAtTime(playTimeRef.current, playResolvedActionsRef.current, playInitRef.current.x, playInitRef.current.y, clipsRef.current, authoredAnimationsRef.current);
-    const rise = current.boardY - snapped.y;
+    const target = { x: clampInsideClipX(clickedSurface, rawX), y: clickedSurface.boardY, clipId: clickedSurface.id };
+    const dx = target.x - current.boardX;
+    const cursorDx = rawX - current.boardX;
+    const cursorDy = rawY - (current.boardY + current.airY - 95);
+    const cursorDistance = Math.hypot(cursorDx, cursorDy);
+    const rise = current.boardY - target.y;
     const held = playHeldKeysRef.current;
     let type: CharacterAction["type"];
     if (held.has("KeyG")) type = "grapple";
     else if (held.has("KeyS")) type = "skateTo";
+    else if (cursorDy < -PLAY_JUMP_CURSOR_PX && rise <= 280) type = "jumpTo";
     else if (rise >= 60 && rise <= 250) type = "jumpTo";
-    else if (rise > 250) type = Math.abs(snapped.x - current.boardX) < 260 ? "wallClimb" : "grapple";
+    else if (rise > 250) type = Math.abs(dx) < 260 ? "wallClimb" : "grapple";
     else type = "walkTo";
-    queuePlayAction(type, { x: snapped.x, y: snapped.y, clipId: clickedSurface?.id });
+    const travelSpeed = cursorDistance <= PLAY_WALK_RADIUS_PX ? PLAY_WALK_SPEED : PLAY_RUN_SPEED;
+    queuePlayAction(type, target, travelSpeed);
+  }
+
+  function handlePlayPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    playPointerRef.current = { id: e.pointerId, clientX: e.clientX, clientY: e.clientY, down: true, lastSteerAt: performance.now() };
+    steerPlayCharacter(e.clientX, e.clientY, e.currentTarget);
+  }
+
+  function handlePlayPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    const pointer = playPointerRef.current;
+    if (!pointer || pointer.id !== e.pointerId) return;
+    pointer.clientX = e.clientX;
+    pointer.clientY = e.clientY;
+    if (pointer.down && performance.now() - pointer.lastSteerAt >= PLAY_STEER_INTERVAL_MS) {
+      pointer.lastSteerAt = performance.now();
+      steerPlayCharacter(e.clientX, e.clientY, e.currentTarget);
+    }
+  }
+
+  function handlePlayPointerUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    const pointer = playPointerRef.current;
+    if (pointer?.id === e.pointerId) playPointerRef.current = null;
   }
 
   useEffect(() => {
@@ -9196,7 +9261,10 @@ export default function Board2Page() {
           ref={playCanvasRef}
           width={playViewport.width}
           height={playViewport.height}
-          onClick={handlePlayClick}
+          onPointerDown={handlePlayPointerDown}
+          onPointerMove={handlePlayPointerMove}
+          onPointerUp={handlePlayPointerUp}
+          onPointerCancel={handlePlayPointerUp}
           onWheel={(e) => {
             e.preventDefault();
             const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
@@ -9221,7 +9289,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click run · G+click grapple · S+click skate<br />D dance · E emote · F flip · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Hold near character to walk · hold farther to run<br />Aim above to jump · movement lands only on uploaded media<br />G+hold grapple · S+hold skate · D dance · E emote · F flip<br />P pull-ups · M mirror · V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
             </div>
           )}
         </div>
