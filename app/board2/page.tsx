@@ -3,8 +3,16 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ProGated } from "@/app/components/ProGated";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
+import { getBrowserSupabase } from "@/lib/supabase-browser";
+import {
+  STREAM_FPS,
+  StreamCharacterFrame,
+  StreamSnapshotMessage,
+  streamChannelName,
+} from "@/lib/stream";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -14,7 +22,7 @@ import {
   deriveOccupancyWindows,
   occupancyWindowAt,
 } from "@/lib/character-camera";
-import { AI_FEATURES_ENABLED } from "./config";
+import { AI_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -142,6 +150,7 @@ type CharacterBlockerTimeline = {
 };
 
 type LiveCommandKey = "walkTo" | "runTo" | "jumpTo" | "flip" | "grapple" | "zipline" | "skateTo" | "wallClimb" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "stop";
+type LiveCameraMode = "character" | "scene";
 
 type LiveCharacterRuntime = {
   enabled: boolean;
@@ -727,6 +736,7 @@ const LIVE_BLEND_SEC = 0.15;
 const LIVE_WALK_SPEED = 420;
 const LIVE_RUN_SPEED = 780;
 const LIVE_EMOTES = ["🤔", "💡", "❗", "😂"];
+const LIVE_CAMERA_TRANSITION_MS = 600;
 const PULLUP_BAR_WIDTH = 180;
 const PULLUP_BAR_HEIGHT = 230;
 const PULLUP_GRIP_HALF_WIDTH = 32;
@@ -3527,9 +3537,10 @@ export default function Board2Page() {
   const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
   const [faceCropPreview, setFaceCropPreview] = useState<{ url: string; aspect: number } | null>(null);
   const [liveControlEnabled, setLiveControlEnabled] = useState(false);
-  const [liveCameraFollow, setLiveCameraFollow] = useState(true);
+  const [liveCameraMode, setLiveCameraMode] = useState<LiveCameraMode>("character");
   const [liveLegendOpen, setLiveLegendOpen] = useState(true);
   const [liveHeldCommand, setLiveHeldCommand] = useState<LiveCommandKey | null>(null);
+  const [streamPublishing, setStreamPublishing] = useState(false);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
@@ -3762,10 +3773,18 @@ export default function Board2Page() {
   const characterMode2Ref = useRef<"auto" | "manual">("auto");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const liveControlEnabledRef = useRef(false);
-  const liveCameraFollowRef = useRef(true);
+  const liveCameraModeRef = useRef<LiveCameraMode>("character");
+  const liveSceneSurfaceKeyRef = useRef<string | null>(null);
+  const liveSceneCameraRef = useRef<{ cameraX: number; cameraY: number; boardZoom: number } | null>(null);
+  const liveCameraTransitionRef = useRef<{ from: { cameraX: number; cameraY: number; boardZoom: number }; startMs: number; durationMs: number } | null>(null);
   const liveHeldCommandRef = useRef<LiveCommandKey | null>(null);
   const liveRafIdRef = useRef<number | null>(null);
   const liveCameraRef = useRef<{ cameraX: number; cameraY: number; boardZoom: number } | null>(null);
+  const streamChannelRef = useRef<RealtimeChannel | null>(null);
+  const streamSessionIdRef = useRef("");
+  const streamLastFrameAtRef = useRef(0);
+  const streamSnapshotQueuedRef = useRef(false);
+  const streamSnapshotBusyRef = useRef(false);
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
     c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
@@ -3893,6 +3912,185 @@ export default function Board2Page() {
     };
   }, [livePoseFor, resetLiveRuntimeFor]);
 
+  const liveSurfaceKeyForPose = useCallback((pose: CharPoseResult | null): string | null => {
+    if (!pose) return null;
+    const surface = clipsRef.current.find((c) =>
+      isBoardSurface(c) &&
+      pose.boardX >= c.boardX! &&
+      pose.boardX <= c.boardX! + c.boardW! &&
+      Math.abs(pose.boardY - c.boardY!) < Math.max(90, c.boardH! * 0.18)
+    );
+    return surface?.id ?? null;
+  }, []);
+
+  const liveCharacterCameraTarget = useCallback((pose: CharPoseResult | null, wide = false): { cameraX: number; cameraY: number; boardZoom: number } => {
+    const p = pose ?? standingCharPose(charInitXRef.current, charInitYRef.current, 1, performance.now() / 1000);
+    const targetHeight = wide ? 560 : 420;
+    return {
+      cameraX: p.boardX,
+      cameraY: p.boardY - (wide ? 40 : 80),
+      boardZoom: clamp(canvasHRef.current * BOARD_W / (canvasWRef.current * targetHeight), wide ? 0.25 : 0.35, wide ? 1.8 : 2.4),
+    };
+  }, []);
+
+  const liveSceneCameraTarget = useCallback((pose: CharPoseResult | null): { camera: { cameraX: number; cameraY: number; boardZoom: number }; surfaceKey: string | null } => {
+    if (!pose) return { camera: liveCharacterCameraTarget(null, true), surfaceKey: null };
+    const surface = clipsRef.current.find((c) =>
+      isBoardSurface(c) &&
+      pose.boardX >= c.boardX! &&
+      pose.boardX <= c.boardX! + c.boardW! &&
+      Math.abs(pose.boardY - c.boardY!) < Math.max(90, c.boardH! * 0.18)
+    );
+    if (!surface) return { camera: liveCharacterCameraTarget(pose, true), surfaceKey: null };
+    const sf = 0.70 * Math.min(canvasWRef.current / surface.boardW!, canvasHRef.current / surface.boardH!);
+    return {
+      surfaceKey: surface.id,
+      camera: {
+        cameraX: surface.boardX! + surface.boardW! / 2,
+        cameraY: surface.boardY! + surface.boardH! / 2,
+        boardZoom: clamp(sf * BOARD_W / canvasWRef.current, 0.25, 5),
+      },
+    };
+  }, [liveCharacterCameraTarget]);
+
+  const startLiveCameraTransition = useCallback(() => {
+    liveCameraTransitionRef.current = {
+      from: liveCameraRef.current ?? liveCharacterCameraTarget(liveCharactersRef.current[activeCharacterIdRef.current]?.currentPose ?? null),
+      startMs: performance.now(),
+      durationMs: LIVE_CAMERA_TRANSITION_MS,
+    };
+  }, [liveCharacterCameraTarget]);
+
+  const toggleLiveCameraMode = useCallback(() => {
+    const runtime = liveCharactersRef.current[activeCharacterIdRef.current];
+    const pose = runtime.currentPose ?? livePoseFor(activeCharacterIdRef.current);
+    startLiveCameraTransition();
+    if (liveCameraModeRef.current === "scene") {
+      liveCameraModeRef.current = "character";
+      setLiveCameraMode("character");
+      liveSceneSurfaceKeyRef.current = null;
+      liveSceneCameraRef.current = null;
+      return;
+    }
+    const scene = liveSceneCameraTarget(pose);
+    liveCameraModeRef.current = "scene";
+    setLiveCameraMode("scene");
+    liveSceneSurfaceKeyRef.current = scene.surfaceKey;
+    liveSceneCameraRef.current = scene.camera;
+  }, [livePoseFor, liveSceneCameraTarget, startLiveCameraTransition]);
+
+  const blobUrlToDataUrl = useCallback(async (url?: string | null): Promise<string | undefined> => {
+    if (!url) return undefined;
+    if (url.startsWith("data:")) return url;
+    if (!url.startsWith("blob:")) return url;
+    try {
+      const blob = await fetch(url).then((r) => r.blob());
+      return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+      });
+    } catch {
+      return undefined;
+    }
+  }, []);
+
+  const buildStreamSnapshot = useCallback(async (): Promise<StreamSnapshotMessage> => {
+    const [face1, face2] = await Promise.all([
+      blobUrlToDataUrl(characterFaceRef.current?.faceBlobUrl),
+      blobUrlToDataUrl(characterFace2Ref.current?.faceBlobUrl),
+    ]);
+    return {
+      kind: "snapshot",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: Date.now(),
+      board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
+      clips: clipsRef.current
+        .filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.boardX !== undefined)
+        .map((c) => ({
+          id: c.id,
+          type: c.type as "image" | "video",
+          name: c.name,
+          sourceUrl: c.sourceUrl,
+          thumbnailUrl: c.thumbnailBlobUrl,
+          boardX: c.boardX!,
+          boardY: c.boardY!,
+          boardW: c.boardW!,
+          boardH: c.boardH!,
+          layer: c.layer,
+        })),
+      annotations: annotationsRef.current,
+      characters: [
+        { id: "c1", enabled: showCharacterRef.current, faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
+        { id: "c2", enabled: showCharacter2Ref.current, faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
+      ],
+    };
+  }, [blobUrlToDataUrl]);
+
+  const publishStreamSnapshot = useCallback(async () => {
+    if (!liveControlEnabledRef.current || !streamSessionIdRef.current || streamSnapshotBusyRef.current) {
+      if (streamSnapshotBusyRef.current) streamSnapshotQueuedRef.current = true;
+      return;
+    }
+    streamSnapshotBusyRef.current = true;
+    try {
+      const snapshot = await buildStreamSnapshot();
+      streamChannelRef.current?.send({ type: "broadcast", event: "snapshot", payload: snapshot });
+      await fetch("/api/stream/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshot),
+      }).catch(() => {});
+    } finally {
+      streamSnapshotBusyRef.current = false;
+      if (streamSnapshotQueuedRef.current) {
+        streamSnapshotQueuedRef.current = false;
+        void publishStreamSnapshot();
+      }
+    }
+  }, [buildStreamSnapshot]);
+
+  const publishStreamFrame = useCallback((wallMs: number) => {
+    const channel = streamChannelRef.current;
+    const cam = liveCameraRef.current;
+    if (!channel || !cam || !streamSessionIdRef.current) return;
+    if (wallMs - streamLastFrameAtRef.current < 1000 / STREAM_FPS) return;
+    streamLastFrameAtRef.current = wallMs;
+    const characters = (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
+      const runtime = liveCharactersRef.current[id];
+      const t = liveRuntimeSeconds(runtime, wallMs);
+      const resolved = liveResolvedActions(runtime, clipsRef.current);
+      const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
+      const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current);
+      return {
+        id,
+        enabled: runtime.enabled,
+        x: pose.boardX,
+        y: pose.boardY,
+        facing: pose.facing,
+        physique: physiqueAt(t, resolved),
+        actionType: active?.type ?? "idle",
+        progress: active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0,
+        emoji: pose.emojiText,
+        emojiAlpha: pose.emojiAlpha,
+      };
+    });
+    channel.send({
+      type: "broadcast",
+      event: "frame",
+      payload: {
+        kind: "frame",
+        streamId: STREAM_OWNER_USER_ID,
+        sessionId: streamSessionIdRef.current,
+        sentAt: Date.now(),
+        camera: cam,
+        characters,
+      },
+    });
+  }, []);
+
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
@@ -4003,7 +4201,7 @@ export default function Board2Page() {
   useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
-  useEffect(() => { liveCameraFollowRef.current = liveCameraFollow; }, [liveCameraFollow]);
+  useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
@@ -4165,6 +4363,11 @@ export default function Board2Page() {
         resetLiveRuntimeFor(next);
         return;
       }
+      if (e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        toggleLiveCameraMode();
+        return;
+      }
       const cmd = keyToCommand(e.key);
       if (!cmd || e.repeat) return;
       e.preventDefault();
@@ -4186,7 +4389,7 @@ export default function Board2Page() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [liveControlEnabled, issueLiveAction, resetLiveRuntimeFor]);
+  }, [liveControlEnabled, issueLiveAction, resetLiveRuntimeFor, toggleLiveCameraMode]);
 
   useEffect(() => {
     if (!liveControlEnabled) {
@@ -4194,19 +4397,57 @@ export default function Board2Page() {
       liveRafIdRef.current = null;
       liveHeldCommandRef.current = null;
       liveCameraRef.current = null;
+      liveCameraModeRef.current = "character";
+      liveSceneSurfaceKeyRef.current = null;
+      liveSceneCameraRef.current = null;
+      liveCameraTransitionRef.current = null;
+      window.setTimeout(() => setStreamPublishing(false), 0);
+      if (streamSessionIdRef.current) {
+        const endPayload = { kind: "session-end", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, sentAt: Date.now() };
+        streamChannelRef.current?.send({ type: "broadcast", event: "session-end", payload: endPayload });
+        fetch("/api/stream/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(endPayload),
+        }).catch(() => {});
+      }
+      if (streamChannelRef.current) {
+        const supabase = getBrowserSupabase();
+        supabase?.removeChannel(streamChannelRef.current);
+        streamChannelRef.current = null;
+      }
+      streamSessionIdRef.current = "";
       drawFrameRef.current(playheadRef.current);
       return;
     }
     isPlayingRef.current = false;
     resetLiveRuntimeFor("c1");
     if (showCharacter2Ref.current) resetLiveRuntimeFor("c2");
+    streamSessionIdRef.current = generateId();
+    streamLastFrameAtRef.current = 0;
+    const supabase = getBrowserSupabase();
+    if (supabase && session?.user?.email) {
+      const channel = supabase.channel(streamChannelName(STREAM_OWNER_USER_ID), {
+        config: { broadcast: { self: false }, presence: { key: session.user.email } },
+      });
+      streamChannelRef.current = channel;
+      channel.subscribe((status) => {
+        setStreamPublishing(status === "SUBSCRIBED");
+        if (status === "SUBSCRIBED") void publishStreamSnapshot();
+      });
+    } else {
+      window.setTimeout(() => setStreamPublishing(false), 0);
+    }
+    void publishStreamSnapshot();
     const loop = () => {
+      const wallMs = performance.now();
       const t = playheadRef.current;
       drawFrameRef.current(t);
       evaluateVideoPlaybackStatesRef.current?.(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, {
         audioMode: "silent",
         overrideCamera: liveCameraRef.current,
       });
+      publishStreamFrame(wallMs);
       liveRafIdRef.current = requestAnimationFrame(loop);
     };
     liveRafIdRef.current = requestAnimationFrame(loop);
@@ -4214,7 +4455,12 @@ export default function Board2Page() {
       if (liveRafIdRef.current !== null) cancelAnimationFrame(liveRafIdRef.current);
       liveRafIdRef.current = null;
     };
-  }, [liveControlEnabled, resetLiveRuntimeFor]);
+  }, [liveControlEnabled, publishStreamFrame, publishStreamSnapshot, resetLiveRuntimeFor, session?.user?.email]);
+
+  useEffect(() => {
+    if (!liveControlEnabled) return;
+    void publishStreamSnapshot();
+  }, [liveControlEnabled, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, publishStreamSnapshot]);
 
   useEffect(() => {
     return () => {
@@ -4440,29 +4686,39 @@ export default function Board2Page() {
     if (liveControlEnabledRef.current) {
       const live = liveCharactersRef.current[activeCharacterIdRef.current];
       const pose = live.currentPose;
-      if (liveCameraFollowRef.current && pose) {
-        const target = {
-          cameraX: pose.boardX,
-          cameraY: pose.boardY - 80,
-          boardZoom: clamp(canvasHRef.current * BOARD_W / (canvasWRef.current * 380), 0.35, 2.4),
-        };
-        const prev = liveCameraRef.current ?? target;
-        liveCam = {
-          cameraX: lerp(prev.cameraX, target.cameraX, 0.14),
-          cameraY: lerp(prev.cameraY, target.cameraY, 0.14),
-          boardZoom: lerp(prev.boardZoom, target.boardZoom, 0.12),
-        };
-      } else {
-        const rect = boardContainerRef.current?.getBoundingClientRect();
-        if (rect && rect.width > 0 && rect.height > 0) {
-          liveCam = {
-            cameraX: (rect.width / 2 - boardPanRef.current.x) / Math.max(0.001, boardZoomRef.current),
-            cameraY: (rect.height / 2 - boardPanRef.current.y) / Math.max(0.001, boardZoomRef.current),
-            boardZoom: clamp(BOARD_W * boardZoomRef.current / Math.max(1, rect.width), 0.05, 3),
-          };
-        } else {
-          liveCam = liveCameraRef.current ?? interpolateCameraKeyframes(cameraKeyframesRef.current, playheadRef.current);
+      if (liveCameraModeRef.current === "scene") {
+        const currentSurfaceKey = liveSurfaceKeyForPose(pose);
+        const expectedSurfaceKey = liveSceneSurfaceKeyRef.current;
+        const leftScene = expectedSurfaceKey ? currentSurfaceKey !== expectedSurfaceKey : currentSurfaceKey !== null;
+        if (leftScene) {
+          liveCameraModeRef.current = "character";
+          liveSceneSurfaceKeyRef.current = null;
+          liveSceneCameraRef.current = null;
+          startLiveCameraTransition();
+          setLiveCameraMode("character");
         }
+      }
+      const target = liveCameraModeRef.current === "scene" && liveSceneCameraRef.current
+        ? liveSceneCameraRef.current
+        : liveCharacterCameraTarget(pose);
+      const transition = liveCameraTransitionRef.current;
+      if (transition) {
+        const rawT = clamp((performance.now() - transition.startMs) / transition.durationMs, 0, 1);
+        const eased = rawT < 0.5 ? 4 * rawT * rawT * rawT : 1 - Math.pow(-2 * rawT + 2, 3) / 2;
+        liveCam = {
+          cameraX: lerp(transition.from.cameraX, target.cameraX, eased),
+          cameraY: lerp(transition.from.cameraY, target.cameraY, eased),
+          boardZoom: lerp(transition.from.boardZoom, target.boardZoom, eased),
+        };
+        if (rawT >= 1) liveCameraTransitionRef.current = null;
+      } else {
+        const prev = liveCameraRef.current ?? target;
+        const alpha = liveCameraModeRef.current === "scene" ? 1 : 0.14;
+        liveCam = {
+          cameraX: lerp(prev.cameraX, target.cameraX, alpha),
+          cameraY: lerp(prev.cameraY, target.cameraY, alpha),
+          boardZoom: lerp(prev.boardZoom, target.boardZoom, liveCameraModeRef.current === "scene" ? 1 : 0.12),
+        };
       }
       liveCameraRef.current = liveCam;
     }
@@ -10765,6 +11021,7 @@ export default function Board2Page() {
                       <span>D Dance</span><span>P Pull-ups</span>
                       <span>M Mirror</span><span>T Sit</span>
                       <span>E Emote</span><span>X Stop</span>
+                      <span>V Camera</span><span>{liveCameraMode === "scene" ? "Scene shot" : "Character shot"}</span>
                       <span>1/2 or Tab switch</span><span>{activeCharacterId === "c2" ? "Active: C2" : "Active: C1"}</span>
                     </div>
                   )}
@@ -11013,6 +11270,7 @@ export default function Board2Page() {
                               if (!liveControlEnabled) {
                                 if (activeCharacterId === "c2") setShowCharacter2(true); else setShowCharacter(true);
                                 setCharacterPanelOpen(true);
+                                setLiveCameraMode("character");
                                 setIsPlaying(false);
                                 isPlayingRef.current = false;
                               }
@@ -11023,15 +11281,12 @@ export default function Board2Page() {
                             🎮 Live Control {liveControlEnabled ? "ON" : "OFF"}
                           </button>
                           {liveControlEnabled && (
-                            <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
-                              <input
-                                type="checkbox"
-                                checked={liveCameraFollow}
-                                onChange={(e) => setLiveCameraFollow(e.target.checked)}
-                                style={{ margin: 0, accentColor: "#c8f135" }}
-                              />
-                              Camera follows character
-                            </label>
+                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+                              <span>Camera: {liveCameraMode === "scene" ? "scene shot" : "character shot"} · V toggles</span>
+                              <span style={{ color: streamPublishing ? "#228b22" : "#8a6a00", fontWeight: 700 }}>
+                                {streamPublishing ? "LIVE" : "LOCAL"}
+                              </span>
+                            </div>
                           )}
                         </div>
                       </ProGated>
