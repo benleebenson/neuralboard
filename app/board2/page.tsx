@@ -675,8 +675,15 @@ const CHAR_WALK_DIST = 500;   // board px — below this: walkTo
 const CHAR_JUMP_DIST = 1500;  // board px — below this: jumpTo; above: grapple
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
-// Travel-type action kinds — these change the character's resting board position
-const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple", "pullUps", "mirrorCheck", "dance"]);
+// Travel-type action kinds — these are movement primitives from the prior resolved position.
+const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
+// Stationary actions whose target is a place to perform the action. Runtime may spend the first
+// part of the same block walking in, but the timeline still stores one action.
+const CHAR_STATIONARY_TARGET_TYPES = new Set<CharacterAction["type"]>(["dance", "emote", "pullUps", "mirrorCheck", "sitAndWatch"]);
+const CHAR_STATIONARY_NEAR_TARGET_PX = 60;
+const CHAR_STATIONARY_RUN_DIST_PX = 600;
+const CHAR_STATIONARY_WALK_SPEED = 360;
+const CHAR_STATIONARY_RUN_SPEED = 720;
 const CHAR_OFFSCREEN_PAD = 900;
 const CHAR_ENTRANCE_Y_LIFT = 600;
 const PHASE_TIME_SCALE = 1.2;
@@ -1043,16 +1050,121 @@ function resolvedActionRestPosition(
 ): { x: number; y: number } {
   const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips) : null;
   if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
-  if ((action.type === "pullUps" || action.type === "mirrorCheck") && action.targetX !== undefined) {
+  if (CHAR_STATIONARY_TARGET_TYPES.has(action.type) && action.targetX !== undefined) {
+    const targetY = resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips);
+    const dist = Math.hypot(action.targetX - action.fromX, targetY - action.fromY);
+    if (dist < CHAR_STATIONARY_NEAR_TARGET_PX) return { x: action.fromX, y: action.fromY };
     return {
       x: action.targetX,
-      y: resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips),
+      y: targetY,
     };
   }
   return {
     x: action.targetX ?? action.fromX,
     y: action.targetY ?? action.fromY,
   };
+}
+
+function actionCanChangeRestPosition(type: CharacterAction["type"]): boolean {
+  return CHAR_TRAVEL_TYPES.has(type) || CHAR_STATIONARY_TARGET_TYPES.has(type);
+}
+
+type StationaryRuntime =
+  | {
+      hasTarget: false;
+      didWalkIn: false;
+      action: ResolvedCharAction;
+      progress: number;
+      elapsed: number;
+      targetX: number;
+      targetY: number;
+    }
+  | {
+      hasTarget: true;
+      phase: "near" | "travel" | "act";
+      didWalkIn: boolean;
+      action: ResolvedCharAction;
+      progress: number;
+      elapsed: number;
+      targetX: number;
+      targetY: number;
+      travelDuration: number;
+      distance: number;
+      running: boolean;
+    };
+
+function stationaryRuntimeForAction(
+  active: ResolvedCharAction,
+  clips: CharSurfaceClip[],
+  time: number
+): StationaryRuntime {
+  if (!CHAR_STATIONARY_TARGET_TYPES.has(active.type) || active.targetX === undefined) {
+    const elapsed = time - active.startTime;
+    return {
+      hasTarget: false,
+      didWalkIn: false,
+      action: active,
+      progress: clamp(elapsed / Math.max(0.001, active.duration), 0, 1),
+      elapsed,
+      targetX: active.fromX,
+      targetY: active.fromY,
+    };
+  }
+
+  const targetX = active.targetX;
+  const targetY = resolveGroundY(targetX, active.targetY ?? active.fromY, clips);
+  const distance = Math.hypot(targetX - active.fromX, targetY - active.fromY);
+  const elapsed = time - active.startTime;
+  if (distance < CHAR_STATIONARY_NEAR_TARGET_PX) {
+    return {
+      hasTarget: true,
+      phase: "near",
+      didWalkIn: false,
+      action: { ...active, targetX: active.fromX, targetY: active.fromY },
+      progress: clamp(elapsed / Math.max(0.001, active.duration), 0, 1),
+      elapsed,
+      targetX: active.fromX,
+      targetY: active.fromY,
+      travelDuration: 0,
+      distance,
+      running: false,
+    };
+  }
+
+  const running = distance >= CHAR_STATIONARY_RUN_DIST_PX;
+  const naturalTravel = distance / (running ? CHAR_STATIONARY_RUN_SPEED : CHAR_STATIONARY_WALK_SPEED);
+  const travelDuration = Math.max(0.001, Math.min(active.duration * 0.5, naturalTravel));
+  const remainingDuration = Math.max(0.001, active.duration - travelDuration);
+  const actionStartTime = active.startTime + travelDuration;
+  const actionElapsed = Math.max(0, elapsed - travelDuration);
+  const action: ResolvedCharAction = {
+    ...active,
+    startTime: actionStartTime,
+    duration: remainingDuration,
+    fromX: targetX,
+    fromY: targetY,
+    targetX,
+    targetY,
+  };
+
+  return {
+    hasTarget: true,
+    phase: elapsed < travelDuration ? "travel" : "act",
+    didWalkIn: true,
+    action,
+    progress: clamp(actionElapsed / remainingDuration, 0, 1),
+    elapsed: actionElapsed,
+    targetX,
+    targetY,
+    travelDuration,
+    distance,
+    running,
+  };
+}
+
+function characterActionHasWalkIn(action: ResolvedCharAction, clips: CharSurfaceClip[]): boolean {
+  const runtime = stationaryRuntimeForAction(action, clips, action.startTime);
+  return runtime.hasTarget && runtime.didWalkIn;
 }
 
 // Resolve an action's targetClipId to board coordinates, using the clip's CURRENT position —
@@ -1090,7 +1202,7 @@ function resolveCharActions(
     const resolvedTarget = resolveClipTarget(a, clips);
     let targetX = a.targetX ?? resolvedTarget?.x;
     let targetY = a.targetY ?? resolvedTarget?.y;
-    if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
+    if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
       const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0);
       targetX = slot.x;
       targetY = slot.y;
@@ -1099,11 +1211,12 @@ function resolveCharActions(
     // the chain continues from targetX/targetY afterward, same as any other travel action.
     const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
     result.push(resolvedAction);
-    if (CHAR_TRAVEL_TYPES.has(a.type) && targetX !== undefined) {
+    if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
       const rest = resolvedActionRestPosition(resolvedAction, clips);
       x = rest.x; y = rest.y;
     }
-    // pointAt/sitAndWatch/explainGesture/emote/idle don't change position
+    // pointAt/explainGesture/idle don't change position; stationary target actions may end at
+    // their target after an evaluation-layer walk-in.
   }
   return result;
 }
@@ -1569,6 +1682,38 @@ function aimAngleFromPoint(
   return -Math.atan2(dxLocal, dy);
 }
 
+function travelPoseBetween(
+  time: number,
+  fromX: number,
+  fromY: number,
+  targetX: number,
+  targetY: number,
+  progress: number,
+  clips: CharSurfaceClip[],
+  running = false
+): CharPoseResult {
+  const bx = lerp(fromX, targetX, clamp(progress, 0, 1));
+  const rawBy = lerp(fromY, targetY, clamp(progress, 0, 1));
+  const by = resolveGroundY(bx, rawBy, clips);
+  const facing: 1 | -1 = targetX >= fromX ? 1 : -1;
+  const dist = Math.hypot(targetX - fromX, targetY - fromY);
+  const stepFreq = Math.max(running ? 7 : 4, dist * (running ? 0.022 : 0.015));
+  const phase = progress * stepFreq * Math.PI * 2;
+  const swing = running ? 0.72 : 0.5;
+  return {
+    boardX: bx, boardY: by, facing,
+    headBob: Math.sin(phase * 2) * (running ? 3 : 2),
+    bodyLean: (running ? 0.12 : 0.04) * facing + Math.sin(phase) * 0.04,
+    leftLegA: Math.sin(phase) * swing,
+    rightLegA: Math.sin(phase + Math.PI) * swing,
+    leftArmA: Math.sin(phase + Math.PI) * (running ? 0.5 : 0.35),
+    rightArmA: Math.sin(phase) * (running ? 0.5 : 0.35),
+    leftForeA: Math.sin(phase + Math.PI) * (running ? 0.24 : 0.15),
+    rightForeA: Math.sin(phase) * (running ? 0.24 : 0.15),
+    airY: 0,
+  };
+}
+
 function evalCharAtTime(
   time: number,
   resolved: ResolvedCharAction[],
@@ -1604,7 +1749,7 @@ function evalCharAtTime(
       const end = a.startTime + a.duration;
       if (end <= time && end > lastEnd) {
         lastEnd = end;
-        if (CHAR_TRAVEL_TYPES.has(a.type) && a.targetX !== undefined) {
+        if (actionCanChangeRestPosition(a.type) && a.targetX !== undefined) {
           const rest = resolvedActionRestPosition(a, clips);
           rx = rest.x; ry = rest.y;
         } else {
@@ -1621,26 +1766,26 @@ function evalCharAtTime(
   const authoredPose = slotName
     ? sampleAnimation(authoredAnimations[slotName], authoredProgressForAction(active, progress))
     : null;
+  const stationaryRuntime = stationaryRuntimeForAction(active, clips, time);
+  if (stationaryRuntime.hasTarget && stationaryRuntime.phase === "travel") {
+    return travelPoseBetween(
+      time,
+      active.fromX,
+      active.fromY,
+      stationaryRuntime.targetX,
+      stationaryRuntime.targetY,
+      clamp((time - active.startTime) / stationaryRuntime.travelDuration, 0, 1),
+      clips,
+      stationaryRuntime.running
+    );
+  }
+  const stationaryActive = stationaryRuntime.action;
+  const stationaryProgress = stationaryRuntime.progress;
+  const stationaryElapsed = stationaryRuntime.elapsed;
 
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
-    const bx = active.fromX + (tx - active.fromX) * progress;
-    // Ground-resolve the feet Y along the path so he steps UP onto clip surfaces
-    const rawBy = active.fromY + (ty - active.fromY) * progress;
-    const by = resolveGroundY(bx, rawBy, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    const dist = Math.hypot(tx - active.fromX, ty - active.fromY);
-    const stepFreq = Math.max(4, dist * 0.015);
-    const phase = progress * stepFreq * Math.PI * 2;
-    const swing = 0.5;
-    return applyAuthoredPose({
-      boardX: bx, boardY: by, facing,
-      headBob: Math.sin(phase * 2) * 2, bodyLean: Math.sin(phase) * 0.05,
-      leftLegA: Math.sin(phase) * swing, rightLegA: Math.sin(phase + Math.PI) * swing,
-      leftArmA: Math.sin(phase + Math.PI) * 0.35, rightArmA: Math.sin(phase) * 0.35,
-      leftForeA: Math.sin(phase + Math.PI) * 0.15, rightForeA: Math.sin(phase) * 0.15,
-      airY: 0,
-    }, authoredPose);
+    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips), authoredPose);
   }
 
   if (active.type === "jumpTo") {
@@ -1999,16 +2144,18 @@ function evalCharAtTime(
   }
 
   if (active.type === "sitAndWatch") {
-    const tx = active.targetX ?? active.fromX;
-    const groundY = resolveGroundY(active.fromX, active.targetY ?? active.fromY, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const a = stationaryActive;
+    const p = stationaryProgress;
+    const tx = a.targetX ?? a.fromX;
+    const groundY = resolveGroundY(a.fromX, a.targetY ?? a.fromY, clips);
+    const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const STEP_END = 0.12;
     const LOWER_END = 0.3;
     const STAND_START = 0.9;
     const seatedBoardY = groundY + CHAR_HIP_RAW;
-    const jitter = seededRandom(active.id + ":popcorn") * 0.34;
+    const jitter = seededRandom(a.id + ":popcorn") * 0.34;
     const eatingCycle = ((time + jitter) / 2.2) % 1;
-    let bx = active.fromX;
+    let bx = a.fromX;
     let by = groundY;
     let headBob = 0;
     let bodyLean = 0;
@@ -2048,9 +2195,9 @@ function evalCharAtTime(
       popcornY = 8;
     };
 
-    if (progress < STEP_END) {
-      const t = easeInOutCubic(progress / STEP_END);
-      bx = active.fromX;
+    if (p < STEP_END) {
+      const t = easeInOutCubic(p / STEP_END);
+      bx = a.fromX;
       bodyLean = lerp(0, 0.12, t);
       leftLegA = lerp(0.12, 0.32, t);
       rightLegA = lerp(-0.12, -0.32, t);
@@ -2061,8 +2208,8 @@ function evalCharAtTime(
       popcornAlpha = t;
       popcornX = 40;
       popcornY = 72;
-    } else if (progress < LOWER_END) {
-      const t = easeInOutCubic((progress - STEP_END) / (LOWER_END - STEP_END));
+    } else if (p < LOWER_END) {
+      const t = easeInOutCubic((p - STEP_END) / (LOWER_END - STEP_END));
       by = lerp(groundY, seatedBoardY, t);
       bodyLean = lerp(0.16, 0.08, t);
       leftLegA = lerp(0.32, 1.08, t);
@@ -2078,7 +2225,7 @@ function evalCharAtTime(
       popcornX = lerp(40, 16, t);
       popcornY = lerp(72, 8, t);
       sitSeated = t > 0.72;
-    } else if (progress < STAND_START) {
+    } else if (p < STAND_START) {
       by = seatedBoardY;
       leftLegA = 1.08;
       rightLegA = -1.02;
@@ -2087,7 +2234,7 @@ function evalCharAtTime(
       sitSeated = true;
       seatedPose(eatingCycle);
     } else {
-      const t = easeInOutCubic((progress - STAND_START) / (1 - STAND_START));
+      const t = easeInOutCubic((p - STAND_START) / (1 - STAND_START));
       by = lerp(seatedBoardY, groundY, t);
       bodyLean = lerp(0.16, 0, t);
       leftLegA = lerp(1.08, 0.12, t);
@@ -2152,9 +2299,11 @@ function evalCharAtTime(
   }
 
   if (active.type === "pullUps") {
-    const tx = active.targetX ?? active.fromX;
-    const ty = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const a = stationaryActive;
+    const p = stationaryProgress;
+    const tx = a.targetX ?? a.fromX;
+    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const APPROACH_END = 0.1;
     const HANG_END = 0.15;
     const DISMOUNT_START = 0.9;
@@ -2168,12 +2317,11 @@ function evalCharAtTime(
     let bodyLean = 0;
     let headBob = 0;
     let arms = pullUpArmPose(airY);
-    const barAlpha = progress < 0.15 ? progress / 0.15 : progress > 0.92 ? Math.max(0, (1 - progress) / 0.08) : 1;
 
-    if (progress < APPROACH_END) {
-      const t = easeInOutCubic(progress / APPROACH_END);
-      bx = lerp(active.fromX, tx, t);
-      by = lerp(active.fromY, ty, t);
+    if (p < APPROACH_END) {
+      const t = easeInOutCubic(p / APPROACH_END);
+      bx = lerp(a.fromX, tx, t);
+      by = lerp(a.fromY, ty, t);
       airY = 0;
       const reach = t;
       leftLegA = Math.sin(t * Math.PI * 2) * 0.2;
@@ -2185,17 +2333,17 @@ function evalCharAtTime(
         leftForeA: lerp(0.13, -0.35, reach),
         rightForeA: lerp(-0.13, 0.35, reach),
       };
-    } else if (progress < HANG_END) {
-      const t = easeInOutCubic((progress - APPROACH_END) / (HANG_END - APPROACH_END));
+    } else if (p < HANG_END) {
+      const t = easeInOutCubic((p - APPROACH_END) / (HANG_END - APPROACH_END));
       airY = lerp(0, -40, t);
       arms = pullUpArmPose(airY);
       leftLegA = lerp(0.12, 0.07, t);
       rightLegA = lerp(-0.12, -0.05, t);
       legBackBend = 0.25;
-    } else if (progress < DISMOUNT_START) {
+    } else if (p < DISMOUNT_START) {
       const repSpan = DISMOUNT_START - HANG_END;
-      const reps = Math.max(1, Math.round(active.duration / 4 * 3));
-      const loop = ((progress - HANG_END) / repSpan) * reps;
+      const reps = Math.max(1, Math.round(a.duration / 4 * 3));
+      const loop = ((p - HANG_END) / repSpan) * reps;
       const repT = loop - Math.floor(loop);
       const lift = Math.pow(Math.max(0, Math.sin(Math.PI * repT)), 0.75);
       airY = lerp(-40, -103, easeInOutCubic(lift));
@@ -2207,7 +2355,7 @@ function evalCharAtTime(
       rightLegA = lerp(-0.05, -0.08, kneeEase);
       legBackBend = 0.25 + lift * 0.04;
     } else {
-      const t = easeInOutCubic((progress - DISMOUNT_START) / (1 - DISMOUNT_START));
+      const t = easeInOutCubic((p - DISMOUNT_START) / (1 - DISMOUNT_START));
       airY = lerp(-40, 0, t);
       arms = t < 0.35 ? pullUpArmPose(airY) : {
         leftArmA: lerp(-0.45, 0.08, (t - 0.35) / 0.65),
@@ -2233,7 +2381,7 @@ function evalCharAtTime(
       }
       headBob = absorb * 2;
     }
-    if (progress < DISMOUNT_START) {
+    if (p < DISMOUNT_START) {
       leftShinA = -legBackBend;
       rightShinA = legBackBend;
     }
@@ -2247,25 +2395,27 @@ function evalCharAtTime(
       leftArmA: arms.leftArmA, rightArmA: arms.rightArmA,
       leftForeA: arms.leftForeA, rightForeA: arms.rightForeA,
       airY,
-      pullUpBarAlpha: barAlpha,
+      pullUpBarAlpha: p < 0.15 ? p / 0.15 : p > 0.92 ? Math.max(0, (1 - p) / 0.08) : 1,
       pullUpBarBX: tx,
       pullUpBarBY: ty,
     };
   }
 
   if (active.type === "mirrorCheck") {
-    const tx = active.targetX ?? active.fromX;
-    const ty = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
+    const a = stationaryActive;
+    const p = stationaryProgress;
+    const tx = a.targetX ?? a.fromX;
+    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     let pose = standingCharPose(tx, ty, facing, time);
     let surpriseAlpha = 0;
     let sparkleAlpha = 0;
     let physiquePulse = 0;
 
-    if (progress < 0.15) {
-      const t = progress / 0.15;
-      const bx = lerp(active.fromX, tx, easeInOutCubic(t));
-      const rawBy = lerp(active.fromY, ty, easeInOutCubic(t));
+    if (p < 0.15) {
+      const t = p / 0.15;
+      const bx = lerp(a.fromX, tx, easeInOutCubic(t));
+      const rawBy = lerp(a.fromY, ty, easeInOutCubic(t));
       const phase = t * Math.PI * 2;
       pose = {
         ...standingCharPose(bx, rawBy, facing, time),
@@ -2278,8 +2428,8 @@ function evalCharAtTime(
         leftForeA: Math.sin(phase + Math.PI) * 0.1,
         rightForeA: Math.sin(phase) * 0.1,
       };
-    } else if (progress < 0.35) {
-      const t = (progress - 0.15) / 0.2;
+    } else if (p < 0.35) {
+      const t = (p - 0.15) / 0.2;
       surpriseAlpha = Math.max(0, 1 - Math.abs(t - 0.35) / 0.35);
       pose.headTilt = lerp(0, 0.13, easeOutQuad(t));
       pose.headBob = -Math.sin(Math.PI * t) * 4;
@@ -2287,14 +2437,14 @@ function evalCharAtTime(
       pose.rightArmA = lerp(-0.08, -0.28, t);
       pose.leftForeA = lerp(0.13, 0.28, t);
       pose.rightForeA = lerp(-0.13, -0.28, t);
-    } else if (progress < 0.55) {
-      const t = (progress - 0.35) / 0.2;
-      pose = thinkingPoseBase(tx, ty, facing, time, active.id, time - active.startTime, "hold");
+    } else if (p < 0.55) {
+      const t = (p - 0.35) / 0.2;
+      pose = thinkingPoseBase(tx, ty, facing, time, a.id, stationaryElapsed, "hold");
       pose.headTilt = lerp(-0.06, 0.18, easeInOutCubic(t));
       physiquePulse = Math.max(0, 1 - Math.abs(t - 0.28) / 0.28);
-    } else if (progress < 0.8) {
-      const t = (progress - 0.55) / 0.25;
-      const tremble = Math.sin(time * 42 + seededRandom(`${active.id}:flex`) * 10) * 0.02;
+    } else if (p < 0.8) {
+      const t = (p - 0.55) / 0.25;
+      const tremble = Math.sin(time * 42 + seededRandom(`${a.id}:flex`) * 10) * 0.02;
       pose.bodyLean = Math.sin(time * 11) * 0.015;
       pose.headTilt = 0.08;
       pose.leftArmA = 1.18 + tremble;
@@ -2305,7 +2455,7 @@ function evalCharAtTime(
       pose.rightLegA = -0.18;
       sparkleAlpha = Math.min(1, t * 2);
     } else {
-      const t = (progress - 0.8) / 0.2;
+      const t = (p - 0.8) / 0.2;
       sparkleAlpha = Math.max(0, 1 - t * 0.4);
       pose.headTilt = 0.08;
       pose.leftLegA = 0.22;
@@ -2327,7 +2477,7 @@ function evalCharAtTime(
     return {
       ...pose,
       airY: 0,
-      mirrorAlpha: progress < 0.12 ? progress / 0.12 : progress > 0.94 ? Math.max(0, (1 - progress) / 0.06) : 1,
+      mirrorAlpha: p < 0.12 ? p / 0.12 : p > 0.94 ? Math.max(0, (1 - p) / 0.06) : 1,
       mirrorBX: tx + facing * MIRROR_OFFSET,
       mirrorBY: ty,
       mirrorFacing: facing,
@@ -2338,11 +2488,12 @@ function evalCharAtTime(
   }
 
   if (active.type === "dance") {
-    const tx = active.targetX ?? active.fromX;
-    const groundY = resolveGroundY(tx, active.targetY ?? active.fromY, clips);
-    const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    const elapsed = Math.max(0, time - active.startTime);
-    const edge = Math.min(1, elapsed / 0.22, (active.duration - elapsed) / 0.22);
+    const a = stationaryActive;
+    const tx = a.targetX ?? a.fromX;
+    const groundY = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
+    const elapsed = Math.max(0, stationaryElapsed);
+    const edge = Math.min(1, elapsed / 0.22, (a.duration - elapsed) / 0.22);
     const phase = (elapsed / 0.9) * Math.PI * 2;
     const hipWave = Math.sin(phase) * clamp(edge, 0, 1);
     const hit = Math.pow(Math.abs(Math.sin(phase)), 1.7) * clamp(edge, 0, 1);
@@ -2389,29 +2540,34 @@ function evalCharAtTime(
   }
 
   if (active.type === "emote") {
-    const elapsed = time - active.startTime;
-    const transitionScale = Math.min(1, Math.max(0.35, active.duration / 2));
+    const a = stationaryActive;
+    const elapsed = stationaryElapsed;
+    const p = stationaryProgress;
+    const transitionScale = Math.min(1, Math.max(0.35, a.duration / 2));
     const liftEnd = 0.2 * transitionScale;
     const bendEnd = liftEnd + 0.24 * transitionScale;
     const chinEnd = bendEnd + 0.16 * transitionScale;
     const releaseDur = 0.2 * transitionScale;
-    const releaseStart = Math.max(chinEnd, active.duration - releaseDur);
-    const priorPose = evalCharAtTime(
-      active.startTime,
-      resolved.filter((a) => a.id !== active.id),
-      initX,
-      initY,
-      clips,
-      authoredAnimations,
-      hasFace,
-      faceAspect
-    );
+    const releaseStart = Math.max(chinEnd, a.duration - releaseDur);
+    const fallbackFacing: 1 | -1 = (a.targetX ?? a.fromX) >= a.fromX ? 1 : -1;
+    const priorPose = stationaryRuntime.didWalkIn
+      ? standingCharPose(a.fromX, a.fromY, fallbackFacing, time)
+      : evalCharAtTime(
+          a.startTime,
+          resolved.filter((action) => action.id !== a.id),
+          initX,
+          initY,
+          clips,
+          authoredAnimations,
+          hasFace,
+          faceAspect
+        );
     const facing = priorPose.facing ?? 1;
-    const standing = standingCharPose(active.fromX, active.fromY, facing, time);
-    const liftPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "lift", hasFace, faceAspect);
-    const bendPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "bend", hasFace, faceAspect);
-    const chinPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "chin", hasFace, faceAspect);
-    const holdPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "hold", hasFace, faceAspect);
+    const standing = standingCharPose(a.fromX, a.fromY, facing, time);
+    const liftPose = thinkingPoseBase(a.fromX, a.fromY, facing, time, a.id, elapsed, "lift", hasFace, faceAspect);
+    const bendPose = thinkingPoseBase(a.fromX, a.fromY, facing, time, a.id, elapsed, "bend", hasFace, faceAspect);
+    const chinPose = thinkingPoseBase(a.fromX, a.fromY, facing, time, a.id, elapsed, "chin", hasFace, faceAspect);
+    const holdPose = thinkingPoseBase(a.fromX, a.fromY, facing, time, a.id, elapsed, "hold", hasFace, faceAspect);
     let pose: CharPoseResult;
 
     if (elapsed < liftEnd) {
@@ -2423,18 +2579,18 @@ function evalCharAtTime(
     } else if (elapsed < releaseStart) {
       pose = holdPose;
     } else {
-      const releaseT = easeOutQuad((elapsed - releaseStart) / Math.max(0.001, active.duration - releaseStart));
+      const releaseT = easeOutQuad((elapsed - releaseStart) / Math.max(0.001, a.duration - releaseStart));
       pose = lerpCharPose(holdPose, standing, releaseT);
     }
 
-    const emojiAlpha = progress <= 0.2
-      ? progress / 0.2
-      : progress <= 0.8 ? 1
-      : Math.max(0, 1 - (progress - 0.8) / 0.2);
+    const emojiAlpha = p <= 0.2
+      ? p / 0.2
+      : p <= 0.8 ? 1
+      : Math.max(0, 1 - (p - 0.8) / 0.2);
     return {
       ...pose,
       airY: 0,
-      emojiText: active.emoji, emojiAlpha,
+      emojiText: a.emoji, emojiAlpha,
     };
   }
 
@@ -7490,7 +7646,7 @@ export default function Board2Page() {
       .filter((a) => {
         if (a.type === "emote") return !!a.emoji;
         if (a.type === "pointAt") return !!a.targetClipId && clipIds.has(a.targetClipId);
-        if (CHAR_TRAVEL_TYPES.has(a.type as CharacterAction["type"])) return !!a.targetClipId && clipIds.has(a.targetClipId);
+        if (actionCanChangeRestPosition(a.type as CharacterAction["type"])) return !!a.targetClipId && clipIds.has(a.targetClipId);
         return !a.targetClipId || clipIds.has(a.targetClipId);
       })
       .map((a) => {
@@ -11025,6 +11181,7 @@ export default function Board2Page() {
                         key={action.id}
                         data-charaction
                         data-actionid={action.id}
+                        title={characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
                         style={{
                           position: "absolute",
                           left: action.startTime * pxPerSec,
@@ -11122,6 +11279,7 @@ export default function Board2Page() {
                         key={action.id}
                         data-charaction
                         data-actionid={action.id}
+                        title={characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
                         style={{
                           position: "absolute",
                           left: action.startTime * pxPerSec,
