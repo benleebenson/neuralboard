@@ -14,6 +14,7 @@ import {
   deriveOccupancyWindows,
   occupancyWindowAt,
 } from "@/lib/character-camera";
+import { AI_FEATURES_ENABLED } from "./config";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -138,6 +139,22 @@ type CharacterBlockerTimeline = {
   initX: number;
   initY: number;
   entranceTime: number;
+};
+
+type LiveCommandKey = "walkTo" | "runTo" | "jumpTo" | "flip" | "grapple" | "zipline" | "skateTo" | "wallClimb" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "stop";
+
+type LiveCharacterRuntime = {
+  enabled: boolean;
+  startWallMs: number;
+  initX: number;
+  initY: number;
+  actions: CharacterAction[];
+  currentPose: CharPoseResult | null;
+  blendFromPose: CharPoseResult | null;
+  blendStartWallMs: number;
+  blendDuration: number;
+  lastStationaryAction: CharacterAction | null;
+  emoteIndex: number;
 };
 
 type CharTimelineDrag = {
@@ -706,6 +723,10 @@ const CHAR_HEAD_R_RAW = 20;
 const CHAR_ARM_RAW = 32;
 const CHAR_RELAX_ARM_A = 0.25;
 const CHAR_RELAX_FORE_A = 0.18;
+const LIVE_BLEND_SEC = 0.15;
+const LIVE_WALK_SPEED = 420;
+const LIVE_RUN_SPEED = 780;
+const LIVE_EMOTES = ["🤔", "💡", "❗", "😂"];
 const PULLUP_BAR_WIDTH = 180;
 const PULLUP_BAR_HEIGHT = 230;
 const PULLUP_GRIP_HALF_WIDTH = 32;
@@ -2597,6 +2618,32 @@ function evalCharAtTime(
   return idlePose(active.fromX, active.fromY);
 }
 
+function liveRuntimeSeconds(runtime: LiveCharacterRuntime, wallMs: number): number {
+  return Math.max(0, (wallMs - runtime.startWallMs) / 1000);
+}
+
+function liveResolvedActions(runtime: LiveCharacterRuntime, clips: Clip[]): ResolvedCharAction[] {
+  return resolveCharActions(runtime.actions, runtime.initX, runtime.initY, clips);
+}
+
+function evalLiveCharacterAtWallTime(
+  runtime: LiveCharacterRuntime,
+  wallMs: number,
+  clips: Clip[],
+  authoredAnimations: Record<string, AuthoredAnimation> = {},
+  hasFace = false,
+  faceAspect = 1
+): CharPoseResult {
+  const t = liveRuntimeSeconds(runtime, wallMs);
+  const resolved = liveResolvedActions(runtime, clips);
+  let pose = evalCharAtTime(t, resolved, runtime.initX, runtime.initY, clips, authoredAnimations, hasFace, faceAspect);
+  if (runtime.blendFromPose && runtime.blendStartWallMs > 0) {
+    const blendT = clamp((wallMs - runtime.blendStartWallMs) / Math.max(0.001, runtime.blendDuration * 1000), 0, 1);
+    if (blendT < 1) pose = lerpCharPose(runtime.blendFromPose, pose, blendT);
+  }
+  return pose;
+}
+
 function drawCharacterToCanvas(
   ctx: CanvasRenderingContext2D,
   time: number,
@@ -2611,12 +2658,13 @@ function drawCharacterToCanvas(
   clips: CharSurfaceClip[],
   entranceTime: number,
   authoredAnimations: Record<string, AuthoredAnimation> = {},
-  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null
+  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
+  poseOverride: CharPoseResult | null = null
 ) {
   if (!showChar || time < entranceTime) return;
   const hasFace = !!characterFace?.image;
   const faceAspect = clamp(characterFace?.aspect ?? 1, 0.75, 1.6);
-  const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
+  const p = poseOverride ?? evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
   const { facing } = p;
   const physique = physiqueAt(time, resolved);
   const isJacked = physique === "jacked";
@@ -3478,6 +3526,10 @@ export default function Board2Page() {
   const [faceCropSource, setFaceCropSource] = useState<{ url: string; name: string } | null>(null);
   const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
   const [faceCropPreview, setFaceCropPreview] = useState<{ url: string; aspect: number } | null>(null);
+  const [liveControlEnabled, setLiveControlEnabled] = useState(false);
+  const [liveCameraFollow, setLiveCameraFollow] = useState(true);
+  const [liveLegendOpen, setLiveLegendOpen] = useState(true);
+  const [liveHeldCommand, setLiveHeldCommand] = useState<LiveCommandKey | null>(null);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
@@ -3709,8 +3761,137 @@ export default function Board2Page() {
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const characterMode2Ref = useRef<"auto" | "manual">("auto");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
+  const liveControlEnabledRef = useRef(false);
+  const liveCameraFollowRef = useRef(true);
+  const liveHeldCommandRef = useRef<LiveCommandKey | null>(null);
+  const liveRafIdRef = useRef<number | null>(null);
+  const liveCameraRef = useRef<{ cameraX: number; cameraY: number; boardZoom: number } | null>(null);
+  const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
+  const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
+    c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
+    c2: { enabled: false, startWallMs: 0, initX: BOARD_W / 2 + 60, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
+  });
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
   const faceCropDragRef = useRef<{ mode: "move" | "resize"; corner?: FaceCropCorner; startX: number; startY: number; orig: typeof faceCrop; rectW: number; rectH: number } | null>(null);
+
+  const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
+    const placed = clipsRef.current.filter((c) => c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined && c.boardH !== undefined);
+    if (placed.length === 0) return { x: fallbackX, y: fallbackY };
+    const minX = Math.min(...placed.map((c) => c.boardX!));
+    const maxX = Math.max(...placed.map((c) => c.boardX! + c.boardW!));
+    const minY = Math.min(...placed.map((c) => c.boardY!));
+    const maxY = Math.max(...placed.map((c) => c.boardY! + c.boardH!));
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  }, []);
+
+  const livePoseFor = useCallback((id: CharacterId, wallMs = performance.now()): CharPoseResult => {
+    const runtime = liveCharactersRef.current[id];
+    const hasFace = id === "c2" ? !!(characterFace2Ref.current && characterFace2ImageRef.current) : !!(characterFaceRef.current && characterFaceImageRef.current);
+    const faceAspect = id === "c2" ? clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6) : clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
+    const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+    runtime.currentPose = pose;
+    return pose;
+  }, []);
+
+  const resetLiveRuntimeFor = useCallback((id: CharacterId, startPose?: CharPoseResult) => {
+    const now = performance.now();
+    const fallback = id === "c2" ? { x: charInitXRef.current + 60, y: charInitYRef.current } : { x: charInitXRef.current, y: charInitYRef.current };
+    const center = liveBoardCenter(fallback.x, fallback.y);
+    const pose = startPose ?? (id === "c2"
+      ? evalCharAtTime(playheadRef.current, resolvedCharActions2Ref.current, fallback.x, fallback.y, clipsRef.current, authoredAnimationsRef.current)
+      : evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, fallback.x, fallback.y, clipsRef.current, authoredAnimationsRef.current));
+    const startX = Number.isFinite(pose.boardX) ? pose.boardX : center.x;
+    const startY = Number.isFinite(pose.boardY) ? pose.boardY : resolveGroundY(center.x, center.y, clipsRef.current);
+    liveCharactersRef.current[id] = {
+      ...liveCharactersRef.current[id],
+      enabled: true,
+      startWallMs: now,
+      initX: startX,
+      initY: startY,
+      actions: [],
+      currentPose: standingCharPose(startX, startY, pose.facing ?? 1, now / 1000),
+      blendFromPose: null,
+      blendStartWallMs: 0,
+      blendDuration: LIVE_BLEND_SEC,
+      lastStationaryAction: null,
+    };
+  }, [liveBoardCenter]);
+
+  const boardPointFromClient = useCallback((clientX: number, clientY: number): { rawX: number; rawY: number; x: number; y: number; surface?: RequiredSurfaceClip } | null => {
+    const rect = boardContainerRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const rawX = (clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+    const rawY = (clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+    const snapped = snapToClipTop(rawX, rawY, clipsRef.current);
+    const surface = clipsRef.current
+      .find((c): c is Clip & RequiredSurfaceClip =>
+        isBoardSurface(c) &&
+        rawX >= c.boardX && rawX <= c.boardX + c.boardW &&
+        rawY >= c.boardY && rawY <= c.boardY + c.boardH
+      );
+    return { rawX, rawY, x: snapped.x, y: snapped.y, surface };
+  }, []);
+
+  const issueLiveAction = useCallback((id: CharacterId, command: LiveCommandKey, target?: { x: number; y: number; surface?: RequiredSurfaceClip }) => {
+    const now = performance.now();
+    let runtime = liveCharactersRef.current[id];
+    if (!runtime.enabled) {
+      resetLiveRuntimeFor(id);
+      runtime = liveCharactersRef.current[id];
+    }
+    const currentPose = livePoseFor(id, now);
+    const startX = currentPose.boardX;
+    const startY = resolveGroundY(startX, currentPose.boardY, clipsRef.current);
+    const t0 = 0;
+    const mk = (type: CharacterAction["type"], duration: number, tx = startX, ty = startY): CharacterAction => ({
+      id: generateId(),
+      type,
+      startTime: t0,
+      duration,
+      targetX: Math.round(tx),
+      targetY: Math.round(ty),
+      ...(type === "skateTo" && target?.surface?.id ? { targetClipId: target.surface.id } : {}),
+    });
+    const tx = target?.x ?? startX;
+    const ty = target?.y ?? startY;
+    const dist = Math.hypot(tx - startX, ty - startY);
+    let action: CharacterAction | null = null;
+
+    if (command === "stop") {
+      action = null;
+    } else if (command === "walkTo" || command === "runTo") {
+      const speed = command === "runTo" ? LIVE_RUN_SPEED : LIVE_WALK_SPEED;
+      action = mk("walkTo", clamp(dist / speed, 0.25, 4.5), tx, ty);
+    } else if (command === "jumpTo") action = mk("jumpTo", clamp(dist / 900, 0.7, 1.6), tx, ty);
+    else if (command === "flip") action = mk("flip", clamp(dist / 900, 0.8, 1.6), tx, ty);
+    else if (command === "grapple") action = mk("grapple", GRAPPLE_MANUAL_DURATION_SEC, tx, ty);
+    else if (command === "zipline") action = mk("zipline", clamp(dist / 650, 0.8, 2.5), tx, ty);
+    else if (command === "skateTo") action = mk("skateTo", Math.max(1.2, Math.min(4.5, dist / SKATE_ROLL_SPEED + 0.8)), tx, ty);
+    else if (command === "wallClimb") action = mk("wallClimb", clamp(Math.abs(ty - startY) / 350 + 0.8, 0.9, 2.8), tx, ty);
+    else if (command === "dance") action = mk("dance", 2.5);
+    else if (command === "pullUps") action = mk("pullUps", 4);
+    else if (command === "mirrorCheck") action = mk("mirrorCheck", 5);
+    else if (command === "sitAndWatch") action = mk("sitAndWatch", 3600);
+    else if (command === "emote") {
+      const emoji = LIVE_EMOTES[runtime.emoteIndex % LIVE_EMOTES.length];
+      action = { ...mk("emote", 2), emoji };
+      runtime.emoteIndex += 1;
+    }
+
+    liveCharactersRef.current[id] = {
+      ...runtime,
+      enabled: true,
+      startWallMs: now,
+      initX: startX,
+      initY: startY,
+      actions: action ? [action] : [],
+      currentPose,
+      blendFromPose: currentPose,
+      blendStartWallMs: now,
+      blendDuration: LIVE_BLEND_SEC,
+      lastStationaryAction: action && CHAR_STATIONARY_TARGET_TYPES.has(action.type) ? action : null,
+    };
+  }, [livePoseFor, resetLiveRuntimeFor]);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
@@ -3821,6 +4002,9 @@ export default function Board2Page() {
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
+  useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
+  useEffect(() => { liveCameraFollowRef.current = liveCameraFollow; }, [liveCameraFollow]);
+  useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
@@ -3946,6 +4130,93 @@ export default function Board2Page() {
   }, [toast]);
 
   useEffect(() => {
+    if (!liveControlEnabled) return;
+    const isTyping = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      return !!el.closest("input, textarea, select, [contenteditable='true']");
+    };
+    const keyToCommand = (key: string): LiveCommandKey | null => {
+      const k = key.toLowerCase();
+      if (k === "w") return "walkTo";
+      if (k === "r") return "runTo";
+      if (k === "j") return "jumpTo";
+      if (k === "f") return "flip";
+      if (k === "g") return "grapple";
+      if (k === "z") return "zipline";
+      if (k === "s") return "skateTo";
+      if (k === "c") return "wallClimb";
+      if (k === "d") return "dance";
+      if (k === "p") return "pullUps";
+      if (k === "m") return "mirrorCheck";
+      if (k === "t") return "sitAndWatch";
+      if (k === "e") return "emote";
+      if (k === "x") return "stop";
+      return null;
+    };
+    const tapCommands = new Set<LiveCommandKey>(["dance", "pullUps", "mirrorCheck", "sitAndWatch", "emote", "stop"]);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isTyping(e.target)) return;
+      if (e.key === "1" || e.key === "2" || e.key === "Tab") {
+        e.preventDefault();
+        const next: CharacterId = e.key === "1" ? "c1" : e.key === "2" ? "c2" : activeCharacterIdRef.current === "c1" ? "c2" : "c1";
+        if (next === "c2") setShowCharacter2(true);
+        setActiveCharacterId(next);
+        resetLiveRuntimeFor(next);
+        return;
+      }
+      const cmd = keyToCommand(e.key);
+      if (!cmd || e.repeat) return;
+      e.preventDefault();
+      if (tapCommands.has(cmd)) {
+        issueLiveAction(activeCharacterIdRef.current, cmd);
+        setLiveHeldCommand(null);
+      } else {
+        setLiveHeldCommand(cmd);
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (isTyping(e.target)) return;
+      const cmd = keyToCommand(e.key);
+      if (cmd && liveHeldCommandRef.current === cmd) setLiveHeldCommand(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [liveControlEnabled, issueLiveAction, resetLiveRuntimeFor]);
+
+  useEffect(() => {
+    if (!liveControlEnabled) {
+      if (liveRafIdRef.current !== null) cancelAnimationFrame(liveRafIdRef.current);
+      liveRafIdRef.current = null;
+      liveHeldCommandRef.current = null;
+      liveCameraRef.current = null;
+      drawFrameRef.current(playheadRef.current);
+      return;
+    }
+    isPlayingRef.current = false;
+    resetLiveRuntimeFor("c1");
+    if (showCharacter2Ref.current) resetLiveRuntimeFor("c2");
+    const loop = () => {
+      const t = playheadRef.current;
+      drawFrameRef.current(t);
+      evaluateVideoPlaybackStatesRef.current?.(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, {
+        audioMode: "silent",
+        overrideCamera: liveCameraRef.current,
+      });
+      liveRafIdRef.current = requestAnimationFrame(loop);
+    };
+    liveRafIdRef.current = requestAnimationFrame(loop);
+    return () => {
+      if (liveRafIdRef.current !== null) cancelAnimationFrame(liveRafIdRef.current);
+      liveRafIdRef.current = null;
+    };
+  }, [liveControlEnabled, resetLiveRuntimeFor]);
+
+  useEffect(() => {
     return () => {
       if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -4031,11 +4302,13 @@ export default function Board2Page() {
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number,
-    currentAnnotations: Annotation[]
+    currentAnnotations: Annotation[],
+    overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null,
+    liveWallMs?: number
   ) => {
     ctx.fillStyle = "#f5ecd8";
     ctx.fillRect(0, 0, W, H);
-    const cam = interpolateCameraKeyframes(currentCameraKeyframes, time);
+    const cam = overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
     const sf = cam.boardZoom * W / BOARD_W;
     const sortedClips = [...currentClips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
     for (const clip of sortedClips) {
@@ -4097,7 +4370,41 @@ export default function Board2Page() {
       }
     }
     ctx.globalAlpha = 1;
-    if (showCharacterRef.current) {
+    const liveMode = liveControlEnabledRef.current;
+    if (liveMode) {
+      const wallMs = liveWallMs ?? performance.now();
+      const live = liveCharactersRef.current;
+      if (live.c1.enabled) {
+        const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
+        const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
+        const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+        live.c1.currentPose = pose;
+        drawCharacterToCanvas(
+          ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current), true,
+          cam, sf, W, H, live.c1.initX, live.c1.initY,
+          clipsRef.current, -Infinity, authoredAnimationsRef.current,
+          characterFaceRef.current && characterFaceImageRef.current
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+            : null,
+          pose
+        );
+      }
+      if (live.c2.enabled) {
+        const hasFace = !!(characterFace2Ref.current && characterFace2ImageRef.current);
+        const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
+        const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+        live.c2.currentPose = pose;
+        drawCharacterToCanvas(
+          ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current), true,
+          cam, sf, W, H, live.c2.initX, live.c2.initY,
+          clipsRef.current, -Infinity, authoredAnimationsRef.current,
+          characterFace2Ref.current && characterFace2ImageRef.current
+            ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
+            : null,
+          pose
+        );
+      }
+    } else if (showCharacterRef.current) {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, showCharacterRef.current,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
@@ -4107,7 +4414,7 @@ export default function Board2Page() {
           : null
       );
     }
-    if (showCharacter2Ref.current) {
+    if (!liveMode && showCharacter2Ref.current) {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActions2Ref.current, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
@@ -4129,7 +4436,37 @@ export default function Board2Page() {
     if (!ctx) return;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current);
+    let liveCam: { cameraX: number; cameraY: number; boardZoom: number } | null = null;
+    if (liveControlEnabledRef.current) {
+      const live = liveCharactersRef.current[activeCharacterIdRef.current];
+      const pose = live.currentPose;
+      if (liveCameraFollowRef.current && pose) {
+        const target = {
+          cameraX: pose.boardX,
+          cameraY: pose.boardY - 80,
+          boardZoom: clamp(canvasHRef.current * BOARD_W / (canvasWRef.current * 380), 0.35, 2.4),
+        };
+        const prev = liveCameraRef.current ?? target;
+        liveCam = {
+          cameraX: lerp(prev.cameraX, target.cameraX, 0.14),
+          cameraY: lerp(prev.cameraY, target.cameraY, 0.14),
+          boardZoom: lerp(prev.boardZoom, target.boardZoom, 0.12),
+        };
+      } else {
+        const rect = boardContainerRef.current?.getBoundingClientRect();
+        if (rect && rect.width > 0 && rect.height > 0) {
+          liveCam = {
+            cameraX: (rect.width / 2 - boardPanRef.current.x) / Math.max(0.001, boardZoomRef.current),
+            cameraY: (rect.height / 2 - boardPanRef.current.y) / Math.max(0.001, boardZoomRef.current),
+            boardZoom: clamp(BOARD_W * boardZoomRef.current / Math.max(1, rect.width), 0.05, 3),
+          };
+        } else {
+          liveCam = liveCameraRef.current ?? interpolateCameraKeyframes(cameraKeyframesRef.current, playheadRef.current);
+        }
+      }
+      liveCameraRef.current = liveCam;
+    }
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current, liveCam);
   }, [renderToCtx]);
 
   useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
@@ -4291,7 +4628,7 @@ export default function Board2Page() {
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number,
-    options: { force?: boolean; audioMode?: "preview" | "silent" } = {}
+    options: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null } = {}
   ) {
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
@@ -4308,7 +4645,7 @@ export default function Board2Page() {
       if (!ambientVideoEnabledRef.current) {
         ambientCandidateIdsRef.current = new Set();
       } else {
-        const cam = interpolateCameraKeyframes(currentCameraKeyframes, time);
+        const cam = options.overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
         const ambientSlots = Math.max(0, AMBIENT_BUDGET - activeIds.size);
         const candidates = videoClips
           .filter((clip) => !activeIds.has(clip.id))
@@ -4389,6 +4726,10 @@ export default function Board2Page() {
       lastAmbientCensusAtRef.current = now;
     }
   }
+
+  useEffect(() => {
+    evaluateVideoPlaybackStatesRef.current = evaluateVideoPlaybackStates;
+  });
 
   // Warms up a freshly created video element's decoder with a silent play()→pause() cycle so
   // its first "real" entry (restart-on-entry, Step 16.10) already has a decoded frame ready to
@@ -8101,6 +8442,7 @@ export default function Board2Page() {
   // ─── Neural Search modal ────────────────────────────────────────────────────
 
   function renderNeuralSearchModal() {
+    if (!AI_FEATURES_ENABLED) return null;
     if (!neuralModalOpen) return null;
     return (
       <div
@@ -8177,6 +8519,7 @@ export default function Board2Page() {
   // ─── Top 5 Neural Search modal ──────────────────────────────────────────────
 
   function renderTop5Modal() {
+    if (!AI_FEATURES_ENABLED) return null;
     if (!top5ModalOpen) return null;
     return (
       <div
@@ -8335,6 +8678,15 @@ export default function Board2Page() {
 
   // Mobile Top 5 Tinder flow — takes over the entire mobile experience.
   // mobileDesktopOverride lets the user escape to the desktop UI.
+  if (isMobile && !mobileDesktopOverride && !AI_FEATURES_ENABLED) {
+    return (
+      <div style={{ position: "fixed", inset: 0, background: "#f5ecd8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace", padding: 28, textAlign: "center" }}>
+        <div style={{ fontSize: 17, fontWeight: 700, color: "#2a2a2a" }}>Open Neural Board on desktop</div>
+        <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 10, lineHeight: 1.6 }}>The mobile AI flow is currently hidden while AI features are disabled.</div>
+      </div>
+    );
+  }
+
   if (isMobile && !mobileDesktopOverride) {
     return renderMobileTop5Flow();
   }
@@ -8469,7 +8821,7 @@ export default function Board2Page() {
             })}
 
             {/* Neural Search placeholders — not yet downloaded, tap to trim & add */}
-            {neuralPlaceholders.map((ph) => (
+            {AI_FEATURES_ENABLED && neuralPlaceholders.map((ph) => (
               <div
                 key={ph.id}
                 style={{
@@ -8506,7 +8858,7 @@ export default function Board2Page() {
             ))}
 
             {/* Neural Search image placeholders — not yet downloaded, tap to preview & add */}
-            {imagePlaceholders.map((ph) => (
+            {AI_FEATURES_ENABLED && imagePlaceholders.map((ph) => (
               <div
                 key={ph.id}
                 style={{
@@ -8547,7 +8899,7 @@ export default function Board2Page() {
             ))}
           </div>
 
-          {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && imagePlaceholders.length === 0 && (
+          {clips.filter((c) => c.boardX !== undefined).length === 0 && (!AI_FEATURES_ENABLED || (neuralPlaceholders.length === 0 && imagePlaceholders.length === 0)) && (
             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
               <span style={{ fontFamily: "monospace", fontSize: 10, color: "rgba(42,42,42,0.35)", textAlign: "center" }}>Tap ≡ to add media</span>
             </div>
@@ -8731,22 +9083,22 @@ export default function Board2Page() {
                     <button onClick={() => { addCharacterZoomClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_ZOOM_CLIP_COLOR }}>
                       ◎  Zoom on character
                     </button>
-                    <ProGated featureName="Neural Search">
+                    {AI_FEATURES_ENABLED && <ProGated featureName="Neural Search">
                       <button
                         onClick={() => { setNeuralModalOpen(true); setNeuralConcept(""); setNeuralError(""); setNeuralPhase(null); setMobileDrawer(null); }}
                         style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: "#e4cfff" }}
                       >
                         🔮  Neural Search
                       </button>
-                    </ProGated>
-                    <ProGated featureName="Top 5 Neural Search">
+                    </ProGated>}
+                    {AI_FEATURES_ENABLED && <ProGated featureName="Top 5 Neural Search">
                       <button
                         onClick={() => { setTop5ModalOpen(true); setTop5Concept(""); setTop5Error(""); setTop5Phase(null); setMobileDrawer(null); }}
                         style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: "#fef3c7" }}
                       >
                         🏆  Top 5
                       </button>
-                    </ProGated>
+                    </ProGated>}
                     <ProGated featureName="Narration Recording">
                       <button
                         onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
@@ -9424,23 +9776,23 @@ export default function Board2Page() {
               ▶ Add YouTube
             </button>
 
-            <ProGated featureName="Neural Search">
+            {AI_FEATURES_ENABLED && <ProGated featureName="Neural Search">
               <button
                 onClick={() => { setNeuralModalOpen(true); setNeuralConcept(""); setNeuralError(""); setNeuralPhase(null); }}
                 style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", background: "#e4cfff" }}
               >
                 🔮 Neural Search
               </button>
-            </ProGated>
+            </ProGated>}
 
-            <ProGated featureName="Top 5 Neural Search">
+            {AI_FEATURES_ENABLED && <ProGated featureName="Top 5 Neural Search">
               <button
                 onClick={() => { setTop5ModalOpen(true); setTop5Concept(""); setTop5Error(""); setTop5Phase(null); }}
                 style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", background: "#fef3c7" }}
               >
                 🏆 Top 5
               </button>
-            </ProGated>
+            </ProGated>}
 
             <ProGated featureName="Narration Recording">
               <button
@@ -9479,7 +9831,7 @@ export default function Board2Page() {
 
             <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
 
-            <ProGated featureName="AI Annotation Generation">
+            {AI_FEATURES_ENABLED && <ProGated featureName="AI Annotation Generation">
               {(() => {
                 const hasBoardClips = clips.filter((c) => c.boardX !== undefined).length > 0;
                 const hasNarration = clips.some((c) => c.type === "narration");
@@ -9528,7 +9880,7 @@ export default function Board2Page() {
                   </>
                 );
               })()}
-            </ProGated>
+            </ProGated>}
 
             <input
               ref={mediaUploadRef}
@@ -9653,7 +10005,7 @@ export default function Board2Page() {
                 })}
 
                 {/* Neural Search placeholders — not yet downloaded, click to trim & add */}
-                {neuralPlaceholders.map((ph) => (
+                {AI_FEATURES_ENABLED && neuralPlaceholders.map((ph) => (
                   <div
                     key={ph.id}
                     style={{
@@ -9705,7 +10057,7 @@ export default function Board2Page() {
                 ))}
 
                 {/* Neural Search image placeholders — not yet downloaded, click to preview & add */}
-                {imagePlaceholders.map((ph) => (
+                {AI_FEATURES_ENABLED && imagePlaceholders.map((ph) => (
                   <div
                     key={ph.id}
                     style={{
@@ -9938,7 +10290,7 @@ export default function Board2Page() {
               </div>
 
               {/* Empty state */}
-              {clips.filter((c) => c.boardX !== undefined).length === 0 && neuralPlaceholders.length === 0 && imagePlaceholders.length === 0 && (
+              {clips.filter((c) => c.boardX !== undefined).length === 0 && (!AI_FEATURES_ENABLED || (neuralPlaceholders.length === 0 && imagePlaceholders.length === 0)) && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
                   <span style={{ fontFamily: "monospace", fontSize: 11, color: "rgba(42,42,42,0.4)" }}>
                     Upload images or videos to auto-add to the board
@@ -10371,6 +10723,53 @@ export default function Board2Page() {
                   }}
                 />
               )}
+
+              {liveControlEnabled && liveHeldCommand && (
+                <div
+                  style={{ position: "absolute", inset: 0, cursor: "crosshair", zIndex: 31 }}
+                  title={`${liveHeldCommand}: click a board target`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const target = boardPointFromClient(e.clientX, e.clientY);
+                    if (!target) return;
+                    const liveTarget = liveHeldCommand === "wallClimb" && target.surface
+                      ? {
+                          ...target,
+                          x: target.rawX < target.surface.boardX + target.surface.boardW / 2
+                            ? target.surface.boardX + 40
+                            : target.surface.boardX + target.surface.boardW - 40,
+                          y: target.surface.boardY,
+                        }
+                      : target;
+                    issueLiveAction(activeCharacterIdRef.current, liveHeldCommand, liveTarget);
+                    setLiveHeldCommand(null);
+                  }}
+                />
+              )}
+
+              {liveControlEnabled && (
+                <div style={{ position: "absolute", left: 10, bottom: 10, zIndex: 32, width: liveLegendOpen ? 260 : "auto", background: "rgba(255,253,245,0.94)", border: "1.5px solid #2a2a2a", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a", pointerEvents: "auto" }}>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); setLiveLegendOpen((v) => !v); }}
+                    style={{ width: "100%", border: "none", borderBottom: liveLegendOpen ? "1px solid rgba(42,42,42,0.25)" : "none", background: "#2a2a2a", color: CHARACTER_COLOR, fontFamily: "monospace", fontSize: 10, fontWeight: 700, padding: "5px 7px", textAlign: "left", cursor: "pointer" }}
+                  >
+                    🎮 Live Control {liveLegendOpen ? "▲" : "▼"} {liveHeldCommand ? `— ${liveHeldCommand}: click target` : ""}
+                  </button>
+                  {liveLegendOpen && (
+                    <div style={{ padding: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 8px", lineHeight: 1.35 }}>
+                      <span>W+click Walk</span><span>R+click Run</span>
+                      <span>J+click Jump</span><span>F+click Flip</span>
+                      <span>G+click Grapple</span><span>Z+click Zip</span>
+                      <span>S+click Skate</span><span>C+click Climb</span>
+                      <span>D Dance</span><span>P Pull-ups</span>
+                      <span>M Mirror</span><span>T Sit</span>
+                      <span>E Emote</span><span>X Stop</span>
+                      <span>1/2 or Tab switch</span><span>{activeCharacterId === "c2" ? "Active: C2" : "Active: C1"}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Preview overlay — resizable PiP, top-right */}
@@ -10605,6 +11004,37 @@ export default function Board2Page() {
                       >
                         {activeCharacter.enabled ? "● Show Character" : "○ Show Character"}
                       </button>
+                      <ProGated featureName="Live Character Control">
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: liveControlEnabled ? "#f0ffe0" : "transparent" }}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setLiveHeldCommand(null);
+                              if (!liveControlEnabled) {
+                                if (activeCharacterId === "c2") setShowCharacter2(true); else setShowCharacter(true);
+                                setCharacterPanelOpen(true);
+                                setIsPlaying(false);
+                                isPlayingRef.current = false;
+                              }
+                              setLiveControlEnabled((v) => !v);
+                            }}
+                            style={{ ...miniButton, background: liveControlEnabled ? "#2a2a2a" : "transparent", color: liveControlEnabled ? CHARACTER_COLOR : "#2a2a2a", fontWeight: 700 }}
+                          >
+                            🎮 Live Control {liveControlEnabled ? "ON" : "OFF"}
+                          </button>
+                          {liveControlEnabled && (
+                            <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+                              <input
+                                type="checkbox"
+                                checked={liveCameraFollow}
+                                onChange={(e) => setLiveCameraFollow(e.target.checked)}
+                                style={{ margin: 0, accentColor: "#c8f135" }}
+                              />
+                              Camera follows character
+                            </label>
+                          )}
+                        </div>
+                      </ProGated>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button
                           type="button"
@@ -10691,7 +11121,7 @@ export default function Board2Page() {
                         <ProGated featureName="Pose Lab">
                           <button type="button" onClick={() => { window.location.href = "/board2/poselab"; }} style={{ ...miniButton, padding: "4px 6px" }}>🎭 Pose Lab</button>
                         </ProGated>
-                        <button
+                        {AI_FEATURES_ENABLED && <button
                           type="button"
                           onClick={() => {
                             setDirectCharacterOpen((v) => {
@@ -10703,8 +11133,8 @@ export default function Board2Page() {
                           style={{ ...miniButton, padding: "4px 6px", background: directCharacterOpen ? "#2a2a2a" : "transparent", color: directCharacterOpen ? CHARACTER_COLOR : "#2a2a2a" }}
                         >
                           ✨ Direct
-                        </button>
-                        {activeCharacter.actions.some((a) => a.aiGenerated) && (
+                        </button>}
+                        {AI_FEATURES_ENABLED && activeCharacter.actions.some((a) => a.aiGenerated) && (
                           <button type="button" onClick={() => updateCharacterActionsFor(activeCharacterId, (prev) => prev.filter((a) => !a.aiGenerated))} style={{ ...miniButton, padding: "4px 6px" }}>
                             🧹 Clear AI
                           </button>
@@ -11775,7 +12205,7 @@ export default function Board2Page() {
       )}
 
       {/* AI Annotation Modal */}
-      {directCharacterOpen && (
+      {AI_FEATURES_ENABLED && directCharacterOpen && (
         <div
           onClick={(e) => { if (e.target === e.currentTarget && !choreoPhase) setDirectCharacterOpen(false); }}
           style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}
@@ -11859,7 +12289,7 @@ export default function Board2Page() {
         </div>
       )}
 
-      {aiModalOpen && (
+      {AI_FEATURES_ENABLED && aiModalOpen && (
         <div
           onClick={(e) => { if (e.target === e.currentTarget && !aiPhase) setAiModalOpen(false); }}
           style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { AI_FEATURES_ENABLED } from "@/app/board2/config";
 import { authOptions, isUserPro } from "@/lib/auth";
 import { logApiCost } from "@/lib/supabase";
 
@@ -75,6 +76,10 @@ OUTPUT: Return ONLY valid JSON with this exact schema — no markdown, no explan
 
 export async function POST(req: NextRequest) {
   try {
+    if (!AI_FEATURES_ENABLED) {
+      return NextResponse.json({ error: "AI features disabled" }, { status: 404 });
+    }
+
     const session = await getServerSession(authOptions);
     if (!session?.user?.email) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

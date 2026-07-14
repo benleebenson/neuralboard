@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { AI_FEATURES_ENABLED } from "@/app/board2/config";
 import { authOptions, isUserPro } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -150,6 +151,10 @@ function mergeAndRankVideos(results: RawSearchResult[][], maxVideos: number) {
 }
 
 export async function POST(req: NextRequest) {
+  if (!AI_FEATURES_ENABLED) {
+    return NextResponse.json({ error: "AI features disabled" }, { status: 404 });
+  }
+
   const session = await getServerSession(authOptions);
   if (!session?.user?.email) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
