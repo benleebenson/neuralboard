@@ -704,6 +704,8 @@ const CHAR_TORSO_RAW = 53;
 const CHAR_NECK_RAW = 12;
 const CHAR_HEAD_R_RAW = 20;
 const CHAR_ARM_RAW = 32;
+const CHAR_RELAX_ARM_A = 0.25;
+const CHAR_RELAX_FORE_A = 0.18;
 const PULLUP_BAR_WIDTH = 180;
 const PULLUP_BAR_HEIGHT = 230;
 const PULLUP_GRIP_HALF_WIDTH = 32;
@@ -1593,10 +1595,10 @@ function standingCharPose(boardX: number, boardY: number, facing: 1 | -1, time: 
     headTilt: 0,
     leftLegA: 0.12,
     rightLegA: -0.12,
-    leftArmA: 0.08,
-    rightArmA: -0.08,
-    leftForeA: 0.13,
-    rightForeA: -0.13,
+    leftArmA: CHAR_RELAX_ARM_A,
+    rightArmA: -CHAR_RELAX_ARM_A,
+    leftForeA: CHAR_RELAX_FORE_A,
+    rightForeA: -CHAR_RELAX_FORE_A,
     airY: 0,
   };
 }
@@ -1725,17 +1727,15 @@ function evalCharAtTime(
   faceAspect = 1
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
-  // Legs +0.12/-0.12 (feet slightly apart), upper arms +0.08/-0.08 (hanging at sides), forearms
-  // continue the same line with +0.05 additional bend. Body lean 0, no rotation. The idle bob below
-  // is a headBob/breathing offset ONLY — it never touches arm/leg angles.
+  // Relaxed arms stay visibly away from the torso; the idle bob below is head/breathing only.
   const idlePose = (rx: number, ry: number): CharPoseResult => {
     const t = time * 2;
     return {
       boardX: rx, boardY: ry, facing: 1,
       headBob: Math.sin(t) * 2, bodyLean: 0,
       leftLegA: 0.12, rightLegA: -0.12,
-      leftArmA: 0.08, rightArmA: -0.08,
-      leftForeA: 0.13, rightForeA: -0.13,
+      leftArmA: CHAR_RELAX_ARM_A, rightArmA: -CHAR_RELAX_ARM_A,
+      leftForeA: CHAR_RELAX_FORE_A, rightForeA: -CHAR_RELAX_FORE_A,
       airY: 0,
     };
   };
@@ -1821,10 +1821,10 @@ function evalCharAtTime(
       const t = (progress - 0.75) / 0.25;
       leftLegA  = lerp(-0.55, 0.25, t);
       rightLegA = lerp(-0.45, 0.15, t);
-      leftArmA  = lerp(-0.5,  0.4,  t);
-      rightArmA = lerp(-0.5, -0.4,  t);
-      leftForeA  = lerp(-0.3, 0, t);
-      rightForeA = lerp(-0.3, 0, t);
+      leftArmA  = lerp(-0.5,  CHAR_RELAX_ARM_A,  t);
+      rightArmA = lerp(-0.5, -CHAR_RELAX_ARM_A,  t);
+      leftForeA  = lerp(-0.3, CHAR_RELAX_FORE_A, t);
+      rightForeA = lerp(-0.3, -CHAR_RELAX_FORE_A, t);
     }
 
     return applyAuthoredPose({
@@ -1943,8 +1943,8 @@ function evalCharAtTime(
       boardX: bx, boardY: by, facing: plan.facing,
       headBob: 0, bodyLean: skateBodyLean,
       leftLegA: 0.12, rightLegA: -0.12,
-      leftArmA: 0.08, rightArmA: -0.08,
-      leftForeA: 0.13, rightForeA: -0.13,
+      leftArmA: CHAR_RELAX_ARM_A, rightArmA: -CHAR_RELAX_ARM_A,
+      leftForeA: CHAR_RELAX_FORE_A, rightForeA: -CHAR_RELAX_FORE_A,
       airY,
       skateboardVisible,
       skateFootMode,
@@ -1974,8 +1974,8 @@ function evalCharAtTime(
     let by = active.fromY;
     let bodyLean = 0;
     let leftLegA = 0.12, rightLegA = -0.12;
-    let leftArmA = 0.08, rightArmA = -0.08;
-    let leftForeA = 0.13, rightForeA = -0.13;
+    let leftArmA = CHAR_RELAX_ARM_A, rightArmA = -CHAR_RELAX_ARM_A;
+    let leftForeA = CHAR_RELAX_FORE_A, rightForeA = -CHAR_RELAX_FORE_A;
     let headBob = 0;
     let ropeAlpha = 0;
     let hookT: number | undefined;
@@ -2063,8 +2063,8 @@ function evalCharAtTime(
       bodyLean = lerp(-0.18, 0, t) * facing;
       leftLegA = lerp(-0.72, 0.12, t); rightLegA = lerp(-0.62, -0.12, t);
       leftForeA = lerp(0.65, 0.13, t); rightForeA = lerp(0.62, -0.13, t);
-      setFiringArm(lerp(0.05, -0.08, t), lerp(0.1, -0.13, t));
-      setFreeArm(lerp(-0.2, 0.08, t), lerp(-0.1, 0.13, t));
+      setFiringArm(lerp(0.05, -CHAR_RELAX_ARM_A, t), lerp(0.1, -CHAR_RELAX_FORE_A, t));
+      setFreeArm(lerp(-0.2, CHAR_RELAX_ARM_A, t), lerp(-0.1, CHAR_RELAX_FORE_A, t));
       impact = Math.max(0, 1 - t * 1.3);
     }
 
@@ -2164,10 +2164,10 @@ function evalCharAtTime(
     let rightLegA = -0.12;
     let leftShinA: number | undefined;
     let rightShinA: number | undefined;
-    let leftArmA = 0.08;
-    let rightArmA = -0.08;
-    let leftForeA = 0.13;
-    let rightForeA = -0.13;
+    let leftArmA = CHAR_RELAX_ARM_A;
+    let rightArmA = -CHAR_RELAX_ARM_A;
+    let leftForeA = CHAR_RELAX_FORE_A;
+    let rightForeA = -CHAR_RELAX_FORE_A;
     let popcornAlpha = 0;
     let popcornX = 40;
     let popcornY = 72;
@@ -2203,8 +2203,8 @@ function evalCharAtTime(
       rightLegA = lerp(-0.12, -0.32, t);
       leftShinA = lerp(0.18, 0.42, t);
       rightShinA = lerp(-0.18, -0.42, t);
-      leftArmA = 0.08;
-      rightArmA = -0.08;
+      leftArmA = CHAR_RELAX_ARM_A;
+      rightArmA = -CHAR_RELAX_ARM_A;
       popcornAlpha = t;
       popcornX = 40;
       popcornY = 72;
@@ -2217,10 +2217,10 @@ function evalCharAtTime(
       leftShinA = lerp(0.42, -0.88, t);
       rightShinA = lerp(-0.42, 0.82, t);
       const reachBack = solveArmToLocalPoint(-24, 22, -1);
-      leftArmA = lerp(0.08, reachBack.armA, t);
-      leftForeA = lerp(0.13, reachBack.foreA, t);
-      rightArmA = lerp(-0.08, -0.28, t);
-      rightForeA = lerp(-0.13, -0.1, t);
+      leftArmA = lerp(CHAR_RELAX_ARM_A, reachBack.armA, t);
+      leftForeA = lerp(CHAR_RELAX_FORE_A, reachBack.foreA, t);
+      rightArmA = lerp(-CHAR_RELAX_ARM_A, -0.28, t);
+      rightForeA = lerp(-CHAR_RELAX_FORE_A, -0.1, t);
       popcornAlpha = 1;
       popcornX = lerp(40, 16, t);
       popcornY = lerp(72, 8, t);
@@ -2242,10 +2242,10 @@ function evalCharAtTime(
       leftShinA = lerp(-0.88, 0.12, t);
       rightShinA = lerp(0.82, -0.12, t);
       const pushHand = solveArmToLocalPoint(-24, 22, -1);
-      leftArmA = lerp(pushHand.armA, 0.08, t);
-      rightArmA = lerp(0.2, -0.08, t);
-      leftForeA = lerp(pushHand.foreA, 0.13, t);
-      rightForeA = lerp(0.1, -0.13, t);
+      leftArmA = lerp(pushHand.armA, CHAR_RELAX_ARM_A, t);
+      rightArmA = lerp(0.2, -CHAR_RELAX_ARM_A, t);
+      leftForeA = lerp(pushHand.foreA, CHAR_RELAX_FORE_A, t);
+      rightForeA = lerp(0.1, -CHAR_RELAX_FORE_A, t);
       popcornAlpha = Math.max(0, 1 - t * 1.4);
       popcornX = lerp(16, 40, t);
       popcornY = lerp(8, 72, t);
@@ -2282,10 +2282,10 @@ function evalCharAtTime(
     const spreadCycle = time % 4.3;
     const spread = Math.max(0, 1 - Math.abs(spreadCycle - 2.0) / 0.5);
 
-    const leftArmA = 0.15 + lRaise * 0.95 + spread * 0.35;
-    const rightArmA = -0.15 - rRaise * 0.95 - spread * 0.35;
-    const leftForeA = 0.15 + lRaise * 0.35 + spread * 0.15;
-    const rightForeA = -0.15 - rRaise * 0.35 - spread * 0.15;
+    const leftArmA = CHAR_RELAX_ARM_A + lRaise * 0.95 + spread * 0.35;
+    const rightArmA = -CHAR_RELAX_ARM_A - rRaise * 0.95 - spread * 0.35;
+    const leftForeA = CHAR_RELAX_FORE_A + lRaise * 0.35 + spread * 0.15;
+    const rightForeA = -CHAR_RELAX_FORE_A - rRaise * 0.35 - spread * 0.15;
 
     return applyAuthoredPose({
       boardX: active.fromX, boardY: active.fromY, facing: 1,
@@ -2328,10 +2328,10 @@ function evalCharAtTime(
       rightLegA = Math.sin(t * Math.PI * 2 + Math.PI) * 0.2;
       legBackBend = lerp(0.1, 0.25, reach);
       arms = {
-        leftArmA: lerp(0.08, -0.75, reach),
-        rightArmA: lerp(-0.08, 0.75, reach),
-        leftForeA: lerp(0.13, -0.35, reach),
-        rightForeA: lerp(-0.13, 0.35, reach),
+        leftArmA: lerp(CHAR_RELAX_ARM_A, -0.75, reach),
+        rightArmA: lerp(-CHAR_RELAX_ARM_A, 0.75, reach),
+        leftForeA: lerp(CHAR_RELAX_FORE_A, -0.35, reach),
+        rightForeA: lerp(-CHAR_RELAX_FORE_A, 0.35, reach),
       };
     } else if (p < HANG_END) {
       const t = easeInOutCubic((p - APPROACH_END) / (HANG_END - APPROACH_END));
@@ -2358,10 +2358,10 @@ function evalCharAtTime(
       const t = easeInOutCubic((p - DISMOUNT_START) / (1 - DISMOUNT_START));
       airY = lerp(-40, 0, t);
       arms = t < 0.35 ? pullUpArmPose(airY) : {
-        leftArmA: lerp(-0.45, 0.08, (t - 0.35) / 0.65),
-        rightArmA: lerp(0.45, -0.08, (t - 0.35) / 0.65),
-        leftForeA: lerp(-0.2, 0.13, (t - 0.35) / 0.65),
-        rightForeA: lerp(0.2, -0.13, (t - 0.35) / 0.65),
+        leftArmA: lerp(-0.45, CHAR_RELAX_ARM_A, (t - 0.35) / 0.65),
+        rightArmA: lerp(0.45, -CHAR_RELAX_ARM_A, (t - 0.35) / 0.65),
+        leftForeA: lerp(-0.2, CHAR_RELAX_FORE_A, (t - 0.35) / 0.65),
+        rightForeA: lerp(0.2, -CHAR_RELAX_FORE_A, (t - 0.35) / 0.65),
       };
       const absorb = Math.sin(Math.PI * t);
       if (t < 0.58) {
@@ -2433,10 +2433,10 @@ function evalCharAtTime(
       surpriseAlpha = Math.max(0, 1 - Math.abs(t - 0.35) / 0.35);
       pose.headTilt = lerp(0, 0.13, easeOutQuad(t));
       pose.headBob = -Math.sin(Math.PI * t) * 4;
-      pose.leftArmA = lerp(0.08, 0.28, t);
-      pose.rightArmA = lerp(-0.08, -0.28, t);
-      pose.leftForeA = lerp(0.13, 0.28, t);
-      pose.rightForeA = lerp(-0.13, -0.28, t);
+      pose.leftArmA = lerp(CHAR_RELAX_ARM_A, 0.28, t);
+      pose.rightArmA = lerp(-CHAR_RELAX_ARM_A, -0.28, t);
+      pose.leftForeA = lerp(CHAR_RELAX_FORE_A, 0.28, t);
+      pose.rightForeA = lerp(-CHAR_RELAX_FORE_A, -0.28, t);
     } else if (p < 0.55) {
       const t = (p - 0.35) / 0.2;
       pose = thinkingPoseBase(tx, ty, facing, time, a.id, stationaryElapsed, "hold");
@@ -2531,8 +2531,8 @@ function evalCharAtTime(
       headBob: 0, bodyLean: 0,
       leftLegA: stanceShift, rightLegA: -stanceShift * 0.5,
       // Arm defaults — will be overridden in draw for the pointing arm
-      leftArmA: 0.15, rightArmA: 0.15,
-      leftForeA: 0.2, rightForeA: 0.2,
+      leftArmA: CHAR_RELAX_ARM_A, rightArmA: -CHAR_RELAX_ARM_A,
+      leftForeA: CHAR_RELAX_FORE_A, rightForeA: -CHAR_RELAX_FORE_A,
       airY: 0,
       pointTargetBX: active.fromX + (tx - active.fromX) * armProgress,
       pointTargetBY: active.fromY + (ty - active.fromY) * armProgress,
@@ -2611,8 +2611,7 @@ function drawCharacterToCanvas(
   clips: CharSurfaceClip[],
   entranceTime: number,
   authoredAnimations: Record<string, AuthoredAnimation> = {},
-  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
-  accentColor = "#2a2a2a"
+  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null
 ) {
   if (!showChar || time < entranceTime) return;
   const hasFace = !!characterFace?.image;
@@ -3017,14 +3016,12 @@ function drawCharacterToCanvas(
     if (mag > 0) {
       // Negated to match drawArm's negated sin() below (same outward-positive convention as legs)
       const pointAngle = -Math.atan2(tdxLocal, tdyCanvas);
-      const RELAX_ARM = 0.15;  // natural hang angle
-      const RELAX_FORE = 0.2;
       if (tdxLocal >= 0) {
         rArmA = pointAngle; rForeA = pointAngle;
-        lArmA = RELAX_ARM;  lForeA = RELAX_FORE;
+        lArmA = CHAR_RELAX_ARM_A;  lForeA = CHAR_RELAX_FORE_A;
       } else {
         lArmA = pointAngle; lForeA = pointAngle;
-        rArmA = RELAX_ARM;  rForeA = RELAX_FORE;
+        rArmA = -CHAR_RELAX_ARM_A;  rForeA = -CHAR_RELAX_FORE_A;
       }
     }
   }
@@ -3252,17 +3249,6 @@ function drawCharacterToCanvas(
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
     drawArm(lArmA, lForeA);
     drawArm(rArmA, rForeA);
-  }
-
-  if (accentColor !== "#2a2a2a") {
-    ctx.save();
-    ctx.strokeStyle = accentColor;
-    ctx.lineWidth = Math.max(2, 3 * S);
-    ctx.beginPath();
-    ctx.moveTo(-10 * S, -torsoLen * 0.52);
-    ctx.lineTo(10 * S, -torsoLen * 0.52);
-    ctx.stroke();
-    ctx.restore();
   }
 
   if (p.popcornAlpha && p.popcornAlpha > 0) {
@@ -4118,8 +4104,7 @@ export default function Board2Page() {
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
-          : null,
-        "#2a2a2a"
+          : null
       );
     }
     if (showCharacter2Ref.current) {
@@ -4129,8 +4114,7 @@ export default function Board2Page() {
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
-          : null,
-        "#3a3a5a"
+          : null
       );
     }
     if (currentAnnotations.length > 0) {
