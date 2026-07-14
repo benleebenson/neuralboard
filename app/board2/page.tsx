@@ -70,6 +70,7 @@ type CharacterFaceSettings = {
 };
 
 type CharacterId = "c1" | "c2";
+type CharacterSkin = "stick" | "styled";
 
 type CharacterInstance = {
   id: CharacterId;
@@ -77,6 +78,7 @@ type CharacterInstance = {
   accentColor: string;
   mode: "auto" | "manual";
   actions: CharacterAction[];
+  skin: CharacterSkin;
   faceBlobUrl?: string;
   faceAspect?: number;
 };
@@ -3050,6 +3052,7 @@ function drawCharacterToCanvas(
   entranceTime: number,
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
+  characterSkin: CharacterSkin = "stick",
   poseOverride: CharPoseResult | null = null
 ) {
   if (!showChar || time < entranceTime) return;
@@ -3059,6 +3062,7 @@ function drawCharacterToCanvas(
   const { facing } = p;
   const physique = physiqueAt(time, resolved);
   const isJacked = physique === "jacked";
+  const effectiveSkin: CharacterSkin = isJacked ? "stick" : characterSkin;
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
   const sy = (p.boardY - cam.cameraY) * sf + H / 2;
@@ -3684,6 +3688,28 @@ function drawCharacterToCanvas(
     drawJackedShoulderCapsWorld(joints);
     if (frontIsRight) drawJackedArmWorld("right", joints);
     else drawJackedArmWorld("left", joints);
+  } else if (effectiveSkin === "styled") {
+    const shoulderHalf = 19 * S;
+    const waistHalf = 9 * S;
+    ctx.save();
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.fillStyle = "#fff3dc";
+    ctx.lineWidth = Math.max(1.5, 2.4 * S);
+    ctx.beginPath();
+    ctx.moveTo(-shoulderHalf, shoulderY);
+    ctx.quadraticCurveTo(-16 * S, -torsoLen * 0.48, -waistHalf, 0);
+    ctx.lineTo(waistHalf, 0);
+    ctx.quadraticCurveTo(16 * S, -torsoLen * 0.48, shoulderHalf, shoulderY);
+    ctx.quadraticCurveTo(0, -torsoLen * 1.08, -shoulderHalf, shoulderY);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+    ctx.save();
+    ctx.lineWidth = Math.max(lw * 1.28, 4 * S);
+    drawArm(lArmA, lForeA);
+    drawArm(rArmA, rForeA);
+    ctx.restore();
   } else {
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
     drawArm(lArmA, lForeA);
@@ -3902,9 +3928,11 @@ export default function Board2Page() {
   const [showCharacter, setShowCharacter] = useState(false);
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
+  const [characterSkin, setCharacterSkin] = useState<CharacterSkin>("stick");
   const [showCharacter2, setShowCharacter2] = useState(false);
   const [characterActions2, setCharacterActions2] = useState<CharacterAction[]>([]);
   const [characterMode2, setCharacterMode2] = useState<"auto" | "manual">("auto");
+  const [characterSkin2, setCharacterSkin2] = useState<CharacterSkin>("stick");
   const [activeCharacterId, setActiveCharacterId] = useState<CharacterId>("c1");
   const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
@@ -4028,8 +4056,8 @@ export default function Board2Page() {
       ? characterActions2.find((a) => a.id === selectedCharActionId) ?? null
       : null;
   const activeCharacter: CharacterInstance = activeCharacterId === "c2"
-    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect }
-    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect };
+    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect }
+    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect };
   const characterDuration = characterProjectDuration(characterActions);
   const generatedDuration = cameraKeyframeMode === "character" && characterDuration > 0
     ? characterDuration
@@ -4159,6 +4187,8 @@ export default function Board2Page() {
   const characterAddModeRef = useRef<CharacterAddMode | null>(null);
   const characterModeRef = useRef<"auto" | "manual">("auto");
   const characterMode2Ref = useRef<"auto" | "manual">("auto");
+  const characterSkinRef = useRef<CharacterSkin>("stick");
+  const characterSkin2Ref = useRef<CharacterSkin>("stick");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const liveControlEnabledRef = useRef(false);
   const liveCameraModeRef = useRef<LiveCameraMode>("character");
@@ -4596,6 +4626,8 @@ export default function Board2Page() {
   useEffect(() => { authoredAnimationsRef.current = animationMap(authoredAnimations); }, [authoredAnimations]);
   useEffect(() => { characterModeRef.current = characterMode; }, [characterMode]);
   useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
+  useEffect(() => { characterSkinRef.current = characterSkin; }, [characterSkin]);
+  useEffect(() => { characterSkin2Ref.current = characterSkin2; }, [characterSkin2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
@@ -5030,6 +5062,7 @@ export default function Board2Page() {
           characterFaceRef.current && characterFaceImageRef.current
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
             : null,
+          characterSkinRef.current,
           pose
         );
       }
@@ -5045,6 +5078,7 @@ export default function Board2Page() {
           characterFace2Ref.current && characterFace2ImageRef.current
             ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
             : null,
+          characterSkin2Ref.current,
           pose
         );
       }
@@ -5055,7 +5089,8 @@ export default function Board2Page() {
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
-          : null
+          : null,
+        characterSkinRef.current
       );
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
@@ -5065,7 +5100,8 @@ export default function Board2Page() {
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
-          : null
+          : null,
+        characterSkin2Ref.current
       );
     }
     if (currentAnnotations.length > 0) {
@@ -10468,8 +10504,8 @@ export default function Board2Page() {
       const manifestFace = await saveFaceAsset(characterFaceRef.current, "assets/character-face-c1.png");
       const manifestFace2 = await saveFaceAsset(characterFace2Ref.current, "assets/character-face-c2.png");
       const manifestCharacters: ManifestCharacter[] = [
-        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, actions: characterActionsRef.current, face: manifestFace },
-        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, actions: characterActions2Ref.current, face: manifestFace2 },
+        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current, face: manifestFace },
+        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current, face: manifestFace2 },
       ];
 
       const manifest = {
@@ -10488,6 +10524,7 @@ export default function Board2Page() {
         characterActions: characterActionsRef.current,
         showCharacter: showCharacterRef.current,
         characterMode: characterModeRef.current,
+        characterSkin: characterSkinRef.current,
         characterFace: manifestFace,
         characters: manifestCharacters,
       };
@@ -10592,15 +10629,18 @@ export default function Board2Page() {
         };
       };
       if (Array.isArray(manifest.characters)) {
-        const c1 = manifest.characters.find((c: CharacterInstance) => c.id === "c1");
-        const c2 = manifest.characters.find((c: CharacterInstance) => c.id === "c2");
+        type LoadedCharacter = Partial<CharacterInstance> & { id?: CharacterId; face?: ManifestFace | null };
+        const c1 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c1");
+        const c2 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c2");
         setCharacterActions(c1?.actions ?? []);
         setShowCharacter(c1?.enabled ?? false);
         setCharacterMode(c1?.mode ?? "auto");
+        setCharacterSkin(c1?.skin === "styled" ? "styled" : "stick");
         setCharacterFace(loadFace(c1?.face));
         setCharacterActions2(c2?.actions ?? []);
         setShowCharacter2(c2?.enabled ?? false);
         setCharacterMode2(c2?.mode ?? "auto");
+        setCharacterSkin2(c2?.skin === "styled" ? "styled" : "stick");
         setCharacterFace2(loadFace(c2?.face));
       } else {
         if (manifest.characterActions) setCharacterActions(manifest.characterActions);
@@ -10609,10 +10649,12 @@ export default function Board2Page() {
         else setShowCharacter(false);
         if (manifest.characterMode) setCharacterMode(manifest.characterMode);
         else setCharacterMode("auto");
+        setCharacterSkin(manifest.characterSkin === "styled" ? "styled" : "stick");
         setCharacterFace(loadFace(manifest.characterFace));
         setCharacterActions2([]);
         setShowCharacter2(false);
         setCharacterMode2("auto");
+        setCharacterSkin2("stick");
         setCharacterFace2(null);
       }
       setToast(`Loaded "${manifest.name ?? "board"}"`);
@@ -12041,6 +12083,30 @@ export default function Board2Page() {
                             Remove
                           </button>
                         )}
+                      </div>
+                      <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
+                        {(["stick", "styled"] as const).map((skin) => (
+                          <button
+                            key={skin}
+                            type="button"
+                            onClick={() => activeCharacterId === "c2" ? setCharacterSkin2(skin) : setCharacterSkin(skin)}
+                            title={skin === "stick" ? "Classic stick figure" : "Styled character skin"}
+                            style={{
+                              flex: 1,
+                              padding: "5px 6px",
+                              fontFamily: "monospace",
+                              fontSize: 10,
+                              cursor: "pointer",
+                              border: "none",
+                              borderRight: skin === "stick" ? "1px solid rgba(42,42,42,0.35)" : "none",
+                              background: activeCharacter.skin === skin ? "#2a2a2a" : "transparent",
+                              color: activeCharacter.skin === skin ? (activeCharacterId === "c2" ? "#dcd6ff" : CHARACTER_COLOR) : "#2a2a2a",
+                              fontWeight: activeCharacter.skin === skin ? 700 : 400,
+                            }}
+                          >
+                            {skin === "stick" ? "Stick" : "Styled"}
+                          </button>
+                        ))}
                       </div>
                       <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
                         {(["auto", "manual"] as const).map((m) => (
