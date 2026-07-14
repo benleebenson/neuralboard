@@ -2810,6 +2810,177 @@ function evalLiveCharacterAtWallTime(
   return pose;
 }
 
+type PlayCharacterState = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  facing: 1 | -1;
+  grounded: boolean;
+  surfaceId: string | null;
+  stride: number;
+  spin: number;
+  spawnX: number;
+  spawnY: number;
+  action: "none" | "dance" | "emote" | "pullups" | "mirror";
+  actionUntil: number;
+};
+
+const PLAY_GRAVITY = 1850;
+const PLAY_JUMP_SPEED = 720;
+const PLAY_MAX_FALL_SPEED = 1350;
+const PLAY_CHARACTER_HEIGHT = 168;
+const PLAY_RESPAWN_MARGIN = 420;
+
+function drawPlaySpawnDoor(
+  ctx: CanvasRenderingContext2D,
+  state: PlayCharacterState,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number
+) {
+  const x = (state.spawnX - cam.cameraX) * sf + W / 2;
+  const y = (state.spawnY - cam.cameraY) * sf + H / 2;
+  const dw = 72 * sf;
+  const dh = 126 * sf;
+  ctx.save();
+  ctx.fillStyle = "#f4b942";
+  ctx.strokeStyle = "#2b2520";
+  ctx.lineWidth = Math.max(1.5, 3 * sf);
+  ctx.beginPath();
+  ctx.roundRect(x - dw / 2, y - dh, dw, dh, [dw * 0.5, dw * 0.5, 4 * sf, 4 * sf]);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#fff8df";
+  ctx.beginPath();
+  ctx.arc(x + dw * 0.23, y - dh * 0.45, 4.5 * sf, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,0.72)";
+  ctx.font = `700 ${Math.max(8, 11 * sf)}px monospace`;
+  ctx.textAlign = "center";
+  ctx.fillText("START", x, y - dh - 10 * sf);
+  ctx.restore();
+}
+
+function drawPoptropicaPlayCharacter(
+  ctx: CanvasRenderingContext2D,
+  state: PlayCharacterState,
+  time: number,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number,
+  face: { image: HTMLImageElement | null; aspect: number } | null
+) {
+  const x = (state.x - cam.cameraX) * sf + W / 2;
+  const y = (state.y - cam.cameraY) * sf + H / 2;
+  const speed01 = clamp(Math.abs(state.vx) / PLAY_RUN_SPEED, 0, 1);
+  const moving = speed01 > 0.08 && state.grounded;
+  const idleBob = state.grounded && !moving ? Math.sin(time * 2.8) * 4 + Math.sin(time * 1.35) * 1.5 : 0;
+  const phase = state.stride;
+  const stride = moving ? Math.sin(phase) * lerp(0.38, 0.82, speed01) : 0;
+  const lift = moving ? Math.abs(Math.sin(phase)) * 3 : 0;
+  const actionWave = state.action === "dance" ? Math.sin(time * 9) * 0.65 : 0;
+  const pull = state.action === "pullups";
+  const bodyY = idleBob - lift + (pull ? -Math.abs(Math.sin(time * 6)) * 20 : 0);
+  const S = sf;
+  ctx.save();
+  ctx.translate(x, y + bodyY * S);
+  ctx.scale(state.facing, 1);
+  if (!state.grounded) {
+    const centerY = -82 * S;
+    ctx.translate(0, centerY);
+    ctx.rotate(state.spin);
+    ctx.translate(0, -centerY);
+  }
+  ctx.strokeStyle = "#27221f";
+  ctx.fillStyle = "#f6d4b4";
+  ctx.lineWidth = Math.max(1.5, 3.2 * S);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const hipY = -64 * S;
+  const shoulderY = -113 * S;
+  const headY = -148 * S;
+  const legSwing = stride;
+  const armSwing = -stride * 0.78 + actionWave;
+  const limb = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, endR: number) => {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.quadraticCurveTo(x2, y2, x3, y3);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(x3, y3, endR * 1.35, endR, -0.15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  };
+
+  const leftFootX = (-18 + legSwing * 37) * S;
+  const rightFootX = (18 - legSwing * 37) * S;
+  limb(-8 * S, hipY, (-24 + legSwing * 12) * S, -34 * S, leftFootX, -4 * S, 8 * S);
+  limb(8 * S, hipY, (24 - legSwing * 12) * S, -34 * S, rightFootX, -4 * S, 8 * S);
+
+  ctx.fillStyle = "#4f83cc";
+  ctx.beginPath();
+  ctx.moveTo(-20 * S, hipY);
+  ctx.quadraticCurveTo(-25 * S, -92 * S, -17 * S, shoulderY);
+  ctx.quadraticCurveTo(0, -124 * S, 17 * S, shoulderY);
+  ctx.quadraticCurveTo(25 * S, -92 * S, 20 * S, hipY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = "#f6d4b4";
+  const leftHandX = (-40 + armSwing * 28) * S;
+  const rightHandX = (40 - armSwing * 28) * S;
+  const handY = (pull ? -190 : -62 + Math.abs(armSwing) * 6) * S;
+  limb(-13 * S, shoulderY + 8 * S, (-34 + armSwing * 14) * S, -92 * S, leftHandX, handY, 9 * S);
+  limb(13 * S, shoulderY + 8 * S, (34 - armSwing * 14) * S, -92 * S, rightHandX, handY, 9 * S);
+
+  if (pull) {
+    ctx.beginPath();
+    ctx.moveTo(-68 * S, -198 * S);
+    ctx.lineTo(68 * S, -198 * S);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#f6d4b4";
+  ctx.beginPath();
+  ctx.ellipse(0, headY, 39 * S, 47 * S, -0.03, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  if (face?.image) {
+    const aspect = clamp(face.aspect, 0.75, 1.6);
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(0, headY, 35 * S, 43 * S, 0, 0, Math.PI * 2);
+    ctx.clip();
+    const fw = 70 * S;
+    const fh = fw / aspect;
+    ctx.drawImage(face.image, -fw / 2, headY - fh / 2, fw, fh);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "#27221f";
+    for (const ex of [-13, 13]) {
+      ctx.beginPath();
+      ctx.ellipse(ex * S, (headY / S - 5) * S, 3.8 * S, 6 * S, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.strokeStyle = "#9b5144";
+    ctx.lineWidth = Math.max(1, 1.8 * S);
+    ctx.beginPath();
+    ctx.arc(0, headY + 10 * S, 11 * S, 0.15, Math.PI - 0.15);
+    ctx.stroke();
+  }
+  if (state.action === "emote") {
+    ctx.font = `${30 * S}px sans-serif`;
+    ctx.fillText("!", 48 * S, headY - 25 * S);
+  }
+  ctx.restore();
+}
+
 function drawCharacterToCanvas(
   ctx: CanvasRenderingContext2D,
   time: number,
@@ -3956,11 +4127,10 @@ export default function Board2Page() {
   const playModeRef = useRef(false);
   const playTimeRef = useRef(0);
   const playWallStartRef = useRef(0);
-  const playInitRef = useRef({ x: BOARD_W / 2, y: BOARD_H * 0.75 });
-  const playResolvedActionsRef = useRef<ResolvedCharAction[]>([]);
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
   const playHeldKeysRef = useRef(new Set<string>());
   const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
+  const playPhysicsRef = useRef<PlayCharacterState | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
@@ -4821,12 +4991,11 @@ export default function Board2Page() {
           pose
         );
       }
-    } else if (showCharacterRef.current || playModeRef.current) {
-      const playActive = playModeRef.current;
+    } else if (showCharacterRef.current && !playModeRef.current) {
       drawCharacterToCanvas(
-        ctx, time, playActive ? playResolvedActionsRef.current : resolvedCharActionsRef.current, true,
-        cam, sf, W, H, playActive ? playInitRef.current.x : charInitXRef.current, playActive ? playInitRef.current.y : charInitYRef.current,
-        clipsRef.current, playActive ? -Infinity : characterEntranceTimeRef.current, authoredAnimationsRef.current,
+        ctx, time, resolvedCharActionsRef.current, true,
+        cam, sf, W, H, charInitXRef.current, charInitYRef.current,
+        clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
           : null
@@ -8606,8 +8775,11 @@ export default function Board2Page() {
     }
     const startX = clampInsideClipX(startSurface, sourcePose.boardX);
     const startY = startSurface.boardY;
-    playInitRef.current = { x: startX, y: startY };
-    playResolvedActionsRef.current = [];
+    playPhysicsRef.current = {
+      x: startX, y: startY, vx: 0, vy: 0, facing: sourcePose.facing ?? 1,
+      grounded: true, surfaceId: startSurface.id ?? null, stride: 0, spin: 0,
+      spawnX: startX, spawnY: startY, action: "none", actionUntil: 0,
+    };
     playTimeRef.current = 0;
     playWallStartRef.current = 0;
     playCameraRef.current = { cameraX: sourcePose.boardX, cameraY: sourcePose.boardY - 120, boardZoom: 1.35 };
@@ -8620,31 +8792,10 @@ export default function Board2Page() {
     setPlayMode(false);
     playHeldKeysRef.current.clear();
     playPointerRef.current = null;
+    playPhysicsRef.current = null;
     setPlayhead(editorPlayheadBeforePlayRef.current);
     playheadRef.current = editorPlayheadBeforePlayRef.current;
     requestAnimationFrame(() => drawFrameRef.current(editorPlayheadBeforePlayRef.current));
-  }
-
-  function queuePlayAction(type: CharacterAction["type"], target?: { x: number; y: number; clipId?: string }, travelSpeed?: number) {
-    const now = playTimeRef.current;
-    const current = evalCharAtTime(now, playResolvedActionsRef.current, playInitRef.current.x, playInitRef.current.y, clipsRef.current, authoredAnimationsRef.current);
-    const groundedY = resolveGroundY(current.boardX, current.boardY, clipsRef.current);
-    playInitRef.current = { x: current.boardX, y: groundedY };
-    const distance = target ? Math.hypot(target.x - current.boardX, target.y - groundedY) : 0;
-    const durationByType: Partial<Record<CharacterAction["type"], number>> = {
-      dance: 2.5, emote: 1.8, flip: 1.15, pullUps: 4, mirrorCheck: 5,
-      sitAndWatch: 2.5, explainGesture: 2, idle: 1.5, grapple: GRAPPLE_MANUAL_DURATION_SEC,
-      wallClimb: 2, skateTo: 2.5 * PHASE_TIME_SCALE, jumpTo: 1.05,
-    };
-    const duration = type === "walkTo"
-      ? clamp(distance / (travelSpeed ?? PLAY_RUN_SPEED), 0.22, 4)
-      : durationByType[type] ?? clamp(distance / 900, 0.7, 2.5);
-    const action: CharacterAction = {
-      id: `play_${generateId()}`, type, startTime: now, duration,
-      ...(target ? { targetX: Math.round(target.x), targetY: Math.round(target.y) } : {}),
-      ...(type === "skateTo" && target?.clipId ? { targetClipId: target.clipId } : {}),
-    };
-    playResolvedActionsRef.current = resolveCharActions([action], playInitRef.current.x, playInitRef.current.y, clipsRef.current);
   }
 
   function steerPlayCharacter(clientX: number, clientY: number, canvas: HTMLCanvasElement) {
@@ -8653,25 +8804,23 @@ export default function Board2Page() {
     const sf = cam.boardZoom * rect.width / BOARD_W;
     const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
     const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
-    const clickedSurface = nearestPlayableSurface(rawX, rawY, clipsRef.current);
-    if (!clickedSurface) return;
-    const current = evalCharAtTime(playTimeRef.current, playResolvedActionsRef.current, playInitRef.current.x, playInitRef.current.y, clipsRef.current, authoredAnimationsRef.current);
-    const target = { x: clampInsideClipX(clickedSurface, rawX), y: clickedSurface.boardY, clipId: clickedSurface.id };
-    const dx = target.x - current.boardX;
-    const cursorDx = rawX - current.boardX;
-    const cursorDy = rawY - (current.boardY + current.airY - 95);
+    const state = playPhysicsRef.current;
+    if (!state) return;
+    const cursorDx = rawX - state.x;
+    const cursorDy = rawY - (state.y - PLAY_CHARACTER_HEIGHT * 0.56);
     const cursorDistance = Math.hypot(cursorDx, cursorDy);
-    const rise = current.boardY - target.y;
-    const held = playHeldKeysRef.current;
-    let type: CharacterAction["type"];
-    if (held.has("KeyG")) type = "grapple";
-    else if (held.has("KeyS")) type = "skateTo";
-    else if (cursorDy < -PLAY_JUMP_CURSOR_PX && rise <= 280) type = "jumpTo";
-    else if (rise >= 60 && rise <= 250) type = "jumpTo";
-    else if (rise > 250) type = Math.abs(dx) < 260 ? "wallClimb" : "grapple";
-    else type = "walkTo";
     const travelSpeed = cursorDistance <= PLAY_WALK_RADIUS_PX ? PLAY_WALK_SPEED : PLAY_RUN_SPEED;
-    queuePlayAction(type, target, travelSpeed);
+    if (Math.abs(cursorDx) > 18) {
+      state.facing = cursorDx >= 0 ? 1 : -1;
+      state.vx = state.facing * travelSpeed;
+    }
+    if (cursorDy < -PLAY_JUMP_CURSOR_PX && state.grounded) {
+      const jumpBoost = clamp((-cursorDy - PLAY_JUMP_CURSOR_PX) * 0.45, 0, 170);
+      state.vy = -(PLAY_JUMP_SPEED + jumpBoost);
+      state.grounded = false;
+      state.surfaceId = null;
+      state.spin = 0;
+    }
   }
 
   function handlePlayPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -8696,6 +8845,84 @@ export default function Board2Page() {
     if (pointer?.id === e.pointerId) playPointerRef.current = null;
   }
 
+  function setPlayAction(action: PlayCharacterState["action"], duration: number) {
+    const state = playPhysicsRef.current;
+    if (!state) return;
+    state.action = action;
+    state.actionUntil = playTimeRef.current + duration;
+    state.vx = 0;
+  }
+
+  function updatePlayPhysics(state: PlayCharacterState, dt: number, canvas: HTMLCanvasElement) {
+    const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
+    if (state.action !== "none" && playTimeRef.current >= state.actionUntil) state.action = "none";
+    const pointer = playPointerRef.current;
+    if (pointer?.down && state.action === "none") {
+      steerPlayCharacter(pointer.clientX, pointer.clientY, canvas);
+    } else if (state.grounded && state.action === "none") {
+      state.vx *= Math.exp(-dt * 11);
+      if (Math.abs(state.vx) < 5) state.vx = 0;
+    }
+
+    if (state.action === "pullups") {
+      state.vx = 0;
+      state.vy = 0;
+      return;
+    }
+
+    if (state.grounded) {
+      const support = surfaces.find((surface) => surface.id === state.surfaceId);
+      const onSupport = support && state.x >= support.boardX + 12 && state.x <= support.boardX + support.boardW - 12;
+      if (!onSupport) {
+        state.grounded = false;
+        state.surfaceId = null;
+        state.vy = 35;
+      } else {
+        state.y = support.boardY;
+      }
+    }
+
+    const previousY = state.y;
+    state.x += state.vx * dt;
+    if (!state.grounded) {
+      state.vy = Math.min(PLAY_MAX_FALL_SPEED, state.vy + PLAY_GRAVITY * dt);
+      const nextY = state.y + state.vy * dt;
+      if (state.vy >= 0) {
+        const landing = surfaces
+          .filter((surface) => state.x >= surface.boardX + 18 && state.x <= surface.boardX + surface.boardW - 18)
+          .filter((surface) => previousY <= surface.boardY && nextY >= surface.boardY)
+          .sort((a, b) => a.boardY - b.boardY)[0];
+        if (landing) {
+          state.y = landing.boardY;
+          state.vy = 0;
+          state.grounded = true;
+          state.surfaceId = landing.id ?? null;
+          state.spin = 0;
+        } else {
+          state.y = nextY;
+        }
+      } else {
+        state.y = nextY;
+      }
+      if (Math.abs(state.vx) > 520) state.spin += state.facing * dt * 6.2;
+    }
+
+    state.stride += Math.abs(state.vx) * dt / (Math.abs(state.vx) > 520 ? 28 : 23);
+    const visible = cameraViewport(playCameraRef.current, canvas.width, canvas.height);
+    if (state.y > visible.bottom + PLAY_RESPAWN_MARGIN) {
+      state.x = state.spawnX;
+      state.y = state.spawnY;
+      state.vx = 0;
+      state.vy = 0;
+      state.grounded = true;
+      state.surfaceId = findSurfaceAtFeet(state.spawnX, state.spawnY, surfaces)?.id ?? null;
+      state.spin = 0;
+      state.action = "none";
+      playCameraRef.current.cameraX = state.spawnX;
+      playCameraRef.current.cameraY = state.spawnY - 120;
+    }
+  }
+
   useEffect(() => {
     if (!playMode) return;
     const resize = () => setPlayViewport({ width: Math.max(1, Math.round(window.innerWidth * Math.min(2, window.devicePixelRatio || 1))), height: Math.max(1, Math.round(window.innerHeight * Math.min(2, window.devicePixelRatio || 1))) });
@@ -8711,14 +8938,26 @@ export default function Board2Page() {
       last = wall;
       const now = (wall - playWallStartRef.current) / 1000;
       playTimeRef.current = now;
-      const pose = evalCharAtTime(now, playResolvedActionsRef.current, playInitRef.current.x, playInitRef.current.y, clipsRef.current, authoredAnimationsRef.current);
+      const state = playPhysicsRef.current;
+      if (!state) return;
+      updatePlayPhysics(state, dt, canvas);
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
-      const target = playSceneShot ? shot : { cameraX: pose.boardX, cameraY: pose.boardY + pose.airY - 120, boardZoom: playCameraRef.current.boardZoom };
+      const target = playSceneShot ? shot : { cameraX: state.x, cameraY: state.y - 120, boardZoom: playCameraRef.current.boardZoom };
       const follow = 1 - Math.exp(-dt * 5.5);
       playCameraRef.current = { cameraX: lerp(playCameraRef.current.cameraX, target.cameraX, follow), cameraY: lerp(playCameraRef.current.cameraY, target.cameraY, follow), boardZoom: lerp(playCameraRef.current.boardZoom, target.boardZoom, playSceneShot ? follow : follow * 0.08) };
       evaluateVideoPlaybackStates(editorPlayheadBeforePlayRef.current, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, { audioMode: "preview" });
       const ctx = canvas.getContext("2d");
-      if (ctx) renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
+      if (ctx) {
+        renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
+        const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
+        drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
+        drawPoptropicaPlayCharacter(
+          ctx, state, now, playCameraRef.current, sf, canvas.width, canvas.height,
+          characterFaceRef.current && characterFaceImageRef.current
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+            : null
+        );
+      }
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -8736,11 +8975,16 @@ export default function Board2Page() {
         playHeldKeysRef.current.add(e.code);
         if (e.repeat) return;
         if (e.code === "KeyV") { e.preventDefault(); setPlaySceneShot((v) => !v); return; }
-        if (e.code === "KeyD") { e.preventDefault(); queuePlayAction("dance"); return; }
-        if (e.code === "KeyF") { e.preventDefault(); queuePlayAction("flip", { x: playInitRef.current.x + 280, y: playInitRef.current.y }); return; }
-        if (e.code === "KeyM") { e.preventDefault(); queuePlayAction("mirrorCheck", { x: playInitRef.current.x + 80, y: playInitRef.current.y }); return; }
-        if (e.code === "KeyP") { e.preventDefault(); queuePlayAction("pullUps", { x: playInitRef.current.x, y: playInitRef.current.y }); return; }
-        if (e.code === "KeyE") { e.preventDefault(); queuePlayAction("emote"); return; }
+        if (e.code === "KeyD") { e.preventDefault(); setPlayAction("dance", 2.5); return; }
+        if (e.code === "KeyF") {
+          e.preventDefault();
+          const state = playPhysicsRef.current;
+          if (state?.grounded) { state.vy = -PLAY_JUMP_SPEED; state.vx = state.facing * PLAY_RUN_SPEED; state.grounded = false; state.surfaceId = null; }
+          return;
+        }
+        if (e.code === "KeyM") { e.preventDefault(); setPlayAction("mirror", 3); return; }
+        if (e.code === "KeyP") { e.preventDefault(); setPlayAction("pullups", 4); return; }
+        if (e.code === "KeyE") { e.preventDefault(); setPlayAction("emote", 1.8); return; }
         return;
       }
       if (e.code === "Space") {
@@ -9289,7 +9533,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Hold near character to walk · hold farther to run<br />Aim above to jump · movement lands only on uploaded media<br />G+hold grapple · S+hold skate · D dance · E emote · F flip<br />P pull-ups · M mirror · V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Hold near character to walk · hold farther to run<br />Aim above to jump · run off edges to fall · fast jumps flip<br />D dance · E emote · F flip · P in-place pull-ups<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
             </div>
           )}
         </div>
