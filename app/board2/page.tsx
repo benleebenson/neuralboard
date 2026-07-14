@@ -2824,13 +2824,20 @@ type PlayCharacterState = {
   spawnY: number;
   action: "none" | "dance" | "emote" | "pullups" | "mirror";
   actionUntil: number;
+  landedAt: number;
+  grappleX: number | null;
+  grappleY: number | null;
+  grappleLength: number;
 };
+
+type PlayHairStyle = "crop" | "spikes" | "curls" | "none";
+type PlayOutfitStyle = "tee" | "varsity" | "adventure";
 
 const PLAY_GRAVITY = 1850;
 const PLAY_JUMP_SPEED = 720;
 const PLAY_MAX_FALL_SPEED = 1350;
 const PLAY_CHARACTER_HEIGHT = 168;
-const PLAY_RESPAWN_MARGIN = 420;
+const PLAY_RESPAWN_BELOW_LOWEST_SURFACE = 650;
 
 function drawPlaySpawnDoor(
   ctx: CanvasRenderingContext2D,
@@ -2872,10 +2879,28 @@ function drawPoptropicaPlayCharacter(
   sf: number,
   W: number,
   H: number,
-  face: { image: HTMLImageElement | null; aspect: number } | null
+  face: { image: HTMLImageElement | null; aspect: number } | null,
+  cursor: { x: number; y: number } | null,
+  hairStyle: PlayHairStyle,
+  outfitStyle: PlayOutfitStyle
 ) {
   const x = (state.x - cam.cameraX) * sf + W / 2;
   const y = (state.y - cam.cameraY) * sf + H / 2;
+  if (state.grappleX !== null && state.grappleY !== null) {
+    const anchorX = (state.grappleX - cam.cameraX) * sf + W / 2;
+    const anchorY = (state.grappleY - cam.cameraY) * sf + H / 2;
+    ctx.save();
+    ctx.strokeStyle = "#4d3827";
+    ctx.lineWidth = Math.max(1.5, 2.4 * sf);
+    ctx.beginPath();
+    ctx.moveTo(x, y - 105 * sf);
+    ctx.lineTo(anchorX, anchorY);
+    ctx.stroke();
+    ctx.fillStyle = "#4d3827";
+    ctx.beginPath(); ctx.arc(anchorX, anchorY, 5 * sf, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(anchorX, anchorY); ctx.lineTo(anchorX - 9 * sf, anchorY + 7 * sf); ctx.moveTo(anchorX, anchorY); ctx.lineTo(anchorX + 9 * sf, anchorY + 7 * sf); ctx.stroke();
+    ctx.restore();
+  }
   const speed01 = clamp(Math.abs(state.vx) / PLAY_RUN_SPEED, 0, 1);
   const moving = speed01 > 0.08 && state.grounded;
   const idleBob = state.grounded && !moving ? Math.sin(time * 2.8) * 4 + Math.sin(time * 1.35) * 1.5 : 0;
@@ -2884,11 +2909,15 @@ function drawPoptropicaPlayCharacter(
   const lift = moving ? Math.abs(Math.sin(phase)) * 3 : 0;
   const actionWave = state.action === "dance" ? Math.sin(time * 9) * 0.65 : 0;
   const pull = state.action === "pullups";
+  const landingAge = time - state.landedAt;
+  const landingSquash = state.grounded && landingAge >= 0 && landingAge < 0.18
+    ? Math.sin((1 - landingAge / 0.18) * Math.PI) * 0.12
+    : 0;
   const bodyY = idleBob - lift + (pull ? -Math.abs(Math.sin(time * 6)) * 20 : 0);
   const S = sf;
   ctx.save();
   ctx.translate(x, y + bodyY * S);
-  ctx.scale(state.facing, 1);
+  ctx.scale(state.facing * (1 + landingSquash), 1 - landingSquash);
   if (!state.grounded) {
     const centerY = -82 * S;
     ctx.translate(0, centerY);
@@ -2901,9 +2930,9 @@ function drawPoptropicaPlayCharacter(
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
-  const hipY = -64 * S;
-  const shoulderY = -113 * S;
-  const headY = -148 * S;
+  const hipY = -61 * S;
+  const shoulderY = -103 * S;
+  const headY = -160 * S;
   const legSwing = stride;
   const armSwing = -stride * 0.78 + actionWave;
   const limb = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, endR: number) => {
@@ -2917,12 +2946,14 @@ function drawPoptropicaPlayCharacter(
     ctx.stroke();
   };
 
-  const leftFootX = (-18 + legSwing * 37) * S;
-  const rightFootX = (18 - legSwing * 37) * S;
-  limb(-8 * S, hipY, (-24 + legSwing * 12) * S, -34 * S, leftFootX, -4 * S, 8 * S);
-  limb(8 * S, hipY, (24 - legSwing * 12) * S, -34 * S, rightFootX, -4 * S, 8 * S);
+  const tuck = state.grounded ? 0 : clamp((Math.abs(state.spin) + Math.max(0, -state.vy) / 500) * 0.2, 0.25, 1);
+  const leftFootX = (-18 + legSwing * 37) * S * (1 - tuck * 0.45);
+  const rightFootX = (18 - legSwing * 37) * S * (1 - tuck * 0.45);
+  const footY = (-4 - tuck * 34) * S;
+  limb(-8 * S, hipY, (-24 + legSwing * 12) * S, (-34 - tuck * 10) * S, leftFootX, footY, 8 * S);
+  limb(8 * S, hipY, (24 - legSwing * 12) * S, (-34 - tuck * 10) * S, rightFootX, footY, 8 * S);
 
-  ctx.fillStyle = "#4f83cc";
+  ctx.fillStyle = outfitStyle === "varsity" ? "#fffdf4" : outfitStyle === "adventure" ? "#8cb8cf" : "#f4f1e8";
   ctx.beginPath();
   ctx.moveTo(-20 * S, hipY);
   ctx.quadraticCurveTo(-25 * S, -92 * S, -17 * S, shoulderY);
@@ -2931,6 +2962,16 @@ function drawPoptropicaPlayCharacter(
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
+  if (outfitStyle === "tee") {
+    ctx.fillStyle = "#f2b51d";
+    ctx.beginPath();
+    ctx.moveTo(-7 * S, -91 * S); ctx.lineTo(3 * S, -91 * S); ctx.lineTo(-3 * S, -78 * S); ctx.lineTo(8 * S, -78 * S); ctx.lineTo(-7 * S, -65 * S); ctx.lineTo(-2 * S, -76 * S); ctx.lineTo(-13 * S, -76 * S); ctx.closePath(); ctx.fill();
+  } else if (outfitStyle === "varsity") {
+    ctx.strokeStyle = "#285ca8"; ctx.lineWidth = Math.max(2, 5 * S); ctx.beginPath(); ctx.arc(0, -103 * S, 16 * S, 0.2, Math.PI - 0.2); ctx.stroke();
+    ctx.fillStyle = "#174fb8"; ctx.font = `700 ${27 * S}px sans-serif`; ctx.textAlign = "center"; ctx.fillText("8", 0, -70 * S);
+  } else {
+    ctx.fillStyle = "#332f24"; ctx.beginPath(); ctx.moveTo(-18 * S, -100 * S); ctx.lineTo(-4 * S, -61 * S); ctx.lineTo(5 * S, -61 * S); ctx.lineTo(-9 * S, -104 * S); ctx.closePath(); ctx.fill();
+  }
 
   ctx.fillStyle = "#f6d4b4";
   const leftHandX = (-40 + armSwing * 28) * S;
@@ -2946,38 +2987,51 @@ function drawPoptropicaPlayCharacter(
     ctx.stroke();
   }
 
+  const headLagX = moving ? -state.vx / PLAY_RUN_SPEED * 4 * S : Math.sin(time * 2.8 + 0.35) * 1.5 * S;
+  const headLagY = idleBob * 0.35 * S;
+  ctx.save();
+  ctx.translate(headLagX, headLagY);
   ctx.fillStyle = "#f6d4b4";
   ctx.beginPath();
-  ctx.ellipse(0, headY, 39 * S, 47 * S, -0.03, 0, Math.PI * 2);
+  ctx.ellipse(0, headY, 61 * S, 43 * S, -0.015, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
   if (face?.image) {
     const aspect = clamp(face.aspect, 0.75, 1.6);
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(0, headY, 35 * S, 43 * S, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, headY, 57 * S, 39 * S, 0, 0, Math.PI * 2);
     ctx.clip();
-    const fw = 70 * S;
+    const fw = 116 * S;
     const fh = fw / aspect;
     ctx.drawImage(face.image, -fw / 2, headY - fh / 2, fw, fh);
     ctx.restore();
-  } else {
-    ctx.fillStyle = "#27221f";
-    for (const ex of [-13, 13]) {
-      ctx.beginPath();
-      ctx.ellipse(ex * S, (headY / S - 5) * S, 3.8 * S, 6 * S, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.strokeStyle = "#9b5144";
-    ctx.lineWidth = Math.max(1, 1.8 * S);
-    ctx.beginPath();
-    ctx.arc(0, headY + 10 * S, 11 * S, 0.15, Math.PI - 0.15);
-    ctx.stroke();
   }
+  ctx.fillStyle = "#191b1d";
+  if (hairStyle === "crop") {
+    ctx.beginPath(); ctx.ellipse(-4 * S, headY - 35 * S, 51 * S, 17 * S, -0.05, Math.PI, Math.PI * 2); ctx.fill();
+  } else if (hairStyle === "spikes") {
+    ctx.beginPath(); ctx.moveTo(-55 * S, headY - 24 * S); ctx.lineTo(-70 * S, headY - 53 * S); ctx.lineTo(-39 * S, headY - 42 * S); ctx.lineTo(-33 * S, headY - 68 * S); ctx.lineTo(-10 * S, headY - 43 * S); ctx.lineTo(11 * S, headY - 65 * S); ctx.lineTo(25 * S, headY - 39 * S); ctx.lineTo(52 * S, headY - 48 * S); ctx.lineTo(55 * S, headY - 19 * S); ctx.closePath(); ctx.fill();
+  } else if (hairStyle === "curls") {
+    for (const [hx, hy, hr] of [[-45,-30,18],[-24,-43,20],[0,-46,21],[25,-42,20],[46,-28,18]] as const) { ctx.beginPath(); ctx.arc(hx * S, headY + hy * S, hr * S, 0, Math.PI * 2); ctx.fill(); }
+  }
+  const localCursorX = cursor ? (cursor.x - state.x) * state.facing : 80;
+  const localCursorY = cursor ? cursor.y - (state.y - 150) : 0;
+  const lookLen = Math.max(1, Math.hypot(localCursorX, localCursorY));
+  const lookX = clamp(localCursorX / lookLen, -1, 1);
+  const lookY = clamp(localCursorY / lookLen, -1, 1);
+  const eyes = [{ x: -22, rx: 20, ry: 25 }, { x: 18, rx: 28, ry: 31 }];
+  for (const eye of eyes) {
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = "#5b554d"; ctx.lineWidth = Math.max(1.5, 3 * S);
+    ctx.beginPath(); ctx.ellipse(eye.x * S, headY - 13 * S, eye.rx * S, eye.ry * S, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#111"; ctx.beginPath(); ctx.arc((eye.x + lookX * eye.rx * 0.42) * S, headY + (-13 + lookY * eye.ry * 0.38) * S, 6.5 * S, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.strokeStyle = "#80564a"; ctx.lineWidth = Math.max(1, 2.1 * S); ctx.beginPath(); ctx.moveTo(-19 * S, headY + 24 * S); ctx.quadraticCurveTo(12 * S, headY + 29 * S, 33 * S, headY + 13 * S); ctx.stroke();
   if (state.action === "emote") {
     ctx.font = `${30 * S}px sans-serif`;
     ctx.fillText("!", 48 * S, headY - 25 * S);
   }
+  ctx.restore();
   ctx.restore();
 }
 
@@ -3875,6 +3929,8 @@ export default function Board2Page() {
   const [playMode, setPlayMode] = useState(false);
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
+  const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
+  const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
 
   // ── AI character choreography ──
@@ -4130,6 +4186,7 @@ export default function Board2Page() {
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
   const playHeldKeysRef = useRef(new Set<string>());
   const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
+  const playCursorRef = useRef<{ x: number; y: number } | null>(null);
   const playPhysicsRef = useRef<PlayCharacterState | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
 
@@ -8778,7 +8835,8 @@ export default function Board2Page() {
     playPhysicsRef.current = {
       x: startX, y: startY, vx: 0, vy: 0, facing: sourcePose.facing ?? 1,
       grounded: true, surfaceId: startSurface.id ?? null, stride: 0, spin: 0,
-      spawnX: startX, spawnY: startY, action: "none", actionUntil: 0,
+      spawnX: startX, spawnY: startY, action: "none", actionUntil: 0, landedAt: -Infinity,
+      grappleX: null, grappleY: null, grappleLength: 0,
     };
     playTimeRef.current = 0;
     playWallStartRef.current = 0;
@@ -8792,6 +8850,7 @@ export default function Board2Page() {
     setPlayMode(false);
     playHeldKeysRef.current.clear();
     playPointerRef.current = null;
+    playCursorRef.current = null;
     playPhysicsRef.current = null;
     setPlayhead(editorPlayheadBeforePlayRef.current);
     playheadRef.current = editorPlayheadBeforePlayRef.current;
@@ -8804,11 +8863,21 @@ export default function Board2Page() {
     const sf = cam.boardZoom * rect.width / BOARD_W;
     const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
     const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
+    playCursorRef.current = { x: rawX, y: rawY };
     const state = playPhysicsRef.current;
     if (!state) return;
     const cursorDx = rawX - state.x;
     const cursorDy = rawY - (state.y - PLAY_CHARACTER_HEIGHT * 0.56);
     const cursorDistance = Math.hypot(cursorDx, cursorDy);
+    if (playHeldKeysRef.current.has("KeyG")) {
+      state.grappleX = rawX;
+      state.grappleY = rawY;
+      state.grappleLength = Math.max(90, cursorDistance * 0.82);
+      state.grounded = false;
+      state.surfaceId = null;
+      state.action = "none";
+      return;
+    }
     const travelSpeed = cursorDistance <= PLAY_WALK_RADIUS_PX ? PLAY_WALK_SPEED : PLAY_RUN_SPEED;
     if (Math.abs(cursorDx) > 18) {
       state.facing = cursorDx >= 0 ? 1 : -1;
@@ -8831,6 +8900,13 @@ export default function Board2Page() {
 
   function handlePlayPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
     const pointer = playPointerRef.current;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const cam = playCameraRef.current;
+    const sf = cam.boardZoom * rect.width / BOARD_W;
+    playCursorRef.current = {
+      x: (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX,
+      y: (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY,
+    };
     if (!pointer || pointer.id !== e.pointerId) return;
     pointer.clientX = e.clientX;
     pointer.clientY = e.clientY;
@@ -8886,6 +8962,24 @@ export default function Board2Page() {
     state.x += state.vx * dt;
     if (!state.grounded) {
       state.vy = Math.min(PLAY_MAX_FALL_SPEED, state.vy + PLAY_GRAVITY * dt);
+      if (state.grappleX !== null && state.grappleY !== null) {
+        const dx = state.grappleX - state.x;
+        const dy = state.grappleY - (state.y - 90);
+        const distance = Math.max(1, Math.hypot(dx, dy));
+        const ux = dx / distance;
+        const uy = dy / distance;
+        const pull = clamp((distance - state.grappleLength) * 8, 0, 1800);
+        state.vx += ux * pull * dt;
+        state.vy += uy * pull * dt;
+        if (distance > state.grappleLength) {
+          const radialSpeed = state.vx * ux + state.vy * uy;
+          if (radialSpeed < 0) {
+            state.vx -= ux * radialSpeed * 0.72;
+            state.vy -= uy * radialSpeed * 0.72;
+          }
+        }
+        state.facing = dx >= 0 ? 1 : -1;
+      }
       const nextY = state.y + state.vy * dt;
       if (state.vy >= 0) {
         const landing = surfaces
@@ -8898,6 +8992,7 @@ export default function Board2Page() {
           state.grounded = true;
           state.surfaceId = landing.id ?? null;
           state.spin = 0;
+          state.landedAt = playTimeRef.current;
         } else {
           state.y = nextY;
         }
@@ -8908,8 +9003,10 @@ export default function Board2Page() {
     }
 
     state.stride += Math.abs(state.vx) * dt / (Math.abs(state.vx) > 520 ? 28 : 23);
-    const visible = cameraViewport(playCameraRef.current, canvas.width, canvas.height);
-    if (state.y > visible.bottom + PLAY_RESPAWN_MARGIN) {
+    const lowestSurfaceBottom = surfaces.length > 0
+      ? Math.max(...surfaces.map((surface) => surface.boardY + surface.boardH))
+      : state.spawnY;
+    if (state.y > lowestSurfaceBottom + PLAY_RESPAWN_BELOW_LOWEST_SURFACE) {
       state.x = state.spawnX;
       state.y = state.spawnY;
       state.vx = 0;
@@ -8918,6 +9015,9 @@ export default function Board2Page() {
       state.surfaceId = findSurfaceAtFeet(state.spawnX, state.spawnY, surfaces)?.id ?? null;
       state.spin = 0;
       state.action = "none";
+      state.landedAt = playTimeRef.current;
+      state.grappleX = null;
+      state.grappleY = null;
       playCameraRef.current.cameraX = state.spawnX;
       playCameraRef.current.cameraY = state.spawnY - 120;
     }
@@ -8955,14 +9055,17 @@ export default function Board2Page() {
           ctx, state, now, playCameraRef.current, sf, canvas.width, canvas.height,
           characterFaceRef.current && characterFaceImageRef.current
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
-            : null
+            : null,
+          playCursorRef.current,
+          playHairStyle,
+          playOutfitStyle
         );
       }
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
     return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
-  }, [playMode, playSceneShot, renderToCtx]);
+  }, [playMode, playSceneShot, playHairStyle, playOutfitStyle, renderToCtx]);
 
   // ─ Keyboard shortcuts ─────────────────────────────────────────────────────
 
@@ -9035,6 +9138,10 @@ export default function Board2Page() {
     };
     const onKeyUp = (e: KeyboardEvent) => {
       playHeldKeysRef.current.delete(e.code);
+      if (e.code === "KeyG") {
+        const state = playPhysicsRef.current;
+        if (state) { state.grappleX = null; state.grappleY = null; }
+      }
       if (e.code === "Space") {
         isSpaceDownRef.current = false;
         setIsSpaceDown(false);
@@ -9523,6 +9630,21 @@ export default function Board2Page() {
         >
           ✕ Exit
         </button>
+        <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
+          <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
+          <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
+            {(["crop", "spikes", "curls", "none"] as PlayHairStyle[]).map((style) => (
+              <button key={style} type="button" onClick={() => setPlayHairStyle(style)} style={{ padding: "4px 6px", border: "1px solid #2a2a2a", background: playHairStyle === style ? "#f4b942" : "#fffdf5", font: "inherit", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}>{style}</button>
+            ))}
+          </div>
+          <div style={{ fontSize: 9, marginBottom: 4 }}>Outfit</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {(["tee", "varsity", "adventure"] as PlayOutfitStyle[]).map((style) => (
+              <button key={style} type="button" onClick={() => setPlayOutfitStyle(style)} style={{ padding: "4px 6px", border: "1px solid #2a2a2a", background: playOutfitStyle === style ? "#8cb8cf" : "#fffdf5", font: "inherit", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}>{style}</button>
+            ))}
+          </div>
+        </div>
         <div style={{ position: "fixed", right: 14, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
           <button
             type="button"
@@ -9533,7 +9655,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Hold near character to walk · hold farther to run<br />Aim above to jump · run off edges to fall · fast jumps flip<br />D dance · E emote · F flip · P in-place pull-ups<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Hold near character to walk · hold farther to run<br />Aim above to jump · run off edges to fall · fast jumps flip<br />Hold G + click to grapple · release G to detach<br />D dance · E emote · F flip · P in-place pull-ups<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
             </div>
           )}
         </div>
