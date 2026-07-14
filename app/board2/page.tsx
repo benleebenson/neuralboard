@@ -305,6 +305,54 @@ function formatTime(sec: number): string {
   return `${m}:${s.toFixed(1).padStart(4, "0")}`;
 }
 
+// Bakes the face-crop oval into a standalone transparent PNG so the modal preview and the
+// baked character head render from the exact same pixels. The modal displays the source image
+// as a normal width:100% / height:auto image, so imageDrawOffset is 0 and imageDrawScale is
+// displayWidth / naturalWidth; crop fractions map directly into source pixels.
+async function bakeFaceCropImage(
+  sourceUrl: string,
+  crop: { x: number; y: number; w: number; h: number }
+): Promise<{ blob: Blob; aspect: number }> {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Face image failed to load"));
+    img.src = sourceUrl;
+  });
+  const sourceX = clamp(Math.round(crop.x * img.naturalWidth), 0, Math.max(0, img.naturalWidth - 1));
+  const sourceY = clamp(Math.round(crop.y * img.naturalHeight), 0, Math.max(0, img.naturalHeight - 1));
+  const sourceW = Math.max(1, Math.min(img.naturalWidth - sourceX, Math.round(crop.w * img.naturalWidth)));
+  const sourceH = Math.max(1, Math.min(img.naturalHeight - sourceY, Math.round(crop.h * img.naturalHeight)));
+  const aspect = clamp(sourceH / Math.max(1, sourceW), 0.75, 1.6);
+  const canvas = document.createElement("canvas");
+  canvas.width = sourceW;
+  canvas.height = sourceH;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not create face crop");
+  ctx.clearRect(0, 0, sourceW, sourceH);
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(sourceW / 2, sourceH / 2, sourceW / 2, sourceH / 2, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.drawImage(
+    img,
+    sourceX,
+    sourceY,
+    sourceW,
+    sourceH,
+    0,
+    0,
+    sourceW,
+    sourceH
+  );
+  ctx.restore();
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Face crop failed"))), "image/png");
+  });
+  return { blob, aspect };
+}
+
 function shadeColor(hex: string, factor: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -1385,15 +1433,17 @@ function lerpCharPose(a: CharPoseResult, b: CharPoseResult, t: number): CharPose
   };
 }
 
-function thinkingChinPoint(headTilt: number, visibleSide: -1 | 1): { x: number; y: number } {
+function thinkingChinPoint(headTilt: number, visibleSide: -1 | 1, hasFace = false, faceAspect = 1): { x: number; y: number } {
   const torsoTopY = -CHAR_TORSO_RAW;
   const neckTopX = -Math.sin(headTilt) * CHAR_NECK_RAW;
   const neckTopY = torsoTopY - Math.cos(headTilt) * CHAR_NECK_RAW;
-  const headCX = neckTopX - Math.sin(headTilt) * CHAR_HEAD_R_RAW * 0.35;
-  const headCY = neckTopY - Math.cos(headTilt) * CHAR_HEAD_R_RAW;
+  const headR = CHAR_HEAD_R_RAW * (hasFace ? 1.15 : 1);
+  const headRY = hasFace ? headR * Math.sqrt(faceAspect) : headR;
+  const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
+  const headCY = neckTopY - Math.cos(headTilt) * headRY;
   return {
     x: headCX + visibleSide * 4,
-    y: headCY + CHAR_HEAD_R_RAW * 0.92,
+    y: headCY + headRY * 0.92,
   };
 }
 
@@ -1445,7 +1495,9 @@ function thinkingPoseBase(
   time: number,
   actionId: string,
   elapsed: number,
-  phase: "lift" | "bend" | "chin" | "hold" | "release"
+  phase: "lift" | "bend" | "chin" | "hold" | "release",
+  hasFace = false,
+  faceAspect = 1
 ): CharPoseResult {
   const thinkingSide: -1 | 1 = facing >= 0 ? 1 : -1;
   const s0 = seededRandom(`${actionId}:head`);
@@ -1459,7 +1511,7 @@ function thinkingPoseBase(
     : 0;
   const freeSway = phase === "hold" ? Math.sin((elapsed / 3.7) * Math.PI * 2 + s3 * Math.PI * 2) * 0.04 : 0;
   const headTilt = phase === "lift" ? 0 : phase === "bend" ? 0.08 : 0.15 + headMicro;
-  const chin = thinkingChinPoint(headTilt, thinkingSide);
+  const chin = thinkingChinPoint(headTilt, thinkingSide, hasFace, faceAspect);
   const solved = solveArmToLocalPoint(chin.x, chin.y, thinkingSide);
   const pose = standingCharPose(boardX + weight * 3 * facing, boardY, facing, time);
 
@@ -1523,7 +1575,9 @@ function evalCharAtTime(
   initX: number,
   initY: number,
   clips: CharSurfaceClip[],
-  authoredAnimations: Record<string, AuthoredAnimation> = {}
+  authoredAnimations: Record<string, AuthoredAnimation> = {},
+  hasFace = false,
+  faceAspect = 1
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
   // Legs +0.12/-0.12 (feet slightly apart), upper arms +0.08/-0.08 (hanging at sides), forearms
@@ -2348,14 +2402,16 @@ function evalCharAtTime(
       initX,
       initY,
       clips,
-      authoredAnimations
+      authoredAnimations,
+      hasFace,
+      faceAspect
     );
     const facing = priorPose.facing ?? 1;
     const standing = standingCharPose(active.fromX, active.fromY, facing, time);
-    const liftPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "lift");
-    const bendPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "bend");
-    const chinPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "chin");
-    const holdPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "hold");
+    const liftPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "lift", hasFace, faceAspect);
+    const bendPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "bend", hasFace, faceAspect);
+    const chinPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "chin", hasFace, faceAspect);
+    const holdPose = thinkingPoseBase(active.fromX, active.fromY, facing, time, active.id, elapsed, "hold", hasFace, faceAspect);
     let pose: CharPoseResult;
 
     if (elapsed < liftEnd) {
@@ -2403,7 +2459,9 @@ function drawCharacterToCanvas(
   accentColor = "#2a2a2a"
 ) {
   if (!showChar || time < entranceTime) return;
-  const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations);
+  const hasFace = !!characterFace?.image;
+  const faceAspect = clamp(characterFace?.aspect ?? 1, 0.75, 1.6);
+  const p = evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
   const { facing } = p;
   const physique = physiqueAt(time, resolved);
   const isJacked = physique === "jacked";
@@ -2423,8 +2481,9 @@ function drawCharacterToCanvas(
   const torsoLen = CHAR_TORSO_RAW * S;
   const neckLen = CHAR_NECK_RAW * S * (isJacked ? 0.72 : 1);
   const armLen = CHAR_ARM_RAW * S;
-  const hasFace = !!characterFace?.image;
   const headR = CHAR_HEAD_R_RAW * S * (hasFace ? 1.15 : 1);
+  const headRX = hasFace ? headR / Math.sqrt(faceAspect) : headR;
+  const headRY = hasFace ? headR * Math.sqrt(faceAspect) : headR;
   const bobS = p.headBob * S;
   const headTilt = p.headTilt ?? 0;
   const hipY = (-CHAR_HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
@@ -3107,23 +3166,24 @@ function drawCharacterToCanvas(
   ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(neckTopX, neckTopY); ctx.stroke();
   ctx.restore();
 
-  // Head — blank circle by default; optional cropped face image clips into the same tilted head.
-  const headCX = neckTopX - Math.sin(headTilt) * headR * 0.35;
-  const headCY = neckTopY - Math.cos(headTilt) * headR;
-  const faceAspect = clamp(characterFace?.aspect ?? 1, 0.55, 1.8);
-  const headRX = hasFace ? headR * Math.sqrt(faceAspect) : headR;
-  const headRY = hasFace ? headR / Math.sqrt(faceAspect) : headR;
+  // Head — blank circle by default; optional cropped face image clips into the same tilted head,
+  // adopting the crop oval's aspect ratio (headRX/headRY) instead of staying perfectly round.
+  const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
+  const headCY = neckTopY - Math.cos(headTilt) * headRY;
   if (hasFace && characterFace?.image) {
     ctx.save();
-    ctx.beginPath();
-    ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2);
-    ctx.clip();
     ctx.translate(headCX, headCY);
+    ctx.rotate(headTilt);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, headRX, headRY, 0, 0, Math.PI * 2);
+    ctx.clip();
     if (facing < 0) ctx.scale(-1, 1);
     ctx.drawImage(characterFace.image, -headRX, -headRY, headRX * 2, headRY * 2);
     ctx.restore();
+  } else {
+    // Blank default head keeps its outline; a custom face's clipped image edge IS the head edge.
+    ctx.beginPath(); ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2); ctx.stroke();
   }
-  ctx.beginPath(); ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2); ctx.stroke();
 
   // Emoji emote
   if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
@@ -3133,7 +3193,7 @@ function drawCharacterToCanvas(
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
     ctx.scale(1 / facing, 1);
-    ctx.fillText(p.emojiText, headCX * facing, headCY - headR - 12 * S);
+    ctx.fillText(p.emojiText, headCX * facing, headCY - headRY - 12 * S);
     ctx.restore();
   }
 
@@ -3144,8 +3204,8 @@ function drawCharacterToCanvas(
     ctx.lineWidth = Math.max(1, 1.5 * S);
     for (const [x, y] of [[-22, -12], [0, -22], [22, -12]] as const) {
       ctx.beginPath();
-      ctx.moveTo(headCX + x * S * 0.6, headCY - headR + y * S);
-      ctx.lineTo(headCX + x * S, headCY - headR + (y - 16) * S);
+      ctx.moveTo(headCX + x * S * 0.6, headCY - headRY + y * S);
+      ctx.lineTo(headCX + x * S, headCY - headRY + (y - 16) * S);
       ctx.stroke();
     }
     ctx.restore();
@@ -3275,6 +3335,7 @@ export default function Board2Page() {
   const [facePickerOpen, setFacePickerOpen] = useState(false);
   const [faceCropSource, setFaceCropSource] = useState<{ url: string; name: string } | null>(null);
   const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
+  const [faceCropPreview, setFaceCropPreview] = useState<{ url: string; aspect: number } | null>(null);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
@@ -3586,6 +3647,31 @@ export default function Board2Page() {
     img.src = characterFace2.faceBlobUrl;
     return () => { cancelled = true; };
   }, [characterFace2?.faceBlobUrl]);
+  // Live crop-modal preview — baked from the same helper as the final "Use Face" bake, so the
+  // preview is a regression test: what's shown here is exactly the pixels that will be used.
+  useEffect(() => {
+    if (!faceCropSource) {
+      const timer = window.setTimeout(() => {
+        setFaceCropPreview((prev) => {
+          if (prev) URL.revokeObjectURL(prev.url);
+          return null;
+        });
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    let cancelled = false;
+    bakeFaceCropImage(faceCropSource.url, faceCrop)
+      .then(({ blob, aspect }) => {
+        if (cancelled) return;
+        const url = URL.createObjectURL(blob);
+        setFaceCropPreview((prev) => {
+          if (prev) URL.revokeObjectURL(prev.url);
+          return { url, aspect };
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [faceCropSource, faceCrop]);
   useEffect(() => { characterActionsRef.current = characterActions; }, [characterActions]);
   useEffect(() => { characterActions2Ref.current = characterActions2; }, [characterActions2]);
   useEffect(() => { selectedCharActionIdRef.current = selectedCharActionId; }, [selectedCharActionId]);
@@ -4617,41 +4703,7 @@ export default function Board2Page() {
   async function confirmFaceCrop() {
     if (!faceCropSource) return;
     try {
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      await new Promise<void>((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error("Face image failed to load"));
-        img.src = faceCropSource.url;
-      });
-      const aspect = clamp(faceCrop.w / Math.max(0.001, faceCrop.h), 0.55, 1.8);
-      const outW = 512;
-      const outH = Math.round(outW / aspect);
-      const canvas = document.createElement("canvas");
-      canvas.width = outW;
-      canvas.height = outH;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Could not create face crop");
-      ctx.clearRect(0, 0, outW, outH);
-      ctx.save();
-      ctx.beginPath();
-      ctx.ellipse(outW / 2, outH / 2, outW / 2, outH / 2, 0, 0, Math.PI * 2);
-      ctx.clip();
-      ctx.drawImage(
-        img,
-        faceCrop.x * img.naturalWidth,
-        faceCrop.y * img.naturalHeight,
-        faceCrop.w * img.naturalWidth,
-        faceCrop.h * img.naturalHeight,
-        0,
-        0,
-        outW,
-        outH
-      );
-      ctx.restore();
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Face crop failed")), "image/png");
-      });
+      const { blob, aspect } = await bakeFaceCropImage(faceCropSource.url, faceCrop);
       const faceBlobUrl = URL.createObjectURL(blob);
       const activeFace = activeCharacterIdRef.current === "c2" ? characterFace2Ref.current : characterFaceRef.current;
       if (activeFace?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(activeFace.faceBlobUrl);
@@ -11327,20 +11379,26 @@ export default function Board2Page() {
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
                 <div style={{ ...panelLabelStyle, alignSelf: "stretch" }}>Preview</div>
-                <div style={{ width: 86, height: 86, borderRadius: "50%", overflow: "hidden", border: "2px solid #2a2a2a", background: "#fff", position: "relative" }}>
-                  <img
-                    src={faceCropSource.url}
-                    alt=""
-                    draggable={false}
-                    style={{
-                      position: "absolute",
-                      left: `${-(faceCrop.x / Math.max(faceCrop.w, 0.001)) * 100}%`,
-                      top: `${-(faceCrop.y / Math.max(faceCrop.h, 0.001)) * 100}%`,
-                      width: `${(1 / Math.max(faceCrop.w, 0.001)) * 100}%`,
-                      height: `${(1 / Math.max(faceCrop.h, 0.001)) * 100}%`,
-                      objectFit: "fill",
-                    }}
-                  />
+                <div
+                  style={{
+                    width: faceCropPreview && faceCropPreview.aspect > 1 ? Math.round(86 / faceCropPreview.aspect) : 86,
+                    height: faceCropPreview && faceCropPreview.aspect < 1 ? Math.round(86 * faceCropPreview.aspect) : 86,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "repeating-conic-gradient(#e2e2e2 0% 25%, #fafafa 0% 50%) 50% / 12px 12px",
+                  }}
+                >
+                  {/* Rendered straight from the same bake as "Use Face" — no CSS approximation,
+                      so what's shown here is exactly the oval that lands on the character. */}
+                  {faceCropPreview && (
+                    <img
+                      src={faceCropPreview.url}
+                      alt=""
+                      draggable={false}
+                      style={{ display: "block", width: "100%", height: "100%" }}
+                    />
+                  )}
                 </div>
                 <div style={{ fontSize: 9, color: "#6a6a6a", textAlign: "center", lineHeight: 1.45 }}>
                   Drag the oval to move it. Drag a corner to resize.
