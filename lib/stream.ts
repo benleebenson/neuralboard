@@ -1,5 +1,8 @@
 export const STREAM_FPS = 15;
 export const STREAM_CHANNEL_PREFIX = "stream";
+export const MAX_GUESTS = 8;
+export const GUEST_NAME_MAX_LENGTH = 16;
+export const GUEST_EMOTES = ["🤔", "💡", "❗", "😂", "👋"] as const;
 
 export type StreamCamera = {
   cameraX: number;
@@ -62,12 +65,45 @@ export type StreamCharacterFrame = {
   emojiAlpha?: number;
 };
 
+export type SpawnDoor = { x: number; y: number };
+
+export type StreamParticipantPresence = {
+  role: "host" | "viewer" | "guest";
+  guestId?: string;
+  name?: string;
+  faceDataUrl?: string;
+  joinedAt: number;
+};
+
+export type GuestCharacterFrame = {
+  kind: "guest-state";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  guestId: string;
+  name: string;
+  position: { x: number; y: number };
+  facing: 1 | -1;
+  actionType: "idle" | "walk" | "run" | "jump" | "emote";
+  actionProgress: number;
+  emote?: string;
+};
+
+export type StreamKickMessage = {
+  kind: "kick";
+  streamId: string;
+  sessionId: string;
+  guestId: string;
+  sentAt: number;
+};
+
 export type StreamSnapshotMessage = {
   kind: "snapshot";
   streamId: string;
   sessionId: string;
   sentAt: number;
   board: { width: number; height: number; backgroundColor: string };
+  spawnDoor?: SpawnDoor | null;
   clips: StreamClip[];
   annotations: StreamAnnotation[];
   characters: StreamCharacterSnapshot[];

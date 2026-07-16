@@ -9,10 +9,15 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import {
   STREAM_FPS,
+  GuestCharacterFrame,
+  MAX_GUESTS,
+  SpawnDoor,
+  StreamParticipantPresence,
   StreamCharacterFrame,
   StreamSnapshotMessage,
   streamChannelName,
 } from "@/lib/stream";
+import { drawSharedStreamCharacter, guestCharacterForRender } from "@/lib/stream-character-renderer";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -2873,6 +2878,14 @@ function drawPlaySpawnDoor(
   ctx.restore();
 }
 
+function drawPlacedSpawnDoor(ctx: CanvasRenderingContext2D, door: SpawnDoor, cam: { cameraX: number; cameraY: number; boardZoom: number }, sf: number, W: number, H: number) {
+  const x = (door.x - cam.cameraX) * sf + W / 2, y = (door.y - cam.cameraY) * sf + H / 2;
+  const dw = 90 * sf, dh = 150 * sf;
+  ctx.save(); ctx.fillStyle = "#f4b942"; ctx.strokeStyle = "#2b2520"; ctx.lineWidth = Math.max(1.5, 3 * sf);
+  ctx.beginPath(); ctx.roundRect(x - dw / 2, y - dh, dw, dh, [dw * .5, dw * .5, 4, 4]); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x + dw * .23, y - dh * .45, 4.5 * sf, 0, Math.PI * 2); ctx.fillStyle = "#fff8df"; ctx.fill(); ctx.stroke(); ctx.restore();
+}
+
 function drawPoptropicaPlayCharacter(
   ctx: CanvasRenderingContext2D,
   state: PlayCharacterState,
@@ -3950,6 +3963,8 @@ export default function Board2Page() {
   const [liveLegendOpen, setLiveLegendOpen] = useState(true);
   const [liveHeldCommand, setLiveHeldCommand] = useState<LiveCommandKey | null>(null);
   const [streamPublishing, setStreamPublishing] = useState(false);
+  const [spawnDoor, setSpawnDoor] = useState<SpawnDoor | null>(null);
+  const [streamGuests, setStreamGuests] = useState<StreamParticipantPresence[]>([]);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
   const [retargetCharActionId, setRetargetCharActionId] = useState<string | null>(null);
   const [charActionContextMenu, setCharActionContextMenu] = useState<{ x: number; y: number; actionId: string } | null>(null);
@@ -4203,6 +4218,9 @@ export default function Board2Page() {
   const streamLastFrameAtRef = useRef(0);
   const streamSnapshotQueuedRef = useRef(false);
   const streamSnapshotBusyRef = useRef(false);
+  const spawnDoorRef = useRef<SpawnDoor | null>(null);
+  const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
+  const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
     c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
@@ -4434,6 +4452,7 @@ export default function Board2Page() {
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
       board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
+      spawnDoor: spawnDoorRef.current,
       clips: clipsRef.current
         .filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.boardX !== undefined)
         .map((c) => ({
@@ -4516,6 +4535,13 @@ export default function Board2Page() {
         characters,
       },
     });
+  }, []);
+
+  const kickStreamGuest = useCallback((guestId?: string) => {
+    if (!guestId) return;
+    streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt: Date.now() } });
+    streamGuestFramesRef.current.delete(guestId);
+    setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
@@ -4630,6 +4656,7 @@ export default function Board2Page() {
   useEffect(() => { characterSkin2Ref.current = characterSkin2; }, [characterSkin2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
+  useEffect(() => { spawnDoorRef.current = spawnDoor; }, [spawnDoor]);
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
@@ -4847,6 +4874,9 @@ export default function Board2Page() {
         streamChannelRef.current = null;
       }
       streamSessionIdRef.current = "";
+      streamGuestFramesRef.current.clear();
+      streamGuestFacesRef.current.clear();
+      window.setTimeout(() => setStreamGuests([]), 0);
       drawFrameRef.current(playheadRef.current);
       return;
     }
@@ -4861,9 +4891,27 @@ export default function Board2Page() {
         config: { broadcast: { self: false }, presence: { key: session.user.email } },
       });
       streamChannelRef.current = channel;
+      channel
+        .on("broadcast", { event: "guest-state" }, ({ payload }) => {
+          const frame = payload as GuestCharacterFrame;
+          if (frame.sessionId === streamSessionIdRef.current) streamGuestFramesRef.current.set(frame.guestId, frame);
+        })
+        .on("presence", { event: "sync" }, () => {
+          const people = Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];
+          const guests = people.filter((person) => person.role === "guest").slice(0, MAX_GUESTS);
+          setStreamGuests(guests);
+          for (const guest of guests) {
+            if (!guest.guestId || !guest.faceDataUrl || streamGuestFacesRef.current.has(guest.guestId)) continue;
+            const image = new Image(); image.src = guest.faceDataUrl;
+            streamGuestFacesRef.current.set(guest.guestId, image);
+          }
+        });
       channel.subscribe((status) => {
         setStreamPublishing(status === "SUBSCRIBED");
-        if (status === "SUBSCRIBED") void publishStreamSnapshot();
+        if (status === "SUBSCRIBED") {
+          void channel.track({ role: "host", name: STREAM_OWNER_USER_ID, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+          void publishStreamSnapshot();
+        }
       });
     } else {
       window.setTimeout(() => setStreamPublishing(false), 0);
@@ -4890,7 +4938,7 @@ export default function Board2Page() {
   useEffect(() => {
     if (!liveControlEnabled) return;
     void publishStreamSnapshot();
-  }, [liveControlEnabled, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, publishStreamSnapshot]);
+  }, [liveControlEnabled, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, spawnDoor, publishStreamSnapshot]);
 
   useEffect(() => {
     return () => {
@@ -5080,6 +5128,18 @@ export default function Board2Page() {
             : null,
           characterSkin2Ref.current,
           pose
+        );
+      }
+      if (spawnDoorRef.current) drawPlacedSpawnDoor(ctx, spawnDoorRef.current, cam, sf, W, H);
+      for (const frame of streamGuestFramesRef.current.values()) {
+        drawSharedStreamCharacter(
+          ctx,
+          guestCharacterForRender(frame),
+          streamGuestFacesRef.current.get(frame.guestId) ?? null,
+          cam,
+          sf,
+          W,
+          H,
         );
       }
     } else if (showCharacterRef.current && !playModeRef.current) {
@@ -10527,6 +10587,7 @@ export default function Board2Page() {
         characterSkin: characterSkinRef.current,
         characterFace: manifestFace,
         characters: manifestCharacters,
+        spawnDoor: spawnDoorRef.current,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
@@ -10612,6 +10673,7 @@ export default function Board2Page() {
       setCameraKeyframeMode(loadedKeyframeMode);
       cameraKeyframeModeRef.current = loadedKeyframeMode;
       setAnnotations(manifest.annotations ?? []);
+      setSpawnDoor(manifest.spawnDoor ?? null);
       if (manifest.canvasAspect) setCanvasAspect(manifest.canvasAspect);
       if (manifest.pxPerSec) { pxPerSecRef.current = manifest.pxPerSec; setPxPerSec(manifest.pxPerSec); }
       if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
@@ -12032,6 +12094,19 @@ export default function Board2Page() {
                       <div style={{ ...panelLabelStyle, marginBottom: -2 }}>Character</div>
                       <button
                         type="button"
+                        onClick={() => {
+                          const centerX = boardPanRef.current.x + BOARD_W / (2 * boardZoomRef.current);
+                          const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
+                          const surface = surfaces.filter((clip) => centerX >= clip.boardX && centerX <= clip.boardX + clip.boardW).sort((a, b) => Math.abs(a.boardY - boardPanRef.current.y) - Math.abs(b.boardY - boardPanRef.current.y))[0] ?? surfaces[0];
+                          const next = surface ? { x: clamp(centerX, surface.boardX + 45, surface.boardX + surface.boardW - 45), y: surface.boardY } : { x: BOARD_W / 2, y: BOARD_H / 2 };
+                          setSpawnDoor(next); spawnDoorRef.current = next; setToast("Spawn Door placed at the current view");
+                        }}
+                        style={{ ...miniButton, background: spawnDoor ? "#f4b942" : "transparent" }}
+                      >
+                        🚪 {spawnDoor ? "Move Spawn Door here" : "Place Spawn Door"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => activeCharacterId === "c2" ? setShowCharacter2((v) => !v) : setShowCharacter((v) => !v)}
                         style={{ ...miniButton, background: activeCharacter.enabled ? (activeCharacterId === "c2" ? "#dcd6ff" : CHARACTER_COLOR) : "transparent", color: "#2a2a2a" }}
                       >
@@ -12057,11 +12132,17 @@ export default function Board2Page() {
                             🎮 Live Control {liveControlEnabled ? "ON" : "OFF"}
                           </button>
                           {liveControlEnabled && (
-                            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 5, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                               <span>Camera: {liveCameraMode === "scene" ? "scene shot" : "character shot"} · V toggles</span>
                               <span style={{ color: streamPublishing ? "#228b22" : "#8a6a00", fontWeight: 700 }}>
                                 {streamPublishing ? "LIVE" : "LOCAL"}
                               </span>
+                              </div>
+                              <strong>Participants ({streamGuests.length}/{MAX_GUESTS})</strong>
+                              {/* refs are read only when the click handler runs */}
+                              {/* eslint-disable-next-line react-hooks/refs */}
+                              {streamGuests.map((guest) => <div key={guest.guestId} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span>{guest.name}</span><button type="button" style={{ ...miniButton, color: "#cc2200", padding: "2px 5px" }} onClick={() => kickStreamGuest(guest.guestId)}>KICK</button></div>)}
                             </div>
                           )}
                         </div>
