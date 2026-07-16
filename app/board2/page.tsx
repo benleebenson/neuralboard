@@ -4896,6 +4896,9 @@ export default function Board2Page() {
           const frame = payload as GuestCharacterFrame;
           if (frame.sessionId === streamSessionIdRef.current) streamGuestFramesRef.current.set(frame.guestId, frame);
         })
+        .on("broadcast", { event: "snapshot-request" }, () => {
+          void publishStreamSnapshot();
+        })
         .on("presence", { event: "sync" }, () => {
           const people = Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];
           const guests = people.filter((person) => person.role === "guest").slice(0, MAX_GUESTS);
