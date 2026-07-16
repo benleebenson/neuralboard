@@ -11,3 +11,5 @@ export function getBrowserSupabase(): SupabaseClient | null {
   if (!browserSupabase) browserSupabase = createClient(url, anonKey);
   return browserSupabase;
 }
+
+// Browser Realtime configuration is compiled during deployment.
