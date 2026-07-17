@@ -5,13 +5,15 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { drawSharedStreamCharacter, guestCharacterForRender, hostCharacterForRender } from "@/lib/stream-character-renderer";
-import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GuestCharacterFrame, MAX_GUESTS, StreamAnnotation, StreamCamera, StreamFrameMessage, StreamParticipantPresence, StreamSnapshotMessage, streamChannelName } from "@/lib/stream";
+import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GuestCharacterFrame, MAX_GUESTS, STREAM_FPS, StreamAnnotation, StreamCamera, StreamFrameMessage, StreamParticipantPresence, StreamSnapshotMessage, streamChannelName } from "@/lib/stream";
 
 type Mode = "landing" | "watch" | "join" | "guest";
 type GuestPhysics = { x: number; y: number; vx: number; vy: number; targetX: number | null; targetY: number | null; facing: 1 | -1; grounded: boolean; surfaceId: string | null; action: GuestCharacterFrame["actionType"]; actionStarted: number; emote?: string; spawnAt: number };
 const BOARD_W = 4000;
+const GUEST_RESPAWN_BELOW_LOWEST_SURFACE = 650;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+type StreamSurface = StreamSnapshotMessage["clips"][number];
 
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:guest]", ...args);
@@ -80,6 +82,45 @@ function drawImageSafe(ctx: CanvasRenderingContext2D, img: HTMLImageElement | un
   }
 }
 
+function streamSurfaces(snapshot: StreamSnapshotMessage): StreamSurface[] {
+  return snapshot.clips.filter((clip) => clip.type === "image" || clip.type === "video");
+}
+
+function findGuestSupport(x: number, y: number, surfaces: StreamSurface[]): StreamSurface | undefined {
+  return surfaces
+    .filter((surface) => x >= surface.boardX + 12 && x <= surface.boardX + surface.boardW - 12)
+    .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+}
+
+function nearestGuestSurface(x: number, y: number, surfaces: StreamSurface[]): StreamSurface | undefined {
+  return [...surfaces].sort((a, b) => {
+    const ax = clamp(x, a.boardX + 24, a.boardX + a.boardW - 24);
+    const bx = clamp(x, b.boardX + 24, b.boardX + b.boardW - 24);
+    return Math.hypot(ax - x, a.boardY - y) - Math.hypot(bx - x, b.boardY - y);
+  })[0];
+}
+
+function resolveGuestSpawn(snapshot: StreamSnapshotMessage) {
+  const surfaces = streamSurfaces(snapshot);
+  const doorX = snapshot.spawnDoor?.x ?? snapshot.board.width / 2;
+  const doorY = snapshot.spawnDoor?.y ?? snapshot.board.height / 2;
+  const support = findGuestSupport(doorX, doorY, surfaces) ?? nearestGuestSurface(doorX, doorY, surfaces);
+  if (!support) return { x: doorX, y: doorY, grounded: false, surfaceId: null as string | null };
+  return {
+    x: clamp(doorX, support.boardX + 24, support.boardX + support.boardW - 24),
+    y: support.boardY,
+    grounded: true,
+    surfaceId: support.id,
+  };
+}
+
+function lowestGuestSurfaceBottom(snapshot: StreamSnapshotMessage): number {
+  const surfaces = streamSurfaces(snapshot);
+  return surfaces.length > 0
+    ? Math.max(...surfaces.map((surface) => surface.boardY + surface.boardH))
+    : snapshot.spawnDoor?.y ?? snapshot.board.height;
+}
+
 export default function StreamPage() {
   const canvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0);
@@ -99,7 +140,7 @@ export default function StreamPage() {
 
   useEffect(()=>{if(!snapshot)return;const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl)load(faceCache.current,ch.faceDataUrl);},[snapshot]);
 
-  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;const surfaces=snapshot.clips.filter(c=>c.type==="image"||c.type==="video");const x=snapshot.spawnDoor?.x??snapshot.board.width/2;let y=snapshot.spawnDoor?.y??snapshot.board.height/2;const support=surfaces.filter(s=>x>=s.boardX&&x<=s.boardX+s.boardW).sort((a,b)=>Math.abs(a.boardY-y)-Math.abs(b.boardY-y))[0];if(support)y=support.boardY;physics.current={x,y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:!!support,surfaceId:support?.id??null,action:"idle",actionStarted:performance.now(),spawnAt:performance.now()};await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,joinedAt:Date.now()} satisfies StreamParticipantPresence);setMode("guest");setJoinError("");};
+  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now()};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,joinedAt:Date.now()} satisfies StreamParticipantPresence);setMode("guest");setJoinError("");};
   const emote=()=>{const p=physics.current;if(!p)return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];p.action="emote";p.actionStarted=performance.now();};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
 
@@ -136,7 +177,7 @@ export default function StreamPage() {
         const host = latestHost.current;
         const p = physics.current;
         if (p && snapshot) {
-          const surfaces = snapshot.clips;
+          const surfaces = streamSurfaces(snapshot);
           const target = p.targetX;
           if (p.action === "emote" && now - p.actionStarted > 1500) {
             p.action = "idle";
@@ -180,6 +221,23 @@ export default function StreamPage() {
               p.y = nextY;
             }
           }
+          if (p.y > lowestGuestSurfaceBottom(snapshot) + GUEST_RESPAWN_BELOW_LOWEST_SURFACE) {
+            const spawn = resolveGuestSpawn(snapshot);
+            p.x = spawn.x;
+            p.y = spawn.y;
+            p.vx = 0;
+            p.vy = 0;
+            p.targetX = null;
+            p.targetY = null;
+            p.grounded = spawn.grounded;
+            p.surfaceId = spawn.surfaceId;
+            p.action = "idle";
+            p.emote = undefined;
+            p.actionStarted = now;
+            p.spawnAt = now;
+            camera.current.cameraX = spawn.x;
+            camera.current.cameraY = spawn.y - 120;
+          }
           if (!hostCam) {
             const t = 1 - Math.exp(-dt * 5.5);
             camera.current.cameraX = lerp(camera.current.cameraX, p.x, t);
@@ -194,7 +252,7 @@ export default function StreamPage() {
             boardZoom: lerp(camera.current.boardZoom, host.camera.boardZoom, 0.2),
           };
         }
-        if (p && now - publishAt.current > 1000 / 15 && host) {
+        if (p && now - publishAt.current > 1000 / STREAM_FPS && host) {
           publishAt.current = now;
           const packet: GuestCharacterFrame = { kind: "guest-state", streamId: STREAM_OWNER_USER_ID, sessionId: host.sessionId, sentAt: Date.now(), guestId, name: nameRef.current, position: { x: p.x, y: p.y }, facing: p.facing, actionType: p.action, actionProgress: (now - p.actionStarted) / 1000, emote: p.emote };
           channelRef.current?.send({ type: "broadcast", event: "guest-state", payload: packet });
@@ -250,7 +308,7 @@ export default function StreamPage() {
     return () => cancelAnimationFrame(raf);
   }, [guestId, mode, hostCam, snapshot]);
 
-  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam)return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=snapshot.clips.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];if(destination&&p.grounded&&p.y-destination.boardY>=60&&p.y-destination.boardY<=250){p.vy=-clamp(680+(p.y-destination.boardY)*.5,680,810);p.grounded=false;p.surfaceId=null;p.action="jump";p.actionStarted=performance.now();}p.targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);p.targetY=destination?.boardY??p.y;};
+  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam)return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=streamSurfaces(snapshot).filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const wantsJump=p.grounded&&rawY<p.y-90;const jumpsToHigherSurface=!!destination&&p.grounded&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280;if(wantsJump||jumpsToHigherSurface){const height=jumpsToHigherSurface&&destination?Math.max(0,p.y-destination.boardY):120;p.vy=-clamp(680+height*.5,680,850);p.grounded=false;p.surfaceId=null;p.action="jump";p.actionStarted=performance.now();}p.targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);p.targetY=destination?.boardY??p.y;};
   useEffect(()=>{const k=(e:KeyboardEvent)=>{if(mode!=="guest"||e.target instanceof HTMLInputElement)return;if(e.key.toLowerCase()==="e")emote();if(e.key.toLowerCase()==="v")setHostCam(v=>!v);};addEventListener("keydown",k);return()=>removeEventListener("keydown",k);},[mode]);
 
   if(mode==="join")return <main style={landing}><section style={card}><h2>Join as character</h2><input autoFocus maxLength={GUEST_NAME_MAX_LENGTH} value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={input}/><label style={{...button,display:"block",textAlign:"center",marginTop:10}}>Optional face<input hidden type="file" accept="image/*" onChange={async e=>{const f=e.target.files?.[0];if(f)setFace(await bakeFace(f));}}/></label>{face&&<img src={face} alt="Face preview" style={{width:48,height:56,display:"block",margin:"10px auto"}}/>}<p style={{fontSize:10,color:"#8b2b20"}}>{joinError}</p><button style={{...button,background:"#c8f135"}} onClick={beginGuest}>Spawn</button><button style={button} onClick={()=>setMode("landing")}>Cancel</button></section></main>;

@@ -4225,6 +4225,7 @@ export default function Board2Page() {
   const streamSnapshotBusyRef = useRef(false);
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
+  const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
@@ -5035,6 +5036,7 @@ export default function Board2Page() {
       }
       streamSessionIdRef.current = "";
       streamGuestFramesRef.current.clear();
+      streamRenderedGuestFramesRef.current.clear();
       streamGuestFacesRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
@@ -5074,6 +5076,13 @@ export default function Board2Page() {
           streamDebugLog("presence sync", people);
           const guests = people.filter((person) => person.role === "guest").slice(0, MAX_GUESTS);
           setStreamGuests(guests);
+          const activeGuestIds = new Set(guests.map((guest) => guest.guestId).filter(Boolean));
+          for (const guestId of streamGuestFramesRef.current.keys()) {
+            if (!activeGuestIds.has(guestId)) {
+              streamGuestFramesRef.current.delete(guestId);
+              streamRenderedGuestFramesRef.current.delete(guestId);
+            }
+          }
           for (const guest of guests) {
             if (!guest.guestId || !guest.faceDataUrl || streamGuestFacesRef.current.has(guest.guestId)) continue;
             const image = new Image(); image.src = guest.faceDataUrl;
@@ -5197,6 +5206,38 @@ export default function Board2Page() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const drawStreamGuestsToCtx = useCallback((
+    ctx: CanvasRenderingContext2D,
+    cam: { cameraX: number; cameraY: number; boardZoom: number },
+    sf: number,
+    W: number,
+    H: number,
+  ) => {
+    if (spawnDoorRef.current) drawPlacedSpawnDoor(ctx, spawnDoorRef.current, cam, sf, W, H);
+    for (const frame of streamGuestFramesRef.current.values()) {
+      const previous = streamRenderedGuestFramesRef.current.get(frame.guestId);
+      const smoothed = previous
+        ? {
+            ...frame,
+            position: {
+              x: lerp(previous.position.x, frame.position.x, 0.42),
+              y: lerp(previous.position.y, frame.position.y, 0.42),
+            },
+          }
+        : frame;
+      streamRenderedGuestFramesRef.current.set(frame.guestId, smoothed);
+      drawSharedStreamCharacter(
+        ctx,
+        guestCharacterForRender(smoothed),
+        streamGuestFacesRef.current.get(frame.guestId) ?? null,
+        cam,
+        sf,
+        W,
+        H,
+      );
+    }
+  }, []);
+
   // ─ Canvas draw ────────────────────────────────────────────────────────────
 
   const renderToCtx = useCallback((
@@ -5310,18 +5351,7 @@ export default function Board2Page() {
           pose
         );
       }
-      if (spawnDoorRef.current) drawPlacedSpawnDoor(ctx, spawnDoorRef.current, cam, sf, W, H);
-      for (const frame of streamGuestFramesRef.current.values()) {
-        drawSharedStreamCharacter(
-          ctx,
-          guestCharacterForRender(frame),
-          streamGuestFacesRef.current.get(frame.guestId) ?? null,
-          cam,
-          sf,
-          W,
-          H,
-        );
-      }
+      drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
       drawCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, true,
@@ -5347,7 +5377,7 @@ export default function Board2Page() {
     if (currentAnnotations.length > 0) {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
-  }, []);
+  }, [drawStreamGuestsToCtx]);
 
   const drawFrame = useCallback((time: number) => {
     const canvas = canvasRef.current;
@@ -9336,13 +9366,14 @@ export default function Board2Page() {
           playHairStyle,
           playOutfitStyle
         );
+        drawStreamGuestsToCtx(ctx, playCameraRef.current, sf, canvas.width, canvas.height);
       }
       publishStreamFrame(wall);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
     return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
-  }, [playMode, playSceneShot, playHairStyle, playOutfitStyle, publishStreamFrame, renderToCtx]);
+  }, [playMode, playSceneShot, playHairStyle, playOutfitStyle, drawStreamGuestsToCtx, publishStreamFrame, renderToCtx]);
 
   // ─ Keyboard shortcuts ─────────────────────────────────────────────────────
 

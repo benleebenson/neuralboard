@@ -1,4 +1,4 @@
-export const STREAM_FPS = 15;
+export const STREAM_FPS = 30;
 export const STREAM_CHANNEL_PREFIX = "stream";
 export const MAX_GUESTS = 8;
 export const GUEST_NAME_MAX_LENGTH = 16;
