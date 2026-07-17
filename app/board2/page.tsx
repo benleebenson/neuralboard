@@ -27,7 +27,7 @@ import {
   deriveOccupancyWindows,
   occupancyWindowAt,
 } from "@/lib/character-camera";
-import { AI_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
+import { AI_FEATURES_ENABLED, DEBUG_STREAM, STREAM_OWNER_USER_ID } from "./config";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +38,10 @@ type CameraKeyframe = {
   boardZoom: number;
   easing?: 'linear' | 'ease-in-out'; // applied when interpolating TO this keyframe
 };
+
+function streamDebugLog(...args: unknown[]) {
+  if (DEBUG_STREAM) console.log("[stream:host]", ...args);
+}
 
 type Clip = {
   id: string;
@@ -4216,6 +4220,7 @@ export default function Board2Page() {
   const streamChannelRef = useRef<RealtimeChannel | null>(null);
   const streamSessionIdRef = useRef("");
   const streamLastFrameAtRef = useRef(0);
+  const streamLastDebugFrameAtRef = useRef(0);
   const streamSnapshotQueuedRef = useRef(false);
   const streamSnapshotBusyRef = useRef(false);
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
@@ -4476,19 +4481,30 @@ export default function Board2Page() {
   }, [blobUrlToDataUrl]);
 
   const publishStreamSnapshot = useCallback(async () => {
-    if (!liveControlEnabledRef.current || !streamSessionIdRef.current || streamSnapshotBusyRef.current) {
+    if (!(liveControlEnabledRef.current || playModeRef.current) || !streamSessionIdRef.current || streamSnapshotBusyRef.current) {
       if (streamSnapshotBusyRef.current) streamSnapshotQueuedRef.current = true;
       return;
     }
     streamSnapshotBusyRef.current = true;
     try {
       const snapshot = await buildStreamSnapshot();
+      streamDebugLog("snapshot broadcast", {
+        channel: streamChannelName(STREAM_OWNER_USER_ID),
+        sessionId: snapshot.sessionId,
+        clips: snapshot.clips.length,
+        characters: snapshot.characters.filter((ch) => ch.enabled).map((ch) => ch.id),
+        mode: playModeRef.current ? "play" : "live-control",
+      });
       streamChannelRef.current?.send({ type: "broadcast", event: "snapshot", payload: snapshot });
-      await fetch("/api/stream/snapshot", {
+      const res = await fetch("/api/stream/snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(snapshot),
-      }).catch(() => {});
+      }).catch((error) => {
+        streamDebugLog("snapshot endpoint failed", error);
+        return null;
+      });
+      if (DEBUG_STREAM && res) streamDebugLog("snapshot endpoint", res.status, res.ok ? "ok" : "failed");
     } finally {
       streamSnapshotBusyRef.current = false;
       if (streamSnapshotQueuedRef.current) {
@@ -4500,29 +4516,65 @@ export default function Board2Page() {
 
   const publishStreamFrame = useCallback((wallMs: number) => {
     const channel = streamChannelRef.current;
-    const cam = liveCameraRef.current;
+    const cam = playModeRef.current ? playCameraRef.current : liveCameraRef.current;
     if (!channel || !cam || !streamSessionIdRef.current) return;
     if (wallMs - streamLastFrameAtRef.current < 1000 / STREAM_FPS) return;
     streamLastFrameAtRef.current = wallMs;
-    const characters = (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
-      const runtime = liveCharactersRef.current[id];
-      const t = liveRuntimeSeconds(runtime, wallMs);
-      const resolved = liveResolvedActions(runtime, clipsRef.current);
-      const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
-      const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current);
-      return {
-        id,
-        enabled: runtime.enabled,
-        x: pose.boardX,
-        y: pose.boardY,
-        facing: pose.facing,
-        physique: physiqueAt(t, resolved),
-        actionType: active?.type ?? "idle",
-        progress: active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0,
-        emoji: pose.emojiText,
-        emojiAlpha: pose.emojiAlpha,
-      };
-    });
+    const characters = playModeRef.current
+      ? (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
+          const state = id === "c1" ? playPhysicsRef.current : null;
+          const moving = state ? Math.abs(state.vx) > 40 : false;
+          const actionType = !state
+            ? "idle"
+            : state.action === "dance" ? "dance"
+              : state.action === "emote" ? "emote"
+              : state.action === "pullups" ? "pullUps"
+              : state.action === "mirror" ? "mirrorCheck"
+              : state.grappleX !== null ? "grapple"
+              : !state.grounded ? "jumpTo"
+              : moving ? (Math.abs(state.vx) >= PLAY_RUN_SPEED * 0.72 ? "runTo" : "walkTo")
+              : "idle";
+          return {
+            id,
+            enabled: !!state,
+            x: state?.x ?? 0,
+            y: state?.y ?? 0,
+            facing: state?.facing ?? 1,
+            physique: "slim",
+            actionType,
+            progress: state?.action === "none" ? 0 : 0.5,
+            emoji: state?.action === "emote" ? "🤔" : undefined,
+            emojiAlpha: state?.action === "emote" ? 1 : 0,
+          };
+        })
+      : (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
+          const runtime = liveCharactersRef.current[id];
+          const t = liveRuntimeSeconds(runtime, wallMs);
+          const resolved = liveResolvedActions(runtime, clipsRef.current);
+          const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
+          const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current);
+          return {
+            id,
+            enabled: runtime.enabled,
+            x: pose.boardX,
+            y: pose.boardY,
+            facing: pose.facing,
+            physique: physiqueAt(t, resolved),
+            actionType: active?.type ?? "idle",
+            progress: active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0,
+            emoji: pose.emojiText,
+            emojiAlpha: pose.emojiAlpha,
+          };
+        });
+    if (DEBUG_STREAM && wallMs - streamLastDebugFrameAtRef.current > 2000) {
+      streamLastDebugFrameAtRef.current = wallMs;
+      streamDebugLog("frame broadcast", {
+        channel: streamChannelName(STREAM_OWNER_USER_ID),
+        mode: playModeRef.current ? "play" : "live-control",
+        camera: cam,
+        characters: characters.filter((ch) => ch.enabled).map((ch) => ({ id: ch.id, x: Math.round(ch.x), y: Math.round(ch.y), actionType: ch.actionType })),
+      });
+    }
     channel.send({
       type: "broadcast",
       event: "frame",
@@ -4858,67 +4910,12 @@ export default function Board2Page() {
       liveSceneSurfaceKeyRef.current = null;
       liveSceneCameraRef.current = null;
       liveCameraTransitionRef.current = null;
-      window.setTimeout(() => setStreamPublishing(false), 0);
-      if (streamSessionIdRef.current) {
-        const endPayload = { kind: "session-end", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, sentAt: Date.now() };
-        streamChannelRef.current?.send({ type: "broadcast", event: "session-end", payload: endPayload });
-        fetch("/api/stream/snapshot", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(endPayload),
-        }).catch(() => {});
-      }
-      if (streamChannelRef.current) {
-        const supabase = getBrowserSupabase();
-        supabase?.removeChannel(streamChannelRef.current);
-        streamChannelRef.current = null;
-      }
-      streamSessionIdRef.current = "";
-      streamGuestFramesRef.current.clear();
-      streamGuestFacesRef.current.clear();
-      window.setTimeout(() => setStreamGuests([]), 0);
-      drawFrameRef.current(playheadRef.current);
+      if (!playModeRef.current) drawFrameRef.current(playheadRef.current);
       return;
     }
     isPlayingRef.current = false;
     resetLiveRuntimeFor("c1");
     if (showCharacter2Ref.current) resetLiveRuntimeFor("c2");
-    streamSessionIdRef.current = generateId();
-    streamLastFrameAtRef.current = 0;
-    const supabase = getBrowserSupabase();
-    if (supabase && session?.user?.email) {
-      const channel = supabase.channel(streamChannelName(STREAM_OWNER_USER_ID), {
-        config: { broadcast: { self: false }, presence: { key: session.user.email } },
-      });
-      streamChannelRef.current = channel;
-      channel
-        .on("broadcast", { event: "guest-state" }, ({ payload }) => {
-          const frame = payload as GuestCharacterFrame;
-          if (frame.sessionId === streamSessionIdRef.current) streamGuestFramesRef.current.set(frame.guestId, frame);
-        })
-        .on("broadcast", { event: "snapshot-request" }, () => {
-          void publishStreamSnapshot();
-        })
-        .on("presence", { event: "sync" }, () => {
-          const people = Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];
-          const guests = people.filter((person) => person.role === "guest").slice(0, MAX_GUESTS);
-          setStreamGuests(guests);
-          for (const guest of guests) {
-            if (!guest.guestId || !guest.faceDataUrl || streamGuestFacesRef.current.has(guest.guestId)) continue;
-            const image = new Image(); image.src = guest.faceDataUrl;
-            streamGuestFacesRef.current.set(guest.guestId, image);
-          }
-        });
-      channel.subscribe((status) => {
-        setStreamPublishing(status === "SUBSCRIBED");
-        if (status === "SUBSCRIBED") {
-          void channel.track({ role: "host", name: STREAM_OWNER_USER_ID, joinedAt: Date.now() } satisfies StreamParticipantPresence);
-          void publishStreamSnapshot();
-        }
-      });
-    } else {
-      window.setTimeout(() => setStreamPublishing(false), 0);
-    }
     void publishStreamSnapshot();
     const loop = () => {
       const wallMs = performance.now();
@@ -4936,12 +4933,114 @@ export default function Board2Page() {
       if (liveRafIdRef.current !== null) cancelAnimationFrame(liveRafIdRef.current);
       liveRafIdRef.current = null;
     };
-  }, [liveControlEnabled, publishStreamFrame, publishStreamSnapshot, resetLiveRuntimeFor, session?.user?.email]);
+  }, [liveControlEnabled, publishStreamFrame, publishStreamSnapshot, resetLiveRuntimeFor]);
 
   useEffect(() => {
-    if (!liveControlEnabled) return;
+    const streamActive = liveControlEnabled || playMode;
+    const channelName = streamChannelName(STREAM_OWNER_USER_ID);
+    if (!streamActive) {
+      window.setTimeout(() => setStreamPublishing(false), 0);
+      if (streamSessionIdRef.current) {
+        const endPayload = { kind: "session-end", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, sentAt: Date.now() };
+        streamDebugLog("session end", { channel: channelName, sessionId: streamSessionIdRef.current });
+        streamChannelRef.current?.send({ type: "broadcast", event: "session-end", payload: endPayload });
+        fetch("/api/stream/snapshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(endPayload),
+        }).catch((error) => streamDebugLog("session-end endpoint failed", error));
+      }
+      if (streamChannelRef.current) {
+        const supabase = getBrowserSupabase();
+        supabase?.removeChannel(streamChannelRef.current);
+        streamChannelRef.current = null;
+      }
+      streamSessionIdRef.current = "";
+      streamGuestFramesRef.current.clear();
+      streamGuestFacesRef.current.clear();
+      window.setTimeout(() => setStreamGuests([]), 0);
+      return;
+    }
+
+    if (!streamSessionIdRef.current) {
+      streamSessionIdRef.current = generateId();
+      streamLastFrameAtRef.current = 0;
+      streamLastDebugFrameAtRef.current = 0;
+      streamDebugLog("session start", {
+        channel: channelName,
+        sessionId: streamSessionIdRef.current,
+        mode: playMode ? "play" : "live-control",
+        hasBrowserSupabase: !!getBrowserSupabase(),
+        hasUserEmail: !!session?.user?.email,
+      });
+    }
+
+    const supabase = getBrowserSupabase();
+    if (supabase && session?.user?.email && !streamChannelRef.current) {
+      streamDebugLog("join channel", { channel: channelName, presenceKey: session.user.email });
+      const channel = supabase.channel(channelName, {
+        config: { broadcast: { self: false }, presence: { key: session.user.email } },
+      });
+      streamChannelRef.current = channel;
+      channel
+        .on("broadcast", { event: "guest-state" }, ({ payload }) => {
+          const frame = payload as GuestCharacterFrame;
+          if (frame.sessionId === streamSessionIdRef.current) streamGuestFramesRef.current.set(frame.guestId, frame);
+        })
+        .on("broadcast", { event: "snapshot-request" }, ({ payload }) => {
+          streamDebugLog("snapshot request", payload);
+          void publishStreamSnapshot();
+        })
+        .on("presence", { event: "sync" }, () => {
+          const people = Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];
+          streamDebugLog("presence sync", people);
+          const guests = people.filter((person) => person.role === "guest").slice(0, MAX_GUESTS);
+          setStreamGuests(guests);
+          for (const guest of guests) {
+            if (!guest.guestId || !guest.faceDataUrl || streamGuestFacesRef.current.has(guest.guestId)) continue;
+            const image = new Image(); image.src = guest.faceDataUrl;
+            streamGuestFacesRef.current.set(guest.guestId, image);
+          }
+        })
+        .subscribe(async (status) => {
+          streamDebugLog("subscribe status", status);
+          setStreamPublishing(status === "SUBSCRIBED");
+          if (status === "SUBSCRIBED") {
+            await channel.track({ role: "host", name: STREAM_OWNER_USER_ID, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+            void publishStreamSnapshot();
+          }
+        });
+    } else if (!supabase || !session?.user?.email) {
+      streamDebugLog("publisher not connected", {
+        channel: channelName,
+        hasBrowserSupabase: !!supabase,
+        hasUserEmail: !!session?.user?.email,
+      });
+      window.setTimeout(() => setStreamPublishing(false), 0);
+    }
+
     void publishStreamSnapshot();
-  }, [liveControlEnabled, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, spawnDoor, publishStreamSnapshot]);
+  }, [liveControlEnabled, playMode, publishStreamSnapshot, session?.user?.email]);
+
+  useEffect(() => {
+    if (!(liveControlEnabled || playMode)) return;
+    void publishStreamSnapshot();
+  }, [liveControlEnabled, playMode, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, spawnDoor, publishStreamSnapshot]);
+
+  useEffect(() => {
+    return () => {
+      if (!streamSessionIdRef.current) return;
+      const endPayload = { kind: "session-end", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, sentAt: Date.now() };
+      streamChannelRef.current?.send({ type: "broadcast", event: "session-end", payload: endPayload });
+      fetch("/api/stream/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(endPayload),
+      }).catch(() => {});
+      const supabase = getBrowserSupabase();
+      if (streamChannelRef.current) supabase?.removeChannel(streamChannelRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -9160,11 +9259,12 @@ export default function Board2Page() {
           playOutfitStyle
         );
       }
+      publishStreamFrame(wall);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
     return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
-  }, [playMode, playSceneShot, playHairStyle, playOutfitStyle, renderToCtx]);
+  }, [playMode, playSceneShot, playHairStyle, playOutfitStyle, publishStreamFrame, renderToCtx]);
 
   // ─ Keyboard shortcuts ─────────────────────────────────────────────────────
 
@@ -9729,6 +9829,9 @@ export default function Board2Page() {
         >
           ✕ Exit
         </button>
+        <div style={{ position: "fixed", top: 14, left: 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
+          {streamPublishing ? "LIVE" : "LOCAL"}
+        </div>
         <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
           <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
           <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>

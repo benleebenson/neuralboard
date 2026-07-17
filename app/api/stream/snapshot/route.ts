@@ -4,6 +4,8 @@ import { STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { authOptions } from "@/lib/auth";
 import type { StreamSnapshotMessage } from "@/lib/stream";
 
+const STREAM_OWNER_EMAIL = process.env.STREAM_OWNER_EMAIL ?? process.env.NEXT_PUBLIC_STREAM_OWNER_EMAIL ?? "";
+
 type StreamStore = {
   live: boolean;
   snapshot: StreamSnapshotMessage | null;
@@ -16,7 +18,7 @@ globalStore.__nbStreamSnapshots = stores;
 
 function canPublish(email?: string | null): boolean {
   if (!email) return false;
-  return STREAM_OWNER_USER_ID === "owner" || email === STREAM_OWNER_USER_ID;
+  return STREAM_OWNER_USER_ID === "owner" || email === STREAM_OWNER_USER_ID || (!!STREAM_OWNER_EMAIL && email === STREAM_OWNER_EMAIL);
 }
 
 export async function GET(req: NextRequest) {
