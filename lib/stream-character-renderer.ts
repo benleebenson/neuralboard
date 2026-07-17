@@ -25,6 +25,7 @@ export type SharedCharacter = {
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const ELIMINATION_LAUNCH_AT = 0.58;
+const ELIMINATION_DESPAWN_AT = 1.04;
 
 export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect = 1, clockOffsetMs = 0): SharedCharacter {
   return {
@@ -175,9 +176,10 @@ export function eliminationFrameForGuest(
   event: StreamEliminationMessage,
   renderTimeMs = Date.now(),
   clockOffsetMs = 0,
-): GuestCharacterFrame {
+): GuestCharacterFrame | null {
   const hostNow = renderTimeMs - clockOffsetMs;
-  const t = clamp((hostNow - event.startTime) / Math.max(1, event.duration * 1000), 0, 1.15);
+  const t = clamp((hostNow - event.startTime) / Math.max(1, event.duration * 1000), 0, 1.2);
+  if (t >= ELIMINATION_DESPAWN_AT) return null;
   const dir: 1 | -1 = event.target.x >= event.shooter.x ? 1 : -1;
   const hitShake =
     Math.sin(t * Math.PI * 54 + event.seed) *
@@ -188,10 +190,10 @@ export function eliminationFrameForGuest(
   };
   let velocity = { x: dir * 80, y: -30 };
   if (t >= ELIMINATION_LAUNCH_AT) {
-    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (1 - ELIMINATION_LAUNCH_AT), 0, 1.2);
-    const horizontal = 420 * u + 2400 * u * u;
+    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (ELIMINATION_DESPAWN_AT - ELIMINATION_LAUNCH_AT), 0, 1.15);
+    const horizontal = 520 * u + 5200 * u * u;
     const lift = -Math.sin(clamp(u, 0, 1) * Math.PI) * 660;
-    const fall = 920 * u * u;
+    const fall = 260 * u * u;
     position = {
       x: event.target.x + dir * horizontal,
       y: event.target.y + lift + fall,
@@ -231,37 +233,88 @@ export function drawEliminationSequence(
   const tx = (event.target.x - cam.cameraX) * sf + W / 2;
   const ty = (event.target.y - cam.cameraY) * sf + H / 2;
   const dir = event.shooter.facing;
-  const recoil = Math.sin(t * Math.PI * 36 + event.seed) * (t > 0.14 && t < 0.58 ? 3 * sf : 0);
+  const aim = Math.atan2((ty - 92 * sf) - (sy - 104 * sf), tx - sx);
+  const recoil = Math.sin(t * Math.PI * 36 + event.seed) * (t > 0.14 && t < 0.58 ? 4.5 * sf : 0);
+  const rearGrip = {
+    x: sx + Math.cos(aim) * 38 * sf - Math.abs(recoil) * Math.cos(aim),
+    y: sy - 104 * sf + Math.sin(aim) * 38 * sf - Math.abs(recoil) * Math.sin(aim),
+  };
+  const frontGrip = {
+    x: sx + Math.cos(aim) * 90 * sf - Math.abs(recoil) * Math.cos(aim),
+    y: sy - 104 * sf + Math.sin(aim) * 90 * sf - Math.abs(recoil) * Math.sin(aim),
+  };
+  const shoulderA = { x: sx + dir * 11 * sf, y: sy - 108 * sf };
+  const shoulderB = { x: sx - dir * 14 * sf, y: sy - 108 * sf };
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#27221f";
-  ctx.fillStyle = "#fffdf5";
-  ctx.lineWidth = Math.max(1.5, 2.5 * sf);
-  const handX = sx + dir * 48 * sf;
-  const handY = sy - 104 * sf;
-  ctx.translate(handX, handY);
-  ctx.rotate(dir > 0 ? -0.12 : Math.PI + 0.12);
-  ctx.translate(-Math.abs(recoil), recoil * 0.25);
+  ctx.lineWidth = Math.max(1.5, 3 * sf);
+  const armTo = (shoulder: { x: number; y: number }, hand: { x: number; y: number }) => {
+    const mid = { x: (shoulder.x + hand.x) / 2, y: (shoulder.y + hand.y) / 2 + 18 * sf };
+    ctx.beginPath();
+    ctx.moveTo(shoulder.x, shoulder.y);
+    ctx.quadraticCurveTo(mid.x, mid.y, hand.x, hand.y);
+    ctx.stroke();
+    ctx.fillStyle = "#f6d4b4";
+    ctx.beginPath();
+    ctx.arc(hand.x, hand.y, 7 * sf, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  };
+  armTo(shoulderA, rearGrip);
+  armTo(shoulderB, frontGrip);
+  ctx.translate(rearGrip.x, rearGrip.y);
+  ctx.rotate(aim);
+  ctx.translate(-30 * sf, 0);
+  ctx.fillStyle = "#595f66";
   ctx.beginPath();
-  ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 5 * sf);
-  ctx.moveTo(15 * sf, 9 * sf);
-  ctx.lineTo(23 * sf, 27 * sf);
-  ctx.moveTo(38 * sf, 9 * sf);
-  ctx.lineTo(43 * sf, 28 * sf);
-  ctx.moveTo(51 * sf, -8 * sf);
-  ctx.lineTo(72 * sf, -11 * sf);
+  ctx.roundRect(0, -9 * sf, 56 * sf, 18 * sf, 4 * sf);
+  ctx.fill();
   ctx.stroke();
   ctx.beginPath();
-  ctx.arc(28 * sf, 15 * sf, 13 * sf, 0, Math.PI * 2);
+  ctx.moveTo(54 * sf, -3 * sf);
+  ctx.lineTo(86 * sf, -3 * sf);
+  ctx.lineTo(86 * sf, 3 * sf);
+  ctx.lineTo(54 * sf, 3 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(82 * sf, -9 * sf);
+  ctx.lineTo(89 * sf, -9 * sf);
+  ctx.stroke();
+  ctx.fillStyle = "#8B5A2B";
+  ctx.beginPath();
+  ctx.moveTo(-1 * sf, 1 * sf);
+  ctx.lineTo(-38 * sf, 18 * sf);
+  ctx.lineTo(-43 * sf, 9 * sf);
+  ctx.lineTo(-8 * sf, -6 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(17 * sf, 9 * sf, 10 * sf, 26 * sf, 3 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(36 * sf, 7 * sf, 9 * sf, 24 * sf, 3 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#6d7379";
+  ctx.beginPath();
+  ctx.moveTo(25 * sf, 9 * sf);
+  ctx.bezierCurveTo(34 * sf, 28 * sf, 39 * sf, 43 * sf, 31 * sf, 52 * sf);
+  ctx.bezierCurveTo(48 * sf, 48 * sf, 56 * sf, 28 * sf, 46 * sf, 9 * sf);
+  ctx.closePath();
   ctx.fill();
   ctx.stroke();
   if (t > 0.14 && t < 0.58) {
     for (let i = 0; i < 3; i += 1) {
       const casingT = (t * 16 + i * 0.31 + event.seed * 0.001) % 1;
       ctx.beginPath();
-      ctx.moveTo((22 - casingT * 18) * sf, (-11 - i * 4 - casingT * 9) * sf);
-      ctx.lineTo((26 - casingT * 18) * sf, (-13 - i * 4 - casingT * 9) * sf);
+      ctx.moveTo((35 - casingT * 18) * sf, (-13 - i * 4 - casingT * 9) * sf);
+      ctx.lineTo((39 - casingT * 18) * sf, (-15 - i * 4 - casingT * 9) * sf);
       ctx.stroke();
     }
   }
@@ -270,8 +323,8 @@ export function drawEliminationSequence(
   [0.18, 0.33, 0.48].forEach((start, index) => {
     const shotT = clamp((t - start) / 0.14, 0, 1);
     if (shotT <= 0 || shotT >= 1) return;
-    const muzzleX = handX + dir * 72 * sf;
-    const muzzleY = handY - 7 * sf;
+    const muzzleX = rearGrip.x + Math.cos(aim) * 116 * sf;
+    const muzzleY = rearGrip.y + Math.sin(aim) * 116 * sf;
     const targetX = tx + Math.sin(event.seed + index) * 14 * sf;
     const targetY = ty - (96 + index * 8) * sf;
     const ex = lerp(muzzleX, targetX, shotT);
@@ -319,7 +372,7 @@ export function drawEliminationSequence(
     ctx.restore();
   });
   if (t >= ELIMINATION_LAUNCH_AT) {
-    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (1 - ELIMINATION_LAUNCH_AT), 0, 1.15);
+    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (ELIMINATION_DESPAWN_AT - ELIMINATION_LAUNCH_AT), 0, 1.15);
     const trailDir = event.target.x >= event.shooter.x ? 1 : -1;
     ctx.save();
     ctx.strokeStyle = "rgba(39,34,31,0.62)";
