@@ -153,21 +153,6 @@ export function drawSharedStreamCharacter(
     ctx.textAlign = "center";
     ctx.fillText(ch.emoji, sx, sy - 280 * sf);
   }
-  if (ch.actionType === "eliminated" && actionProgress(ch, renderTimeMs) > 0.72) {
-    const sx = (ch.x - cam.cameraX) * sf + W / 2;
-    const sy = (ch.y - cam.cameraY) * sf + H / 2;
-    const t = clamp((actionProgress(ch, renderTimeMs) - 0.72) / 0.18, 0, 1);
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = "rgba(255,253,245,0.9)";
-    for (let i = 0; i < 8; i += 1) {
-      const a = (i / 8) * Math.PI * 2;
-      const r = (18 + i * 3) * sf * t;
-      ctx.beginPath();
-      ctx.arc(sx + Math.cos(a) * r, sy - 78 * sf + Math.sin(a) * r * 0.55, (9 + (i % 3) * 4) * sf, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    }
-  }
   ctx.restore();
 }
 
@@ -234,27 +219,62 @@ export function drawEliminationSequence(
   const ty = (event.target.y - cam.cameraY) * sf + H / 2;
   const dir = event.shooter.facing;
   const aim = Math.atan2((ty - 92 * sf) - (sy - 104 * sf), tx - sx);
-  const recoil = Math.sin(t * Math.PI * 36 + event.seed) * (t > 0.14 && t < 0.58 ? 4.5 * sf : 0);
+  const recoil = Math.sin(t * Math.PI * 36 + event.seed) * (t > 0.14 && t < 0.58 ? 3 * sf : 0);
+  const aimUx = Math.cos(aim);
+  const aimUy = Math.sin(aim);
+  const perpX = -aimUy;
+  const perpY = aimUx;
+  const chest = { x: sx, y: sy - 108 * sf };
   const rearGrip = {
-    x: sx + Math.cos(aim) * 38 * sf - Math.abs(recoil) * Math.cos(aim),
-    y: sy - 104 * sf + Math.sin(aim) * 38 * sf - Math.abs(recoil) * Math.sin(aim),
+    x: chest.x + aimUx * 34 * sf - aimUx * Math.abs(recoil),
+    y: chest.y + aimUy * 34 * sf - aimUy * Math.abs(recoil),
   };
   const frontGrip = {
-    x: sx + Math.cos(aim) * 90 * sf - Math.abs(recoil) * Math.cos(aim),
-    y: sy - 104 * sf + Math.sin(aim) * 90 * sf - Math.abs(recoil) * Math.sin(aim),
+    x: rearGrip.x + aimUx * 52 * sf,
+    y: rearGrip.y + aimUy * 52 * sf,
   };
-  const shoulderA = { x: sx + dir * 11 * sf, y: sy - 108 * sf };
-  const shoulderB = { x: sx - dir * 14 * sf, y: sy - 108 * sf };
+  const shoulderTrigger = { x: sx + dir * 14 * sf, y: sy - 118 * sf };
+  const shoulderSupport = { x: sx - dir * 14 * sf, y: sy - 116 * sf };
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#27221f";
   ctx.lineWidth = Math.max(1.5, 3 * sf);
-  const armTo = (shoulder: { x: number; y: number }, hand: { x: number; y: number }) => {
-    const mid = { x: (shoulder.x + hand.x) / 2, y: (shoulder.y + hand.y) / 2 + 18 * sf };
+  ctx.fillStyle = "#fff3dc";
+  ctx.beginPath();
+  ctx.moveTo(sx - 16 * sf, sy - 122 * sf);
+  ctx.lineTo(sx + 18 * sf, sy - 120 * sf);
+  ctx.lineTo(sx + 10 * sf, sy - 54 * sf);
+  ctx.lineTo(sx - 10 * sf, sy - 54 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(sx - 12 * sf, sy - 54 * sf);
+  ctx.lineTo(sx - 24 * sf, sy - 5 * sf);
+  ctx.moveTo(sx + 12 * sf, sy - 54 * sf);
+  ctx.lineTo(sx + 24 * sf, sy - 5 * sf);
+  ctx.stroke();
+  const solveArm = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
+    const upper = 44 * sf;
+    const fore = 42 * sf;
+    const dx = hand.x - shoulder.x;
+    const dy = hand.y - shoulder.y;
+    const rawD = Math.max(0.001, Math.hypot(dx, dy));
+    const d = clamp(rawD, 8 * sf, upper + fore - 0.01);
+    const ux = dx / rawD;
+    const uy = dy / rawD;
+    const along = (upper * upper - fore * fore + d * d) / (2 * d);
+    const height = Math.sqrt(Math.max(0, upper * upper - along * along));
+    const base = { x: shoulder.x + ux * along, y: shoulder.y + uy * along };
+    return { x: base.x + (-uy) * height * bend, y: base.y + ux * height * bend };
+  };
+  const armTo = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
+    const elbow = solveArm(shoulder, hand, bend);
     ctx.beginPath();
     ctx.moveTo(shoulder.x, shoulder.y);
-    ctx.quadraticCurveTo(mid.x, mid.y, hand.x, hand.y);
+    ctx.lineTo(elbow.x, elbow.y);
+    ctx.lineTo(hand.x, hand.y);
     ctx.stroke();
     ctx.fillStyle = "#f6d4b4";
     ctx.beginPath();
@@ -262,21 +282,20 @@ export function drawEliminationSequence(
     ctx.fill();
     ctx.stroke();
   };
-  armTo(shoulderA, rearGrip);
-  armTo(shoulderB, frontGrip);
-  ctx.translate(rearGrip.x, rearGrip.y);
+  armTo(shoulderSupport, frontGrip, dir > 0 ? 1 : -1);
+  armTo(shoulderTrigger, rearGrip, dir > 0 ? -1 : 1);
+  ctx.translate(rearGrip.x - aimUx * 18 * sf - perpX * 1.5 * sf, rearGrip.y - aimUy * 18 * sf - perpY * 1.5 * sf);
   ctx.rotate(aim);
-  ctx.translate(-30 * sf, 0);
   ctx.fillStyle = "#595f66";
   ctx.beginPath();
-  ctx.roundRect(0, -9 * sf, 56 * sf, 18 * sf, 4 * sf);
+  ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 4 * sf);
   ctx.fill();
   ctx.stroke();
   ctx.beginPath();
-  ctx.moveTo(54 * sf, -3 * sf);
+  ctx.moveTo(56 * sf, -3 * sf);
   ctx.lineTo(86 * sf, -3 * sf);
   ctx.lineTo(86 * sf, 3 * sf);
-  ctx.lineTo(54 * sf, 3 * sf);
+  ctx.lineTo(56 * sf, 3 * sf);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
@@ -303,10 +322,7 @@ export function drawEliminationSequence(
   ctx.stroke();
   ctx.fillStyle = "#6d7379";
   ctx.beginPath();
-  ctx.moveTo(25 * sf, 9 * sf);
-  ctx.bezierCurveTo(34 * sf, 28 * sf, 39 * sf, 43 * sf, 31 * sf, 52 * sf);
-  ctx.bezierCurveTo(48 * sf, 48 * sf, 56 * sf, 28 * sf, 46 * sf, 9 * sf);
-  ctx.closePath();
+  ctx.arc(31 * sf, 20 * sf, 16 * sf, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
   if (t > 0.14 && t < 0.58) {

@@ -342,7 +342,12 @@ export default function StreamPage() {
             if (id === guestId && p) continue;
             const event = eliminations.current.get(id);
             const renderFrame = event ? eliminationFrameForGuest(g, event, Date.now(), hostClockOffset.current) : g;
-            if (!renderFrame) continue;
+            if (!renderFrame) {
+              renderedGuests.current.delete(id);
+              remoteGuests.current.delete(id);
+              if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "spectator-remote", guestId: id, event: event?.sequenceType });
+              continue;
+            }
             const old = renderedGuests.current.get(id);
             const error = old ? Math.hypot(old.position.x - renderFrame.position.x, old.position.y - renderFrame.position.y) : 0;
             const alpha = event ? 0.85 : error > 300 ? 1 : 0.35;
@@ -357,6 +362,8 @@ export default function StreamPage() {
             const renderFrame = event ? eliminationFrameForGuest(localFrame, event, Date.now(), hostClockOffset.current) : localFrame;
             if (renderFrame) {
               drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0), faceCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
+            } else if (process.env.NODE_ENV !== "production") {
+              console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
             }
           }
         }

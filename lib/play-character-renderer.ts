@@ -10,6 +10,7 @@ export type PlayCharacterState = {
   surfaceId: string | null;
   stride: number;
   spin: number;
+  airborneAt?: number;
   spawnX: number;
   spawnY: number;
   action: "none" | "dance" | "emote" | "pullups" | "mirror";

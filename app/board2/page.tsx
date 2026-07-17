@@ -1715,36 +1715,6 @@ function standingCharPose(boardX: number, boardY: number, facing: 1 | -1, time: 
   };
 }
 
-function playPhysicsPoseFromState(state: PlayCharacterState, time: number): CharPoseResult {
-  const speed = Math.abs(state.vx);
-  const speed01 = clamp(speed / PLAY_RUN_SPEED, 0, 1);
-  const moving = state.grounded && speed > 25;
-  const airborne = !state.grounded;
-  const stride = moving ? Math.sin(state.stride) : 0;
-  const runLift = moving ? Math.abs(Math.sin(state.stride)) * 3.5 : 0;
-  const relaxedArm = state.action === "dance" ? 0.48 : CHAR_RELAX_ARM_A;
-  const relaxedFore = state.action === "dance" ? 0.85 : CHAR_RELAX_FORE_A;
-  const pose = standingCharPose(state.x, state.y, state.facing, time);
-  pose.headBob = moving ? -runLift : Math.sin(time * 2.2) * 1.6;
-  pose.bodyLean = clamp(state.vx / PLAY_RUN_SPEED, -1, 1) * (airborne ? 0.08 : 0.14);
-  pose.spinAngle = airborne && Math.abs(state.spin) > 0.01 ? state.spin : undefined;
-  pose.leftLegA = airborne ? 0.46 : 0.12 + stride * (0.28 + speed01 * 0.34);
-  pose.rightLegA = airborne ? -0.46 : -0.12 - stride * (0.28 + speed01 * 0.34);
-  pose.leftShinA = airborne ? 0.36 : 0.08 + Math.max(0, -stride) * 0.45;
-  pose.rightShinA = airborne ? -0.36 : -0.08 - Math.max(0, stride) * 0.45;
-  pose.leftArmA = relaxedArm - stride * (0.22 + speed01 * 0.2);
-  pose.rightArmA = -relaxedArm - stride * (0.22 + speed01 * 0.2);
-  pose.leftForeA = relaxedFore + (state.action === "dance" ? Math.sin(time * 7) * 0.28 : 0);
-  pose.rightForeA = -relaxedFore + (state.action === "dance" ? Math.sin(time * 7 + Math.PI) * 0.28 : 0);
-  pose.momentumScaleX = 1 + speed01 * 0.025;
-  pose.momentumScaleY = 1 - speed01 * 0.018;
-  if (state.action === "emote") {
-    pose.emojiText = "🤔";
-    pose.emojiAlpha = 1;
-  }
-  return pose;
-}
-
 function thinkingPoseBase(
   boardX: number,
   boardY: number,
@@ -4423,7 +4393,7 @@ export default function Board2Page() {
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
           const pose = runtime?.enabled && state
             ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current))
-            : state ? playPhysicsPoseFromState(state, playTimeRef.current) : null;
+            : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = active?.type ?? (!state
             ? "idle"
@@ -5068,7 +5038,12 @@ export default function Board2Page() {
       const elimination = streamEliminationsRef.current.get(frame.guestId);
       const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
       const activeFrame = elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
-      if (!activeFrame) continue;
+      if (!activeFrame) {
+        streamRenderedGuestFramesRef.current.delete(frame.guestId);
+        streamGuestFramesRef.current.delete(frame.guestId);
+        if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "host-board", guestId: frame.guestId, event: elimination?.sequenceType });
+        continue;
+      }
       const previous = streamRenderedGuestFramesRef.current.get(frame.guestId);
       const smoothed = previous
         ? {
@@ -9006,14 +8981,68 @@ export default function Board2Page() {
       return pose;
     }
     const state = playPhysicsRef.current;
-    return state ? playPhysicsPoseFromState(state, playTimeRef.current) : null;
+    return state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
+  }
+
+  function sharedPlayPoseFromPhysics(state: PlayCharacterState, time: number): CharPoseResult {
+    const speed = Math.abs(state.vx);
+    const moving = state.grounded && speed > 25;
+    const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
+    const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
+    let sampleTime = 0;
+    let resolved: ResolvedCharAction[] = [];
+
+    if (!state.grounded) {
+      const airborneAge = Math.max(0, time - (state.airborneAt ?? time));
+      const isFlip = Math.abs(state.spin) > 0.08 || speed > PLAY_RUN_SPEED * 0.7;
+      const duration = isFlip ? 1.05 : 0.85;
+      const progress = isFlip
+        ? (((state.spin * state.facing) / (Math.PI * 2)) % 1 + 1) % 1
+        : clamp(airborneAge / duration, 0, 0.98);
+      const type: CharacterAction["type"] = isFlip ? "flip" : "jumpTo";
+      sampleTime = progress * duration;
+      resolved = [{
+        id: "play-physics-air",
+        type,
+        startTime: 0,
+        duration,
+        fromX: 0,
+        fromY: state.y,
+        targetX: state.facing * 520,
+        targetY: state.y,
+      }];
+    } else if (moving) {
+      const duration = 1;
+      sampleTime = (((state.stride / (Math.PI * 2)) % 1) + 1) % 1;
+      resolved = [{
+        id: "play-physics-walk",
+        type: "walkTo",
+        startTime: 0,
+        duration,
+        fromX: 0,
+        fromY: state.y,
+        targetX: state.facing * 220,
+        targetY: state.y,
+      }];
+    }
+
+    const pose = evalCharAtTime(sampleTime, resolved, 0, state.y, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+    return {
+      ...pose,
+      boardX: state.x,
+      boardY: state.y,
+      facing: state.facing,
+      airY: 0,
+      emojiText: state.action === "emote" ? "🤔" : pose.emojiText,
+      emojiAlpha: state.action === "emote" ? 1 : pose.emojiAlpha,
+    };
   }
 
   function issuePlayCharacterAction(command: LiveCommandKey, target?: { x: number; y: number; rawX?: number; rawY?: number; surface?: RequiredSurfaceClip }) {
     const state = playPhysicsRef.current;
     if (!state) return;
     const now = performance.now();
-    const currentPose = currentPlayPose(now) ?? playPhysicsPoseFromState(state, playTimeRef.current);
+    const currentPose = currentPlayPose(now) ?? sharedPlayPoseFromPhysics(state, playTimeRef.current);
     const startX = currentPose.boardX;
     const startY = currentPose.boardY;
     if (command === "stop") {
@@ -9025,6 +9054,7 @@ export default function Board2Page() {
       state.grounded = true;
       state.surfaceId = findSurfaceAtFeet(state.x, state.y, clipsRef.current)?.id ?? null;
       state.action = "none";
+      state.airborneAt = undefined;
       state.grappleX = null;
       state.grappleY = null;
       return;
@@ -9076,6 +9106,7 @@ export default function Board2Page() {
     state.grounded = true;
     state.surfaceId = findSurfaceAtFeet(startX, startY, clipsRef.current)?.id ?? null;
     state.action = "none";
+    state.airborneAt = undefined;
     state.grappleX = null;
     state.grappleY = null;
     const previousRuntime = playActionRuntimeRef.current;
@@ -9168,6 +9199,7 @@ export default function Board2Page() {
       state.grounded = false;
       state.surfaceId = null;
       state.spin = 0;
+      state.airborneAt = playTimeRef.current;
     }
   }
 
@@ -9295,6 +9327,7 @@ export default function Board2Page() {
         state.grounded = false;
         state.surfaceId = null;
         state.vy = 35;
+        state.airborneAt = playTimeRef.current;
       } else {
         state.y = support.boardY;
       }
@@ -9334,6 +9367,7 @@ export default function Board2Page() {
           state.grounded = true;
           state.surfaceId = landing.id ?? null;
           state.spin = 0;
+          state.airborneAt = undefined;
           state.landedAt = playTimeRef.current;
         } else {
           state.y = nextY;
@@ -9356,6 +9390,7 @@ export default function Board2Page() {
       state.grounded = true;
       state.surfaceId = findSurfaceAtFeet(state.spawnX, state.spawnY, surfaces)?.id ?? null;
       state.spin = 0;
+      state.airborneAt = undefined;
       state.action = "none";
       state.landedAt = playTimeRef.current;
       state.grappleX = null;
@@ -9412,7 +9447,7 @@ export default function Board2Page() {
         }
       } else {
         updatePlayPhysics(state, dt, canvas);
-        playPose = playPhysicsPoseFromState(state, now);
+        playPose = sharedPlayPoseFromPhysics(state, now);
       }
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
       const target = playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom };
