@@ -49,6 +49,9 @@ export type StreamAnnotation = {
 export type StreamCharacterSnapshot = {
   id: "c1" | "c2";
   enabled: boolean;
+  name?: string;
+  skin?: "stick" | "styled";
+  physique?: "slim" | "jacked";
   faceDataUrl?: string;
   faceAspect?: number;
 };
@@ -60,8 +63,13 @@ export type StreamCharacterFrame = {
   y: number;
   facing: 1 | -1;
   physique: "slim" | "jacked";
+  skin?: "stick" | "styled";
   actionType: string;
   progress: number;
+  actionStartTime?: number;
+  actionDuration?: number;
+  velocity?: { x: number; y: number };
+  actionParams?: Record<string, number | string | boolean | null | undefined>;
   emoji?: string;
   emojiAlpha?: number;
 };
@@ -73,6 +81,8 @@ export type StreamParticipantPresence = {
   guestId?: string;
   name?: string;
   faceDataUrl?: string;
+  skin?: "stick" | "styled";
+  physique?: "slim" | "jacked";
   joinedAt: number;
 };
 
@@ -84,9 +94,16 @@ export type GuestCharacterFrame = {
   guestId: string;
   name: string;
   position: { x: number; y: number };
+  velocity?: { x: number; y: number };
   facing: 1 | -1;
-  actionType: "idle" | "walk" | "run" | "jump" | "emote";
+  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "dance" | "emote" | "eliminated";
   actionProgress: number;
+  actionStartTime?: number;
+  actionDuration?: number;
+  actionParams?: Record<string, number | string | boolean | null | undefined>;
+  skin?: "stick" | "styled";
+  physique?: "slim" | "jacked";
+  receivedAt?: number;
   emote?: string;
 };
 
@@ -96,6 +113,20 @@ export type StreamKickMessage = {
   sessionId: string;
   guestId: string;
   sentAt: number;
+};
+
+export type StreamEliminationMessage = {
+  kind: "elimination";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  startTime: number;
+  duration: number;
+  targetGuestId: string;
+  hostName: string;
+  seed: number;
+  shooter: { x: number; y: number; facing: 1 | -1 };
+  target: { x: number; y: number };
 };
 
 export type StreamSnapshotMessage = {
@@ -126,7 +157,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamEliminationMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

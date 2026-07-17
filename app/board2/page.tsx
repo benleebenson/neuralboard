@@ -14,10 +14,11 @@ import {
   SpawnDoor,
   StreamParticipantPresence,
   StreamCharacterFrame,
+  StreamEliminationMessage,
   StreamSnapshotMessage,
   streamChannelName,
 } from "@/lib/stream";
-import { drawSharedStreamCharacter, guestCharacterForRender } from "@/lib/stream-character-renderer";
+import { drawEliminationSequence, drawSharedStreamCharacter, guestCharacterForRender } from "@/lib/stream-character-renderer";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -4226,7 +4227,9 @@ export default function Board2Page() {
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
+  const streamGuestClockOffsetsRef = useRef<Map<string, number>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const streamEliminationsRef = useRef<Map<string, StreamEliminationMessage>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
@@ -4244,6 +4247,7 @@ export default function Board2Page() {
   const playCursorRef = useRef<{ x: number; y: number } | null>(null);
   const playPhysicsRef = useRef<PlayCharacterState | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
+  const [playGuestMenu, setPlayGuestMenu] = useState<{ guestId: string; name: string; x: number; y: number } | null>(null);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
     const placed = clipsRef.current.filter((c) => c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined && c.boardH !== undefined);
@@ -4537,8 +4541,8 @@ export default function Board2Page() {
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
       characters: [
-        { id: "c1", enabled: showCharacterRef.current, faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
-        { id: "c2", enabled: showCharacter2Ref.current, faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
+        { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: characterSkinRef.current, physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
+        { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: characterSkin2Ref.current, physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
       ],
     });
     let maxLongEdge = 512;
@@ -4599,6 +4603,7 @@ export default function Board2Page() {
     if (!channel || !cam || !streamSessionIdRef.current) return;
     if (wallMs - streamLastFrameAtRef.current < 1000 / STREAM_FPS) return;
     streamLastFrameAtRef.current = wallMs;
+    const sentAt = Date.now();
     const characters = playModeRef.current
       ? (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
           const state = id === "c1" ? playPhysicsRef.current : null;
@@ -4613,6 +4618,8 @@ export default function Board2Page() {
               : !state.grounded ? "jumpTo"
               : moving ? (Math.abs(state.vx) >= PLAY_RUN_SPEED * 0.72 ? "runTo" : "walkTo")
               : "idle";
+          const actionDuration = actionType === "dance" ? 2.5 : actionType === "emote" ? 1.8 : actionType === "pullUps" ? 4 : actionType === "mirrorCheck" ? 3 : !state?.grounded ? 1.1 : moving ? 0.8 : 2;
+          const actionProgress = state ? (actionType === "idle" ? 0 : moving ? ((state.stride / (Math.PI * 2)) % 1 + 1) % 1 : actionType === "jumpTo" ? clamp((state.vy + PLAY_JUMP_SPEED) / (PLAY_JUMP_SPEED + PLAY_MAX_FALL_SPEED), 0, 1) : clamp(1 - Math.max(0, state.actionUntil - playTimeRef.current) / actionDuration, 0, 1)) : 0;
           return {
             id,
             enabled: !!state,
@@ -4620,8 +4627,12 @@ export default function Board2Page() {
             y: state?.y ?? 0,
             facing: state?.facing ?? 1,
             physique: "slim",
+            skin: "styled",
             actionType,
-            progress: state?.action === "none" ? 0 : 0.5,
+            progress: actionProgress,
+            actionStartTime: sentAt - actionProgress * actionDuration * 1000,
+            actionDuration,
+            velocity: { x: state?.vx ?? 0, y: state?.vy ?? 0 },
             emoji: state?.action === "emote" ? "🤔" : undefined,
             emojiAlpha: state?.action === "emote" ? 1 : 0,
           };
@@ -4632,6 +4643,8 @@ export default function Board2Page() {
           const resolved = liveResolvedActions(runtime, clipsRef.current);
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
           const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current);
+          const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
+          const duration = active?.duration ?? 2;
           return {
             id,
             enabled: runtime.enabled,
@@ -4639,8 +4652,12 @@ export default function Board2Page() {
             y: pose.boardY,
             facing: pose.facing,
             physique: physiqueAt(t, resolved),
+            skin: id === "c2" ? characterSkin2Ref.current : characterSkinRef.current,
             actionType: active?.type ?? "idle",
-            progress: active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0,
+            progress,
+            actionStartTime: sentAt - progress * duration * 1000,
+            actionDuration: duration,
+            velocity: { x: 0, y: 0 },
             emoji: pose.emojiText,
             emojiAlpha: pose.emojiAlpha,
           };
@@ -4661,7 +4678,7 @@ export default function Board2Page() {
         kind: "frame",
         streamId: STREAM_OWNER_USER_ID,
         sessionId: streamSessionIdRef.current,
-        sentAt: Date.now(),
+        sentAt,
         camera: cam,
         characters,
       },
@@ -4672,6 +4689,9 @@ export default function Board2Page() {
     if (!guestId) return;
     streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt: Date.now() } });
     streamGuestFramesRef.current.delete(guestId);
+    streamRenderedGuestFramesRef.current.delete(guestId);
+    streamGuestClockOffsetsRef.current.delete(guestId);
+    streamEliminationsRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
@@ -5037,7 +5057,9 @@ export default function Board2Page() {
       streamSessionIdRef.current = "";
       streamGuestFramesRef.current.clear();
       streamRenderedGuestFramesRef.current.clear();
+      streamGuestClockOffsetsRef.current.clear();
       streamGuestFacesRef.current.clear();
+      streamEliminationsRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
     }
@@ -5065,7 +5087,16 @@ export default function Board2Page() {
       channel
         .on("broadcast", { event: "guest-state" }, ({ payload }) => {
           const frame = payload as GuestCharacterFrame;
-          if (frame.sessionId === streamSessionIdRef.current) streamGuestFramesRef.current.set(frame.guestId, frame);
+          if (frame.sessionId === streamSessionIdRef.current) {
+            const measuredOffset = Date.now() - frame.sentAt;
+            const prevOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? measuredOffset;
+            streamGuestClockOffsetsRef.current.set(frame.guestId, prevOffset * 0.85 + measuredOffset * 0.15);
+            streamGuestFramesRef.current.set(frame.guestId, { ...frame, receivedAt: Date.now() });
+          }
+        })
+        .on("broadcast", { event: "elimination" }, ({ payload }) => {
+          const event = payload as StreamEliminationMessage;
+          if (event.sessionId === streamSessionIdRef.current) streamEliminationsRef.current.set(event.targetGuestId, event);
         })
         .on("broadcast", { event: "snapshot-request" }, ({ payload }) => {
           streamDebugLog("snapshot request", payload);
@@ -5081,6 +5112,8 @@ export default function Board2Page() {
             if (!activeGuestIds.has(guestId)) {
               streamGuestFramesRef.current.delete(guestId);
               streamRenderedGuestFramesRef.current.delete(guestId);
+              streamGuestClockOffsetsRef.current.delete(guestId);
+              streamEliminationsRef.current.delete(guestId);
             }
           }
           for (const guest of guests) {
@@ -5213,27 +5246,47 @@ export default function Board2Page() {
     W: number,
     H: number,
   ) => {
+    const now = Date.now();
     if (spawnDoorRef.current) drawPlacedSpawnDoor(ctx, spawnDoorRef.current, cam, sf, W, H);
+    for (const [guestId, event] of streamEliminationsRef.current) {
+      if (now - event.startTime > event.duration * 1000 + 800) streamEliminationsRef.current.delete(guestId);
+      else drawEliminationSequence(ctx, event, cam, sf, W, H, now);
+    }
     for (const frame of streamGuestFramesRef.current.values()) {
+      const elimination = streamEliminationsRef.current.get(frame.guestId);
+      const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
+      const activeFrame = elimination
+        ? {
+            ...frame,
+            actionType: "eliminated" as const,
+            actionStartTime: elimination.startTime,
+            actionDuration: elimination.duration,
+            actionProgress: clamp((now - elimination.startTime) / (elimination.duration * 1000), 0, 1),
+            velocity: { x: 0, y: 0 },
+            position: elimination.target,
+          }
+        : frame;
       const previous = streamRenderedGuestFramesRef.current.get(frame.guestId);
       const smoothed = previous
         ? {
-            ...frame,
+            ...activeFrame,
             position: {
-              x: lerp(previous.position.x, frame.position.x, 0.42),
-              y: lerp(previous.position.y, frame.position.y, 0.42),
+              x: lerp(previous.position.x, activeFrame.position.x, elimination ? 0.85 : 0.42),
+              y: lerp(previous.position.y, activeFrame.position.y, elimination ? 0.85 : 0.42),
             },
           }
-        : frame;
+        : activeFrame;
       streamRenderedGuestFramesRef.current.set(frame.guestId, smoothed);
       drawSharedStreamCharacter(
         ctx,
-        guestCharacterForRender(smoothed),
+        guestCharacterForRender(smoothed, clockOffset),
         streamGuestFacesRef.current.get(frame.guestId) ?? null,
         cam,
         sf,
         W,
         H,
+        1,
+        now,
       );
     }
   }, []);
@@ -9199,9 +9252,63 @@ export default function Board2Page() {
   }
 
   function handlePlayPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (e.button === 2) return;
+    setPlayGuestMenu(null);
     e.currentTarget.setPointerCapture(e.pointerId);
     playPointerRef.current = { id: e.pointerId, clientX: e.clientX, clientY: e.clientY, down: true, lastSteerAt: performance.now() };
     steerPlayCharacter(e.clientX, e.clientY, e.currentTarget);
+  }
+
+  function findPlayGuestAtClientPoint(clientX: number, clientY: number, canvas: HTMLCanvasElement): GuestCharacterFrame | null {
+    const rect = canvas.getBoundingClientRect();
+    const cam = playCameraRef.current;
+    const sf = cam.boardZoom * rect.width / BOARD_W;
+    const boardX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
+    const boardY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
+    let best: { frame: GuestCharacterFrame; distance: number } | null = null;
+    for (const frame of streamGuestFramesRef.current.values()) {
+      const dx = boardX - frame.position.x;
+      const dy = boardY - (frame.position.y - 85);
+      const d = Math.hypot(dx, dy);
+      if (d < 115 && (!best || d < best.distance)) best = { frame, distance: d };
+    }
+    return best?.frame ?? null;
+  }
+
+  function handlePlayContextMenu(e: React.MouseEvent<HTMLCanvasElement>) {
+    e.preventDefault();
+    const guest = findPlayGuestAtClientPoint(e.clientX, e.clientY, e.currentTarget);
+    setPlayGuestMenu(guest ? { guestId: guest.guestId, name: guest.name, x: e.clientX, y: e.clientY } : null);
+  }
+
+  function eliminateStreamGuest(guestId: string) {
+    const guest = streamGuestFramesRef.current.get(guestId);
+    const host = playPhysicsRef.current;
+    if (!guest || !host || !streamSessionIdRef.current) return;
+    const dx = guest.position.x - host.x;
+    const far = Math.abs(dx) > 500;
+    const facing: 1 | -1 = dx >= 0 ? 1 : -1;
+    const event: StreamEliminationMessage = {
+      kind: "elimination",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: Date.now(),
+      startTime: Date.now() + 180,
+      duration: 3.2,
+      targetGuestId: guestId,
+      hostName: session?.user?.name || "Host",
+      seed: Math.floor(Math.random() * 1_000_000),
+      shooter: {
+        x: far ? guest.position.x - facing * 350 : host.x,
+        y: far ? guest.position.y : host.y,
+        facing,
+      },
+      target: { x: guest.position.x, y: guest.position.y },
+    };
+    streamEliminationsRef.current.set(guestId, event);
+    streamChannelRef.current?.send({ type: "broadcast", event: "elimination", payload: event });
+    window.setTimeout(() => kickStreamGuest(guestId), event.duration * 1000 + 450);
+    setPlayGuestMenu(null);
   }
 
   function handlePlayPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -9924,6 +10031,7 @@ export default function Board2Page() {
           onPointerMove={handlePlayPointerMove}
           onPointerUp={handlePlayPointerUp}
           onPointerCancel={handlePlayPointerUp}
+          onContextMenu={handlePlayContextMenu}
           onWheel={(e) => {
             e.preventDefault();
             const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
@@ -9941,6 +10049,17 @@ export default function Board2Page() {
         <div style={{ position: "fixed", top: 14, left: 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
           {streamPublishing ? "LIVE" : "LOCAL"}
         </div>
+        {playGuestMenu && (
+          <div style={{ position: "fixed", left: playGuestMenu.x, top: playGuestMenu.y, zIndex: 5, border: "1.5px solid #2a2a2a", background: "#fffdf5", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", minWidth: 152 }}>
+            <div style={{ padding: "7px 9px", fontSize: 10, borderBottom: "1px solid rgba(42,42,42,0.24)", fontWeight: 800 }}>{playGuestMenu.name}</div>
+            <button type="button" onClick={() => eliminateStreamGuest(playGuestMenu.guestId)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "monospace", fontWeight: 800, color: "#cc2200", cursor: "pointer" }}>
+              Eliminate
+            </button>
+            <button type="button" onClick={() => setPlayGuestMenu(null)} style={{ width: "100%", padding: "7px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.18)", background: "transparent", textAlign: "left", fontFamily: "monospace", cursor: "pointer" }}>
+              Cancel
+            </button>
+          </div>
+        )}
         <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
           <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
           <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>
