@@ -16,6 +16,7 @@ export type StreamClip = {
   name: string;
   sourceUrl: string;
   thumbnailUrl?: string;
+  videoBadge?: boolean;
   boardX: number;
   boardY: number;
   boardW: number;

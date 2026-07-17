@@ -49,7 +49,13 @@ export function drawSharedStreamCharacter(ctx: CanvasRenderingContext2D, ch: Sha
   ctx.fillStyle = ch.isHost ? "#efe0ff" : "#f4f1e8";
   ctx.beginPath(); ctx.moveTo(-19 * S, hipY); ctx.quadraticCurveTo(-24 * S, -90 * S, -16 * S, shoulderY); ctx.quadraticCurveTo(0, -119 * S, 16 * S, shoulderY); ctx.quadraticCurveTo(24 * S, -90 * S, 19 * S, hipY); ctx.closePath(); ctx.fill(); ctx.stroke();
   ctx.save(); ctx.beginPath(); ctx.ellipse(0, headY, headR, headR * (ch.faceAspect ?? 1), 0, 0, Math.PI * 2); ctx.clip();
-  if (face?.complete && face.naturalWidth > 0) ctx.drawImage(face, -headR, headY - headR * (ch.faceAspect ?? 1), headR * 2, headR * 2 * (ch.faceAspect ?? 1)); else { ctx.fillStyle = "#f6d4b4"; ctx.fill(); }
+  if (face?.complete && face.naturalWidth > 0 && face.naturalHeight > 0) {
+    try {
+      ctx.drawImage(face, -headR, headY - headR * (ch.faceAspect ?? 1), headR * 2, headR * 2 * (ch.faceAspect ?? 1));
+    } catch {
+      ctx.fillStyle = "#f6d4b4"; ctx.fill();
+    }
+  } else { ctx.fillStyle = "#f6d4b4"; ctx.fill(); }
   ctx.restore(); ctx.beginPath(); ctx.ellipse(0, headY, headR, headR * (ch.faceAspect ?? 1), 0, 0, Math.PI * 2); ctx.stroke();
   ctx.scale(ch.facing, 1);
   if (ch.name) { ctx.font = `700 ${Math.max(9, 13 * S)}px 'Caveat', monospace`; ctx.textAlign = "center"; ctx.fillStyle = ch.isHost ? "#8b2bd1" : "#27221f"; ctx.fillText(ch.name, 0, headY - headR * 1.65); }

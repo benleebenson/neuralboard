@@ -4226,6 +4226,7 @@ export default function Board2Page() {
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
     c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
@@ -4446,39 +4447,116 @@ export default function Board2Page() {
     }
   }, []);
 
+  const loadStreamImage = useCallback(async (url: string): Promise<HTMLImageElement | null> => {
+    if (!url) return null;
+    const existing = imgCacheRef.current.get(url);
+    if (existing?.complete && existing.naturalWidth > 0) return existing;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    try {
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Stream image failed to load"));
+        img.src = url;
+      });
+      return img.naturalWidth > 0 ? img : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const encodeStreamImageForSnapshot = useCallback(async (
+    clipId: string,
+    signature: string,
+    image: HTMLImageElement | null,
+    maxLongEdge: number
+  ): Promise<string> => {
+    const cached = streamMediaDataUrlCacheRef.current.get(clipId);
+    if (cached && cached.signature === signature && cached.maxLongEdge === maxLongEdge) return cached.dataUrl;
+    if (!image?.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) return "";
+    const scale = Math.min(1, maxLongEdge / Math.max(image.naturalWidth, image.naturalHeight));
+    const w = Math.max(1, Math.round(image.naturalWidth * scale));
+    const h = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "";
+    try {
+      ctx.drawImage(image, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+      streamMediaDataUrlCacheRef.current.set(clipId, { signature, maxLongEdge, dataUrl });
+      return dataUrl;
+    } catch (error) {
+      streamDebugLog("snapshot media encode failed", { clipId, signature, error });
+      return "";
+    }
+  }, []);
+
+  const buildStreamClips = useCallback(async (maxLongEdge: number) => {
+    const streamable = clipsRef.current.filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.boardX !== undefined);
+    return Promise.all(streamable.map(async (c) => {
+      const isVideo = c.type === "video";
+      const thumb = isVideo ? thumbnailImagesRef.current.get(c.id) ?? null : null;
+      const loaded = thumb?.complete && thumb.naturalWidth > 0
+        ? thumb
+        : await loadStreamImage(isVideo ? (c.thumbnailBlobUrl || "") : c.sourceUrl);
+      const signature = isVideo
+        ? `video:${c.id}:${c.thumbnailBlobUrl || ""}:${c.sourceUrl || ""}`
+        : `image:${c.id}:${c.sourceUrl || ""}`;
+      const dataUrl = await encodeStreamImageForSnapshot(c.id, signature, loaded, maxLongEdge);
+      return {
+        id: c.id,
+        type: c.type as "image" | "video",
+        name: c.name,
+        sourceUrl: dataUrl,
+        thumbnailUrl: isVideo ? dataUrl : undefined,
+        videoBadge: isVideo,
+        boardX: c.boardX!,
+        boardY: c.boardY!,
+        boardW: c.boardW!,
+        boardH: c.boardH!,
+        layer: c.layer,
+      };
+    }));
+  }, [encodeStreamImageForSnapshot, loadStreamImage]);
+
   const buildStreamSnapshot = useCallback(async (): Promise<StreamSnapshotMessage> => {
     const [face1, face2] = await Promise.all([
       blobUrlToDataUrl(characterFaceRef.current?.faceBlobUrl),
       blobUrlToDataUrl(characterFace2Ref.current?.faceBlobUrl),
     ]);
-    return {
+    const build = async (maxLongEdge: number): Promise<StreamSnapshotMessage> => ({
       kind: "snapshot",
       streamId: STREAM_OWNER_USER_ID,
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
       board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
       spawnDoor: spawnDoorRef.current,
-      clips: clipsRef.current
-        .filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.boardX !== undefined)
-        .map((c) => ({
-          id: c.id,
-          type: c.type as "image" | "video",
-          name: c.name,
-          sourceUrl: c.sourceUrl,
-          thumbnailUrl: c.thumbnailBlobUrl,
-          boardX: c.boardX!,
-          boardY: c.boardY!,
-          boardW: c.boardW!,
-          boardH: c.boardH!,
-          layer: c.layer,
-        })),
+      clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
       characters: [
         { id: "c1", enabled: showCharacterRef.current, faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
         { id: "c2", enabled: showCharacter2Ref.current, faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
       ],
-    };
-  }, [blobUrlToDataUrl]);
+    });
+    let maxLongEdge = 512;
+    let snapshot = await build(maxLongEdge);
+    let snapshotBytes = new Blob([JSON.stringify(snapshot)]).size;
+    if (snapshotBytes > 2 * 1024 * 1024) {
+      maxLongEdge = 384;
+      snapshot = await build(maxLongEdge);
+      snapshotBytes = new Blob([JSON.stringify(snapshot)]).size;
+    }
+    streamDebugLog("snapshot size", {
+      bytes: snapshotBytes,
+      kb: Math.round(snapshotBytes / 1024),
+      clips: snapshot.clips.length,
+      maxLongEdge,
+      chunking: false,
+    });
+    return snapshot;
+  }, [blobUrlToDataUrl, buildStreamClips]);
 
   const publishStreamSnapshot = useCallback(async () => {
     if (!(liveControlEnabledRef.current || playModeRef.current) || !streamSessionIdRef.current || streamSnapshotBusyRef.current) {

@@ -50,9 +50,39 @@ function drawDoor(ctx: CanvasRenderingContext2D, x: number, y: number, cam: Stre
   ctx.save();ctx.shadowColor="#f4b942";ctx.shadowBlur=pulse*28*sf;ctx.fillStyle="#f4b942";ctx.strokeStyle="#27221f";ctx.lineWidth=Math.max(1.5,3*sf);ctx.beginPath();ctx.roundRect(sx-dw/2,sy-dh,dw*(1-pulse*.35),dh,[dw*.5,dw*.5,3,3]);ctx.fill();ctx.stroke();ctx.beginPath();ctx.arc(sx+dw*.22,sy-dh*.45,4*sf,0,Math.PI*2);ctx.fillStyle="#fff8df";ctx.fill();ctx.stroke();ctx.restore();
 }
 
+function isDrawableImage(img: HTMLImageElement | undefined | null): img is HTMLImageElement {
+  return !!img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0;
+}
+
+function drawPlaceholder(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+  ctx.save();
+  ctx.fillStyle = "#e5dcc7";
+  ctx.strokeStyle = "rgba(42,42,42,0.26)";
+  ctx.lineWidth = Math.max(1, Math.min(w, h) * 0.01);
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  ctx.beginPath();
+  ctx.moveTo(x + w * 0.12, y + h * 0.82);
+  ctx.lineTo(x + w * 0.42, y + h * 0.52);
+  ctx.lineTo(x + w * 0.58, y + h * 0.66);
+  ctx.lineTo(x + w * 0.86, y + h * 0.34);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawImageSafe(ctx: CanvasRenderingContext2D, img: HTMLImageElement | undefined | null, x: number, y: number, w: number, h: number): boolean {
+  if (!isDrawableImage(img)) return false;
+  try {
+    ctx.drawImage(img, x, y, w, h);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export default function StreamPage() {
   const canvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>());
-  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0);
+  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0);
   const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const loadSnapshot=useCallback(async()=>{try{const res=await fetch(`/api/stream/snapshot?streamId=${encodeURIComponent(STREAM_OWNER_USER_ID)}`,{cache:"no-store"});const data=await res.json();streamDebugLog("snapshot endpoint",{status:res.status,live:!!data.live,hasSnapshot:!!data.snapshot,updatedAt:data.updatedAt});if(data.live&&data.snapshot){snapshotRef.current=data.snapshot;setLive(true);setSnapshot(data.snapshot);setStatus("live");}else if(!latestHost.current&&!hostPresent.current){setLive(false);setStatus("offline");}}catch(error){streamDebugLog("snapshot endpoint failed",error);if(!latestHost.current&&!hostPresent.current)setStatus("reconnecting");}},[]);
@@ -65,28 +95,166 @@ export default function StreamPage() {
       .on("broadcast",{event:"kick"},({payload})=>{if((payload as {guestId:string}).guestId===guestId){channel.untrack();physics.current=null;setMode("landing");setJoinError("You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows)if(p.guestId&&p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}})
-      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){await channel.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT")setStatus("reconnecting");});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
+      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;await channel.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
 
-  useEffect(()=>{if(!snapshot)return;for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;if(url&&!imageCache.current.has(url)){const img=new Image();img.crossOrigin="anonymous";img.src=url;imageCache.current.set(url,img);}}for(const ch of snapshot.characters)if(ch.faceDataUrl&&!faceCache.current.has(ch.id)){const img=new Image();img.src=ch.faceDataUrl;faceCache.current.set(ch.id,img);}},[snapshot]);
+  useEffect(()=>{if(!snapshot)return;const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl)load(faceCache.current,ch.faceDataUrl);},[snapshot]);
 
   const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;const surfaces=snapshot.clips.filter(c=>c.type==="image"||c.type==="video");const x=snapshot.spawnDoor?.x??snapshot.board.width/2;let y=snapshot.spawnDoor?.y??snapshot.board.height/2;const support=surfaces.filter(s=>x>=s.boardX&&x<=s.boardX+s.boardW).sort((a,b)=>Math.abs(a.boardY-y)-Math.abs(b.boardY-y))[0];if(support)y=support.boardY;physics.current={x,y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:!!support,surfaceId:support?.id??null,action:"idle",actionStarted:performance.now(),spawnAt:performance.now()};await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,joinedAt:Date.now()} satisfies StreamParticipantPresence);setMode("guest");setJoinError("");};
   const emote=()=>{const p=physics.current;if(!p)return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];p.action="emote";p.actionStarted=performance.now();};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
 
-  useEffect(()=>{if(mode!=="watch"&&mode!=="guest")return;let raf=0,last=performance.now();const frame=(now:number)=>{const dt=Math.min(.05,(now-last)/1000);last=now;const canvas=canvasRef.current,ctx=canvas?.getContext("2d");if(!canvas||!ctx){raf=requestAnimationFrame(frame);return;}const dpr=Math.min(2,devicePixelRatio||1),w=Math.floor(innerWidth*dpr),h=Math.floor(innerHeight*dpr);if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}const host=latestHost.current;
-      const p=physics.current;if(p&&snapshot){const surfaces=snapshot.clips;const target=p.targetX;if(p.action==="emote"&&now-p.actionStarted>1500){p.action="idle";p.emote=undefined;}if(target!==null){const dx=target-p.x;if(Math.abs(dx)<14){p.vx=0;p.targetX=null;if(p.grounded)p.action="idle";}else{p.facing=dx>0?1:-1;p.vx=p.facing*(Math.abs(dx)>280?620:330);p.action=Math.abs(dx)>280?"run":"walk";}}
-        if(p.grounded){const s=surfaces.find(s=>s.id===p.surfaceId);if(!s||p.x<s.boardX||p.x>s.boardX+s.boardW){p.grounded=false;p.surfaceId=null;p.vy=30;}}p.x+=p.vx*dt;if(!p.grounded){const py=p.y;p.vy=Math.min(1200,p.vy+1850*dt);const ny=p.y+p.vy*dt;const land=surfaces.filter(s=>p.x>=s.boardX+10&&p.x<=s.boardX+s.boardW-10&&py<=s.boardY&&ny>=s.boardY).sort((a,b)=>a.boardY-b.boardY)[0];if(land){p.y=land.boardY;p.vy=0;p.grounded=true;p.surfaceId=land.id;p.action=p.targetX===null?"idle":p.action;}else p.y=ny;}
-        if(!hostCam){const t=1-Math.exp(-dt*5.5);camera.current.cameraX=lerp(camera.current.cameraX,p.x,t);camera.current.cameraY=lerp(camera.current.cameraY,p.y-120,t);camera.current.boardZoom=lerp(camera.current.boardZoom,1.35,t*.1);}}
-      if((mode==="watch"||hostCam)&&host){camera.current={cameraX:lerp(camera.current.cameraX,host.camera.cameraX,.22),cameraY:lerp(camera.current.cameraY,host.camera.cameraY,.22),boardZoom:lerp(camera.current.boardZoom,host.camera.boardZoom,.2)};}
-      if(p&&now-publishAt.current>1000/15&&host){publishAt.current=now;const packet:GuestCharacterFrame={kind:"guest-state",streamId:STREAM_OWNER_USER_ID,sessionId:host.sessionId,sentAt:Date.now(),guestId,name:nameRef.current,position:{x:p.x,y:p.y},facing:p.facing,actionType:p.action,actionProgress:(now-p.actionStarted)/1000,emote:p.emote};channelRef.current?.send({type:"broadcast",event:"guest-state",payload:packet});remoteGuests.current.set(packet.guestId,packet);}
-      const cam=camera.current,sf=cam.boardZoom*w/BOARD_W;ctx.fillStyle=snapshot?.board.backgroundColor??"#f5ecd8";ctx.fillRect(0,0,w,h);if(snapshot){for(const clip of [...snapshot.clips].sort((a,b)=>(a.layer??1)-(b.layer??1))){const x=(clip.boardX-cam.cameraX)*sf+w/2,y=(clip.boardY-cam.cameraY)*sf+h/2,im=imageCache.current.get(clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl);if(im?.complete)ctx.drawImage(im,x,y,clip.boardW*sf,clip.boardH*sf);else{ctx.fillStyle="#e5dcc7";ctx.fillRect(x,y,clip.boardW*sf,clip.boardH*sf);}}for(const a of snapshot.annotations)drawAnnotation(ctx,a,cam,sf,w,h);if(snapshot.spawnDoor)drawDoor(ctx,snapshot.spawnDoor.x,snapshot.spawnDoor.y,cam,sf,w,h,p?clamp(1-(now-p.spawnAt)/900,0,1):0);if(host)for(const ch of host.characters)drawSharedStreamCharacter(ctx,hostCharacterForRender(ch,snapshot.characters.find(x=>x.id===ch.id)?.faceAspect),faceCache.current.get(ch.id)??null,cam,sf,w,h);for(const [id,g] of remoteGuests.current){const old=renderedGuests.current.get(id),smooth=old?{...g,position:{x:lerp(old.position.x,g.position.x,.35),y:lerp(old.position.y,g.position.y,.35)}}:g;renderedGuests.current.set(id,smooth);drawSharedStreamCharacter(ctx,guestCharacterForRender(smooth),faceCache.current.get(id)??null,cam,sf,w,h,id===guestId?clamp((now-(p?.spawnAt??0))/650,0,1):1);}}
-      raf=requestAnimationFrame(frame);};raf=requestAnimationFrame(frame);return()=>cancelAnimationFrame(raf);},[guestId,mode,hostCam,snapshot]);
+  useEffect(() => {
+    if (mode !== "watch" && mode !== "guest") return;
+    let raf = 0;
+    let last = performance.now();
+    const retryImage = (url: string) => {
+      if (!url || imageRetried.current.has(url)) return;
+      imageRetried.current.add(url);
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onerror = () => streamDebugLog("image retry failed", { url: url.slice(0, 48) });
+      img.src = url;
+      imageCache.current.set(url, img);
+    };
+    const frame = (now: number) => {
+      try {
+        const dt = Math.min(0.05, (now - last) / 1000);
+        last = now;
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext("2d");
+        if (!canvas || !ctx) {
+          raf = requestAnimationFrame(frame);
+          return;
+        }
+        const dpr = Math.min(2, devicePixelRatio || 1);
+        const w = Math.floor(innerWidth * dpr);
+        const h = Math.floor(innerHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        const host = latestHost.current;
+        const p = physics.current;
+        if (p && snapshot) {
+          const surfaces = snapshot.clips;
+          const target = p.targetX;
+          if (p.action === "emote" && now - p.actionStarted > 1500) {
+            p.action = "idle";
+            p.emote = undefined;
+          }
+          if (target !== null) {
+            const dx = target - p.x;
+            if (Math.abs(dx) < 14) {
+              p.vx = 0;
+              p.targetX = null;
+              if (p.grounded) p.action = "idle";
+            } else {
+              p.facing = dx > 0 ? 1 : -1;
+              p.vx = p.facing * (Math.abs(dx) > 280 ? 620 : 330);
+              p.action = Math.abs(dx) > 280 ? "run" : "walk";
+            }
+          }
+          if (p.grounded) {
+            const support = surfaces.find((s) => s.id === p.surfaceId);
+            if (!support || p.x < support.boardX || p.x > support.boardX + support.boardW) {
+              p.grounded = false;
+              p.surfaceId = null;
+              p.vy = 30;
+            }
+          }
+          p.x += p.vx * dt;
+          if (!p.grounded) {
+            const previousY = p.y;
+            p.vy = Math.min(1200, p.vy + 1850 * dt);
+            const nextY = p.y + p.vy * dt;
+            const landing = surfaces
+              .filter((s) => p.x >= s.boardX + 10 && p.x <= s.boardX + s.boardW - 10 && previousY <= s.boardY && nextY >= s.boardY)
+              .sort((a, b) => a.boardY - b.boardY)[0];
+            if (landing) {
+              p.y = landing.boardY;
+              p.vy = 0;
+              p.grounded = true;
+              p.surfaceId = landing.id;
+              p.action = p.targetX === null ? "idle" : p.action;
+            } else {
+              p.y = nextY;
+            }
+          }
+          if (!hostCam) {
+            const t = 1 - Math.exp(-dt * 5.5);
+            camera.current.cameraX = lerp(camera.current.cameraX, p.x, t);
+            camera.current.cameraY = lerp(camera.current.cameraY, p.y - 120, t);
+            camera.current.boardZoom = lerp(camera.current.boardZoom, 1.35, t * 0.1);
+          }
+        }
+        if ((mode === "watch" || hostCam) && host) {
+          camera.current = {
+            cameraX: lerp(camera.current.cameraX, host.camera.cameraX, 0.22),
+            cameraY: lerp(camera.current.cameraY, host.camera.cameraY, 0.22),
+            boardZoom: lerp(camera.current.boardZoom, host.camera.boardZoom, 0.2),
+          };
+        }
+        if (p && now - publishAt.current > 1000 / 15 && host) {
+          publishAt.current = now;
+          const packet: GuestCharacterFrame = { kind: "guest-state", streamId: STREAM_OWNER_USER_ID, sessionId: host.sessionId, sentAt: Date.now(), guestId, name: nameRef.current, position: { x: p.x, y: p.y }, facing: p.facing, actionType: p.action, actionProgress: (now - p.actionStarted) / 1000, emote: p.emote };
+          channelRef.current?.send({ type: "broadcast", event: "guest-state", payload: packet });
+          remoteGuests.current.set(packet.guestId, packet);
+        }
+        const cam = camera.current;
+        const sf = cam.boardZoom * w / BOARD_W;
+        ctx.fillStyle = snapshot?.board.backgroundColor ?? "#f5ecd8";
+        ctx.fillRect(0, 0, w, h);
+        if (snapshot) {
+          for (const clip of [...snapshot.clips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1))) {
+            const x = (clip.boardX - cam.cameraX) * sf + w / 2;
+            const y = (clip.boardY - cam.cameraY) * sf + h / 2;
+            const sw = clip.boardW * sf;
+            const sh = clip.boardH * sf;
+            const url = clip.type === "video" ? (clip.thumbnailUrl || clip.sourceUrl) : clip.sourceUrl;
+            const img = imageCache.current.get(url);
+            if (!drawImageSafe(ctx, img, x, y, sw, sh)) {
+              drawPlaceholder(ctx, x, y, sw, sh);
+              retryImage(url);
+            }
+            if (clip.type === "video" || clip.videoBadge) {
+              ctx.save();
+              ctx.fillStyle = "rgba(0,0,0,0.62)";
+              ctx.fillRect(x + 8, y + 8, 58, 20);
+              ctx.fillStyle = "#fff";
+              ctx.font = "12px monospace";
+              ctx.fillText("VIDEO", x + 15, y + 22);
+              ctx.restore();
+            }
+          }
+          for (const ann of snapshot.annotations) drawAnnotation(ctx, ann, cam, sf, w, h);
+          if (snapshot.spawnDoor) drawDoor(ctx, snapshot.spawnDoor.x, snapshot.spawnDoor.y, cam, sf, w, h, p ? clamp(1 - (now - p.spawnAt) / 900, 0, 1) : 0);
+          if (host) {
+            for (const ch of host.characters) {
+              const faceInfo = snapshot.characters.find((x) => x.id === ch.id);
+              drawSharedStreamCharacter(ctx, hostCharacterForRender(ch, faceInfo?.faceAspect), faceCache.current.get(ch.id) ?? null, cam, sf, w, h);
+            }
+          }
+          for (const [id, g] of remoteGuests.current) {
+            const old = renderedGuests.current.get(id);
+            const smooth = old ? { ...g, position: { x: lerp(old.position.x, g.position.x, 0.35), y: lerp(old.position.y, g.position.y, 0.35) } } : g;
+            renderedGuests.current.set(id, smooth);
+            drawSharedStreamCharacter(ctx, guestCharacterForRender(smooth), faceCache.current.get(id) ?? null, cam, sf, w, h, id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1);
+          }
+        }
+      } catch (error) {
+        streamDebugLog("render loop recovered", error);
+      }
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [guestId, mode, hostCam, snapshot]);
 
   const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam)return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=snapshot.clips.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];if(destination&&p.grounded&&p.y-destination.boardY>=60&&p.y-destination.boardY<=250){p.vy=-clamp(680+(p.y-destination.boardY)*.5,680,810);p.grounded=false;p.surfaceId=null;p.action="jump";p.actionStarted=performance.now();}p.targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);p.targetY=destination?.boardY??p.y;};
   useEffect(()=>{const k=(e:KeyboardEvent)=>{if(mode!=="guest"||e.target instanceof HTMLInputElement)return;if(e.key.toLowerCase()==="e")emote();if(e.key.toLowerCase()==="v")setHostCam(v=>!v);};addEventListener("keydown",k);return()=>removeEventListener("keydown",k);},[mode]);
 
   if(mode==="join")return <main style={landing}><section style={card}><h2>Join as character</h2><input autoFocus maxLength={GUEST_NAME_MAX_LENGTH} value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={input}/><label style={{...button,display:"block",textAlign:"center",marginTop:10}}>Optional face<input hidden type="file" accept="image/*" onChange={async e=>{const f=e.target.files?.[0];if(f)setFace(await bakeFace(f));}}/></label>{face&&<img src={face} alt="Face preview" style={{width:48,height:56,display:"block",margin:"10px auto"}}/>}<p style={{fontSize:10,color:"#8b2b20"}}>{joinError}</p><button style={{...button,background:"#c8f135"}} onClick={beginGuest}>Spawn</button><button style={button} onClick={()=>setMode("landing")}>Cancel</button></section></main>;
-  if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":joinError||"No active stream right now."}</p>{DEBUG_STREAM&&<div style={{fontSize:10,lineHeight:1.45,color:"#6a6a6a",background:"#f5ecd8",border:"1px solid rgba(42,42,42,.22)",padding:7,marginBottom:10}}>channel: {streamChannelName(STREAM_OWNER_USER_ID)} | subscribe: {subscribeStatus} | presence: {participants.length}</div>}<button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
+  if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":status==="reconnecting"?"RECONNECTING":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":status==="reconnecting"?"reconnecting…":joinError||"No active stream right now."}</p>{DEBUG_STREAM&&<div style={{fontSize:10,lineHeight:1.45,color:"#6a6a6a",background:"#f5ecd8",border:"1px solid rgba(42,42,42,.22)",padding:7,marginBottom:10}}>channel: {streamChannelName(STREAM_OWNER_USER_ID)} | subscribe: {subscribeStatus} | presence: {participants.length}</div>}<button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
   return <main style={{position:"fixed",inset:0,overflow:"hidden",background:"#f5ecd8"}}><canvas ref={canvasRef} onClick={clickCanvas} style={{width:"100vw",height:"100vh",display:"block",cursor:mode==="guest"&&!hostCam?"crosshair":"default"}}/><div style={{position:"fixed",top:12,left:12,display:"flex",gap:8,fontFamily:"monospace"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span>{mode==="guest"&&<><button style={pill} onClick={()=>setHostCam(v=>!v)}>{hostCam?"Host cam":"Follow me"} · V</button><button style={pill} onClick={emote}>Emote · E</button><button style={pill} onClick={leave}>Leave</button></>}</div></main>;
 }
 
