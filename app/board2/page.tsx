@@ -9026,9 +9026,7 @@ export default function Board2Page() {
       const airborneAge = Math.max(0, time - (state.airborneAt ?? time));
       const isFlip = Math.abs(state.spin) > 0.08 || speed > PLAY_RUN_SPEED * 0.7;
       const duration = isFlip ? 1.05 : 0.85;
-      const progress = isFlip
-        ? (((state.spin * state.facing) / (Math.PI * 2)) % 1 + 1) % 1
-        : clamp(airborneAge / duration, 0, 0.98);
+      const progress = clamp(airborneAge / duration, 0, 0.98);
       const type: CharacterAction["type"] = isFlip ? "flip" : "jumpTo";
       sampleTime = progress * duration;
       resolved = [{
@@ -9099,6 +9097,9 @@ export default function Board2Page() {
       ty = clamp(target.rawY ?? ty, target.surface.boardY + 60, target.surface.boardY + target.surface.boardH - 30);
     }
     const dist = Math.hypot(tx - startX, ty - startY);
+    if (["walkTo", "runTo", "jumpTo", "flip", "grapple", "zipline", "skateTo", "wallClimb"].includes(command) && Math.abs(tx - startX) > 4) {
+      state.facing = tx >= startX ? 1 : -1;
+    }
     const mk = (type: CharacterAction["type"], duration: number, ax = tx, ay = ty): CharacterAction => ({
       id: generateId(),
       type,
@@ -9169,6 +9170,44 @@ export default function Board2Page() {
     const dy = aim.y - (state.y - 110);
     const len = Math.max(1, Math.hypot(dx, dy));
     return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
+  }
+
+  function playAimFacing(current: 1 | -1, originX: number, originY: number, aim?: { x: number; y: number } | null): 1 | -1 {
+    if (!aim) return current;
+    const dx = aim.x - originX;
+    const dy = aim.y - originY;
+    const dead = Math.tan((8 * Math.PI) / 180) * Math.max(120, Math.abs(dy));
+    if (Math.abs(dx) <= dead) return current;
+    return dx >= 0 ? 1 : -1;
+  }
+
+  function applyPlayWeaponPose(pose: CharPoseResult, state: PlayCharacterState): CharPoseResult {
+    const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
+    const facing = playAimFacing(state.facing, state.x, state.y - 110, aim);
+    const aimA = aimAngleFromPoint(pose.boardX, pose.boardY, facing, aim.x, aim.y);
+    const firingArmA = clamp(aimA, -1.15, 1.15);
+    const supportArmA = clamp(aimA * 0.78 + 0.08, -0.95, 0.95);
+    const armedPose: CharPoseResult = {
+      ...pose,
+      facing,
+      bodyLean: pose.bodyLean + 0.06 * facing,
+      leftLegA: pose.leftLegA + 0.16,
+      rightLegA: pose.rightLegA - 0.16,
+      leftShinA: (pose.leftShinA ?? pose.leftLegA) + 0.18,
+      rightShinA: (pose.rightShinA ?? pose.rightLegA) - 0.18,
+    };
+    if (facing >= 0) {
+      armedPose.rightArmA = firingArmA;
+      armedPose.rightForeA = firingArmA;
+      armedPose.leftArmA = supportArmA;
+      armedPose.leftForeA = supportArmA * 0.75;
+    } else {
+      armedPose.leftArmA = firingArmA;
+      armedPose.leftForeA = firingArmA;
+      armedPose.rightArmA = -supportArmA;
+      armedPose.rightForeA = -supportArmA * 0.75;
+    }
+    return armedPose;
   }
 
   function broadcastWeaponState(force = false) {
@@ -9383,7 +9422,11 @@ export default function Board2Page() {
     if (e.button === 2) return;
     const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
     if (point) playCursorRef.current = { x: point.rawX, y: point.rawY };
-    if (playWeaponArmedRef.current) firePlayWeaponBurst();
+    if (playWeaponArmedRef.current) {
+      e.preventDefault();
+      firePlayWeaponBurst();
+      return;
+    }
     const heldCommand = heldPlayTargetCommand();
     if (heldCommand) {
       if (point) {
@@ -9411,7 +9454,10 @@ export default function Board2Page() {
       x: (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX,
       y: (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY,
     };
-    if (playWeaponArmedRef.current && (e.buttons & 1) === 1) firePlayWeaponBurst();
+    if (playWeaponArmedRef.current && (e.buttons & 1) === 1) {
+      firePlayWeaponBurst();
+      return;
+    }
     if (!pointer || pointer.id !== e.pointerId) return;
     pointer.clientX = e.clientX;
     pointer.clientY = e.clientY;
@@ -9426,11 +9472,36 @@ export default function Board2Page() {
     if (pointer?.id === e.pointerId) playPointerRef.current = null;
   }
 
+  function applyArmedKeyboardMovement(state: PlayCharacterState) {
+    const keys = playHeldKeysRef.current;
+    const left = keys.has("KeyA") || keys.has("ArrowLeft");
+    const right = keys.has("KeyD") || keys.has("ArrowRight");
+    const jump = keys.has("KeyW") || keys.has("ArrowUp");
+    const dir = (right ? 1 : 0) - (left ? 1 : 0);
+    if (dir !== 0) {
+      state.vx = dir * PLAY_WALK_SPEED;
+      playActionRuntimeRef.current = null;
+    } else if (state.grounded) {
+      state.vx *= Math.exp(-0.18);
+      if (Math.abs(state.vx) < 6) state.vx = 0;
+    }
+    if (jump && state.grounded) {
+      state.vy = -PLAY_JUMP_SPEED;
+      state.grounded = false;
+      state.surfaceId = null;
+      state.spin = 0;
+      state.airborneAt = playTimeRef.current;
+      playActionRuntimeRef.current = null;
+    }
+  }
+
   function updatePlayPhysics(state: PlayCharacterState, dt: number, canvas: HTMLCanvasElement) {
     const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
     if (state.action !== "none" && playTimeRef.current >= state.actionUntil) state.action = "none";
     const pointer = playPointerRef.current;
-    if (pointer?.down && state.action === "none") {
+    if (playWeaponArmedRef.current && state.action === "none") {
+      applyArmedKeyboardMovement(state);
+    } else if (pointer?.down && state.action === "none") {
       steerPlayCharacter(pointer.clientX, pointer.clientY, canvas);
     } else if (state.grounded && state.action === "none") {
       state.vx *= Math.exp(-dt * 11);
@@ -9577,7 +9648,8 @@ export default function Board2Page() {
       updatePlayWeaponShots(nowMs, previousNowMs);
       if (playWeaponArmedRef.current) {
         const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
-        state.facing = aim.x >= state.x ? 1 : -1;
+        state.facing = playAimFacing(state.facing, state.x, state.y - 110, aim);
+        playPose = applyPlayWeaponPose(playPose, state);
       }
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
       const target = playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom };
@@ -9658,6 +9730,10 @@ export default function Board2Page() {
           return;
         }
         if (e.code === "KeyV") { e.preventDefault(); setPlaySceneShot((v) => !v); return; }
+        if (playWeaponArmedRef.current && ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.code)) {
+          e.preventDefault();
+          return;
+        }
         if (["KeyG", "KeyS", "KeyC", "KeyZ"].includes(e.code)) { e.preventDefault(); return; }
         if (e.code === "KeyD") { e.preventDefault(); issuePlayCharacterAction("dance"); return; }
         if (e.code === "KeyF") {

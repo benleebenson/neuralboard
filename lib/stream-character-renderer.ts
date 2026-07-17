@@ -208,75 +208,30 @@ export function drawTommyGunHeld(
   const sy = (shooter.y - cam.cameraY) * sf + H / 2;
   const ax = (aimBoard.x - cam.cameraX) * sf + W / 2;
   const ay = (aimBoard.y - cam.cameraY) * sf + H / 2;
-  const aim = Math.atan2(ay - (sy - 104 * sf), ax - sx);
-  const aimUx = Math.cos(aim);
-  const aimUy = Math.sin(aim);
+  const rawDx = ax - sx;
+  const dir = Math.abs(rawDx) < Math.tan((8 * Math.PI) / 180) * Math.abs(ay - (sy - 104 * sf))
+    ? shooter.facing
+    : rawDx >= 0 ? 1 : -1;
+  const localAim = Math.atan2(ay - (sy - 104 * sf), Math.abs(rawDx));
+  const aimUxLocal = Math.cos(localAim);
+  const aimUy = Math.sin(localAim);
+  const aimUx = aimUxLocal * dir;
   const perpX = -aimUy;
   const perpY = aimUx;
-  const dir = aimUx >= 0 ? 1 : -1;
   const chest = { x: sx, y: sy - 108 * sf };
   const recoil = recoilPx * sf;
   const rearGrip = {
     x: chest.x + aimUx * 34 * sf - aimUx * recoil,
     y: chest.y + aimUy * 34 * sf - aimUy * recoil,
   };
-  const frontGrip = {
-    x: rearGrip.x + aimUx * 52 * sf,
-    y: rearGrip.y + aimUy * 52 * sf,
-  };
-  const shoulderTrigger = { x: sx + dir * 14 * sf, y: sy - 118 * sf };
-  const shoulderSupport = { x: sx - dir * 14 * sf, y: sy - 116 * sf };
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#27221f";
   ctx.lineWidth = Math.max(1.5, 3 * sf);
-  ctx.fillStyle = "#fff3dc";
-  ctx.beginPath();
-  ctx.moveTo(sx - 16 * sf, sy - 122 * sf);
-  ctx.lineTo(sx + 18 * sf, sy - 120 * sf);
-  ctx.lineTo(sx + 10 * sf, sy - 54 * sf);
-  ctx.lineTo(sx - 10 * sf, sy - 54 * sf);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(sx - 12 * sf, sy - 54 * sf);
-  ctx.lineTo(sx - 24 * sf, sy - 5 * sf);
-  ctx.moveTo(sx + 12 * sf, sy - 54 * sf);
-  ctx.lineTo(sx + 24 * sf, sy - 5 * sf);
-  ctx.stroke();
-  const solveArm = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
-    const upper = 44 * sf;
-    const fore = 42 * sf;
-    const dx = hand.x - shoulder.x;
-    const dy = hand.y - shoulder.y;
-    const rawD = Math.max(0.001, Math.hypot(dx, dy));
-    const d = clamp(rawD, 8 * sf, upper + fore - 0.01);
-    const ux = dx / rawD;
-    const uy = dy / rawD;
-    const along = (upper * upper - fore * fore + d * d) / (2 * d);
-    const height = Math.sqrt(Math.max(0, upper * upper - along * along));
-    const base = { x: shoulder.x + ux * along, y: shoulder.y + uy * along };
-    return { x: base.x + (-uy) * height * bend, y: base.y + ux * height * bend };
-  };
-  const armTo = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
-    const elbow = solveArm(shoulder, hand, bend);
-    ctx.beginPath();
-    ctx.moveTo(shoulder.x, shoulder.y);
-    ctx.lineTo(elbow.x, elbow.y);
-    ctx.lineTo(hand.x, hand.y);
-    ctx.stroke();
-    ctx.fillStyle = "#f6d4b4";
-    ctx.beginPath();
-    ctx.arc(hand.x, hand.y, 7 * sf, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-  };
-  armTo(shoulderSupport, frontGrip, dir > 0 ? 1 : -1);
-  armTo(shoulderTrigger, rearGrip, dir > 0 ? -1 : 1);
   ctx.translate(rearGrip.x - aimUx * 18 * sf - perpX * 1.5 * sf, rearGrip.y - aimUy * 18 * sf - perpY * 1.5 * sf);
-  ctx.rotate(aim);
+  ctx.rotate(localAim);
+  ctx.scale(dir, 1);
   ctx.fillStyle = "#595f66";
   ctx.beginPath();
   ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 4 * sf);
