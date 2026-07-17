@@ -3,6 +3,7 @@ export const STREAM_CHANNEL_PREFIX = "stream";
 export const MAX_GUESTS = 8;
 export const GUEST_NAME_MAX_LENGTH = 16;
 export const GUEST_EMOTES = ["🤔", "💡", "❗", "😂", "👋"] as const;
+export const GUEST_VERBS = ["walk", "run", "jump", "flip", "dance", "emote"] as const;
 
 export type StreamCamera = {
   cameraX: number;
@@ -113,10 +114,13 @@ export type StreamKickMessage = {
   sessionId: string;
   guestId: string;
   sentAt: number;
+  reason?: "instant" | "elimination_tommygun";
+  hostName?: string;
 };
 
 export type StreamEliminationMessage = {
   kind: "elimination";
+  sequenceType: "elimination_tommygun";
   streamId: string;
   sessionId: string;
   sentAt: number;
@@ -157,7 +161,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamEliminationMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

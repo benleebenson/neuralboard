@@ -18,7 +18,7 @@ import {
   StreamSnapshotMessage,
   streamChannelName,
 } from "@/lib/stream";
-import { drawEliminationSequence, drawSharedStreamCharacter, guestCharacterForRender } from "@/lib/stream-character-renderer";
+import { drawEliminationSequence, drawSharedStreamCharacter, eliminationFrameForGuest, guestCharacterForRender } from "@/lib/stream-character-renderer";
 import {
   PLAY_CHARACTER_HEIGHT,
   PLAY_GRAVITY,
@@ -4465,9 +4465,9 @@ export default function Board2Page() {
     });
   }, []);
 
-  const kickStreamGuest = useCallback((guestId?: string) => {
+  const kickStreamGuest = useCallback((guestId?: string, options?: { reason?: "instant" | "elimination_tommygun"; hostName?: string }) => {
     if (!guestId) return;
-    streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt: Date.now() } });
+    streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt: Date.now(), reason: options?.reason ?? "instant", hostName: options?.hostName } });
     streamGuestFramesRef.current.delete(guestId);
     streamRenderedGuestFramesRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
@@ -5035,17 +5035,7 @@ export default function Board2Page() {
     for (const frame of streamGuestFramesRef.current.values()) {
       const elimination = streamEliminationsRef.current.get(frame.guestId);
       const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
-      const activeFrame = elimination
-        ? {
-            ...frame,
-            actionType: "eliminated" as const,
-            actionStartTime: elimination.startTime,
-            actionDuration: elimination.duration,
-            actionProgress: clamp((now - elimination.startTime) / (elimination.duration * 1000), 0, 1),
-            velocity: { x: 0, y: 0 },
-            position: elimination.target,
-          }
-        : frame;
+      const activeFrame = elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
       const previous = streamRenderedGuestFramesRef.current.get(frame.guestId);
       const smoothed = previous
         ? {
@@ -9033,8 +9023,15 @@ export default function Board2Page() {
 
   function handlePlayPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (e.button === 2) return;
+    const guest = findPlayGuestAtClientPoint(e.clientX, e.clientY, e.currentTarget);
+    if (guest) {
+      e.preventDefault();
+      setPlayGuestMenu({ guestId: guest.guestId, name: guest.name, x: e.clientX, y: e.clientY });
+      return;
+    }
     setPlayGuestMenu(null);
     e.currentTarget.setPointerCapture(e.pointerId);
+    // eslint-disable-next-line react-hooks/purity -- event timestamp for live input steering
     playPointerRef.current = { id: e.pointerId, clientX: e.clientX, clientY: e.clientY, down: true, lastSteerAt: performance.now() };
     steerPlayCharacter(e.clientX, e.clientY, e.currentTarget);
   }
@@ -9070,11 +9067,12 @@ export default function Board2Page() {
     const facing: 1 | -1 = dx >= 0 ? 1 : -1;
     const event: StreamEliminationMessage = {
       kind: "elimination",
+      sequenceType: "elimination_tommygun",
       streamId: STREAM_OWNER_USER_ID,
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
       startTime: Date.now() + 180,
-      duration: 3.2,
+      duration: 4.2,
       targetGuestId: guestId,
       hostName: session?.user?.name || "Host",
       seed: Math.floor(Math.random() * 1_000_000),
@@ -9087,7 +9085,7 @@ export default function Board2Page() {
     };
     streamEliminationsRef.current.set(guestId, event);
     streamChannelRef.current?.send({ type: "broadcast", event: "elimination", payload: event });
-    window.setTimeout(() => kickStreamGuest(guestId), event.duration * 1000 + 450);
+    window.setTimeout(() => kickStreamGuest(guestId, { reason: "elimination_tommygun", hostName: event.hostName }), event.duration * 1000 + 450);
     setPlayGuestMenu(null);
   }
 
@@ -9833,7 +9831,7 @@ export default function Board2Page() {
           <div style={{ position: "fixed", left: playGuestMenu.x, top: playGuestMenu.y, zIndex: 5, border: "1.5px solid #2a2a2a", background: "#fffdf5", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", minWidth: 152 }}>
             <div style={{ padding: "7px 9px", fontSize: 10, borderBottom: "1px solid rgba(42,42,42,0.24)", fontWeight: 800 }}>{playGuestMenu.name}</div>
             <button type="button" onClick={() => eliminateStreamGuest(playGuestMenu.guestId)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "monospace", fontWeight: 800, color: "#cc2200", cursor: "pointer" }}>
-              Eliminate
+              Kick 💥
             </button>
             <button type="button" onClick={() => setPlayGuestMenu(null)} style={{ width: "100%", padding: "7px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.18)", background: "transparent", textAlign: "left", fontFamily: "monospace", cursor: "pointer" }}>
               Cancel

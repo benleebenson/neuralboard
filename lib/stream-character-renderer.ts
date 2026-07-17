@@ -24,6 +24,7 @@ export type SharedCharacter = {
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const ELIMINATION_LAUNCH_AT = 0.58;
 
 export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect = 1, clockOffsetMs = 0): SharedCharacter {
   return {
@@ -90,7 +91,9 @@ function sharedToPlayState(ch: SharedCharacter, renderTimeMs: number): PlayChara
   const flipSpin = ch.actionType === "flip"
     ? progress * Math.PI * 2
     : ch.actionType === "eliminated"
-      ? lerp(0, Math.PI / 2.4, clamp((progress - 0.48) / 0.26, 0, 1))
+      ? progress < ELIMINATION_LAUNCH_AT
+        ? lerp(0, Math.PI / 2.6, clamp((progress - 0.35) / 0.18, 0, 1))
+        : Math.PI / 2.6 + (progress - ELIMINATION_LAUNCH_AT) * Math.PI * 7.5
       : airborne
         ? clamp(ch.vy / 850, -0.55, 0.8)
         : 0;
@@ -167,6 +170,50 @@ export function drawSharedStreamCharacter(
   ctx.restore();
 }
 
+export function eliminationFrameForGuest(
+  frame: GuestCharacterFrame,
+  event: StreamEliminationMessage,
+  renderTimeMs = Date.now(),
+  clockOffsetMs = 0,
+): GuestCharacterFrame {
+  const hostNow = renderTimeMs - clockOffsetMs;
+  const t = clamp((hostNow - event.startTime) / Math.max(1, event.duration * 1000), 0, 1.15);
+  const dir: 1 | -1 = event.target.x >= event.shooter.x ? 1 : -1;
+  const hitShake =
+    Math.sin(t * Math.PI * 54 + event.seed) *
+    (t < ELIMINATION_LAUNCH_AT ? Math.max(0, 1 - Math.abs(t - 0.35) * 2.4) : 0);
+  let position = {
+    x: event.target.x + dir * hitShake * 18,
+    y: event.target.y - Math.abs(hitShake) * 10,
+  };
+  let velocity = { x: dir * 80, y: -30 };
+  if (t >= ELIMINATION_LAUNCH_AT) {
+    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (1 - ELIMINATION_LAUNCH_AT), 0, 1.2);
+    const horizontal = 420 * u + 2400 * u * u;
+    const lift = -Math.sin(clamp(u, 0, 1) * Math.PI) * 660;
+    const fall = 920 * u * u;
+    position = {
+      x: event.target.x + dir * horizontal,
+      y: event.target.y + lift + fall,
+    };
+    velocity = {
+      x: dir * (650 + 3200 * u),
+      y: -820 + 2100 * u,
+    };
+  }
+  return {
+    ...frame,
+    actionType: "eliminated",
+    actionStartTime: event.startTime,
+    actionDuration: event.duration,
+    actionProgress: t,
+    facing: dir > 0 ? -1 : 1,
+    position,
+    velocity,
+    receivedAt: renderTimeMs,
+  };
+}
+
 export function drawEliminationSequence(
   ctx: CanvasRenderingContext2D,
   event: StreamEliminationMessage,
@@ -183,36 +230,58 @@ export function drawEliminationSequence(
   const sy = (event.shooter.y - cam.cameraY) * sf + H / 2;
   const tx = (event.target.x - cam.cameraX) * sf + W / 2;
   const ty = (event.target.y - cam.cameraY) * sf + H / 2;
+  const dir = event.shooter.facing;
+  const recoil = Math.sin(t * Math.PI * 36 + event.seed) * (t > 0.14 && t < 0.58 ? 3 * sf : 0);
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#27221f";
   ctx.fillStyle = "#fffdf5";
   ctx.lineWidth = Math.max(1.5, 2.5 * sf);
-  const handX = sx + event.shooter.facing * 48 * sf;
+  const handX = sx + dir * 48 * sf;
   const handY = sy - 104 * sf;
   ctx.translate(handX, handY);
-  ctx.rotate(event.shooter.facing > 0 ? -0.12 : Math.PI + 0.12);
+  ctx.rotate(dir > 0 ? -0.12 : Math.PI + 0.12);
+  ctx.translate(-Math.abs(recoil), recoil * 0.25);
   ctx.beginPath();
-  ctx.roundRect(0, -8 * sf, 46 * sf, 16 * sf, 5 * sf);
-  ctx.moveTo(14 * sf, 8 * sf);
-  ctx.lineTo(21 * sf, 25 * sf);
-  ctx.moveTo(37 * sf, -9 * sf);
-  ctx.lineTo(51 * sf, -16 * sf);
+  ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 5 * sf);
+  ctx.moveTo(15 * sf, 9 * sf);
+  ctx.lineTo(23 * sf, 27 * sf);
+  ctx.moveTo(38 * sf, 9 * sf);
+  ctx.lineTo(43 * sf, 28 * sf);
+  ctx.moveTo(51 * sf, -8 * sf);
+  ctx.lineTo(72 * sf, -11 * sf);
   ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(28 * sf, 15 * sf, 13 * sf, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  if (t > 0.14 && t < 0.58) {
+    for (let i = 0; i < 3; i += 1) {
+      const casingT = (t * 16 + i * 0.31 + event.seed * 0.001) % 1;
+      ctx.beginPath();
+      ctx.moveTo((22 - casingT * 18) * sf, (-11 - i * 4 - casingT * 9) * sf);
+      ctx.lineTo((26 - casingT * 18) * sf, (-13 - i * 4 - casingT * 9) * sf);
+      ctx.stroke();
+    }
+  }
   ctx.restore();
 
-  [0.18, 0.36, 0.54].forEach((start, index) => {
-    const shotT = clamp((t - start) / 0.12, 0, 1);
+  [0.18, 0.33, 0.48].forEach((start, index) => {
+    const shotT = clamp((t - start) / 0.14, 0, 1);
     if (shotT <= 0 || shotT >= 1) return;
-    const ex = lerp(handX, tx, shotT);
-    const ey = lerp(handY, ty - 95 * sf, shotT);
+    const muzzleX = handX + dir * 72 * sf;
+    const muzzleY = handY - 7 * sf;
+    const targetX = tx + Math.sin(event.seed + index) * 14 * sf;
+    const targetY = ty - (96 + index * 8) * sf;
+    const ex = lerp(muzzleX, targetX, shotT);
+    const ey = lerp(muzzleY, targetY, shotT);
     ctx.save();
     ctx.strokeStyle = ["#9be7ff", "#f4b942", "#ff5e87"][index];
     ctx.setLineDash([8 * sf, 5 * sf]);
     ctx.lineWidth = Math.max(2, 4 * sf);
     ctx.beginPath();
-    ctx.moveTo(handX, handY);
+    ctx.moveTo(muzzleX, muzzleY);
     ctx.lineTo(ex, ey);
     ctx.stroke();
     ctx.setLineDash([]);
@@ -223,8 +292,23 @@ export function drawEliminationSequence(
       for (let i = 0; i < 10; i += 1) {
         const a = (i / 10) * Math.PI * 2;
         const r = i % 2 ? burst * 0.45 : burst;
-        const px = tx + Math.cos(a) * r;
-        const py = ty - 95 * sf + Math.sin(a) * r;
+        const px = targetX + Math.cos(a) * r;
+        const py = targetY + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (shotT < 0.22) {
+      ctx.fillStyle = "#fff45f";
+      ctx.beginPath();
+      for (let i = 0; i < 8; i += 1) {
+        const a = (i / 8) * Math.PI * 2;
+        const r = (i % 2 ? 10 : 21) * sf * (1 - shotT);
+        const px = muzzleX + Math.cos(a) * r;
+        const py = muzzleY + Math.sin(a) * r;
         if (i === 0) ctx.moveTo(px, py);
         else ctx.lineTo(px, py);
       }
@@ -234,4 +318,29 @@ export function drawEliminationSequence(
     }
     ctx.restore();
   });
+  if (t >= ELIMINATION_LAUNCH_AT) {
+    const u = clamp((t - ELIMINATION_LAUNCH_AT) / (1 - ELIMINATION_LAUNCH_AT), 0, 1.15);
+    const trailDir = event.target.x >= event.shooter.x ? 1 : -1;
+    ctx.save();
+    ctx.strokeStyle = "rgba(39,34,31,0.62)";
+    ctx.fillStyle = "rgba(255,244,95,0.9)";
+    ctx.lineWidth = Math.max(1, 2 * sf);
+    for (let i = 0; i < 5; i += 1) {
+      const px = tx + trailDir * (90 + i * 58 + u * 260) * sf;
+      const py = ty - (120 + Math.sin(u * Math.PI + i) * 80 - i * 14) * sf;
+      ctx.beginPath();
+      for (let j = 0; j < 5; j += 1) {
+        const a = (j / 5) * Math.PI * 2 - Math.PI / 2;
+        const r = (j % 2 ? 5 : 12) * sf * (1 - Math.min(0.75, u * 0.5));
+        const x = px + Math.cos(a) * r;
+        const y = py + Math.sin(a) * r;
+        if (j === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 }
