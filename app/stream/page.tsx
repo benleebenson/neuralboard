@@ -130,10 +130,34 @@ function guestActionDuration(action: GuestCharacterFrame["actionType"]): number 
   return action === "run" ? 0.75 : action === "walk" ? 0.9 : 2;
 }
 
+function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, sessionId: string, now: number): GuestCharacterFrame {
+  const sentAt = Date.now();
+  const duration = guestActionDuration(p.action);
+  const progress = clamp((now - p.actionStarted) / Math.max(1, duration * 1000), 0, 1.4);
+  return {
+    kind: "guest-state",
+    streamId: STREAM_OWNER_USER_ID,
+    sessionId,
+    sentAt,
+    guestId,
+    name,
+    position: { x: p.x, y: p.y },
+    velocity: { x: p.vx, y: p.vy },
+    facing: p.facing,
+    actionType: p.action,
+    actionProgress: progress,
+    actionStartTime: sentAt - progress * duration * 1000,
+    actionDuration: duration,
+    skin: "styled",
+    physique: "slim",
+    emote: p.emote,
+  };
+}
+
 export default function StreamPage() {
   const canvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), eliminations=useRef(new Map<string,StreamEliminationMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0);
-  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[eliminatedBy,setEliminatedBy]=useState("");
+  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const loadSnapshot=useCallback(async()=>{try{const res=await fetch(`/api/stream/snapshot?streamId=${encodeURIComponent(STREAM_OWNER_USER_ID)}`,{cache:"no-store"});const data=await res.json();streamDebugLog("snapshot endpoint",{status:res.status,live:!!data.live,hasSnapshot:!!data.snapshot,updatedAt:data.updatedAt});if(data.live&&data.snapshot){snapshotRef.current=data.snapshot;setLive(true);setSnapshot(data.snapshot);setStatus("live");}else if(!latestHost.current&&!hostPresent.current){setLive(false);setStatus("offline");}}catch(error){streamDebugLog("snapshot endpoint failed",error);if(!latestHost.current&&!hostPresent.current)setStatus("reconnecting");}},[]);
 
@@ -142,15 +166,15 @@ export default function StreamPage() {
     channel.on("broadcast",{event:"snapshot"},({payload})=>{streamDebugLog("snapshot broadcast",{sessionId:(payload as StreamSnapshotMessage).sessionId,clips:(payload as StreamSnapshotMessage).clips?.length});snapshotRef.current=payload as StreamSnapshotMessage;setSnapshot(snapshotRef.current);setLive(true);setStatus("live");})
       .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
       .on("broadcast",{event:"guest-state"},({payload})=>{const f=payload as GuestCharacterFrame;if(f.sessionId===latestHost.current?.sessionId||!latestHost.current){const measured=Date.now()-f.sentAt;const prev=remoteClockOffsets.current.get(f.guestId)??measured;remoteClockOffsets.current.set(f.guestId,prev*.85+measured*.15);remoteGuests.current.set(f.guestId,{...f,receivedAt:Date.now()});}})
-      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;setTimeout(()=>{void channel.untrack();physics.current=null;setMode("landing");setEliminatedBy(event.hostName);setJoinError(`💥 ELIMINATED by ${event.hostName}`);},event.duration*1000+650);}})
-      .on("broadcast",{event:"kick"},({payload})=>{if((payload as {guestId:string}).guestId===guestId){channel.untrack();physics.current=null;setMode("landing");setJoinError(eliminatedBy||"You were removed by the host.");}})
+      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;setTimeout(()=>{void channel.untrack();physics.current=null;setMode("landing");setJoinError(`💥 ELIMINATED by ${event.hostName}`);},event.duration*1000+650);}})
+      .on("broadcast",{event:"kick"},({payload})=>{if((payload as {guestId:string}).guestId===guestId){channel.untrack();physics.current=null;setMode("landing");setJoinError("You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows)if(p.guestId&&p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}})
       .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;await channel.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
 
   useEffect(()=>{if(!snapshot)return;const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl&&!faceCache.current.has(ch.id)){const img=new Image();img.src=ch.faceDataUrl;faceCache.current.set(ch.id,img);}},[snapshot]);
 
-  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now()};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,skin:"styled",physique:"slim",joinedAt:Date.now()} satisfies StreamParticipantPresence);setEliminatedBy("");setMode("guest");setJoinError("");};
+  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;if(face&&!faceCache.current.has(guestId)){const img=new Image();img.src=face;faceCache.current.set(guestId,img);}const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now()};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,skin:"styled",physique:"slim",joinedAt:Date.now()} satisfies StreamParticipantPresence);setMode("guest");setJoinError("");};
   const emote=()=>{const p=physics.current;if(!p)return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];p.action="emote";p.actionStarted=performance.now();};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
 
@@ -270,12 +294,8 @@ export default function StreamPage() {
         }
         if (p && now - publishAt.current > 1000 / STREAM_FPS && host) {
           publishAt.current = now;
-          const sentAt = Date.now();
-          const duration = guestActionDuration(p.action);
-          const progress = clamp((now - p.actionStarted) / Math.max(1, duration * 1000), 0, 1.4);
-          const packet: GuestCharacterFrame = { kind: "guest-state", streamId: STREAM_OWNER_USER_ID, sessionId: host.sessionId, sentAt, guestId, name: nameRef.current, position: { x: p.x, y: p.y }, velocity: { x: p.vx, y: p.vy }, facing: p.facing, actionType: p.action, actionProgress: progress, actionStartTime: sentAt - progress * duration * 1000, actionDuration: duration, skin: "styled", physique: "slim", emote: p.emote };
+          const packet = guestFrameFromPhysics(p, guestId, nameRef.current, host.sessionId, now);
           channelRef.current?.send({ type: "broadcast", event: "guest-state", payload: packet });
-          remoteGuests.current.set(packet.guestId, packet);
         }
         const cam = camera.current;
         const sf = cam.boardZoom * w / BOARD_W;
@@ -316,6 +336,7 @@ export default function StreamPage() {
             else drawEliminationSequence(ctx, event, cam, sf, w, h, Date.now(), hostClockOffset.current);
           }
           for (const [id, g] of remoteGuests.current) {
+            if (id === guestId && p) continue;
             const event = eliminations.current.get(id);
             const renderFrame = event
               ? { ...g, actionType: "eliminated" as const, actionStartTime: event.startTime, actionDuration: event.duration, actionProgress: clamp((Date.now() - event.startTime) / (event.duration * 1000), 0, 1), velocity: { x: 0, y: 0 }, position: event.target }
@@ -326,6 +347,15 @@ export default function StreamPage() {
             const smooth = old ? { ...renderFrame, position: { x: lerp(old.position.x, renderFrame.position.x, alpha), y: lerp(old.position.y, renderFrame.position.y, alpha) } } : renderFrame;
             renderedGuests.current.set(id, smooth);
             drawSharedStreamCharacter(ctx, guestCharacterForRender(smooth, remoteClockOffsets.current.get(id) ?? 0), faceCache.current.get(id) ?? null, cam, sf, w, h, id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, Date.now());
+          }
+          if (p && mode === "guest") {
+            const sessionId = host?.sessionId ?? latestHost.current?.sessionId ?? "local";
+            const localFrame = guestFrameFromPhysics(p, guestId, nameRef.current, sessionId, now);
+            const event = eliminations.current.get(guestId);
+            const renderFrame = event
+              ? { ...localFrame, actionType: "eliminated" as const, actionStartTime: event.startTime, actionDuration: event.duration, actionProgress: clamp((Date.now() - event.startTime) / (event.duration * 1000), 0, 1), velocity: { x: 0, y: 0 }, position: event.target }
+              : localFrame;
+            drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0), faceCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
           }
         }
       } catch (error) {
