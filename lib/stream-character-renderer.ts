@@ -26,6 +26,7 @@ const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const ELIMINATION_LAUNCH_AT = 0.58;
 const ELIMINATION_DESPAWN_AT = 1.04;
+export const STREAM_PROJECTILE_SPEED = 1400;
 
 export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect = 1, clockOffsetMs = 0): SharedCharacter {
   return {
@@ -153,6 +154,164 @@ export function drawSharedStreamCharacter(
     ctx.textAlign = "center";
     ctx.fillText(ch.emoji, sx, sy - 280 * sf);
   }
+  ctx.restore();
+}
+
+export function projectilePoint(origin: { x: number; y: number }, dir: { x: number; y: number }, startMs: number, nowMs: number, speed = STREAM_PROJECTILE_SPEED) {
+  const age = Math.max(0, (nowMs - startMs) / 1000);
+  return { x: origin.x + dir.x * speed * age, y: origin.y + dir.y * speed * age };
+}
+
+export function drawWeaponProjectile(
+  ctx: CanvasRenderingContext2D,
+  shot: { origin: { x: number; y: number }; dir: { x: number; y: number }; sentAt: number; seed: number },
+  cam: StreamCamera,
+  sf: number,
+  W: number,
+  H: number,
+  nowMs = Date.now(),
+) {
+  const head = projectilePoint(shot.origin, shot.dir, shot.sentAt, nowMs);
+  const tail = projectilePoint(shot.origin, shot.dir, shot.sentAt - 85, nowMs);
+  const sx = (head.x - cam.cameraX) * sf + W / 2;
+  const sy = (head.y - cam.cameraY) * sf + H / 2;
+  const tx = (tail.x - cam.cameraX) * sf + W / 2;
+  const ty = (tail.y - cam.cameraY) * sf + H / 2;
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.setLineDash([10 * sf, 7 * sf]);
+  ctx.strokeStyle = "#f4b942";
+  ctx.lineWidth = Math.max(2, 4 * sf);
+  ctx.beginPath();
+  ctx.moveTo(tx, ty);
+  ctx.lineTo(sx, sy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#fff45f";
+  ctx.beginPath();
+  ctx.arc(sx, sy, Math.max(3, 5 * sf), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+export function drawTommyGunHeld(
+  ctx: CanvasRenderingContext2D,
+  shooter: { x: number; y: number; facing: 1 | -1 },
+  aimBoard: { x: number; y: number },
+  cam: StreamCamera,
+  sf: number,
+  W: number,
+  H: number,
+  recoilPx = 0,
+) {
+  const sx = (shooter.x - cam.cameraX) * sf + W / 2;
+  const sy = (shooter.y - cam.cameraY) * sf + H / 2;
+  const ax = (aimBoard.x - cam.cameraX) * sf + W / 2;
+  const ay = (aimBoard.y - cam.cameraY) * sf + H / 2;
+  const aim = Math.atan2(ay - (sy - 104 * sf), ax - sx);
+  const aimUx = Math.cos(aim);
+  const aimUy = Math.sin(aim);
+  const perpX = -aimUy;
+  const perpY = aimUx;
+  const dir = aimUx >= 0 ? 1 : -1;
+  const chest = { x: sx, y: sy - 108 * sf };
+  const recoil = recoilPx * sf;
+  const rearGrip = {
+    x: chest.x + aimUx * 34 * sf - aimUx * recoil,
+    y: chest.y + aimUy * 34 * sf - aimUy * recoil,
+  };
+  const frontGrip = {
+    x: rearGrip.x + aimUx * 52 * sf,
+    y: rearGrip.y + aimUy * 52 * sf,
+  };
+  const shoulderTrigger = { x: sx + dir * 14 * sf, y: sy - 118 * sf };
+  const shoulderSupport = { x: sx - dir * 14 * sf, y: sy - 116 * sf };
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#27221f";
+  ctx.lineWidth = Math.max(1.5, 3 * sf);
+  ctx.fillStyle = "#fff3dc";
+  ctx.beginPath();
+  ctx.moveTo(sx - 16 * sf, sy - 122 * sf);
+  ctx.lineTo(sx + 18 * sf, sy - 120 * sf);
+  ctx.lineTo(sx + 10 * sf, sy - 54 * sf);
+  ctx.lineTo(sx - 10 * sf, sy - 54 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(sx - 12 * sf, sy - 54 * sf);
+  ctx.lineTo(sx - 24 * sf, sy - 5 * sf);
+  ctx.moveTo(sx + 12 * sf, sy - 54 * sf);
+  ctx.lineTo(sx + 24 * sf, sy - 5 * sf);
+  ctx.stroke();
+  const solveArm = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
+    const upper = 44 * sf;
+    const fore = 42 * sf;
+    const dx = hand.x - shoulder.x;
+    const dy = hand.y - shoulder.y;
+    const rawD = Math.max(0.001, Math.hypot(dx, dy));
+    const d = clamp(rawD, 8 * sf, upper + fore - 0.01);
+    const ux = dx / rawD;
+    const uy = dy / rawD;
+    const along = (upper * upper - fore * fore + d * d) / (2 * d);
+    const height = Math.sqrt(Math.max(0, upper * upper - along * along));
+    const base = { x: shoulder.x + ux * along, y: shoulder.y + uy * along };
+    return { x: base.x + (-uy) * height * bend, y: base.y + ux * height * bend };
+  };
+  const armTo = (shoulder: { x: number; y: number }, hand: { x: number; y: number }, bend: 1 | -1) => {
+    const elbow = solveArm(shoulder, hand, bend);
+    ctx.beginPath();
+    ctx.moveTo(shoulder.x, shoulder.y);
+    ctx.lineTo(elbow.x, elbow.y);
+    ctx.lineTo(hand.x, hand.y);
+    ctx.stroke();
+    ctx.fillStyle = "#f6d4b4";
+    ctx.beginPath();
+    ctx.arc(hand.x, hand.y, 7 * sf, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  };
+  armTo(shoulderSupport, frontGrip, dir > 0 ? 1 : -1);
+  armTo(shoulderTrigger, rearGrip, dir > 0 ? -1 : 1);
+  ctx.translate(rearGrip.x - aimUx * 18 * sf - perpX * 1.5 * sf, rearGrip.y - aimUy * 18 * sf - perpY * 1.5 * sf);
+  ctx.rotate(aim);
+  ctx.fillStyle = "#595f66";
+  ctx.beginPath();
+  ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 4 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.rect(56 * sf, -3 * sf, 30 * sf, 6 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(82 * sf, -9 * sf);
+  ctx.lineTo(89 * sf, -9 * sf);
+  ctx.stroke();
+  ctx.fillStyle = "#8B5A2B";
+  ctx.beginPath();
+  ctx.moveTo(-1 * sf, 1 * sf);
+  ctx.lineTo(-38 * sf, 18 * sf);
+  ctx.lineTo(-43 * sf, 9 * sf);
+  ctx.lineTo(-8 * sf, -6 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(17 * sf, 9 * sf, 10 * sf, 26 * sf, 3 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(36 * sf, 7 * sf, 9 * sf, 24 * sf, 3 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#6d7379";
+  ctx.beginPath();
+  ctx.arc(31 * sf, 20 * sf, 16 * sf, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
   ctx.restore();
 }
 

@@ -133,6 +133,38 @@ export type StreamEliminationMessage = {
   target: { x: number; y: number };
 };
 
+export type StreamWeaponStateMessage = {
+  kind: "weapon_state";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  armed: boolean;
+  shooter: { x: number; y: number; facing: 1 | -1 };
+  aim: { x: number; y: number };
+};
+
+export type StreamShotFiredMessage = {
+  kind: "shot_fired";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  shotId: string;
+  origin: { x: number; y: number };
+  dir: { x: number; y: number };
+  seed: number;
+};
+
+export type StreamWeaponHitMessage = {
+  kind: "hit";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  guestId: string;
+  count: number;
+  origin: { x: number; y: number };
+  dir: { x: number; y: number };
+};
+
 export type StreamSnapshotMessage = {
   kind: "snapshot";
   streamId: string;
@@ -161,7 +193,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamWeaponStateMessage | StreamShotFiredMessage | StreamWeaponHitMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

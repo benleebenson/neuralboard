@@ -15,10 +15,13 @@ import {
   StreamParticipantPresence,
   StreamCharacterFrame,
   StreamEliminationMessage,
+  StreamShotFiredMessage,
   StreamSnapshotMessage,
+  StreamWeaponHitMessage,
+  StreamWeaponStateMessage,
   streamChannelName,
 } from "@/lib/stream";
-import { drawEliminationSequence, drawSharedStreamCharacter, eliminationFrameForGuest, guestCharacterForRender } from "@/lib/stream-character-renderer";
+import { STREAM_PROJECTILE_SPEED, drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, projectilePoint } from "@/lib/stream-character-renderer";
 import {
   PLAY_CHARACTER_HEIGHT,
   PLAY_GRAVITY,
@@ -188,6 +191,15 @@ type LiveCharacterRuntime = {
   blendDuration: number;
   lastStationaryAction: CharacterAction | null;
   emoteIndex: number;
+};
+
+type PlayWeaponShot = {
+  shotId: string;
+  origin: { x: number; y: number };
+  dir: { x: number; y: number };
+  seed: number;
+  sentAt: number;
+  hitGuestIds: Set<string>;
 };
 
 type CharTimelineDrag = {
@@ -751,6 +763,10 @@ const PLAY_JUMP_CURSOR_PX = 85;
 const PLAY_STEER_INTERVAL_MS = 140;
 const PLAY_WALK_SPEED = 360;
 const PLAY_RUN_SPEED = 760;
+const PLAY_WALK_CYCLE_PX = 340;
+const PLAY_WEAPON_FIRE_INTERVAL_MS = 120;
+const PLAY_WEAPON_SHOT_LIFETIME_MS = 1700;
+const PLAY_WEAPON_HIT_RADIUS = 58;
 const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 
 // Travel-type action kinds — these are movement primitives from the prior resolved position.
@@ -3756,6 +3772,9 @@ export default function Board2Page() {
   const [playMode, setPlayMode] = useState(false);
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
+  const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
+  const [playCleanUi, setPlayCleanUi] = useState(false);
+  const [playCleanMenuOpen, setPlayCleanMenuOpen] = useState(false);
   const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
   const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
@@ -4026,8 +4045,13 @@ export default function Board2Page() {
   const playCursorRef = useRef<{ x: number; y: number } | null>(null);
   const playPhysicsRef = useRef<PlayCharacterState | null>(null);
   const playActionRuntimeRef = useRef<LiveCharacterRuntime | null>(null);
+  const playWeaponArmedRef = useRef(false);
+  const playWeaponShotsRef = useRef<PlayWeaponShot[]>([]);
+  const playWeaponHitCountsRef = useRef<Map<string, number>>(new Map());
+  const playWeaponLastShotAtRef = useRef(0);
+  const playWeaponLastStateAtRef = useRef(0);
+  const playEliminationKickSentRef = useRef<Set<string>>(new Set());
   const editorPlayheadBeforePlayRef = useRef(0);
-  const [playGuestMenu, setPlayGuestMenu] = useState<{ guestId: string; name: string; x: number; y: number } | null>(null);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
     const placed = clipsRef.current.filter((c) => c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined && c.boardH !== undefined);
@@ -4474,6 +4498,7 @@ export default function Board2Page() {
     streamRenderedGuestFramesRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
     streamEliminationsRef.current.delete(guestId);
+    playWeaponHitCountsRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
@@ -4594,6 +4619,7 @@ export default function Board2Page() {
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   useEffect(() => { playModeRef.current = playMode; }, [playMode]);
+  useEffect(() => { playWeaponArmedRef.current = playWeaponArmed; }, [playWeaponArmed]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
   // array reference), characterActions (manual edits), or characterMode change. There is no way
@@ -5041,7 +5067,11 @@ export default function Board2Page() {
       if (!activeFrame) {
         streamRenderedGuestFramesRef.current.delete(frame.guestId);
         streamGuestFramesRef.current.delete(frame.guestId);
-        if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "host-board", guestId: frame.guestId, event: elimination?.sequenceType });
+        if (!playEliminationKickSentRef.current.has(frame.guestId)) {
+          playEliminationKickSentRef.current.add(frame.guestId);
+          kickStreamGuest(frame.guestId, { reason: "elimination_tommygun", hostName: session?.user?.name || "Host" });
+        }
+        if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "host-board", guestId: frame.guestId, event: elimination?.sequenceType, removedAt: now, gapFrames: 0 });
         continue;
       }
       const previous = streamRenderedGuestFramesRef.current.get(frame.guestId);
@@ -5067,7 +5097,7 @@ export default function Board2Page() {
         now,
       );
     }
-  }, []);
+  }, [kickStreamGuest, session?.user?.name]);
 
   // ─ Canvas draw ────────────────────────────────────────────────────────────
 
@@ -9133,6 +9163,143 @@ export default function Board2Page() {
     return null;
   }
 
+  function playWeaponOrigin(state: PlayCharacterState): { x: number; y: number } {
+    const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
+    const dx = aim.x - state.x;
+    const dy = aim.y - (state.y - 110);
+    const len = Math.max(1, Math.hypot(dx, dy));
+    return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
+  }
+
+  function broadcastWeaponState(force = false) {
+    const state = playPhysicsRef.current;
+    if (!state || !streamSessionIdRef.current) return;
+    const now = Date.now();
+    if (!force && now - playWeaponLastStateAtRef.current < 1000 / STREAM_FPS) return;
+    playWeaponLastStateAtRef.current = now;
+    const payload: StreamWeaponStateMessage = {
+      kind: "weapon_state",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: now,
+      armed: playWeaponArmedRef.current,
+      shooter: { x: state.x, y: state.y, facing: state.facing },
+      aim: playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 },
+    };
+    streamChannelRef.current?.send({ type: "broadcast", event: "weapon_state", payload });
+  }
+
+  function distancePointToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+    const vx = bx - ax;
+    const vy = by - ay;
+    const wx = px - ax;
+    const wy = py - ay;
+    const len2 = vx * vx + vy * vy;
+    const t = len2 <= 0.0001 ? 0 : clamp((wx * vx + wy * vy) / len2, 0, 1);
+    const x = ax + vx * t;
+    const y = ay + vy * t;
+    return Math.hypot(px - x, py - y);
+  }
+
+  function launchGuestFromWeaponHit(guestId: string, frame: GuestCharacterFrame, shot: PlayWeaponShot) {
+    if (!streamSessionIdRef.current || playEliminationKickSentRef.current.has(guestId)) return;
+    const host = playPhysicsRef.current;
+    if (!host) return;
+    const duration = 1.65;
+    const launchStartFraction = 0.58;
+    const now = Date.now();
+    const event: StreamEliminationMessage = {
+      kind: "elimination",
+      sequenceType: "elimination_tommygun",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: now,
+      startTime: now - launchStartFraction * duration * 1000,
+      duration,
+      targetGuestId: guestId,
+      hostName: session?.user?.name || "Host",
+      seed: shot.seed,
+      shooter: { x: host.x, y: host.y, facing: shot.dir.x >= 0 ? 1 : -1 },
+      target: { x: frame.position.x, y: frame.position.y },
+    };
+    streamEliminationsRef.current.set(guestId, event);
+    streamChannelRef.current?.send({ type: "broadcast", event: "elimination", payload: event });
+    streamDebugLog("weapon third hit launch", { guestId, sentAt: now, startTime: event.startTime, t: launchStartFraction });
+  }
+
+  function registerWeaponHit(guestId: string, frame: GuestCharacterFrame, shot: PlayWeaponShot) {
+    const count = (playWeaponHitCountsRef.current.get(guestId) ?? 0) + 1;
+    playWeaponHitCountsRef.current.set(guestId, count);
+    const payload: StreamWeaponHitMessage = {
+      kind: "hit",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: Date.now(),
+      guestId,
+      count,
+      origin: shot.origin,
+      dir: shot.dir,
+    };
+    streamChannelRef.current?.send({ type: "broadcast", event: "hit", payload });
+    if (count >= 3) launchGuestFromWeaponHit(guestId, frame, shot);
+  }
+
+  function firePlayWeaponBurst() {
+    const state = playPhysicsRef.current;
+    const aim = playCursorRef.current;
+    if (!state || !aim || !playWeaponArmedRef.current || !streamSessionIdRef.current) return;
+    const now = Date.now();
+    if (now - playWeaponLastShotAtRef.current < PLAY_WEAPON_FIRE_INTERVAL_MS) return;
+    playWeaponLastShotAtRef.current = now;
+    const origin = playWeaponOrigin(state);
+    const dx = aim.x - origin.x;
+    const dy = aim.y - origin.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    const shot: PlayWeaponShot = {
+      shotId: generateId(),
+      origin,
+      dir: { x: dx / len, y: dy / len },
+      seed: Math.floor(Math.random() * 1_000_000),
+      sentAt: now,
+      hitGuestIds: new Set(),
+    };
+    playWeaponShotsRef.current = [...playWeaponShotsRef.current, shot];
+    const payload: StreamShotFiredMessage = {
+      kind: "shot_fired",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: now,
+      shotId: shot.shotId,
+      origin: shot.origin,
+      dir: shot.dir,
+      seed: shot.seed,
+    };
+    streamChannelRef.current?.send({ type: "broadcast", event: "shot_fired", payload });
+  }
+
+  function updatePlayWeaponShots(nowMs: number, previousNowMs: number) {
+    if (playWeaponShotsRef.current.length === 0) return;
+    const survivors: PlayWeaponShot[] = [];
+    for (const shot of playWeaponShotsRef.current) {
+      if (nowMs - shot.sentAt > PLAY_WEAPON_SHOT_LIFETIME_MS) continue;
+      const prev = projectilePoint(shot.origin, shot.dir, shot.sentAt, Math.max(shot.sentAt, previousNowMs), STREAM_PROJECTILE_SPEED);
+      const curr = projectilePoint(shot.origin, shot.dir, shot.sentAt, nowMs, STREAM_PROJECTILE_SPEED);
+      for (const frame of streamGuestFramesRef.current.values()) {
+        if (shot.hitGuestIds.has(frame.guestId) || streamEliminationsRef.current.has(frame.guestId)) continue;
+        const centerX = frame.position.x;
+        const centerY = frame.position.y - 86;
+        const d = distancePointToSegment(centerX, centerY, prev.x, prev.y, curr.x, curr.y);
+        if (d <= PLAY_WEAPON_HIT_RADIUS) {
+          shot.hitGuestIds.add(frame.guestId);
+          registerWeaponHit(frame.guestId, frame, shot);
+          break;
+        }
+      }
+      survivors.push(shot);
+    }
+    playWeaponShotsRef.current = survivors;
+  }
+
   function enterPlayMode() {
     editorPlayheadBeforePlayRef.current = playheadRef.current;
     const sourcePose = evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current);
@@ -9158,6 +9325,11 @@ export default function Board2Page() {
     playWallStartRef.current = 0;
     playCameraRef.current = { cameraX: sourcePose.boardX, cameraY: sourcePose.boardY - 120, boardZoom: 1.35 };
     playActionRuntimeRef.current = null;
+    playWeaponShotsRef.current = [];
+    playWeaponHitCountsRef.current.clear();
+    playEliminationKickSentRef.current.clear();
+    setPlayWeaponArmed(false);
+    playWeaponArmedRef.current = false;
     setPlaySceneShot(false);
     setPlayMode(true);
     setIsPlaying(false);
@@ -9170,6 +9342,10 @@ export default function Board2Page() {
     playCursorRef.current = null;
     playPhysicsRef.current = null;
     playActionRuntimeRef.current = null;
+    playWeaponShotsRef.current = [];
+    setPlayWeaponArmed(false);
+    playWeaponArmedRef.current = false;
+    broadcastWeaponState(true);
     setPlayhead(editorPlayheadBeforePlayRef.current);
     playheadRef.current = editorPlayheadBeforePlayRef.current;
     requestAnimationFrame(() => drawFrameRef.current(editorPlayheadBeforePlayRef.current));
@@ -9205,19 +9381,14 @@ export default function Board2Page() {
 
   function handlePlayPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (e.button === 2) return;
-    const guest = findPlayGuestAtClientPoint(e.clientX, e.clientY, e.currentTarget);
-    if (guest) {
-      e.preventDefault();
-      setPlayGuestMenu({ guestId: guest.guestId, name: guest.name, x: e.clientX, y: e.clientY });
-      return;
-    }
-    setPlayGuestMenu(null);
+    const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
+    if (point) playCursorRef.current = { x: point.rawX, y: point.rawY };
+    if (playWeaponArmedRef.current) firePlayWeaponBurst();
     const heldCommand = heldPlayTargetCommand();
     if (heldCommand) {
-      const target = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
-      if (target) {
+      if (point) {
         e.preventDefault();
-        issuePlayCharacterAction(heldCommand, target);
+        issuePlayCharacterAction(heldCommand, point);
       }
       return;
     }
@@ -9227,57 +9398,8 @@ export default function Board2Page() {
     steerPlayCharacter(e.clientX, e.clientY, e.currentTarget);
   }
 
-  function findPlayGuestAtClientPoint(clientX: number, clientY: number, canvas: HTMLCanvasElement): GuestCharacterFrame | null {
-    const rect = canvas.getBoundingClientRect();
-    const cam = playCameraRef.current;
-    const sf = cam.boardZoom * rect.width / BOARD_W;
-    const boardX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
-    const boardY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
-    let best: { frame: GuestCharacterFrame; distance: number } | null = null;
-    for (const frame of streamGuestFramesRef.current.values()) {
-      const dx = boardX - frame.position.x;
-      const dy = boardY - (frame.position.y - 85);
-      const d = Math.hypot(dx, dy);
-      if (d < 115 && (!best || d < best.distance)) best = { frame, distance: d };
-    }
-    return best?.frame ?? null;
-  }
-
   function handlePlayContextMenu(e: React.MouseEvent<HTMLCanvasElement>) {
     e.preventDefault();
-    const guest = findPlayGuestAtClientPoint(e.clientX, e.clientY, e.currentTarget);
-    setPlayGuestMenu(guest ? { guestId: guest.guestId, name: guest.name, x: e.clientX, y: e.clientY } : null);
-  }
-
-  function eliminateStreamGuest(guestId: string) {
-    const guest = streamGuestFramesRef.current.get(guestId);
-    const host = playPhysicsRef.current;
-    if (!guest || !host || !streamSessionIdRef.current) return;
-    const dx = guest.position.x - host.x;
-    const far = Math.abs(dx) > 500;
-    const facing: 1 | -1 = dx >= 0 ? 1 : -1;
-    const event: StreamEliminationMessage = {
-      kind: "elimination",
-      sequenceType: "elimination_tommygun",
-      streamId: STREAM_OWNER_USER_ID,
-      sessionId: streamSessionIdRef.current,
-      sentAt: Date.now(),
-      startTime: Date.now() + 180,
-      duration: 4.2,
-      targetGuestId: guestId,
-      hostName: session?.user?.name || "Host",
-      seed: Math.floor(Math.random() * 1_000_000),
-      shooter: {
-        x: far ? guest.position.x - facing * 350 : host.x,
-        y: far ? guest.position.y : host.y,
-        facing,
-      },
-      target: { x: guest.position.x, y: guest.position.y },
-    };
-    streamEliminationsRef.current.set(guestId, event);
-    streamChannelRef.current?.send({ type: "broadcast", event: "elimination", payload: event });
-    window.setTimeout(() => kickStreamGuest(guestId, { reason: "elimination_tommygun", hostName: event.hostName }), event.duration * 1000 + 450);
-    setPlayGuestMenu(null);
   }
 
   function handlePlayPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -9289,6 +9411,7 @@ export default function Board2Page() {
       x: (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX,
       y: (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY,
     };
+    if (playWeaponArmedRef.current && (e.buttons & 1) === 1) firePlayWeaponBurst();
     if (!pointer || pointer.id !== e.pointerId) return;
     pointer.clientX = e.clientX;
     pointer.clientY = e.clientY;
@@ -9378,7 +9501,7 @@ export default function Board2Page() {
       if (Math.abs(state.vx) > 520) state.spin += state.facing * dt * 6.2;
     }
 
-    state.stride += Math.abs(state.vx) * dt / (Math.abs(state.vx) > 520 ? 28 : 23);
+    state.stride += (Math.abs(state.vx) * dt / PLAY_WALK_CYCLE_PX) * Math.PI * 2;
     const lowestSurfaceBottom = surfaces.length > 0
       ? Math.max(...surfaces.map((surface) => surface.boardY + surface.boardH))
       : state.spawnY;
@@ -9415,6 +9538,8 @@ export default function Board2Page() {
       last = wall;
       const now = (wall - playWallStartRef.current) / 1000;
       playTimeRef.current = now;
+      const nowMs = Date.now();
+      const previousNowMs = nowMs - dt * 1000;
       const state = playPhysicsRef.current;
       if (!state) return;
       let playPose: CharPoseResult;
@@ -9449,6 +9574,11 @@ export default function Board2Page() {
         updatePlayPhysics(state, dt, canvas);
         playPose = sharedPlayPoseFromPhysics(state, now);
       }
+      updatePlayWeaponShots(nowMs, previousNowMs);
+      if (playWeaponArmedRef.current) {
+        const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
+        state.facing = aim.x >= state.x ? 1 : -1;
+      }
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
       const target = playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom };
       const follow = 1 - Math.exp(-dt * 5.5);
@@ -9479,8 +9609,26 @@ export default function Board2Page() {
           characterSkinRef.current,
           playPose
         );
+        for (const shot of playWeaponShotsRef.current) {
+          drawWeaponProjectile(ctx, shot, playCameraRef.current, sf, canvas.width, canvas.height, nowMs);
+        }
+        if (playWeaponArmedRef.current) {
+          const recoilAge = nowMs - playWeaponLastShotAtRef.current;
+          const recoil = recoilAge < 140 ? Math.sin((1 - recoilAge / 140) * Math.PI) * 3 : 0;
+          drawTommyGunHeld(
+            ctx,
+            { x: state.x, y: state.y, facing: state.facing },
+            playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 },
+            playCameraRef.current,
+            sf,
+            canvas.width,
+            canvas.height,
+            recoil,
+          );
+        }
         drawStreamGuestsToCtx(ctx, playCameraRef.current, sf, canvas.width, canvas.height);
       }
+      broadcastWeaponState();
       publishStreamFrame(wall);
       raf = requestAnimationFrame(frame);
     };
@@ -9498,6 +9646,17 @@ export default function Board2Page() {
         if (e.code === "Escape") { e.preventDefault(); exitPlayMode(); return; }
         playHeldKeysRef.current.add(e.code);
         if (e.repeat) return;
+        if (e.code === "KeyQ") {
+          e.preventDefault();
+          setPlayWeaponArmed((armed) => {
+            const next = !armed;
+            playWeaponArmedRef.current = next;
+            if (!next) playWeaponShotsRef.current = [];
+            setTimeout(() => broadcastWeaponState(true), 0);
+            return next;
+          });
+          return;
+        }
         if (e.code === "KeyV") { e.preventDefault(); setPlaySceneShot((v) => !v); return; }
         if (["KeyG", "KeyS", "KeyC", "KeyZ"].includes(e.code)) { e.preventDefault(); return; }
         if (e.code === "KeyD") { e.preventDefault(); issuePlayCharacterAction("dance"); return; }
@@ -10052,26 +10211,31 @@ export default function Board2Page() {
         />
         <button
           type="button"
-          onClick={exitPlayMode}
-          style={{ position: "fixed", top: 14, left: 14, zIndex: 2, padding: "8px 12px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontWeight: 700, cursor: "pointer" }}
+          onClick={() => setPlayCleanMenuOpen((v) => !v)}
+          style={{ position: "fixed", top: 14, right: 14, zIndex: 6, padding: "7px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.78)", opacity: 0.72, boxShadow: "2px 2px 0 rgba(42,42,42,0.55)", fontFamily: "monospace", fontWeight: 900, cursor: "pointer" }}
         >
-          ✕ Exit
+          ☰
         </button>
-        <div style={{ position: "fixed", top: 14, left: 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
-          {streamPublishing ? "LIVE" : "LOCAL"}
-        </div>
-        {playGuestMenu && (
-          <div style={{ position: "fixed", left: playGuestMenu.x, top: playGuestMenu.y, zIndex: 5, border: "1.5px solid #2a2a2a", background: "#fffdf5", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", minWidth: 152 }}>
-            <div style={{ padding: "7px 9px", fontSize: 10, borderBottom: "1px solid rgba(42,42,42,0.24)", fontWeight: 800 }}>{playGuestMenu.name}</div>
-            <button type="button" onClick={() => eliminateStreamGuest(playGuestMenu.guestId)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "monospace", fontWeight: 800, color: "#cc2200", cursor: "pointer" }}>
-              Kick 💥
-            </button>
-            <button type="button" onClick={() => setPlayGuestMenu(null)} style={{ width: "100%", padding: "7px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.18)", background: "transparent", textAlign: "left", fontFamily: "monospace", cursor: "pointer" }}>
-              Cancel
-            </button>
+        {playCleanMenuOpen && (
+          <div style={{ position: "fixed", top: 50, right: 14, zIndex: 6, minWidth: 170, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+            <button type="button" onClick={() => setPlayCleanUi((v) => !v)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>{playCleanUi ? "Show chrome" : "Hide chrome"}</button>
+            <button type="button" onClick={() => playCanvasRef.current?.parentElement?.requestFullscreen?.()} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>Fullscreen</button>
+            <button type="button" onClick={exitPlayMode} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, color: "#8b2b20", cursor: "pointer" }}>Exit Play Mode</button>
           </div>
         )}
-        <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
+        {!playCleanUi && (
+          <button
+            type="button"
+            onClick={exitPlayMode}
+            style={{ position: "fixed", top: 14, left: 14, zIndex: 2, padding: "8px 12px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontWeight: 700, cursor: "pointer" }}
+          >
+            ✕ Exit
+          </button>
+        )}
+        <div style={{ position: "fixed", top: 14, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
+          {streamPublishing ? "LIVE" : "LOCAL"}
+        </div>
+        {!playCleanUi && <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
           <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
           <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
@@ -10085,8 +10249,8 @@ export default function Board2Page() {
               <button key={style} type="button" onClick={() => setPlayOutfitStyle(style)} style={{ padding: "4px 6px", border: "1px solid #2a2a2a", background: playOutfitStyle === style ? "#8cb8cf" : "#fffdf5", font: "inherit", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}>{style}</button>
             ))}
           </div>
-        </div>
-        <div style={{ position: "fixed", right: 14, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+        </div>}
+        {!playCleanUi && <div style={{ position: "fixed", right: 58, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
           <button
             type="button"
             onClick={() => setPlayLegendOpen((v) => !v)}
@@ -10096,10 +10260,10 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click near/far to walk/run · aim above to jump<br />Hold G/S/C/Z + click for grapple/skate/climb/zipline<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · click/hold fires while armed<br />Hold G/S/C/Z + click for grapple/skate/climb/zipline<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
             </div>
           )}
-        </div>
+        </div>}
       </div>
     );
   }

@@ -4,8 +4,8 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { drawEliminationSequence, drawSharedStreamCharacter, eliminationFrameForGuest, guestCharacterForRender, hostCharacterForRender } from "@/lib/stream-character-renderer";
-import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, STREAM_FPS, StreamAnnotation, StreamCamera, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamSnapshotMessage, streamChannelName } from "@/lib/stream";
+import { drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, hostCharacterForRender } from "@/lib/stream-character-renderer";
+import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, STREAM_FPS, StreamAnnotation, StreamCamera, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, StreamWeaponStateMessage, streamChannelName } from "@/lib/stream";
 
 type Mode = "landing" | "watch" | "join" | "guest";
 type GuestPhysics = { x: number; y: number; vx: number; vy: number; targetX: number | null; targetY: number | null; facing: 1 | -1; grounded: boolean; surfaceId: string | null; action: GuestCharacterFrame["actionType"]; actionStarted: number; emote?: string; spawnAt: number; frozenUntil?: number; eliminatedBy?: string };
@@ -157,7 +157,7 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
 
 export default function StreamPage() {
   const canvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>());
-  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), eliminations=useRef(new Map<string,StreamEliminationMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
+  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), eliminations=useRef(new Map<string,StreamEliminationMessage>()), weaponState=useRef<StreamWeaponStateMessage|null>(null), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const loadSnapshot=useCallback(async()=>{try{const res=await fetch(`/api/stream/snapshot?streamId=${encodeURIComponent(STREAM_OWNER_USER_ID)}`,{cache:"no-store"});const data=await res.json();streamDebugLog("snapshot endpoint",{status:res.status,live:!!data.live,hasSnapshot:!!data.snapshot,updatedAt:data.updatedAt});if(data.live&&data.snapshot){snapshotRef.current=data.snapshot;setLive(true);setSnapshot(data.snapshot);setStatus("live");}else if(!latestHost.current&&!hostPresent.current){setLive(false);setStatus("offline");}}catch(error){streamDebugLog("snapshot endpoint failed",error);if(!latestHost.current&&!hostPresent.current)setStatus("reconnecting");}},[]);
@@ -168,6 +168,9 @@ export default function StreamPage() {
       .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
       .on("broadcast",{event:"guest-state"},({payload})=>{const f=payload as GuestCharacterFrame;if(f.sessionId===latestHost.current?.sessionId||!latestHost.current){const measured=Date.now()-f.sentAt;const prev=remoteClockOffsets.current.get(f.guestId)??measured;remoteClockOffsets.current.set(f.guestId,prev*.85+measured*.15);remoteGuests.current.set(f.guestId,{...f,receivedAt:Date.now()});}})
       .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;setTimeout(()=>{void channel.untrack();physics.current=null;setMode("landing");setJoinError(`💥 KICKED by ${event.hostName}`);},event.duration*1000+650);}})
+      .on("broadcast",{event:"weapon_state"},({payload})=>{weaponState.current=payload as StreamWeaponStateMessage;})
+      .on("broadcast",{event:"shot_fired"},({payload})=>{weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
+      .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
       .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows)if(p.guestId&&p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}})
@@ -334,6 +337,9 @@ export default function StreamPage() {
               drawSharedStreamCharacter(ctx, hostCharacterForRender(ch, faceInfo?.faceAspect, hostClockOffset.current), faceCache.current.get(ch.id) ?? null, cam, sf, w, h, 1, Date.now());
             }
           }
+          if (weaponState.current?.armed) drawTommyGunHeld(ctx, weaponState.current.shooter, weaponState.current.aim, cam, sf, w, h, 0);
+          weaponShots.current = weaponShots.current.filter((shot) => Date.now() - shot.sentAt < 1700);
+          for (const shot of weaponShots.current) drawWeaponProjectile(ctx, shot, cam, sf, w, h, Date.now());
           for (const [guestIdForEvent, event] of eliminations.current) {
             if (Date.now() - event.startTime > event.duration * 1000 + 900) eliminations.current.delete(guestIdForEvent);
             else drawEliminationSequence(ctx, event, cam, sf, w, h, Date.now(), hostClockOffset.current);
@@ -362,8 +368,12 @@ export default function StreamPage() {
             const renderFrame = event ? eliminationFrameForGuest(localFrame, event, Date.now(), hostClockOffset.current) : localFrame;
             if (renderFrame) {
               drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0), faceCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
-            } else if (process.env.NODE_ENV !== "production") {
-              console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
+            } else {
+              if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
+              void channelRef.current?.untrack();
+              physics.current = null;
+              setMode("landing");
+              setJoinError(`💥 KICKED by ${event?.hostName || "Host"}`);
             }
           }
         }
