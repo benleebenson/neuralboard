@@ -1,4 +1,4 @@
-import type { GuestCharacterFrame, SpawnDoor, StreamCamera, StreamCharacterFrame, StreamEliminationMessage } from "./stream";
+import { isStreamActionType, resolveStreamSkin, type CharacterSkin, type GuestCharacterFrame, type SpawnDoor, type StreamCamera, type StreamCharacterFrame, type StreamEliminationMessage } from "./stream";
 
 export type PlayCharacterState = {
   x: number;
@@ -254,7 +254,7 @@ export function drawPoptropicaPlayCharacter(
 }
 
 // Stream/render adapter exports live in this shared renderer module so /board2 and /stream cannot drift.
-export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-b";
+export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-c";
 
 export type SharedCharacter = {
   id: string;
@@ -267,7 +267,7 @@ export type SharedCharacter = {
   vy: number;
   facing: 1 | -1;
   physique: "slim" | "jacked";
-  skin: "stick" | "styled";
+  skin: CharacterSkin;
   actionType: string;
   progress: number;
   actionStartTime?: number;
@@ -284,6 +284,7 @@ const ELIMINATION_DESPAWN_AT = 1.04;
 export const STREAM_PROJECTILE_SPEED = 1400;
 
 export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect = 1, clockOffsetMs = 0): SharedCharacter {
+  const skin = resolveStreamSkin(frame.skin, { isHost: true, sourceIfPublished: "presence", warnContext: `host:${frame.id}` }).skin;
   return {
     id: frame.id,
     name: frame.id === "c1" ? "HOST" : "HOST 2",
@@ -295,7 +296,7 @@ export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect =
     vy: frame.velocity?.y ?? 0,
     facing: frame.facing,
     physique: frame.physique,
-    skin: frame.skin ?? "styled",
+    skin,
     actionType: frame.actionType,
     progress: frame.progress,
     actionStartTime: frame.actionStartTime,
@@ -307,7 +308,8 @@ export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect =
   };
 }
 
-export function guestCharacterForRender(frame: GuestCharacterFrame, clockOffsetMs = 0): SharedCharacter {
+export function guestCharacterForRender(frame: GuestCharacterFrame, clockOffsetMs = 0, options?: { guestSkinOverride?: CharacterSkin }): SharedCharacter {
+  const skin = resolveStreamSkin(frame.skin, { isHost: false, sourceIfPublished: "presence", guestSkinOverride: options?.guestSkinOverride, warnContext: `guest:${frame.guestId}` }).skin;
   return {
     id: frame.guestId,
     name: frame.name,
@@ -318,7 +320,7 @@ export function guestCharacterForRender(frame: GuestCharacterFrame, clockOffsetM
     vy: frame.velocity?.y ?? 0,
     facing: frame.facing,
     physique: frame.physique ?? "slim",
-    skin: frame.skin ?? "styled",
+    skin,
     actionType: frame.actionType,
     progress: frame.actionProgress,
     actionStartTime: frame.actionStartTime,
@@ -339,19 +341,23 @@ function actionProgress(ch: SharedCharacter, renderTimeMs: number): number {
 }
 
 function sharedToPlayState(ch: SharedCharacter, renderTimeMs: number): PlayCharacterState {
+  if (!isStreamActionType(ch.actionType) && typeof console !== "undefined") {
+    console.warn("[stream:state] unknown actionType; rendering idle fallback", { id: ch.id, actionType: ch.actionType });
+  }
   const progress = actionProgress(ch, renderTimeMs);
-  const moving = ["walk", "run", "walkTo", "runTo"].includes(ch.actionType) || Math.abs(ch.vx) > 45;
-  const airborne = ["jump", "jumpTo", "flip", "grapple", "zipline", "skateTo", "wallClimb", "eliminated"].includes(ch.actionType) || Math.abs(ch.vy) > 40;
+  const actionType = isStreamActionType(ch.actionType) ? ch.actionType : "idle";
+  const moving = ["walk", "run", "walkTo", "runTo"].includes(actionType) || Math.abs(ch.vx) > 45;
+  const airborne = ["jump", "jumpTo", "flip", "grapple", "zipline", "skateTo", "wallClimb", "eliminated"].includes(actionType) || Math.abs(ch.vy) > 40;
   const action: PlayCharacterState["action"] =
-    ch.actionType === "dance" ? "dance" :
-    ch.actionType === "emote" ? "emote" :
-    ch.actionType === "forceChoke" ? "forceChoke" :
-    ch.actionType === "pullUps" || ch.actionType === "pullups" ? "pullups" :
-    ch.actionType === "mirrorCheck" ? "mirror" :
+    actionType === "dance" ? "dance" :
+    actionType === "emote" ? "emote" :
+    actionType === "forceChoke" ? "forceChoke" :
+    actionType === "pullUps" || actionType === "pullups" ? "pullups" :
+    actionType === "mirrorCheck" ? "mirror" :
     "none";
-  const flipSpin = ch.actionType === "flip"
+  const flipSpin = actionType === "flip"
     ? progress * Math.PI * 2 * ch.facing
-    : ch.actionType === "eliminated"
+    : actionType === "eliminated"
       ? progress < ELIMINATION_LAUNCH_AT
         ? lerp(0, Math.PI / 2.6, clamp((progress - 0.35) / 0.18, 0, 1))
         : Math.PI / 2.6 + (progress - ELIMINATION_LAUNCH_AT) * Math.PI * 7.5
@@ -395,7 +401,11 @@ function drawStickStreamCharacter(
   const speed01 = clamp(Math.abs(state.vx) / 760, 0, 1);
   const moving = speed01 > 0.08 && state.grounded;
   const phase = state.stride;
-  const bob = state.grounded ? (moving ? Math.abs(Math.sin(phase)) * -5 : Math.sin(renderTimeMs / 430) * 2.5) : 0;
+  const choked = state.action === "forceChoke";
+  const chokeKick = choked ? Math.sin(renderTimeMs / 70 + ch.id.length) : 0;
+  const bob = choked
+    ? -48 + Math.sin(renderTimeMs / 120) * 4
+    : state.grounded ? (moving ? Math.abs(Math.sin(phase)) * -5 : Math.sin(renderTimeMs / 430) * 2.5) : 0;
   const actionWave = state.action === "dance" ? Math.sin(renderTimeMs / 100) * 0.55 : 0;
   const S = sf;
   ctx.save();
@@ -426,10 +436,28 @@ function drawStickStreamCharacter(
     ctx.quadraticCurveTo(x2, y2, x3, y3);
     ctx.stroke();
   };
-  limb(-8 * S, hipY, (-20 * S) + stride * 0.25, -35 * S, (-24 * S) + stride, -2 * S);
-  limb(8 * S, hipY, (20 * S) - stride * 0.25, -35 * S, (24 * S) - stride, -2 * S);
+  if (choked) {
+    limb(-8 * S, hipY, -34 * S + chokeKick * 8 * S, -30 * S, (-34 + chokeKick * 18) * S, -8 * S);
+    limb(8 * S, hipY, 34 * S + chokeKick * 7 * S, -32 * S, (34 - chokeKick * 16) * S, -9 * S);
+  } else {
+    limb(-8 * S, hipY, (-20 * S) + stride * 0.25, -35 * S, (-24 * S) + stride, -2 * S);
+    limb(8 * S, hipY, (20 * S) - stride * 0.25, -35 * S, (24 * S) - stride, -2 * S);
+  }
   const armSwing = moving ? -Math.sin(phase) * 28 * S : actionWave * 24 * S;
-  if (signRaise) {
+  if (choked) {
+    limb(-2 * S, shoulderY, -20 * S, -135 * S, -9 * S, -142 * S);
+    limb(2 * S, shoulderY, 20 * S, -135 * S, 9 * S, -142 * S);
+    ctx.save();
+    ctx.strokeStyle = "rgba(39,34,31,.48)";
+    ctx.lineWidth = Math.max(1, 1.25 * S);
+    for (const [mx, my] of [[-42, -24], [42, -20], [-31, 6], [35, 8]] as const) {
+      ctx.beginPath();
+      ctx.moveTo(mx * S, my * S);
+      ctx.quadraticCurveTo((mx + Math.sign(mx) * 10) * S, (my - 5) * S, (mx + Math.sign(mx) * 20) * S, my * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  } else if (signRaise) {
     limb(-2 * S, shoulderY, -36 * S, -162 * S, -62 * S, -205 * S);
     limb(2 * S, shoulderY, 36 * S, -162 * S, 62 * S, -205 * S);
   } else {

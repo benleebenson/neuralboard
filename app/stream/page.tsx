@@ -5,7 +5,7 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { RENDERER_VERSION, drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, hostCharacterForRender } from "@/lib/play-character-renderer";
-import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, StreamWeaponStateMessage, streamChannelName } from "@/lib/stream";
+import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, StreamWeaponStateMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 
 type Mode = "landing" | "watch" | "join" | "guest";
 type GuestPhysics = { x: number; y: number; vx: number; vy: number; targetX: number | null; targetY: number | null; facing: 1 | -1; grounded: boolean; surfaceId: string | null; action: GuestCharacterFrame["actionType"]; actionStarted: number; emote?: string; spawnAt: number; frozenUntil?: number; eliminatedBy?: string; physique: "slim" | "jacked" };
@@ -168,15 +168,51 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
   };
 }
 
+function hostDebugRow(ch: StreamFrameMessage["characters"][number]): StreamCharacterDebugRow {
+  const resolved = resolveStreamSkin(ch.skin, { isHost: true, sourceIfPublished: "presence", warnContext: `stream-host:${ch.id}` });
+  return {
+    id: ch.id,
+    isHost: true,
+    skinPublished: resolved.published,
+    skinResolved: resolved.skin,
+    skinSource: resolved.source,
+    actionType: ch.actionType,
+    actionProgress: ch.progress,
+    physique: ch.physique,
+    facing: ch.facing,
+    travelDx: ch.velocity?.x,
+    rotationDirection: ch.actionType === "flip" ? ch.facing : undefined,
+  };
+}
+
+function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" | "styled"): StreamCharacterDebugRow {
+  const resolved = resolveStreamSkin(frame.skin, { isHost: false, sourceIfPublished: "presence", guestSkinOverride, warnContext: `stream-guest:${frame.guestId}` });
+  return {
+    id: frame.guestId,
+    isHost: false,
+    skinPublished: resolved.published,
+    skinResolved: resolved.skin,
+    skinSource: resolved.source,
+    actionType: frame.actionType,
+    actionProgress: frame.actionProgress,
+    physique: frame.physique ?? "slim",
+    facing: frame.facing,
+    travelDx: frame.velocity?.x,
+    rotationDirection: frame.actionType === "flip" ? frame.facing : undefined,
+  };
+}
+
 export default function StreamPage() {
   const canvasRef=useRef<HTMLCanvasElement>(null), signCanvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>()), signCache=useRef(new Map<string,HTMLImageElement>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<StreamWeaponStateMessage|null>(null), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const signDataUrlRef=useRef<string|undefined>(undefined), signActiveRef=useRef(false), signDrawingRef=useRef(false);
   const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
+  const renderDebugRowsRef=useRef<StreamCharacterDebugRow[]>([]), renderDebugOverlayAt=useRef(0);
+  const [renderDebugRows,setRenderDebugRows]=useState<StreamCharacterDebugRow[]>([]);
   const loadSnapshot=useCallback(async()=>{try{const res=await fetch(`/api/stream/snapshot?streamId=${encodeURIComponent(STREAM_OWNER_USER_ID)}`,{cache:"no-store"});const data=await res.json();streamDebugLog("snapshot endpoint",{status:res.status,live:!!data.live,hasSnapshot:!!data.snapshot,updatedAt:data.updatedAt});if(data.live&&data.snapshot){snapshotRef.current=data.snapshot;setLive(true);setSnapshot(data.snapshot);setStatus("live");}else if(!latestHost.current&&!hostPresent.current){setLive(false);setStatus("offline");}}catch(error){streamDebugLog("snapshot endpoint failed",error);if(!latestHost.current&&!hostPresent.current)setStatus("reconnecting");}},[]);
   const cacheSignImage=(id:string,dataUrl?:string)=>{if(!validSignDataUrl(dataUrl))return;const current=signCache.current.get(id);if(current?.src===dataUrl)return;const img=new Image();img.src=dataUrl;signCache.current.set(id,img);};
-  const refreshGuestPresence=async(active=signActiveRef.current,dataUrl=signDataUrlRef.current)=>{if(mode!=="guest")return;await channelRef.current?.track({role:"guest",guestId,name:nameRef.current,faceDataUrl:face,skin:hostGuestSkin.current,physique:physics.current?.physique??"slim",signDataUrl:validSignDataUrl(dataUrl)?dataUrl:undefined,signActive:!!dataUrl&&active,joinedAt:Date.now()} satisfies StreamParticipantPresence);};
+  const refreshGuestPresence=async(active=signActiveRef.current,dataUrl=signDataUrlRef.current)=>{if(mode!=="guest")return;const presence={role:"guest",isHost:false,guestId,name:nameRef.current,faceDataUrl:face,skin:hostGuestSkin.current,physique:physics.current?.physique??"slim",signDataUrl:validSignDataUrl(dataUrl)?dataUrl:undefined,signActive:!!dataUrl&&active,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channelRef.current?.track(presence);};
   const clearSignCanvas=()=>{const c=signCanvasRef.current,ctx=c?.getContext("2d");if(!c||!ctx)return;ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle="#fffdf4";ctx.fillRect(0,0,c.width,c.height);};
   const bakeSign=async()=>{const source=signCanvasRef.current;if(!source)return;const out=document.createElement("canvas");out.width=256;out.height=171;const ctx=out.getContext("2d")!;ctx.fillStyle="#fffdf4";ctx.fillRect(0,0,out.width,out.height);ctx.drawImage(source,0,0,out.width,out.height);const text=signText.trim().slice(0,40);if(text){ctx.fillStyle=signColor;ctx.font="700 27px Caveat, cursive, monospace";ctx.textAlign="center";ctx.textBaseline="middle";const words=text.split(/\s+/),lines:string[]=[];let line="";for(const word of words){const test=line?`${line} ${word}`:word;if(ctx.measureText(test).width>218&&line){lines.push(line);line=word;}else line=test;}if(line)lines.push(line);const start=out.height/2-(lines.length-1)*17;lines.slice(0,4).forEach((ln,i)=>ctx.fillText(ln,out.width/2,start+i*34));}const dataUrl=out.toDataURL("image/png");if(dataUrl.length>MAX_GUEST_SIGN_DATA_URL_BYTES){setJoinError("That sign is too large. Try fewer strokes.");return;}signDataUrlRef.current=dataUrl;signActiveRef.current=true;setSignActive(true);cacheSignImage(guestId,dataUrl);setSignOpen(false);await refreshGuestPresence(true,dataUrl);};
 
@@ -194,11 +230,11 @@ export default function StreamPage() {
       .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);const hostRow=rows.find(p=>p.role==="host");if(hostRow?.guestSkin){hostGuestSkin.current=hostRow.guestSkin;setGuestSkinLabel(hostRow.guestSkin);}hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows){if(p.guestId){const stale=eliminations.current.get(p.guestId);if(stale&&p.joinedAt>stale.sentAt){streamDebugLog("clear stale elimination on rejoin",{guestId:p.guestId,joinedAt:p.joinedAt,eliminationSentAt:stale.sentAt});eliminations.current.delete(p.guestId);remoteGuests.current.delete(p.guestId);renderedGuests.current.delete(p.guestId);}if(p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}if(validSignDataUrl(p.signDataUrl))cacheSignImage(p.guestId,p.signDataUrl);}}})
-      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;await channel.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
+      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;const presence={role:"viewer",isHost:false,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channel.track(presence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
 
   useEffect(()=>{if(!snapshot)return;const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl&&!faceCache.current.has(ch.id)){const img=new Image();img.src=ch.faceDataUrl;faceCache.current.set(ch.id,img);}},[snapshot]);
 
-  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;if(face&&!faceCache.current.has(guestId)){const img=new Image();img.src=face;faceCache.current.set(guestId,img);}if(signDataUrlRef.current)cacheSignImage(guestId,signDataUrlRef.current);const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now(),physique:"slim"};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};const joinedAt=Date.now();await channelRef.current?.track({role:"guest",guestId,name:safe,faceDataUrl:face,skin:hostGuestSkin.current,physique:"slim",signDataUrl:validSignDataUrl(signDataUrlRef.current)?signDataUrlRef.current:undefined,signActive:!!signDataUrlRef.current&&signActiveRef.current,joinedAt} satisfies StreamParticipantPresence);setMode("guest");setJoinError("");};
+  const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;if(face&&!faceCache.current.has(guestId)){const img=new Image();img.src=face;faceCache.current.set(guestId,img);}if(signDataUrlRef.current)cacheSignImage(guestId,signDataUrlRef.current);const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now(),physique:"slim"};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};const joinedAt=Date.now();const presence={role:"guest",isHost:false,guestId,name:safe,faceDataUrl:face,skin:hostGuestSkin.current,physique:"slim",signDataUrl:validSignDataUrl(signDataUrlRef.current)?signDataUrlRef.current:undefined,signActive:!!signDataUrlRef.current&&signActiveRef.current,joinedAt} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channelRef.current?.track(presence);setMode("guest");setJoinError("");};
   const emote=()=>{const p=physics.current;if(!p||!GUEST_VERB_SET.has("emote"))return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];p.action="emote";p.actionStarted=performance.now();};
   const flipGuestTo=(targetX?:number,targetY?:number)=>{const p=physics.current;if(!p||!p.grounded)return;const dx=targetX!==undefined?targetX-p.x:p.facing*520;p.facing=dx>=0?1:-1;p.vx=clamp(Math.abs(dx)*1.35,420,760)*p.facing;p.vy=-clamp(targetY!==undefined?680+Math.max(0,p.y-targetY)*.55:760,700,900);p.grounded=false;p.surfaceId=null;p.targetX=targetX??p.x+p.facing*520;p.targetY=targetY??p.y;p.action="flip";p.actionStarted=performance.now();};
   const guestTargetVerb=(): GuestCharacterFrame["actionType"]|null=>{const keys=guestHeldKeys.current;if(keys.has("g"))return"grapple";if(keys.has("s"))return"skateTo";if(keys.has("c"))return"wallClimb";if(keys.has("z"))return"zipline";return null;};
@@ -367,10 +403,14 @@ export default function StreamPage() {
           for (const ann of snapshot.annotations) drawAnnotation(ctx, ann, cam, sf, w, h);
           if (snapshot.spawnDoor) drawDoor(ctx, snapshot.spawnDoor.x, snapshot.spawnDoor.y, cam, sf, w, h, p ? clamp(1 - (now - p.spawnAt) / 900, 0, 1) : 0);
           if (host) {
+            const rows: StreamCharacterDebugRow[] = [];
             for (const ch of host.characters) {
+              if (!ch.enabled) continue;
               const faceInfo = snapshot.characters.find((x) => x.id === ch.id);
+              rows.push(hostDebugRow(ch));
               drawSharedStreamCharacter(ctx, hostCharacterForRender(ch, faceInfo?.faceAspect, hostClockOffset.current), faceCache.current.get(ch.id) ?? null, null, cam, sf, w, h, 1, Date.now());
             }
+            renderDebugRowsRef.current = rows;
           }
           if (weaponState.current?.armed) drawTommyGunHeld(ctx, weaponState.current.shooter, weaponState.current.aim, cam, sf, w, h, 0);
           weaponShots.current = weaponShots.current.filter((shot) => Date.now() - shot.sentAt < 1700);
@@ -397,9 +437,10 @@ export default function StreamPage() {
             const old = renderedGuests.current.get(id);
             const error = old ? Math.hypot(old.position.x - renderFrame.position.x, old.position.y - renderFrame.position.y) : 0;
             const alpha = event ? 0.85 : error > 300 ? 1 : 0.35;
-            const smooth = old ? { ...renderFrame, skin: hostGuestSkin.current, position: { x: lerp(old.position.x, renderFrame.position.x, alpha), y: lerp(old.position.y, renderFrame.position.y, alpha) } } : { ...renderFrame, skin: hostGuestSkin.current };
+            const smooth = old ? { ...renderFrame, position: { x: lerp(old.position.x, renderFrame.position.x, alpha), y: lerp(old.position.y, renderFrame.position.y, alpha) } } : renderFrame;
             renderedGuests.current.set(id, smooth);
-            drawSharedStreamCharacter(ctx, guestCharacterForRender(smooth, remoteClockOffsets.current.get(id) ?? 0), faceCache.current.get(id) ?? null, signCache.current.get(id) ?? null, cam, sf, w, h, id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, Date.now());
+            renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== id), guestDebugRow(smooth, hostGuestSkin.current)];
+            drawSharedStreamCharacter(ctx, guestCharacterForRender(smooth, remoteClockOffsets.current.get(id) ?? 0, { guestSkinOverride: hostGuestSkin.current }), faceCache.current.get(id) ?? null, signCache.current.get(id) ?? null, cam, sf, w, h, id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, Date.now());
           }
           if (p && mode === "guest") {
             const sessionId = host?.sessionId ?? latestHost.current?.sessionId ?? "local";
@@ -412,7 +453,8 @@ export default function StreamPage() {
                 ? { ...localFrame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
                 : event ? eliminationFrameForGuest(localFrame, event, Date.now(), hostClockOffset.current) : localFrame;
             if (renderFrame) {
-              drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0), faceCache.current.get(guestId) ?? null, signCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
+              renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== guestId), guestDebugRow(renderFrame, hostGuestSkin.current)];
+              drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0, { guestSkinOverride: hostGuestSkin.current }), faceCache.current.get(guestId) ?? null, signCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
             } else {
               if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
               void channelRef.current?.untrack();
@@ -424,6 +466,10 @@ export default function StreamPage() {
               setMode("landing");
               setJoinError(`💥 KICKED by ${event?.hostName || "Host"}`);
             }
+          }
+          if (DEBUG_STREAM && now - renderDebugOverlayAt.current > 600) {
+            renderDebugOverlayAt.current = now;
+            setRenderDebugRows(renderDebugRowsRef.current);
           }
         }
       } catch (error) {
@@ -444,7 +490,7 @@ export default function StreamPage() {
 
   if(mode==="join")return <main style={landing}><section style={card}><h2>Join as character</h2><input autoFocus maxLength={GUEST_NAME_MAX_LENGTH} value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={input}/><label style={{...button,display:"block",textAlign:"center",marginTop:10}}>Optional face<input hidden type="file" accept="image/*" onChange={async e=>{const f=e.target.files?.[0];if(f)setFace(await bakeFace(f));}}/></label>{face&&<img src={face} alt="Face preview" style={{width:48,height:56,display:"block",margin:"10px auto"}}/>}<p style={{fontSize:10,color:"#8b2b20"}}>{joinError}</p><button style={{...button,background:"#c8f135"}} onClick={beginGuest}>Spawn</button><button style={button} onClick={()=>setMode("landing")}>Cancel</button></section></main>;
   if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":status==="reconnecting"?"RECONNECTING":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":status==="reconnecting"?"reconnecting…":joinError||"No active stream right now."}</p>{DEBUG_STREAM&&<div style={{fontSize:10,lineHeight:1.45,color:"#6a6a6a",background:"#f5ecd8",border:"1px solid rgba(42,42,42,.22)",padding:7,marginBottom:10}}>channel: {streamChannelName(STREAM_OWNER_USER_ID)} | subscribe: {subscribeStatus} | presence: {participants.length}</div>}<button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
-  return <main style={{position:"fixed",inset:0,overflow:"hidden",background:"#f5ecd8"}}><canvas ref={canvasRef} onClick={clickCanvas} style={{width:"100vw",height:"100vh",display:"block",cursor:mode==="guest"&&!hostCam?"crosshair":"default"}}/><div style={{position:"fixed",top:12,left:12,display:"flex",gap:8,fontFamily:"monospace",alignItems:"flex-start",flexWrap:"wrap",maxWidth:"calc(100vw - 24px)"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span>{DEBUG_STREAM&&<span style={pill}>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}</span>}{mode==="guest"&&<><span style={pill}>Click move · long/high clicks auto-flip · G grapple · S skate · C climb · Z zip · D dance · P pull · M mirror · T sit · E emote · H sign</span><button style={pill} onClick={()=>setHostCam(v=>!v)}>{hostCam?"Host cam":"Follow me"} · V</button><button style={pill} onClick={emote}>Emote · E</button><button style={pill} onClick={()=>setSignOpen(true)}>✍️ Sign</button><button style={pill} onClick={()=>{const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}}>{signActive?"Lower sign":"Hold sign"} · H</button><button style={pill} onClick={leave}>Leave</button></>}</div>{signModal}</main>;
+  return <main style={{position:"fixed",inset:0,overflow:"hidden",background:"#f5ecd8"}}><canvas ref={canvasRef} onClick={clickCanvas} style={{width:"100vw",height:"100vh",display:"block",cursor:mode==="guest"&&!hostCam?"crosshair":"default"}}/><div style={{position:"fixed",top:12,left:12,display:"flex",gap:8,fontFamily:"monospace",alignItems:"flex-start",flexWrap:"wrap",maxWidth:"calc(100vw - 24px)"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span>{DEBUG_STREAM&&<span style={{...pill,maxWidth:620,lineHeight:1.35}}>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}{renderDebugRows.map((row)=><span key={`${row.isHost?"h":"g"}-${row.id}`} style={{display:"block"}}>{row.id} {row.isHost?"host":"guest"} pub:{row.skinPublished??"∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx!==undefined?` dx:${Math.round(row.travelDx)}`:""}{row.rotationDirection?` rot:${row.rotationDirection}`:""}</span>)}</span>}{mode==="guest"&&<><span style={pill}>Click move · long/high clicks auto-flip · G grapple · S skate · C climb · Z zip · D dance · P pull · M mirror · T sit · E emote · H sign</span><button style={pill} onClick={()=>setHostCam(v=>!v)}>{hostCam?"Host cam":"Follow me"} · V</button><button style={pill} onClick={emote}>Emote · E</button><button style={pill} onClick={()=>setSignOpen(true)}>✍️ Sign</button><button style={pill} onClick={()=>{const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}}>{signActive?"Lower sign":"Hold sign"} · H</button><button style={pill} onClick={leave}>Leave</button></>}</div>{signModal}</main>;
 }
 
 const landing:React.CSSProperties={minHeight:"100vh",background:"#f5ecd8",color:"#2a2a2a",fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"center",padding:24};

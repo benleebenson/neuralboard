@@ -9,6 +9,7 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import {
   STREAM_FPS,
+  HOST_STREAM_SKIN,
   GuestCharacterFrame,
   MAX_GUEST_SIGN_DATA_URL_BYTES,
   MAX_GUESTS,
@@ -16,12 +17,14 @@ import {
   StreamParticipantPresence,
   StreamCharacterFrame,
   StreamChokeMessage,
+  StreamCharacterDebugRow,
   StreamEliminationMessage,
   StreamShotFiredMessage,
   StreamSnapshotMessage,
   StreamWeaponHitMessage,
   StreamWeaponStateMessage,
   streamChannelName,
+  resolveStreamSkin,
 } from "@/lib/stream";
 import {
   PLAY_CHARACTER_HEIGHT,
@@ -4072,6 +4075,10 @@ export default function Board2Page() {
   const playEliminationKickSentRef = useRef<Set<string>>(new Set());
   const playFlipDebugRef = useRef<{ facing: 1 | -1; rotationDirection: 1 | -1; travelDx: number } | null>(null);
   const playForceChokeRef = useRef<{ pointerId: number; targetGuestId: string; startedAt: number; position: { x: number; y: number }; lastSentAt: number } | null>(null);
+  const streamHostCharacterDebugRef = useRef<StreamCharacterDebugRow[]>([]);
+  const streamGuestCharacterDebugRef = useRef<StreamCharacterDebugRow[]>([]);
+  const streamLastDebugOverlayAtRef = useRef(0);
+  const [streamCharacterDebugRows, setStreamCharacterDebugRows] = useState<StreamCharacterDebugRow[]>([]);
   const editorPlayheadBeforePlayRef = useRef(0);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
@@ -4422,6 +4429,46 @@ export default function Board2Page() {
     }
   }, [buildStreamSnapshot]);
 
+  function streamHostDebugRow(ch: StreamCharacterFrame): StreamCharacterDebugRow {
+    const resolved = resolveStreamSkin(ch.skin, { isHost: true, sourceIfPublished: "own-setting", warnContext: `board2-host:${ch.id}` });
+    return {
+      id: ch.id,
+      isHost: true,
+      skinPublished: resolved.published,
+      skinResolved: resolved.skin,
+      skinSource: resolved.source,
+      actionType: ch.actionType,
+      actionProgress: ch.progress,
+      physique: ch.physique,
+      facing: ch.facing,
+      travelDx: ch.velocity?.x,
+      rotationDirection: ch.actionType === "flip" ? ch.facing : undefined,
+    };
+  }
+
+  function streamGuestDebugRow(frame: GuestCharacterFrame): StreamCharacterDebugRow {
+    const resolved = resolveStreamSkin(frame.skin, { isHost: false, sourceIfPublished: "presence", guestSkinOverride: streamGuestSkinRef.current, warnContext: `board2-guest:${frame.guestId}` });
+    return {
+      id: frame.guestId,
+      isHost: false,
+      skinPublished: resolved.published,
+      skinResolved: resolved.skin,
+      skinSource: resolved.source,
+      actionType: frame.actionType,
+      actionProgress: frame.actionProgress,
+      physique: frame.physique ?? "slim",
+      facing: frame.facing,
+      travelDx: frame.velocity?.x,
+      rotationDirection: frame.actionType === "flip" ? frame.facing : undefined,
+    };
+  }
+
+  function refreshStreamDebugRows(wallMs: number) {
+    if (!DEBUG_STREAM || wallMs - streamLastDebugOverlayAtRef.current < 600) return;
+    streamLastDebugOverlayAtRef.current = wallMs;
+    setStreamCharacterDebugRows([...streamHostCharacterDebugRef.current, ...streamGuestCharacterDebugRef.current]);
+  }
+
   const publishStreamFrame = useCallback((wallMs: number) => {
     const channel = streamChannelRef.current;
     const cam = playModeRef.current ? playCameraRef.current : liveCameraRef.current;
@@ -4454,7 +4501,7 @@ export default function Board2Page() {
             y: pose?.boardY ?? state?.y ?? 0,
             facing: pose?.facing ?? state?.facing ?? 1,
             physique: runtime?.enabled ? physiqueAt(t, resolved) : "slim",
-            skin: "stick",
+            skin: HOST_STREAM_SKIN,
             actionType,
             progress: actionProgress,
             actionStartTime: sentAt - actionProgress * actionDuration * 1000,
@@ -4479,7 +4526,7 @@ export default function Board2Page() {
             y: pose.boardY,
             facing: pose.facing,
             physique: physiqueAt(t, resolved),
-            skin: "stick",
+            skin: HOST_STREAM_SKIN,
             actionType: active?.type ?? "idle",
             progress,
             actionStartTime: sentAt - progress * duration * 1000,
@@ -4489,6 +4536,8 @@ export default function Board2Page() {
             emojiAlpha: pose.emojiAlpha,
           };
         });
+    streamHostCharacterDebugRef.current = characters.filter((ch) => ch.enabled).map(streamHostDebugRow);
+    refreshStreamDebugRows(wallMs);
     if (DEBUG_STREAM && wallMs - streamLastDebugFrameAtRef.current > 2000) {
       streamLastDebugFrameAtRef.current = wallMs;
         streamDebugLog("frame broadcast", {
@@ -4497,7 +4546,7 @@ export default function Board2Page() {
           renderer: RENDERER_VERSION,
           guestSkin: streamGuestSkinRef.current,
           camera: cam,
-        characters: characters.filter((ch) => ch.enabled).map((ch) => ({ id: ch.id, x: Math.round(ch.x), y: Math.round(ch.y), actionType: ch.actionType })),
+        characters: streamHostCharacterDebugRef.current,
       });
     }
     channel.send({
@@ -5010,7 +5059,9 @@ export default function Board2Page() {
           streamDebugLog("subscribe status", status);
           setStreamPublishing(status === "SUBSCRIBED");
           if (status === "SUBSCRIBED") {
-            await channel.track({ role: "host", name: STREAM_OWNER_USER_ID, guestSkin: streamGuestSkinRef.current, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+            const presence = { role: "host", isHost: true, name: STREAM_OWNER_USER_ID, skin: HOST_STREAM_SKIN, physique: "slim", guestSkin: streamGuestSkinRef.current, joinedAt: Date.now() } satisfies StreamParticipantPresence;
+            streamDebugLog("presence track send", presence);
+            await channel.track(presence);
             void publishStreamSnapshot();
           }
         });
@@ -5033,7 +5084,9 @@ export default function Board2Page() {
 
   useEffect(() => {
     if (!(liveControlEnabled || playMode) || !streamChannelRef.current) return;
-    void streamChannelRef.current.track({ role: "host", name: STREAM_OWNER_USER_ID, guestSkin: streamGuestSkin, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+    const presence = { role: "host", isHost: true, name: STREAM_OWNER_USER_ID, skin: HOST_STREAM_SKIN, physique: "slim", guestSkin: streamGuestSkin, joinedAt: Date.now() } satisfies StreamParticipantPresence;
+    streamDebugLog("presence track send", presence);
+    void streamChannelRef.current.track(presence);
     publishStreamFrame(performance.now());
   }, [streamGuestSkin, liveControlEnabled, playMode, publishStreamFrame]);
 
@@ -5142,6 +5195,7 @@ export default function Board2Page() {
       if (now - event.startTime > event.duration * 1000 + 800) streamEliminationsRef.current.delete(guestId);
       else drawEliminationSequence(ctx, event, cam, sf, W, H, now);
     }
+    streamGuestCharacterDebugRef.current = [];
     for (const frame of streamGuestFramesRef.current.values()) {
       const elimination = streamEliminationsRef.current.get(frame.guestId);
       const choke = streamChokeStatesRef.current.get(frame.guestId);
@@ -5171,11 +5225,15 @@ export default function Board2Page() {
             },
           }
         : activeFrame;
-      smoothed.skin = streamGuestSkinRef.current;
       streamRenderedGuestFramesRef.current.set(frame.guestId, smoothed);
+      const row = streamGuestDebugRow(smoothed);
+      const existingIndex = streamGuestCharacterDebugRef.current.findIndex((item) => item.id === row.id);
+      if (existingIndex >= 0) streamGuestCharacterDebugRef.current[existingIndex] = row;
+      else streamGuestCharacterDebugRef.current.push(row);
+      refreshStreamDebugRows(performance.now());
       drawSharedStreamCharacter(
         ctx,
-        guestCharacterForRender(smoothed, clockOffset),
+        guestCharacterForRender(smoothed, clockOffset, { guestSkinOverride: streamGuestSkinRef.current }),
         streamGuestFacesRef.current.get(frame.guestId) ?? null,
         streamGuestSignsRef.current.get(frame.guestId) ?? null,
         cam,
@@ -10479,8 +10537,13 @@ export default function Board2Page() {
           {streamPublishing ? "LIVE" : "LOCAL"}
         </div>
         {DEBUG_STREAM && (
-          <div style={{ position: "fixed", top: 48, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.9)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
+          <div style={{ position: "fixed", top: 48, left: playCleanUi ? 14 : 90, zIndex: 2, maxWidth: 560, padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.9)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
             renderer: {RENDERER_VERSION} · flip: {playFlipDebugRef.current ? `f ${playFlipDebugRef.current.facing} r ${playFlipDebugRef.current.rotationDirection} dx ${Math.round(playFlipDebugRef.current.travelDx)}` : "idle"}
+            {streamCharacterDebugRows.map((row) => (
+              <div key={`${row.isHost ? "h" : "g"}-${row.id}`}>
+                {row.id} {row.isHost ? "host" : "guest"} pub:{row.skinPublished ?? "∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx !== undefined ? ` dx:${Math.round(row.travelDx)}` : ""}{row.rotationDirection ? ` rot:${row.rotationDirection}` : ""}
+              </div>
+            ))}
           </div>
         )}
         {!playCleanUi && <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>

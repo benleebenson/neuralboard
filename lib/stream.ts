@@ -5,6 +5,86 @@ export const GUEST_NAME_MAX_LENGTH = 16;
 export const GUEST_EMOTES = ["🤔", "💡", "❗", "😂", "👋"] as const;
 export const GUEST_VERBS = ["move", "grapple", "skateTo", "wallClimb", "zipline", "dance", "pullUps", "mirrorCheck", "sitAndWatch", "emote", "sign"] as const;
 export const MAX_GUEST_SIGN_DATA_URL_BYTES = 150_000;
+export const HOST_STREAM_SKIN = "stick" as const;
+export const DEFAULT_STREAM_SKIN = "stick" as const;
+export const STREAM_ACTION_TYPES = [
+  "idle",
+  "walk",
+  "run",
+  "walkTo",
+  "runTo",
+  "jump",
+  "jumpTo",
+  "flip",
+  "grapple",
+  "skateTo",
+  "wallClimb",
+  "zipline",
+  "pointAt",
+  "explainGesture",
+  "dance",
+  "pullUps",
+  "pullups",
+  "mirrorCheck",
+  "sitAndWatch",
+  "emote",
+  "forceChoke",
+  "eliminated",
+] as const;
+
+export type CharacterSkin = "stick" | "styled";
+export type StreamActionType = (typeof STREAM_ACTION_TYPES)[number];
+export type StreamSkinSource = "own-setting" | "presence" | "guest-skin-default" | "fallback";
+export type StreamCharacterDebugRow = {
+  id: string;
+  isHost: boolean;
+  skinPublished?: CharacterSkin;
+  skinResolved: CharacterSkin;
+  skinSource: StreamSkinSource;
+  actionType: string;
+  actionProgress: number;
+  physique: "slim" | "jacked";
+  facing?: 1 | -1;
+  travelDx?: number;
+  rotationDirection?: 1 | -1;
+};
+
+export function isCharacterSkin(value: unknown): value is CharacterSkin {
+  return value === "stick" || value === "styled";
+}
+
+export function isStreamActionType(value: unknown): value is StreamActionType {
+  return typeof value === "string" && (STREAM_ACTION_TYPES as readonly string[]).includes(value);
+}
+
+export function resolveStreamSkin(
+  published: unknown,
+  options: {
+    isHost: boolean;
+    sourceIfPublished?: StreamSkinSource;
+    guestSkinOverride?: CharacterSkin;
+    warnContext?: string;
+  },
+): { skin: CharacterSkin; source: StreamSkinSource; published?: CharacterSkin } {
+  const skinPublished = isCharacterSkin(published) ? published : undefined;
+  if (options.isHost) {
+    if (skinPublished && skinPublished !== HOST_STREAM_SKIN && typeof console !== "undefined") {
+      console.warn("[stream:state] host skin must resolve to stick", { context: options.warnContext, published: skinPublished });
+    }
+    if (!skinPublished && typeof console !== "undefined") {
+      console.warn("[stream:state] missing host skin; falling back to stick", { context: options.warnContext });
+    }
+    return { skin: HOST_STREAM_SKIN, source: skinPublished ? (options.sourceIfPublished ?? "presence") : "fallback", published: skinPublished };
+  }
+  if (options.guestSkinOverride) {
+    return { skin: options.guestSkinOverride, source: "guest-skin-default", published: skinPublished };
+  }
+  if (skinPublished) return { skin: skinPublished, source: options.sourceIfPublished ?? "presence", published: skinPublished };
+  if (typeof console !== "undefined") {
+    console.warn("[stream:state] missing/unknown guest skin; falling back to stick", { context: options.warnContext, published });
+  }
+  return { skin: DEFAULT_STREAM_SKIN, source: "fallback", published: skinPublished };
+}
 
 export type StreamCamera = {
   cameraX: number;
@@ -80,11 +160,12 @@ export type SpawnDoor = { x: number; y: number };
 
 export type StreamParticipantPresence = {
   role: "host" | "viewer" | "guest";
+  isHost?: boolean;
   guestId?: string;
   name?: string;
   faceDataUrl?: string;
-  skin?: "stick" | "styled";
-  guestSkin?: "stick" | "styled";
+  skin?: CharacterSkin;
+  guestSkin?: CharacterSkin;
   physique?: "slim" | "jacked";
   signDataUrl?: string;
   signActive?: boolean;
