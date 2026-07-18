@@ -34,6 +34,7 @@ import {
   PLAY_RESPAWN_BELOW_LOWEST_SURFACE,
   RENDERER_VERSION,
   STREAM_PROJECTILE_SPEED,
+  STREAM_CHARACTER_GEOMETRY,
   PlayCharacterState,
   PlayHairStyle,
   PlayOutfitStyle,
@@ -46,6 +47,7 @@ import {
   eliminationFrameForGuest,
   guestCharacterForRender,
   projectilePoint,
+  streamCharacterConstructionParams,
 } from "@/lib/play-character-renderer";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -810,11 +812,11 @@ const SKATE_POP_CLEARANCE = 60;
 const SKATE_AUTO_MAX_HEIGHT_DELTA = 150;
 const SKATE_MANUAL_FALLBACK_HEIGHT_DELTA = 180;
 const GRAPPLE_MANUAL_DURATION_SEC = 1.5 * PHASE_TIME_SCALE;
-const CHAR_HIP_RAW = 76;
-const CHAR_TORSO_RAW = 53;
-const CHAR_NECK_RAW = 12;
-const CHAR_HEAD_R_RAW = 20;
-const CHAR_ARM_RAW = 32;
+const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
+const CHAR_TORSO_RAW = STREAM_CHARACTER_GEOMETRY.torsoRaw;
+const CHAR_NECK_RAW = STREAM_CHARACTER_GEOMETRY.neckRaw;
+const CHAR_HEAD_R_RAW = STREAM_CHARACTER_GEOMETRY.headRaw;
+const CHAR_ARM_RAW = STREAM_CHARACTER_GEOMETRY.armRaw;
 const CHAR_RELAX_ARM_A = 0.25;
 const CHAR_RELAX_FORE_A = 0.18;
 const LIVE_BLEND_SEC = 0.15;
@@ -4431,6 +4433,7 @@ export default function Board2Page() {
 
   function streamHostDebugRow(ch: StreamCharacterFrame): StreamCharacterDebugRow {
     const resolved = resolveStreamSkin(ch.skin, { isHost: true, sourceIfPublished: "own-setting", warnContext: `board2-host:${ch.id}` });
+    const face = ch.id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
     return {
       id: ch.id,
       isHost: true,
@@ -4443,6 +4446,7 @@ export default function Board2Page() {
       facing: ch.facing,
       travelDx: ch.velocity?.x,
       rotationDirection: ch.actionType === "flip" ? ch.facing : undefined,
+      construction: streamCharacterConstructionParams(resolved.skin, 1, { hasFace: !!face?.faceBlobUrl, faceAspect: face?.faceAspect ?? 1, jacked: ch.physique === "jacked" }),
     };
   }
 
@@ -4460,6 +4464,7 @@ export default function Board2Page() {
       facing: frame.facing,
       travelDx: frame.velocity?.x,
       rotationDirection: frame.actionType === "flip" ? frame.facing : undefined,
+      construction: streamCharacterConstructionParams(resolved.skin, 1, { hasFace: !!streamGuestFacesRef.current.get(frame.guestId), faceAspect: 1, jacked: (frame.physique ?? "slim") === "jacked" }),
     };
   }
 
@@ -10541,7 +10546,7 @@ export default function Board2Page() {
             renderer: {RENDERER_VERSION} · flip: {playFlipDebugRef.current ? `f ${playFlipDebugRef.current.facing} r ${playFlipDebugRef.current.rotationDirection} dx ${Math.round(playFlipDebugRef.current.travelDx)}` : "idle"}
             {streamCharacterDebugRows.map((row) => (
               <div key={`${row.isHost ? "h" : "g"}-${row.id}`}>
-                {row.id} {row.isHost ? "host" : "guest"} pub:{row.skinPublished ?? "∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx !== undefined ? ` dx:${Math.round(row.travelDx)}` : ""}{row.rotationDirection ? ` rot:${row.rotationDirection}` : ""}
+                {row.id} {row.isHost ? "host" : "guest"} pub:{row.skinPublished ?? "∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx !== undefined ? ` dx:${Math.round(row.travelDx)}` : ""}{row.rotationDirection ? ` rot:${row.rotationDirection}` : ""}{row.construction ? ` h:${row.construction.characterHeight} head:${row.construction.headRadiusX}/${row.construction.headRadiusY} torso:${row.construction.torsoLength} arm:${row.construction.armLength} stroke:${row.construction.strokeWidth}` : ""}
               </div>
             ))}
           </div>

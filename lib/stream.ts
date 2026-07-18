@@ -47,6 +47,7 @@ export type StreamCharacterDebugRow = {
   facing?: 1 | -1;
   travelDx?: number;
   rotationDirection?: 1 | -1;
+  construction?: Record<string, number | string | boolean>;
 };
 
 export function isCharacterSkin(value: unknown): value is CharacterSkin {

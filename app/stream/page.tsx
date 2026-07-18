@@ -4,7 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { RENDERER_VERSION, drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, hostCharacterForRender } from "@/lib/play-character-renderer";
+import { RENDERER_VERSION, drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, hostCharacterForRender, streamCharacterConstructionParams } from "@/lib/play-character-renderer";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, StreamWeaponStateMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 
 type Mode = "landing" | "watch" | "join" | "guest";
@@ -168,7 +168,7 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
   };
 }
 
-function hostDebugRow(ch: StreamFrameMessage["characters"][number]): StreamCharacterDebugRow {
+function hostDebugRow(ch: StreamFrameMessage["characters"][number], faceAspect?: number, hasFace = false): StreamCharacterDebugRow {
   const resolved = resolveStreamSkin(ch.skin, { isHost: true, sourceIfPublished: "presence", warnContext: `stream-host:${ch.id}` });
   return {
     id: ch.id,
@@ -182,10 +182,11 @@ function hostDebugRow(ch: StreamFrameMessage["characters"][number]): StreamChara
     facing: ch.facing,
     travelDx: ch.velocity?.x,
     rotationDirection: ch.actionType === "flip" ? ch.facing : undefined,
+    construction: streamCharacterConstructionParams(resolved.skin, 1, { hasFace, faceAspect: faceAspect ?? 1, jacked: ch.physique === "jacked" }),
   };
 }
 
-function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" | "styled"): StreamCharacterDebugRow {
+function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" | "styled", hasFace = false): StreamCharacterDebugRow {
   const resolved = resolveStreamSkin(frame.skin, { isHost: false, sourceIfPublished: "presence", guestSkinOverride, warnContext: `stream-guest:${frame.guestId}` });
   return {
     id: frame.guestId,
@@ -199,6 +200,7 @@ function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" |
     facing: frame.facing,
     travelDx: frame.velocity?.x,
     rotationDirection: frame.actionType === "flip" ? frame.facing : undefined,
+    construction: streamCharacterConstructionParams(resolved.skin, 1, { hasFace, faceAspect: 1, jacked: (frame.physique ?? "slim") === "jacked" }),
   };
 }
 
@@ -407,7 +409,7 @@ export default function StreamPage() {
             for (const ch of host.characters) {
               if (!ch.enabled) continue;
               const faceInfo = snapshot.characters.find((x) => x.id === ch.id);
-              rows.push(hostDebugRow(ch));
+              rows.push(hostDebugRow(ch, faceInfo?.faceAspect, !!faceInfo?.faceDataUrl));
               drawSharedStreamCharacter(ctx, hostCharacterForRender(ch, faceInfo?.faceAspect, hostClockOffset.current), faceCache.current.get(ch.id) ?? null, null, cam, sf, w, h, 1, Date.now());
             }
             renderDebugRowsRef.current = rows;
@@ -439,7 +441,7 @@ export default function StreamPage() {
             const alpha = event ? 0.85 : error > 300 ? 1 : 0.35;
             const smooth = old ? { ...renderFrame, position: { x: lerp(old.position.x, renderFrame.position.x, alpha), y: lerp(old.position.y, renderFrame.position.y, alpha) } } : renderFrame;
             renderedGuests.current.set(id, smooth);
-            renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== id), guestDebugRow(smooth, hostGuestSkin.current)];
+            renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== id), guestDebugRow(smooth, hostGuestSkin.current, !!faceCache.current.get(id))];
             drawSharedStreamCharacter(ctx, guestCharacterForRender(smooth, remoteClockOffsets.current.get(id) ?? 0, { guestSkinOverride: hostGuestSkin.current }), faceCache.current.get(id) ?? null, signCache.current.get(id) ?? null, cam, sf, w, h, id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, Date.now());
           }
           if (p && mode === "guest") {
@@ -453,7 +455,7 @@ export default function StreamPage() {
                 ? { ...localFrame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
                 : event ? eliminationFrameForGuest(localFrame, event, Date.now(), hostClockOffset.current) : localFrame;
             if (renderFrame) {
-              renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== guestId), guestDebugRow(renderFrame, hostGuestSkin.current)];
+              renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== guestId), guestDebugRow(renderFrame, hostGuestSkin.current, !!faceCache.current.get(guestId))];
               drawSharedStreamCharacter(ctx, guestCharacterForRender(renderFrame, 0, { guestSkinOverride: hostGuestSkin.current }), faceCache.current.get(guestId) ?? null, signCache.current.get(guestId) ?? null, cam, sf, w, h, clamp((now - p.spawnAt) / 650, 0, 1), Date.now());
             } else {
               if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
@@ -490,7 +492,7 @@ export default function StreamPage() {
 
   if(mode==="join")return <main style={landing}><section style={card}><h2>Join as character</h2><input autoFocus maxLength={GUEST_NAME_MAX_LENGTH} value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={input}/><label style={{...button,display:"block",textAlign:"center",marginTop:10}}>Optional face<input hidden type="file" accept="image/*" onChange={async e=>{const f=e.target.files?.[0];if(f)setFace(await bakeFace(f));}}/></label>{face&&<img src={face} alt="Face preview" style={{width:48,height:56,display:"block",margin:"10px auto"}}/>}<p style={{fontSize:10,color:"#8b2b20"}}>{joinError}</p><button style={{...button,background:"#c8f135"}} onClick={beginGuest}>Spawn</button><button style={button} onClick={()=>setMode("landing")}>Cancel</button></section></main>;
   if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":status==="reconnecting"?"RECONNECTING":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":status==="reconnecting"?"reconnecting…":joinError||"No active stream right now."}</p>{DEBUG_STREAM&&<div style={{fontSize:10,lineHeight:1.45,color:"#6a6a6a",background:"#f5ecd8",border:"1px solid rgba(42,42,42,.22)",padding:7,marginBottom:10}}>channel: {streamChannelName(STREAM_OWNER_USER_ID)} | subscribe: {subscribeStatus} | presence: {participants.length}</div>}<button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
-  return <main style={{position:"fixed",inset:0,overflow:"hidden",background:"#f5ecd8"}}><canvas ref={canvasRef} onClick={clickCanvas} style={{width:"100vw",height:"100vh",display:"block",cursor:mode==="guest"&&!hostCam?"crosshair":"default"}}/><div style={{position:"fixed",top:12,left:12,display:"flex",gap:8,fontFamily:"monospace",alignItems:"flex-start",flexWrap:"wrap",maxWidth:"calc(100vw - 24px)"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span>{DEBUG_STREAM&&<span style={{...pill,maxWidth:620,lineHeight:1.35}}>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}{renderDebugRows.map((row)=><span key={`${row.isHost?"h":"g"}-${row.id}`} style={{display:"block"}}>{row.id} {row.isHost?"host":"guest"} pub:{row.skinPublished??"∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx!==undefined?` dx:${Math.round(row.travelDx)}`:""}{row.rotationDirection?` rot:${row.rotationDirection}`:""}</span>)}</span>}{mode==="guest"&&<><span style={pill}>Click move · long/high clicks auto-flip · G grapple · S skate · C climb · Z zip · D dance · P pull · M mirror · T sit · E emote · H sign</span><button style={pill} onClick={()=>setHostCam(v=>!v)}>{hostCam?"Host cam":"Follow me"} · V</button><button style={pill} onClick={emote}>Emote · E</button><button style={pill} onClick={()=>setSignOpen(true)}>✍️ Sign</button><button style={pill} onClick={()=>{const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}}>{signActive?"Lower sign":"Hold sign"} · H</button><button style={pill} onClick={leave}>Leave</button></>}</div>{signModal}</main>;
+  return <main style={{position:"fixed",inset:0,overflow:"hidden",background:"#f5ecd8"}}><canvas ref={canvasRef} onClick={clickCanvas} style={{width:"100vw",height:"100vh",display:"block",cursor:mode==="guest"&&!hostCam?"crosshair":"default"}}/><div style={{position:"fixed",top:12,left:12,display:"flex",gap:8,fontFamily:"monospace",alignItems:"flex-start",flexWrap:"wrap",maxWidth:"calc(100vw - 24px)"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span>{DEBUG_STREAM&&<span style={{...pill,maxWidth:760,lineHeight:1.35}}>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}{renderDebugRows.map((row)=><span key={`${row.isHost?"h":"g"}-${row.id}`} style={{display:"block"}}>{row.id} {row.isHost?"host":"guest"} pub:{row.skinPublished??"∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx!==undefined?` dx:${Math.round(row.travelDx)}`:""}{row.rotationDirection?` rot:${row.rotationDirection}`:""}{row.construction?` h:${row.construction.characterHeight} head:${row.construction.headRadiusX}/${row.construction.headRadiusY} torso:${row.construction.torsoLength} arm:${row.construction.armLength} stroke:${row.construction.strokeWidth}`:""}</span>)}</span>}{mode==="guest"&&<><span style={pill}>Click move · long/high clicks auto-flip · G grapple · S skate · C climb · Z zip · D dance · P pull · M mirror · T sit · E emote · H sign</span><button style={pill} onClick={()=>setHostCam(v=>!v)}>{hostCam?"Host cam":"Follow me"} · V</button><button style={pill} onClick={emote}>Emote · E</button><button style={pill} onClick={()=>setSignOpen(true)}>✍️ Sign</button><button style={pill} onClick={()=>{const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}}>{signActive?"Lower sign":"Hold sign"} · H</button><button style={pill} onClick={leave}>Leave</button></>}</div>{signModal}</main>;
 }
 
 const landing:React.CSSProperties={minHeight:"100vh",background:"#f5ecd8",color:"#2a2a2a",fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"center",padding:24};

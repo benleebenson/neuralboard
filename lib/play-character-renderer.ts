@@ -29,10 +29,52 @@ export const PLAY_JUMP_SPEED = 720;
 export const PLAY_MAX_FALL_SPEED = 1350;
 export const PLAY_CHARACTER_HEIGHT = 168;
 export const PLAY_RESPAWN_BELOW_LOWEST_SURFACE = 650;
+export const STREAM_CHARACTER_GEOMETRY = {
+  characterHeight: 181,
+  hipRaw: 76,
+  legRaw: 38,
+  torsoRaw: 53,
+  neckRaw: 12,
+  headRaw: 20,
+  armRaw: 32,
+  shoulderFactor: 0.85,
+  stickStrokeRaw: 3,
+  launcherStickWidthRaw: 14,
+  launcherStickHeightRaw: 8,
+} as const;
 
 const PLAY_RUN_SPEED_FOR_RENDER = 760;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+export function streamCharacterConstructionParams(
+  skin: CharacterSkin,
+  sf: number,
+  options?: { hasFace?: boolean; faceAspect?: number; jacked?: boolean },
+): Record<string, number | string | boolean> {
+  const g = STREAM_CHARACTER_GEOMETRY;
+  const hasFace = !!options?.hasFace;
+  const faceAspect = clamp(options?.faceAspect ?? 1, 0.75, 1.6);
+  const headR = g.headRaw * sf * (hasFace ? 1.15 : 1);
+  return {
+    skin,
+    scale: sf,
+    characterHeight: g.characterHeight,
+    hipY: -g.hipRaw * sf,
+    torsoLength: g.torsoRaw * sf,
+    neckLength: g.neckRaw * sf * (options?.jacked ? 0.72 : 1),
+    armLength: g.armRaw * sf,
+    legLength: g.legRaw * sf,
+    shoulderY: -g.torsoRaw * g.shoulderFactor * sf,
+    headRadius: headR,
+    headRadiusX: hasFace ? headR / Math.sqrt(faceAspect) : headR,
+    headRadiusY: hasFace ? headR * Math.sqrt(faceAspect) : headR,
+    faceAspect,
+    strokeWidth: Math.max(1, g.stickStrokeRaw * sf),
+    launcherWidth: g.launcherStickWidthRaw * sf,
+    launcherHeight: g.launcherStickHeightRaw * sf,
+  };
+}
 
 export function drawPlaySpawnDoor(
   ctx: CanvasRenderingContext2D,
@@ -254,7 +296,7 @@ export function drawPoptropicaPlayCharacter(
 }
 
 // Stream/render adapter exports live in this shared renderer module so /board2 and /stream cannot drift.
-export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-c";
+export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-d";
 
 export type SharedCharacter = {
   id: string;
@@ -418,17 +460,24 @@ function drawStickStreamCharacter(
   }
   ctx.strokeStyle = "#27221f";
   ctx.fillStyle = "#fffdf4";
-  ctx.lineWidth = Math.max(1.5, 4 * S);
+  const g = STREAM_CHARACTER_GEOMETRY;
+  ctx.lineWidth = Math.max(1, g.stickStrokeRaw * S);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  const hipY = -58 * S;
-  const shoulderY = -118 * S;
-  const headY = -158 * S;
+  const hipY = -g.hipRaw * S;
+  const torsoTopY = hipY - g.torsoRaw * S;
+  const neckTopY = torsoTopY - g.neckRaw * S;
+  const shoulderY = hipY - g.torsoRaw * g.shoulderFactor * S;
+  const headR = g.headRaw * S * (face ? 1.15 : 1);
+  const faceAspect = clamp(ch.faceAspect ?? 1, 0.75, 1.6);
+  const headRX = face ? headR / Math.sqrt(faceAspect) : headR;
+  const headRY = face ? headR * Math.sqrt(faceAspect) : headR;
+  const headY = neckTopY - headRY;
   const stride = moving ? Math.sin(phase) * 44 * S : 0;
   const signRaise = ch.signActive && ch.signDataUrl;
   ctx.beginPath();
   ctx.moveTo(0, hipY);
-  ctx.lineTo(0, shoulderY);
+  ctx.lineTo(0, torsoTopY);
   ctx.stroke();
   const limb = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number) => {
     ctx.beginPath();
@@ -465,17 +514,15 @@ function drawStickStreamCharacter(
     limb(2 * S, shoulderY, 34 * S + armSwing * 0.2, -94 * S, 38 * S + armSwing, -57 * S);
   }
   ctx.beginPath();
-  ctx.ellipse(0, headY, 31 * S, 37 * S, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, headY, headRX, headRY, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
   if (face) {
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(0, headY, 29 * S, 35 * S, 0, 0, Math.PI * 2);
+    ctx.ellipse(0, headY, headRX, headRY, 0, 0, Math.PI * 2);
     ctx.clip();
-    const fw = 62 * S;
-    const fh = fw / clamp(ch.faceAspect ?? 1, 0.75, 1.6);
-    ctx.drawImage(face, -fw / 2, headY - fh / 2, fw, fh);
+    ctx.drawImage(face, -headRX, headY - headRY, headRX * 2, headRY * 2);
     ctx.restore();
   }
   ctx.restore();
