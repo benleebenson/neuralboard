@@ -15,6 +15,7 @@ import {
   SpawnDoor,
   StreamParticipantPresence,
   StreamCharacterFrame,
+  StreamChokeMessage,
   StreamEliminationMessage,
   StreamShotFiredMessage,
   StreamSnapshotMessage,
@@ -4044,6 +4045,7 @@ export default function Board2Page() {
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const streamGuestSignsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const streamEliminationsRef = useRef<Map<string, StreamEliminationMessage>>(new Map());
+  const streamChokeStatesRef = useRef<Map<string, StreamChokeMessage>>(new Map());
   const streamGuestKickTombstonesRef = useRef<Map<string, number>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
@@ -4069,6 +4071,7 @@ export default function Board2Page() {
   const playWeaponLastStateAtRef = useRef(0);
   const playEliminationKickSentRef = useRef<Set<string>>(new Set());
   const playFlipDebugRef = useRef<{ facing: 1 | -1; rotationDirection: 1 | -1; travelDx: number } | null>(null);
+  const playForceChokeRef = useRef<{ pointerId: number; targetGuestId: string; startedAt: number; position: { x: number; y: number }; lastSentAt: number } | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
@@ -4521,6 +4524,7 @@ export default function Board2Page() {
     streamRenderedGuestFramesRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
     streamEliminationsRef.current.delete(guestId);
+    streamChokeStatesRef.current.delete(guestId);
     streamGuestSignsRef.current.delete(guestId);
     playWeaponHitCountsRef.current.delete(guestId);
     playEliminationKickSentRef.current.delete(guestId);
@@ -4895,6 +4899,7 @@ export default function Board2Page() {
       streamGuestFacesRef.current.clear();
       streamGuestSignsRef.current.clear();
       streamEliminationsRef.current.clear();
+      streamChokeStatesRef.current.clear();
       streamGuestKickTombstonesRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
@@ -4944,6 +4949,12 @@ export default function Board2Page() {
           const event = payload as StreamEliminationMessage;
           if (event.sessionId === streamSessionIdRef.current) streamEliminationsRef.current.set(event.targetGuestId, event);
         })
+        .on("broadcast", { event: "choke_state" }, ({ payload }) => {
+          const event = payload as StreamChokeMessage;
+          if (event.sessionId !== streamSessionIdRef.current) return;
+          if (event.phase === "end") streamChokeStatesRef.current.delete(event.targetGuestId);
+          else streamChokeStatesRef.current.set(event.targetGuestId, event);
+        })
         .on("broadcast", { event: "snapshot-request" }, ({ payload }) => {
           streamDebugLog("snapshot request", payload);
           void publishStreamSnapshot();
@@ -4960,6 +4971,7 @@ export default function Board2Page() {
               streamRenderedGuestFramesRef.current.delete(guestId);
               streamGuestClockOffsetsRef.current.delete(guestId);
               streamEliminationsRef.current.delete(guestId);
+              streamChokeStatesRef.current.delete(guestId);
               streamGuestSignsRef.current.delete(guestId);
               playWeaponHitCountsRef.current.delete(guestId);
               playEliminationKickSentRef.current.delete(guestId);
@@ -4971,6 +4983,7 @@ export default function Board2Page() {
             if (staleElimination && guest.joinedAt > staleElimination.sentAt) {
               streamDebugLog("clear stale elimination on rejoin", { guestId: guest.guestId, joinedAt: guest.joinedAt, eliminationSentAt: staleElimination.sentAt });
               streamEliminationsRef.current.delete(guest.guestId);
+              streamChokeStatesRef.current.delete(guest.guestId);
               streamGuestFramesRef.current.delete(guest.guestId);
               streamRenderedGuestFramesRef.current.delete(guest.guestId);
               playWeaponHitCountsRef.current.delete(guest.guestId);
@@ -5131,8 +5144,13 @@ export default function Board2Page() {
     }
     for (const frame of streamGuestFramesRef.current.values()) {
       const elimination = streamEliminationsRef.current.get(frame.guestId);
+      const choke = streamChokeStatesRef.current.get(frame.guestId);
       const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
-      const activeFrame = elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
+      const activeFrame = choke && choke.phase === "hold"
+        ? { ...frame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4 }
+        : choke && choke.phase === "drop"
+          ? { ...frame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
+          : elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
       if (!activeFrame) {
         streamRenderedGuestFramesRef.current.delete(frame.guestId);
         streamGuestFramesRef.current.delete(frame.guestId);
@@ -9247,6 +9265,51 @@ export default function Board2Page() {
     return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
   }
 
+  function guestAtPlayPoint(point: { rawX: number; rawY: number }): GuestCharacterFrame | null {
+    let best: { frame: GuestCharacterFrame; d: number } | null = null;
+    for (const frame of streamGuestFramesRef.current.values()) {
+      if (streamEliminationsRef.current.has(frame.guestId)) continue;
+      const dx = point.rawX - frame.position.x;
+      const dy = point.rawY - (frame.position.y - 92);
+      const d = Math.hypot(dx, dy);
+      if (d <= 105 && (!best || d < best.d)) best = { frame, d };
+    }
+    return best?.frame ?? null;
+  }
+
+  function sendForceChokeState(targetGuestId: string, phase: StreamChokeMessage["phase"], position: { x: number; y: number }) {
+    const state = playPhysicsRef.current;
+    if (!state || !streamSessionIdRef.current) return;
+    const startedAt = playForceChokeRef.current?.startedAt ?? performance.now();
+    const payload: StreamChokeMessage = {
+      kind: "choke_state",
+      streamId: STREAM_OWNER_USER_ID,
+      sessionId: streamSessionIdRef.current,
+      sentAt: Date.now(),
+      targetGuestId,
+      phase,
+      holder: { x: state.x, y: state.y, facing: state.facing },
+      position,
+      progress: clamp((performance.now() - startedAt) / 1400, 0, 1),
+    };
+    if (phase === "end") streamChokeStatesRef.current.delete(targetGuestId);
+    else streamChokeStatesRef.current.set(targetGuestId, payload);
+    streamChannelRef.current?.send({ type: "broadcast", event: "choke_state", payload });
+  }
+
+  function updateForceChokeFromPointer(e: React.PointerEvent<HTMLCanvasElement>) {
+    const choke = playForceChokeRef.current;
+    if (!choke || choke.pointerId !== e.pointerId) return false;
+    const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
+    if (!point) return true;
+    choke.position = { x: point.rawX, y: point.rawY + 120 };
+    if (performance.now() - choke.lastSentAt > 1000 / STREAM_FPS) {
+      choke.lastSentAt = performance.now();
+      sendForceChokeState(choke.targetGuestId, "hold", choke.position);
+    }
+    return true;
+  }
+
   function playAimFacing(current: 1 | -1, originX: number, originY: number, aim?: { x: number; y: number } | null): 1 | -1 {
     if (!aim) return current;
     const dx = aim.x - originX;
@@ -9450,6 +9513,11 @@ export default function Board2Page() {
   }
 
   function exitPlayMode() {
+    const choke = playForceChokeRef.current;
+    if (choke) {
+      sendForceChokeState(choke.targetGuestId, "end", choke.position);
+      playForceChokeRef.current = null;
+    }
     setPlayMode(false);
     playHeldKeysRef.current.clear();
     playPointerRef.current = null;
@@ -9497,6 +9565,22 @@ export default function Board2Page() {
     if (e.button === 2) return;
     const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
     if (point) playCursorRef.current = { x: point.rawX, y: point.rawY };
+    const guest = point ? guestAtPlayPoint(point) : null;
+    if (guest) {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      if (playWeaponArmedRef.current) {
+        playWeaponArmedRef.current = false;
+        setPlayWeaponArmed(false);
+        playWeaponShotsRef.current = [];
+        broadcastWeaponState(true);
+      }
+      playPointerRef.current = null;
+      const position = { x: guest.position.x, y: guest.position.y - 70 };
+      playForceChokeRef.current = { pointerId: e.pointerId, targetGuestId: guest.guestId, startedAt: performance.now(), position, lastSentAt: 0 };
+      sendForceChokeState(guest.guestId, "hold", position);
+      return;
+    }
     if (playWeaponArmedRef.current) {
       e.preventDefault();
       firePlayWeaponBurst();
@@ -9521,6 +9605,7 @@ export default function Board2Page() {
   }
 
   function handlePlayPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (updateForceChokeFromPointer(e)) return;
     const pointer = playPointerRef.current;
     const rect = e.currentTarget.getBoundingClientRect();
     const cam = playCameraRef.current;
@@ -9543,6 +9628,13 @@ export default function Board2Page() {
   }
 
   function handlePlayPointerUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    const choke = playForceChokeRef.current;
+    if (choke?.pointerId === e.pointerId) {
+      sendForceChokeState(choke.targetGuestId, "drop", choke.position);
+      window.setTimeout(() => sendForceChokeState(choke.targetGuestId, "end", choke.position), 900);
+      playForceChokeRef.current = null;
+      return;
+    }
     const pointer = playPointerRef.current;
     if (pointer?.id === e.pointerId) playPointerRef.current = null;
   }

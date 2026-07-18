@@ -101,7 +101,7 @@ export type GuestCharacterFrame = {
   position: { x: number; y: number };
   velocity?: { x: number; y: number };
   facing: 1 | -1;
-  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "grapple" | "skateTo" | "wallClimb" | "zipline" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "eliminated";
+  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "grapple" | "skateTo" | "wallClimb" | "zipline" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "forceChoke" | "eliminated";
   actionProgress: number;
   actionStartTime?: number;
   actionDuration?: number;
@@ -171,6 +171,18 @@ export type StreamWeaponHitMessage = {
   dir: { x: number; y: number };
 };
 
+export type StreamChokeMessage = {
+  kind: "choke_state";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  targetGuestId: string;
+  phase: "hold" | "drop" | "end";
+  holder: { x: number; y: number; facing: 1 | -1 };
+  position: { x: number; y: number };
+  progress: number;
+};
+
 export type StreamSnapshotMessage = {
   kind: "snapshot";
   streamId: string;
@@ -200,7 +212,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamWeaponStateMessage | StreamShotFiredMessage | StreamWeaponHitMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamWeaponStateMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

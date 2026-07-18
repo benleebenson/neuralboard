@@ -13,7 +13,7 @@ export type PlayCharacterState = {
   airborneAt?: number;
   spawnX: number;
   spawnY: number;
-  action: "none" | "dance" | "emote" | "pullups" | "mirror";
+  action: "none" | "dance" | "emote" | "pullups" | "mirror" | "forceChoke";
   actionUntil: number;
   landedAt: number;
   grappleX: number | null;
@@ -112,11 +112,12 @@ export function drawPoptropicaPlayCharacter(
   const lift = moving ? Math.abs(Math.sin(phase)) * 3 : 0;
   const actionWave = state.action === "dance" ? Math.sin(time * 9) * 0.65 : 0;
   const pull = state.action === "pullups";
+  const choked = state.action === "forceChoke";
   const landingAge = time - state.landedAt;
   const landingSquash = state.grounded && landingAge >= 0 && landingAge < 0.18
     ? Math.sin((1 - landingAge / 0.18) * Math.PI) * 0.12
     : 0;
-  const bodyY = idleBob - lift + (pull ? -Math.abs(Math.sin(time * 6)) * 20 : 0);
+  const bodyY = idleBob - lift + (pull ? -Math.abs(Math.sin(time * 6)) * 20 : 0) + (choked ? -28 + Math.sin(time * 9) * 3 : 0);
   const S = sf;
   ctx.save();
   ctx.translate(x, y + bodyY * S);
@@ -150,9 +151,10 @@ export function drawPoptropicaPlayCharacter(
   };
 
   const tuck = state.grounded ? 0 : clamp((Math.abs(state.spin) + Math.max(0, -state.vy) / 500) * 0.2, 0.25, 1);
-  const leftFootX = (-18 + legSwing * 37) * S * (1 - tuck * 0.45);
-  const rightFootX = (18 - legSwing * 37) * S * (1 - tuck * 0.45);
-  const footY = (-4 - tuck * 34) * S;
+  const chokeKick = choked ? Math.sin(time * 13) : 0;
+  const leftFootX = (choked ? -26 + chokeKick * 12 : -18 + legSwing * 37) * S * (1 - tuck * 0.45);
+  const rightFootX = (choked ? 26 + chokeKick * 10 : 18 - legSwing * 37) * S * (1 - tuck * 0.45);
+  const footY = (choked ? -12 + Math.abs(chokeKick) * 10 : -4 - tuck * 34) * S;
   limb(-8 * S, hipY, (-24 + legSwing * 12) * S, (-34 - tuck * 10) * S, leftFootX, footY, 8 * S);
   limb(8 * S, hipY, (24 - legSwing * 12) * S, (-34 - tuck * 10) * S, rightFootX, footY, 8 * S);
 
@@ -177,11 +179,24 @@ export function drawPoptropicaPlayCharacter(
   }
 
   ctx.fillStyle = "#f6d4b4";
-  const leftHandX = (-40 + armSwing * 28) * S;
-  const rightHandX = (40 - armSwing * 28) * S;
-  const handY = (pull ? -190 : -62 + Math.abs(armSwing) * 6) * S;
-  limb(-13 * S, shoulderY + 8 * S, (-34 + armSwing * 14) * S, -92 * S, leftHandX, handY, 9 * S);
-  limb(13 * S, shoulderY + 8 * S, (34 - armSwing * 14) * S, -92 * S, rightHandX, handY, 9 * S);
+  const leftHandX = (choked ? -13 + Math.sin(time * 8) * 2 : -40 + armSwing * 28) * S;
+  const rightHandX = (choked ? 13 - Math.sin(time * 8) * 2 : 40 - armSwing * 28) * S;
+  const handY = (pull ? -190 : choked ? -135 : -62 + Math.abs(armSwing) * 6) * S;
+  limb(-13 * S, shoulderY + 8 * S, choked ? -24 * S : (-34 + armSwing * 14) * S, choked ? -132 * S : -92 * S, leftHandX, handY, 9 * S);
+  limb(13 * S, shoulderY + 8 * S, choked ? 24 * S : (34 - armSwing * 14) * S, choked ? -132 * S : -92 * S, rightHandX, handY, 9 * S);
+
+  if (choked) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(39,34,31,.48)";
+    ctx.lineWidth = Math.max(1, 1.4 * S);
+    for (const [mx, my] of [[-38, -18], [38, -20], [-28, 4], [30, 6]] as const) {
+      ctx.beginPath();
+      ctx.moveTo(mx * S, my * S);
+      ctx.quadraticCurveTo((mx + Math.sign(mx) * 9) * S, (my - 5) * S, (mx + Math.sign(mx) * 18) * S, my * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 
   if (pull) {
     ctx.beginPath();
@@ -239,7 +254,7 @@ export function drawPoptropicaPlayCharacter(
 }
 
 // Stream/render adapter exports live in this shared renderer module so /board2 and /stream cannot drift.
-export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-a";
+export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-b";
 
 export type SharedCharacter = {
   id: string;
@@ -330,6 +345,7 @@ function sharedToPlayState(ch: SharedCharacter, renderTimeMs: number): PlayChara
   const action: PlayCharacterState["action"] =
     ch.actionType === "dance" ? "dance" :
     ch.actionType === "emote" ? "emote" :
+    ch.actionType === "forceChoke" ? "forceChoke" :
     ch.actionType === "pullUps" || ch.actionType === "pullups" ? "pullups" :
     ch.actionType === "mirrorCheck" ? "mirror" :
     "none";
