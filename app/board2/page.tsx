@@ -22,18 +22,26 @@ import {
   StreamWeaponStateMessage,
   streamChannelName,
 } from "@/lib/stream";
-import { STREAM_PROJECTILE_SPEED, drawEliminationSequence, drawSharedStreamCharacter, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, guestCharacterForRender, projectilePoint } from "@/lib/stream-character-renderer";
 import {
   PLAY_CHARACTER_HEIGHT,
   PLAY_GRAVITY,
   PLAY_JUMP_SPEED,
   PLAY_MAX_FALL_SPEED,
   PLAY_RESPAWN_BELOW_LOWEST_SURFACE,
+  RENDERER_VERSION,
+  STREAM_PROJECTILE_SPEED,
   PlayCharacterState,
   PlayHairStyle,
   PlayOutfitStyle,
+  drawEliminationSequence,
   drawPlacedSpawnDoor,
   drawPlaySpawnDoor,
+  drawSharedStreamCharacter,
+  drawTommyGunHeld,
+  drawWeaponProjectile,
+  eliminationFrameForGuest,
+  guestCharacterForRender,
+  projectilePoint,
 } from "@/lib/play-character-renderer";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -3768,6 +3776,7 @@ export default function Board2Page() {
   const [liveLegendOpen, setLiveLegendOpen] = useState(true);
   const [liveHeldCommand, setLiveHeldCommand] = useState<LiveCommandKey | null>(null);
   const [streamPublishing, setStreamPublishing] = useState(false);
+  const [streamGuestSkin, setStreamGuestSkin] = useState<CharacterSkin>("stick");
   const [spawnDoor, setSpawnDoor] = useState<SpawnDoor | null>(null);
   const [streamGuests, setStreamGuests] = useState<StreamParticipantPresence[]>([]);
   const [selectedCharActionId, setSelectedCharActionId] = useState<string | null>(null);
@@ -4014,6 +4023,7 @@ export default function Board2Page() {
   const characterSkin2Ref = useRef<CharacterSkin>("stick");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const liveControlEnabledRef = useRef(false);
+  const streamGuestSkinRef = useRef<CharacterSkin>("stick");
   const liveCameraModeRef = useRef<LiveCameraMode>("character");
   const liveSceneSurfaceKeyRef = useRef<string | null>(null);
   const liveSceneCameraRef = useRef<{ cameraX: number; cameraY: number; boardZoom: number } | null>(null);
@@ -4058,6 +4068,7 @@ export default function Board2Page() {
   const playWeaponLastShotAtRef = useRef(0);
   const playWeaponLastStateAtRef = useRef(0);
   const playEliminationKickSentRef = useRef<Set<string>>(new Set());
+  const playFlipDebugRef = useRef<{ facing: 1 | -1; rotationDirection: 1 | -1; travelDx: number } | null>(null);
   const editorPlayheadBeforePlayRef = useRef(0);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
@@ -4352,8 +4363,8 @@ export default function Board2Page() {
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
       characters: [
-        { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: characterSkinRef.current, physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
-        { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: characterSkin2Ref.current, physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
+        { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: "stick", physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
+        { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: "stick", physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
       ],
     });
     let maxLongEdge = 512;
@@ -4440,7 +4451,7 @@ export default function Board2Page() {
             y: pose?.boardY ?? state?.y ?? 0,
             facing: pose?.facing ?? state?.facing ?? 1,
             physique: runtime?.enabled ? physiqueAt(t, resolved) : "slim",
-            skin: id === "c2" ? characterSkin2Ref.current : characterSkinRef.current,
+            skin: "stick",
             actionType,
             progress: actionProgress,
             actionStartTime: sentAt - actionProgress * actionDuration * 1000,
@@ -4465,7 +4476,7 @@ export default function Board2Page() {
             y: pose.boardY,
             facing: pose.facing,
             physique: physiqueAt(t, resolved),
-            skin: id === "c2" ? characterSkin2Ref.current : characterSkinRef.current,
+            skin: "stick",
             actionType: active?.type ?? "idle",
             progress,
             actionStartTime: sentAt - progress * duration * 1000,
@@ -4477,10 +4488,12 @@ export default function Board2Page() {
         });
     if (DEBUG_STREAM && wallMs - streamLastDebugFrameAtRef.current > 2000) {
       streamLastDebugFrameAtRef.current = wallMs;
-      streamDebugLog("frame broadcast", {
-        channel: streamChannelName(STREAM_OWNER_USER_ID),
-        mode: playModeRef.current ? "play" : "live-control",
-        camera: cam,
+        streamDebugLog("frame broadcast", {
+          channel: streamChannelName(STREAM_OWNER_USER_ID),
+          mode: playModeRef.current ? "play" : "live-control",
+          renderer: RENDERER_VERSION,
+          guestSkin: streamGuestSkinRef.current,
+          camera: cam,
         characters: characters.filter((ch) => ch.enabled).map((ch) => ({ id: ch.id, x: Math.round(ch.x), y: Math.round(ch.y), actionType: ch.actionType })),
       });
     }
@@ -4493,6 +4506,7 @@ export default function Board2Page() {
         sessionId: streamSessionIdRef.current,
         sentAt,
         camera: cam,
+        guestSkin: streamGuestSkinRef.current,
         characters,
       },
     });
@@ -4625,6 +4639,7 @@ export default function Board2Page() {
   useEffect(() => { characterSkin2Ref.current = characterSkin2; }, [characterSkin2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
+  useEffect(() => { streamGuestSkinRef.current = streamGuestSkin; }, [streamGuestSkin]);
   useEffect(() => { spawnDoorRef.current = spawnDoor; }, [spawnDoor]);
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
@@ -4982,7 +4997,7 @@ export default function Board2Page() {
           streamDebugLog("subscribe status", status);
           setStreamPublishing(status === "SUBSCRIBED");
           if (status === "SUBSCRIBED") {
-            await channel.track({ role: "host", name: STREAM_OWNER_USER_ID, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+            await channel.track({ role: "host", name: STREAM_OWNER_USER_ID, guestSkin: streamGuestSkinRef.current, joinedAt: Date.now() } satisfies StreamParticipantPresence);
             void publishStreamSnapshot();
           }
         });
@@ -5002,6 +5017,12 @@ export default function Board2Page() {
     if (!(liveControlEnabled || playMode)) return;
     void publishStreamSnapshot();
   }, [liveControlEnabled, playMode, clips, annotations, characterFace, characterFace2, showCharacter, showCharacter2, spawnDoor, publishStreamSnapshot]);
+
+  useEffect(() => {
+    if (!(liveControlEnabled || playMode) || !streamChannelRef.current) return;
+    void streamChannelRef.current.track({ role: "host", name: STREAM_OWNER_USER_ID, guestSkin: streamGuestSkin, joinedAt: Date.now() } satisfies StreamParticipantPresence);
+    publishStreamFrame(performance.now());
+  }, [streamGuestSkin, liveControlEnabled, playMode, publishStreamFrame]);
 
   useEffect(() => {
     return () => {
@@ -5132,6 +5153,7 @@ export default function Board2Page() {
             },
           }
         : activeFrame;
+      smoothed.skin = streamGuestSkinRef.current;
       streamRenderedGuestFramesRef.current.set(frame.guestId, smoothed);
       drawSharedStreamCharacter(
         ctx,
@@ -9077,6 +9099,7 @@ export default function Board2Page() {
       const duration = isFlip ? 1.05 : 0.85;
       const progress = clamp(airborneAge / duration, 0, 0.98);
       const type: CharacterAction["type"] = isFlip ? "flip" : "jumpTo";
+      playFlipDebugRef.current = isFlip ? { facing: state.facing, rotationDirection: state.facing, travelDx: state.vx } : null;
       sampleTime = progress * duration;
       resolved = [{
         id: "play-physics-air",
@@ -9089,6 +9112,7 @@ export default function Board2Page() {
         targetY: state.y,
       }];
     } else if (moving) {
+      playFlipDebugRef.current = null;
       const duration = 1;
       sampleTime = (((state.stride / (Math.PI * 2)) % 1) + 1) % 1;
       resolved = [{
@@ -9101,6 +9125,8 @@ export default function Board2Page() {
         targetX: state.facing * 220,
         targetY: state.y,
       }];
+    } else {
+      playFlipDebugRef.current = null;
     }
 
     const pose = evalCharAtTime(sampleTime, resolved, 0, state.y, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
@@ -10360,6 +10386,11 @@ export default function Board2Page() {
         <div style={{ position: "fixed", top: 14, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
           {streamPublishing ? "LIVE" : "LOCAL"}
         </div>
+        {DEBUG_STREAM && (
+          <div style={{ position: "fixed", top: 48, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.9)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
+            renderer: {RENDERER_VERSION} · flip: {playFlipDebugRef.current ? `f ${playFlipDebugRef.current.facing} r ${playFlipDebugRef.current.rotationDirection} dx ${Math.round(playFlipDebugRef.current.travelDx)}` : "idle"}
+          </div>
+        )}
         {!playCleanUi && <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
           <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
           <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>
@@ -12773,6 +12804,13 @@ export default function Board2Page() {
                                 {streamPublishing ? "LIVE" : "LOCAL"}
                               </span>
                               </div>
+                              <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                                <span>Guest appearance</span>
+                                <select value={streamGuestSkin} onChange={(event) => setStreamGuestSkin(event.target.value === "styled" ? "styled" : "stick")} style={{ fontFamily: "monospace", fontSize: 10, border: "1px solid #2a2a2a", background: "#fffdf4" }}>
+                                  <option value="stick">stick</option>
+                                  <option value="styled">styled</option>
+                                </select>
+                              </label>
                               <strong>Participants ({streamGuests.length}/{MAX_GUESTS})</strong>
                               {/* refs are read only when the click handler runs */}
                               {/* eslint-disable-next-line react-hooks/refs */}

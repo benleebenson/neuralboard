@@ -3,7 +3,7 @@ export const STREAM_CHANNEL_PREFIX = "stream";
 export const MAX_GUESTS = 8;
 export const GUEST_NAME_MAX_LENGTH = 16;
 export const GUEST_EMOTES = ["🤔", "💡", "❗", "😂", "👋"] as const;
-export const GUEST_VERBS = ["move", "dance", "emote"] as const;
+export const GUEST_VERBS = ["move", "grapple", "skateTo", "wallClimb", "zipline", "dance", "pullUps", "mirrorCheck", "sitAndWatch", "emote", "sign"] as const;
 export const MAX_GUEST_SIGN_DATA_URL_BYTES = 150_000;
 
 export type StreamCamera = {
@@ -84,6 +84,7 @@ export type StreamParticipantPresence = {
   name?: string;
   faceDataUrl?: string;
   skin?: "stick" | "styled";
+  guestSkin?: "stick" | "styled";
   physique?: "slim" | "jacked";
   signDataUrl?: string;
   signActive?: boolean;
@@ -100,7 +101,7 @@ export type GuestCharacterFrame = {
   position: { x: number; y: number };
   velocity?: { x: number; y: number };
   facing: 1 | -1;
-  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "dance" | "emote" | "eliminated";
+  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "grapple" | "skateTo" | "wallClimb" | "zipline" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "eliminated";
   actionProgress: number;
   actionStartTime?: number;
   actionDuration?: number;
@@ -188,6 +189,7 @@ export type StreamFrameMessage = {
   sessionId: string;
   sentAt: number;
   camera: StreamCamera;
+  guestSkin?: "stick" | "styled";
   characters: StreamCharacterFrame[];
 };
 
