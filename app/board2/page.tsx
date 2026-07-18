@@ -10,6 +10,7 @@ import { getBrowserSupabase } from "@/lib/supabase-browser";
 import {
   STREAM_FPS,
   GuestCharacterFrame,
+  MAX_GUEST_SIGN_DATA_URL_BYTES,
   MAX_GUESTS,
   SpawnDoor,
   StreamParticipantPresence,
@@ -57,6 +58,10 @@ type CameraKeyframe = {
 
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:host]", ...args);
+}
+
+function validGuestSignDataUrl(value?: string): value is string {
+  return !!value && value.startsWith("data:image/") && value.length <= MAX_GUEST_SIGN_DATA_URL_BYTES;
 }
 
 type Clip = {
@@ -4027,7 +4032,9 @@ export default function Board2Page() {
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamGuestClockOffsetsRef = useRef<Map<string, number>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const streamGuestSignsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const streamEliminationsRef = useRef<Map<string, StreamEliminationMessage>>(new Map());
+  const streamGuestKickTombstonesRef = useRef<Map<string, number>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
   const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
@@ -4493,12 +4500,16 @@ export default function Board2Page() {
 
   const kickStreamGuest = useCallback((guestId?: string, options?: { reason?: "instant" | "elimination_tommygun"; hostName?: string }) => {
     if (!guestId) return;
-    streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt: Date.now(), reason: options?.reason ?? "instant", hostName: options?.hostName } });
+    const sentAt = Date.now();
+    streamGuestKickTombstonesRef.current.set(guestId, sentAt);
+    streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt, reason: options?.reason ?? "instant", hostName: options?.hostName } });
     streamGuestFramesRef.current.delete(guestId);
     streamRenderedGuestFramesRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
     streamEliminationsRef.current.delete(guestId);
+    streamGuestSignsRef.current.delete(guestId);
     playWeaponHitCountsRef.current.delete(guestId);
+    playEliminationKickSentRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
@@ -4867,7 +4878,9 @@ export default function Board2Page() {
       streamRenderedGuestFramesRef.current.clear();
       streamGuestClockOffsetsRef.current.clear();
       streamGuestFacesRef.current.clear();
+      streamGuestSignsRef.current.clear();
       streamEliminationsRef.current.clear();
+      streamGuestKickTombstonesRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
     }
@@ -4896,6 +4909,16 @@ export default function Board2Page() {
         .on("broadcast", { event: "guest-state" }, ({ payload }) => {
           const frame = payload as GuestCharacterFrame;
           if (frame.sessionId === streamSessionIdRef.current) {
+            const tombstoneAt = streamGuestKickTombstonesRef.current.get(frame.guestId);
+            if (tombstoneAt) {
+              streamDebugLog("ignore tombstoned guest-state", { guestId: frame.guestId, frameSentAt: frame.sentAt, tombstoneAt });
+              return;
+            }
+            if (validGuestSignDataUrl(frame.signDataUrl) && streamGuestSignsRef.current.get(frame.guestId)?.src !== frame.signDataUrl) {
+              const image = new Image();
+              image.src = frame.signDataUrl;
+              streamGuestSignsRef.current.set(frame.guestId, image);
+            }
             const measuredOffset = Date.now() - frame.sentAt;
             const prevOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? measuredOffset;
             streamGuestClockOffsetsRef.current.set(frame.guestId, prevOffset * 0.85 + measuredOffset * 0.15);
@@ -4922,12 +4945,37 @@ export default function Board2Page() {
               streamRenderedGuestFramesRef.current.delete(guestId);
               streamGuestClockOffsetsRef.current.delete(guestId);
               streamEliminationsRef.current.delete(guestId);
+              streamGuestSignsRef.current.delete(guestId);
+              playWeaponHitCountsRef.current.delete(guestId);
+              playEliminationKickSentRef.current.delete(guestId);
             }
           }
           for (const guest of guests) {
-            if (!guest.guestId || !guest.faceDataUrl || streamGuestFacesRef.current.has(guest.guestId)) continue;
-            const image = new Image(); image.src = guest.faceDataUrl;
-            streamGuestFacesRef.current.set(guest.guestId, image);
+            if (!guest.guestId) continue;
+            const staleElimination = streamEliminationsRef.current.get(guest.guestId);
+            if (staleElimination && guest.joinedAt > staleElimination.sentAt) {
+              streamDebugLog("clear stale elimination on rejoin", { guestId: guest.guestId, joinedAt: guest.joinedAt, eliminationSentAt: staleElimination.sentAt });
+              streamEliminationsRef.current.delete(guest.guestId);
+              streamGuestFramesRef.current.delete(guest.guestId);
+              streamRenderedGuestFramesRef.current.delete(guest.guestId);
+              playWeaponHitCountsRef.current.delete(guest.guestId);
+              playEliminationKickSentRef.current.delete(guest.guestId);
+            }
+            const kickedAt = streamGuestKickTombstonesRef.current.get(guest.guestId);
+            if (kickedAt && guest.joinedAt > kickedAt) {
+              streamDebugLog("clear kick tombstone on rejoin", { guestId: guest.guestId, joinedAt: guest.joinedAt, kickedAt });
+              streamGuestKickTombstonesRef.current.delete(guest.guestId);
+              playWeaponHitCountsRef.current.delete(guest.guestId);
+              playEliminationKickSentRef.current.delete(guest.guestId);
+            }
+            if (guest.faceDataUrl && !streamGuestFacesRef.current.has(guest.guestId)) {
+              const image = new Image(); image.src = guest.faceDataUrl;
+              streamGuestFacesRef.current.set(guest.guestId, image);
+            }
+            if (validGuestSignDataUrl(guest.signDataUrl) && streamGuestSignsRef.current.get(guest.guestId)?.src !== guest.signDataUrl) {
+              const sign = new Image(); sign.src = guest.signDataUrl;
+              streamGuestSignsRef.current.set(guest.guestId, sign);
+            }
           }
         })
         .subscribe(async (status) => {
@@ -5089,6 +5137,7 @@ export default function Board2Page() {
         ctx,
         guestCharacterForRender(smoothed, clockOffset),
         streamGuestFacesRef.current.get(frame.guestId) ?? null,
+        streamGuestSignsRef.current.get(frame.guestId) ?? null,
         cam,
         sf,
         W,
@@ -12727,7 +12776,7 @@ export default function Board2Page() {
                               <strong>Participants ({streamGuests.length}/{MAX_GUESTS})</strong>
                               {/* refs are read only when the click handler runs */}
                               {/* eslint-disable-next-line react-hooks/refs */}
-                              {streamGuests.map((guest) => <div key={guest.guestId} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><span>{guest.name}</span><button type="button" style={{ ...miniButton, color: "#cc2200", padding: "2px 5px" }} onClick={() => kickStreamGuest(guest.guestId)}>KICK</button></div>)}
+                              {streamGuests.map((guest) => <div key={guest.guestId} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}><span>{guest.name}</span>{validGuestSignDataUrl(guest.signDataUrl) && <img src={guest.signDataUrl} alt="" style={{ width: 34, height: 23, objectFit: "cover", border: "1px solid #2a2a2a", background: "#fffdf4" }} />}{validGuestSignDataUrl(guest.signDataUrl) && <button type="button" style={{ ...miniButton, padding: "2px 5px" }} onClick={() => { streamChannelRef.current?.send({ type: "broadcast", event: "remove-sign", payload: { guestId: guest.guestId, sentAt: Date.now() } }); if (guest.guestId) streamGuestSignsRef.current.delete(guest.guestId); }}>remove sign</button>}<button type="button" style={{ ...miniButton, color: "#cc2200", padding: "2px 5px" }} onClick={() => kickStreamGuest(guest.guestId)}>KICK</button></div>)}
                             </div>
                           )}
                         </div>

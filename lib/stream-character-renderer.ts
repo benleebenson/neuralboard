@@ -20,6 +20,8 @@ export type SharedCharacter = {
   clockOffsetMs?: number;
   emoji?: string;
   faceAspect?: number;
+  signActive?: boolean;
+  signDataUrl?: string;
 };
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
@@ -48,6 +50,7 @@ export function hostCharacterForRender(frame: StreamCharacterFrame, faceAspect =
     clockOffsetMs,
     emoji: frame.emoji,
     faceAspect,
+    signActive: false,
   };
 }
 
@@ -69,6 +72,8 @@ export function guestCharacterForRender(frame: GuestCharacterFrame, clockOffsetM
     actionDuration: frame.actionDuration,
     clockOffsetMs,
     emoji: frame.emote,
+    signActive: frame.signActive,
+    signDataUrl: frame.signDataUrl,
   };
 }
 
@@ -91,7 +96,7 @@ function sharedToPlayState(ch: SharedCharacter, renderTimeMs: number): PlayChara
     ch.actionType === "mirrorCheck" ? "mirror" :
     "none";
   const flipSpin = ch.actionType === "flip"
-    ? progress * Math.PI * 2
+    ? progress * Math.PI * 2 * ch.facing
     : ch.actionType === "eliminated"
       ? progress < ELIMINATION_LAUNCH_AT
         ? lerp(0, Math.PI / 2.6, clamp((progress - 0.35) / 0.18, 0, 1))
@@ -120,10 +125,120 @@ function sharedToPlayState(ch: SharedCharacter, renderTimeMs: number): PlayChara
   };
 }
 
+function drawStickStreamCharacter(
+  ctx: CanvasRenderingContext2D,
+  state: PlayCharacterState,
+  ch: SharedCharacter,
+  face: HTMLImageElement | null,
+  cam: StreamCamera,
+  sf: number,
+  W: number,
+  H: number,
+  renderTimeMs: number,
+) {
+  const sx = (state.x - cam.cameraX) * sf + W / 2;
+  const sy = (state.y - cam.cameraY) * sf + H / 2;
+  const speed01 = clamp(Math.abs(state.vx) / 760, 0, 1);
+  const moving = speed01 > 0.08 && state.grounded;
+  const phase = state.stride;
+  const bob = state.grounded ? (moving ? Math.abs(Math.sin(phase)) * -5 : Math.sin(renderTimeMs / 430) * 2.5) : 0;
+  const actionWave = state.action === "dance" ? Math.sin(renderTimeMs / 100) * 0.55 : 0;
+  const S = sf;
+  ctx.save();
+  ctx.translate(sx, sy + bob * S);
+  ctx.scale(state.facing, 1);
+  if (!state.grounded) {
+    ctx.translate(0, -92 * S);
+    ctx.rotate(state.spin);
+    ctx.translate(0, 92 * S);
+  }
+  ctx.strokeStyle = "#27221f";
+  ctx.fillStyle = "#fffdf4";
+  ctx.lineWidth = Math.max(1.5, 4 * S);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  const hipY = -58 * S;
+  const shoulderY = -118 * S;
+  const headY = -158 * S;
+  const stride = moving ? Math.sin(phase) * 44 * S : 0;
+  const signRaise = ch.signActive && ch.signDataUrl;
+  ctx.beginPath();
+  ctx.moveTo(0, hipY);
+  ctx.lineTo(0, shoulderY);
+  ctx.stroke();
+  const limb = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number) => {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.quadraticCurveTo(x2, y2, x3, y3);
+    ctx.stroke();
+  };
+  limb(-8 * S, hipY, (-20 * S) + stride * 0.25, -35 * S, (-24 * S) + stride, -2 * S);
+  limb(8 * S, hipY, (20 * S) - stride * 0.25, -35 * S, (24 * S) - stride, -2 * S);
+  const armSwing = moving ? -Math.sin(phase) * 28 * S : actionWave * 24 * S;
+  if (signRaise) {
+    limb(-2 * S, shoulderY, -36 * S, -162 * S, -62 * S, -205 * S);
+    limb(2 * S, shoulderY, 36 * S, -162 * S, 62 * S, -205 * S);
+  } else {
+    limb(-2 * S, shoulderY, -34 * S - armSwing * 0.2, -94 * S, -38 * S - armSwing, -57 * S);
+    limb(2 * S, shoulderY, 34 * S + armSwing * 0.2, -94 * S, 38 * S + armSwing, -57 * S);
+  }
+  ctx.beginPath();
+  ctx.ellipse(0, headY, 31 * S, 37 * S, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  if (face) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(0, headY, 29 * S, 35 * S, 0, 0, Math.PI * 2);
+    ctx.clip();
+    const fw = 62 * S;
+    const fh = fw / clamp(ch.faceAspect ?? 1, 0.75, 1.6);
+    ctx.drawImage(face, -fw / 2, headY - fh / 2, fw, fh);
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawHeldSign(
+  ctx: CanvasRenderingContext2D,
+  ch: SharedCharacter,
+  sign: HTMLImageElement | null,
+  cam: StreamCamera,
+  sf: number,
+  W: number,
+  H: number,
+  renderTimeMs: number,
+) {
+  if (!ch.signActive || !sign) return;
+  const sx = (ch.x - cam.cameraX) * sf + W / 2;
+  const sy = (ch.y - cam.cameraY) * sf + H / 2;
+  const sway = Math.sin(renderTimeMs / 420 + ch.id.length) * 4 * sf;
+  const w = 132 * sf;
+  const h = 88 * sf;
+  ctx.save();
+  ctx.translate(sx + sway, sy - 250 * sf);
+  ctx.rotate(Math.sin(renderTimeMs / 650) * 0.025);
+  ctx.fillStyle = "#fffdf4";
+  ctx.strokeStyle = "#27221f";
+  ctx.lineWidth = Math.max(1.5, 3 * sf);
+  ctx.beginPath();
+  ctx.roundRect(-w / 2, -h / 2, w, h, 6 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(-w / 2 + 6 * sf, -h / 2 + 6 * sf, w - 12 * sf, h - 12 * sf, 4 * sf);
+  ctx.clip();
+  ctx.drawImage(sign, -w / 2 + 6 * sf, -h / 2 + 6 * sf, w - 12 * sf, h - 12 * sf);
+  ctx.restore();
+  ctx.restore();
+}
+
 export function drawSharedStreamCharacter(
   ctx: CanvasRenderingContext2D,
   ch: SharedCharacter,
   face: HTMLImageElement | null,
+  sign: HTMLImageElement | null,
   cam: StreamCamera,
   sf: number,
   W: number,
@@ -136,9 +251,14 @@ export function drawSharedStreamCharacter(
   ctx.globalAlpha *= alpha;
   const state = sharedToPlayState(ch, renderTimeMs);
   const cursor = { x: ch.x + ch.facing * 120, y: ch.y - 145 };
-  const hair: PlayHairStyle = ch.skin === "stick" ? "crop" : "spikes";
-  const outfit: PlayOutfitStyle = ch.isHost ? "varsity" : "tee";
-  drawPoptropicaPlayCharacter(ctx, state, renderTimeMs / 1000, cam, sf, W, H, face ? { image: face, aspect: ch.faceAspect ?? 1 } : null, cursor, hair, outfit);
+  if (ch.skin === "stick") {
+    drawStickStreamCharacter(ctx, state, ch, face, cam, sf, W, H, renderTimeMs);
+  } else {
+    const hair: PlayHairStyle = "spikes";
+    const outfit: PlayOutfitStyle = ch.isHost ? "varsity" : "tee";
+    drawPoptropicaPlayCharacter(ctx, state, renderTimeMs / 1000, cam, sf, W, H, face ? { image: face, aspect: ch.faceAspect ?? 1 } : null, cursor, hair, outfit);
+  }
+  drawHeldSign(ctx, ch, sign, cam, sf, W, H, renderTimeMs);
   if (ch.name) {
     const sx = (ch.x - cam.cameraX) * sf + W / 2;
     const sy = (ch.y - cam.cameraY) * sf + H / 2;
