@@ -4,7 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { RENDERER_VERSION, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/play-character-renderer";
+import { RENDERER_VERSION, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
 import { CharacterEntity, type CharacterEntityIdentity, type CharacterWeaponState } from "@/lib/character/entity";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 

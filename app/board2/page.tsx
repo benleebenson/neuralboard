@@ -40,14 +40,14 @@ import {
   drawEliminationSequence,
   drawPlacedSpawnDoor,
   drawPlaySpawnDoor,
-  drawSharedStreamCharacter,
   drawTommyGunHeld,
   drawWeaponProjectile,
   eliminationFrameForGuest,
-  guestCharacterForRender,
   projectilePoint,
   streamCharacterConstructionParams,
-} from "@/lib/play-character-renderer";
+} from "@/lib/character/renderer";
+import { drawBoardCharacterToCanvas } from "@/lib/character/board-renderer";
+import { CharacterEntity } from "@/lib/character/entity";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -2868,824 +2868,6 @@ function evalLiveCharacterAtWallTime(
   return pose;
 }
 
-function drawCharacterToCanvas(
-  ctx: CanvasRenderingContext2D,
-  time: number,
-  resolved: ResolvedCharAction[],
-  showChar: boolean,
-  cam: { cameraX: number; cameraY: number; boardZoom: number },
-  sf: number,
-  W: number,
-  H: number,
-  initX: number,
-  initY: number,
-  clips: CharSurfaceClip[],
-  entranceTime: number,
-  authoredAnimations: Record<string, AuthoredAnimation> = {},
-  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
-  characterSkin: CharacterSkin = "stick",
-  poseOverride: CharPoseResult | null = null
-) {
-  if (!showChar || time < entranceTime) return;
-  const hasFace = !!characterFace?.image;
-  const faceAspect = clamp(characterFace?.aspect ?? 1, 0.75, 1.6);
-  const p = poseOverride ?? evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
-  const { facing } = p;
-  const physique = physiqueAt(time, resolved);
-  const isJacked = physique === "jacked";
-  const effectiveSkin: CharacterSkin = isJacked ? "stick" : characterSkin;
-
-  const sx = (p.boardX - cam.cameraX) * sf + W / 2;
-  const sy = (p.boardY - cam.cameraY) * sf + H / 2;
-  const S = sf;
-  const lw = Math.max(1, 3 * S);
-  const jackedPulse = isJacked ? 1 + (p.physiquePulse ?? 0) * 0.16 : 1;
-  const standingish = !p.skateboardVisible && !p.grappleRopeAlpha && !p.pullUpBarAlpha && !p.mirrorAlpha && !p.spinAngle;
-  const jackedRestPose = isJacked && standingish && Math.abs(p.airY) < 0.001;
-
-  // Raw (unscaled) body proportions — single source of truth reused below for both the S-scaled
-  // draw geometry and the raw board-space magic numbers (grapple hand height, pointAt shoulder
-  // height) that need to stay in sync with them.
-  const legLen = 38 * S;
-  const torsoLen = CHAR_TORSO_RAW * S;
-  const neckLen = CHAR_NECK_RAW * S * (isJacked ? 0.72 : 1);
-  const armLen = CHAR_ARM_RAW * S;
-  const headR = CHAR_HEAD_R_RAW * S * (hasFace ? 1.15 : 1);
-  const headRX = hasFace ? headR / Math.sqrt(faceAspect) : headR;
-  const headRY = hasFace ? headR * Math.sqrt(faceAspect) : headR;
-  const bobS = p.headBob * S;
-  const headTilt = p.headTilt ?? 0;
-  const hipY = (-CHAR_HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
-  const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number; w: number; h: number } => {
-    const shoulderY = -torsoLen * 0.85;
-    const useRight = preferFiring ? facing >= 0 : facing < 0;
-    const sOff = 0;
-    const armA = useRight ? p.rightArmA : p.leftArmA;
-    const foreA = useRight ? p.rightForeA : p.leftForeA;
-    const shoulderLocalX = sOff;
-    const shoulderLocalY = hipY + shoulderY;
-    const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
-    const elbowLocalY = shoulderLocalY + Math.cos(armA) * armLen;
-    const wristLocalX = elbowLocalX - Math.sin(foreA) * armLen;
-    const wristLocalY = elbowLocalY + Math.cos(foreA) * armLen;
-    const forearmX = wristLocalX - elbowLocalX;
-    const forearmY = wristLocalY - elbowLocalY;
-    const forearmLen = Math.max(0.001, Math.hypot(forearmX, forearmY));
-    const forearmUX = forearmX / forearmLen;
-    const forearmUY = forearmY / forearmLen;
-    const perpX = -forearmUY;
-    const perpY = forearmUX;
-    const surfaceSign = useRight ? 1 : -1;
-    const muscleL = Math.max(torsoLen, headR * 6) * jackedPulse;
-    const launcherW = (isJacked ? 20 : 14) * S;
-    const launcherH = (isJacked ? 11 : 8) * S;
-    const surfaceOffset = isJacked ? 0.05 * muscleL + 2 * S : 4 * S;
-    const mountLocalX = wristLocalX - forearmUX * 10 * S + perpX * surfaceSign * surfaceOffset;
-    const mountLocalY = wristLocalY - forearmUY * 10 * S + perpY * surfaceSign * surfaceOffset;
-    const tipLocalX = mountLocalX + forearmUX * (launcherW / 2);
-    const tipLocalY = mountLocalY + forearmUY * (launcherW / 2);
-    const relX = tipLocalX;
-    const relY = tipLocalY - hipY;
-    const leanCos = Math.cos(p.bodyLean);
-    const leanSin = Math.sin(p.bodyLean);
-    const leanedX = relX * leanCos - relY * leanSin;
-    const leanedY = relX * leanSin + relY * leanCos;
-    const angle = Math.atan2(forearmUY, forearmUX);
-    return {
-      x: sx + leanedX * facing,
-      y: sy + p.airY * S + hipY + leanedY,
-      angle,
-      localX: mountLocalX,
-      localY: mountLocalY,
-      w: launcherW,
-      h: launcherH,
-    };
-  };
-  const launcherMount = getForearmMount(true);
-
-  // ── Grapple / zipline rope (drawn before character transform so coords are screen-space) ──
-  if (p.grappleAnchorBX !== undefined && p.grappleRopeAlpha && p.grappleRopeAlpha > 0) {
-    const anchorSX = (p.grappleAnchorBX - cam.cameraX) * sf + W / 2;
-    const anchorSY = (p.grappleAnchorBY! - cam.cameraY) * sf + H / 2;
-    const endT = p.grappleHookT === undefined || p.grappleTaut ? 1 : clamp(p.grappleHookT, 0, 1);
-    const endSX = lerp(launcherMount.x, anchorSX, endT);
-    const endSY = lerp(launcherMount.y, anchorSY, endT);
-    const sag = p.grappleTaut ? 0 : Math.sin(Math.PI * endT) * 12 * S;
-    const ctrlSX = (launcherMount.x + endSX) / 2;
-    const ctrlSY = (launcherMount.y + endSY) / 2 + sag;
-    ctx.save();
-    ctx.globalAlpha = p.grappleRopeAlpha;
-    ctx.strokeStyle = "#5a3a1a";
-    ctx.lineWidth = Math.max(1, 1.8 * S);
-    ctx.lineCap = "round";
-    ctx.beginPath();
-    ctx.moveTo(launcherMount.x, launcherMount.y);
-    ctx.quadraticCurveTo(ctrlSX, ctrlSY, endSX, endSY);
-    ctx.stroke();
-    // Hook / anchor claw
-    ctx.fillStyle = "#5a3a1a";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 1.3 * S);
-    ctx.beginPath();
-    ctx.moveTo(endSX, endSY);
-    ctx.lineTo(endSX - 7 * S, endSY + 5 * S);
-    ctx.moveTo(endSX, endSY);
-    ctx.lineTo(endSX + 7 * S, endSY + 5 * S);
-    ctx.moveTo(endSX, endSY);
-    ctx.lineTo(endSX, endSY - 8 * S);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(anchorSX, anchorSY, 3 * S, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  if (p.pullUpBarAlpha && p.pullUpBarAlpha > 0) {
-    const baseX = (((p.pullUpBarBX ?? p.boardX) - cam.cameraX) * sf + W / 2);
-    const baseY = (((p.pullUpBarBY ?? p.boardY) - cam.cameraY) * sf + H / 2);
-    const postHalf = (PULLUP_BAR_WIDTH / 2) * S;
-    const topY = baseY - PULLUP_BAR_HEIGHT * S;
-    ctx.save();
-    ctx.globalAlpha = p.pullUpBarAlpha;
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = "#f5ecd8";
-    ctx.lineWidth = Math.max(1, 2.2 * S);
-    ctx.lineCap = "round";
-    for (const x of [baseX - postHalf, baseX + postHalf]) {
-      ctx.beginPath();
-      ctx.moveTo(x, baseY);
-      ctx.lineTo(x, topY);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(x - 22 * S, baseY);
-      ctx.lineTo(x + 22 * S, baseY);
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.moveTo(baseX - postHalf, topY);
-    ctx.lineTo(baseX + postHalf, topY);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  if (p.mirrorAlpha && p.mirrorAlpha > 0) {
-    const mirrorFacing = p.mirrorFacing ?? facing;
-    const mirrorBaseBX = p.mirrorBX ?? (p.boardX + mirrorFacing * MIRROR_OFFSET);
-    const mirrorBaseSX = (mirrorBaseBX - cam.cameraX) * sf + W / 2;
-    const mirrorBaseSY = ((p.mirrorBY ?? p.boardY) - cam.cameraY) * sf + H / 2;
-    const mw = MIRROR_W * S;
-    const mh = MIRROR_H * S;
-    const mx = mirrorBaseSX - mw / 2;
-    const my = mirrorBaseSY - mh;
-    ctx.save();
-    ctx.globalAlpha = p.mirrorAlpha;
-    ctx.translate(mirrorBaseSX, mirrorBaseSY);
-    ctx.rotate(-0.08 * mirrorFacing);
-    ctx.translate(-mirrorBaseSX, -mirrorBaseSY);
-    ctx.fillStyle = "#eaf2f4";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 2 * S);
-    ctx.beginPath();
-    ctx.roundRect(mx, my, mw, mh, 12 * S);
-    ctx.fill();
-    ctx.stroke();
-    ctx.save();
-    ctx.beginPath();
-    ctx.roundRect(mx + 6 * S, my + 8 * S, mw - 12 * S, mh - 18 * S, 8 * S);
-    ctx.clip();
-    ctx.globalAlpha *= 0.42;
-    const rx = mirrorBaseSX;
-    const ry = mirrorBaseSY - 54 * S;
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = isJacked ? "#e6ddcf" : "transparent";
-    ctx.lineWidth = Math.max(1, 1.5 * S);
-    ctx.save();
-    ctx.translate(rx, ry);
-    ctx.scale(-0.85 * mirrorFacing, 0.85);
-    ctx.beginPath();
-    ctx.arc(0, -118 * S, 15 * S, 0, Math.PI * 2);
-    ctx.stroke();
-    if (isJacked) {
-      ctx.beginPath();
-      ctx.moveTo(-24 * S, -95 * S);
-      ctx.quadraticCurveTo(-19 * S, -62 * S, -10 * S, -35 * S);
-      ctx.lineTo(10 * S, -35 * S);
-      ctx.quadraticCurveTo(19 * S, -62 * S, 24 * S, -95 * S);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-    } else {
-      ctx.beginPath();
-      ctx.moveTo(0, -100 * S);
-      ctx.lineTo(0, -35 * S);
-      ctx.stroke();
-    }
-    ctx.restore();
-    ctx.restore();
-    ctx.strokeStyle = "rgba(255,255,255,0.7)";
-    ctx.lineWidth = Math.max(1, 1.2 * S);
-    for (const off of [-12, 10, 29]) {
-      ctx.beginPath();
-      ctx.moveTo(mx + 22 * S, my + (45 + off) * S);
-      ctx.lineTo(mx + 58 * S, my + (20 + off) * S);
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.moveTo(mirrorBaseSX, mirrorBaseSY);
-    ctx.lineTo(mirrorBaseSX - mirrorFacing * 34 * S, mirrorBaseSY + 36 * S);
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  ctx.save();
-  ctx.translate(sx, sy + p.airY * S);
-  ctx.scale(facing * (p.momentumScaleX ?? 1), p.momentumScaleY ?? 1);
-  ctx.strokeStyle = "#2a2a2a";
-  ctx.lineWidth = lw;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-
-  // Whole-body spin (flip only): rotates legs + torso group together around the torso midpoint,
-  // so a flip reads as the whole character turning over rather than the cartwheel-smear you get
-  // rotating just the upper body around the hip. No-op for every other pose (spinAngle undefined).
-  if (p.spinAngle) {
-    const spinCenterY = hipY - torsoLen / 2;
-    ctx.translate(0, spinCenterY);
-    ctx.rotate(p.spinAngle);
-    ctx.translate(0, -spinCenterY);
-  }
-
-  // Legs (two-segment: thigh + shin with independent shin angle). Local-x sign is negated so that
-  // a POSITIVE angle always means "outward from body midline" for both legs — the un-negated form
-  // (x = +sin(angle)) makes positive-left/negative-right cross at the ankles instead of spreading.
-  type LocalPoint = { x: number; y: number };
-  const angledLeg = (thighA: number, shinA: number): { knee: LocalPoint; foot: LocalPoint } => {
-    const kx = -Math.sin(thighA) * legLen;
-    const ky = hipY + Math.cos(thighA) * legLen;
-    return {
-      knee: { x: kx, y: ky },
-      foot: { x: kx - Math.sin(shinA) * legLen, y: ky + Math.cos(shinA) * legLen },
-    };
-  };
-  const plantedLeg = (side: -1 | 1, footX: number, footY: number): { knee: LocalPoint; foot: LocalPoint } => {
-    const hip: LocalPoint = { x: 0, y: hipY };
-    const dx = footX - hip.x;
-    const dy = footY - hip.y;
-    const maxReach = legLen * 2 - 0.001;
-    const d = clamp(Math.hypot(dx, dy), 0.001, maxReach);
-    const ux = dx / Math.max(0.001, Math.hypot(dx, dy));
-    const uy = dy / Math.max(0.001, Math.hypot(dx, dy));
-    const reachableFoot = {
-      x: hip.x + ux * d,
-      y: hip.y + uy * d,
-    };
-    const mid = { x: (hip.x + reachableFoot.x) / 2, y: (hip.y + reachableFoot.y) / 2 };
-    const h = Math.sqrt(Math.max(0, legLen * legLen - (d / 2) * (d / 2)));
-    const px = -uy;
-    const py = ux;
-    const bendSign = side === -1 ? 1 : -1;
-    return {
-      knee: { x: mid.x + px * h * bendSign, y: mid.y + py * h * bendSign },
-      foot: { x: footX, y: footY },
-    };
-  };
-  const drawLegChain = (leg: { knee: LocalPoint; foot: LocalPoint }) => {
-    ctx.beginPath();
-    ctx.moveTo(0, hipY);
-    ctx.lineTo(leg.knee.x, leg.knee.y);
-    ctx.lineTo(leg.foot.x, leg.foot.y);
-    ctx.stroke();
-  };
-  const deckTopY = 0;
-  const leftDeckFootX = -18 * S;
-  const rightDeckFootX = 18 * S;
-  const effectiveLeftLegA = jackedRestPose ? Math.max(p.leftLegA, 0.18) : p.leftLegA;
-  const effectiveRightLegA = jackedRestPose ? Math.min(p.rightLegA, -0.18) : p.rightLegA;
-  let leftLeg = angledLeg(effectiveLeftLegA, p.leftShinA ?? (effectiveLeftLegA + p.leftForeA * 0.5));
-  let rightLeg = angledLeg(effectiveRightLegA, p.rightShinA ?? (effectiveRightLegA + p.rightForeA * 0.5));
-  if (p.skateboardVisible) {
-    if (p.skateFootMode === "left-push") {
-      rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
-    } else {
-      leftLeg = plantedLeg(-1, leftDeckFootX, deckTopY);
-      rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
-    }
-  }
-  if (p.danceFootPlant) {
-    const hipOffset = p.danceHipOffset ?? 0;
-    leftLeg = plantedLeg(-1, (-28 - hipOffset) * S, 0);
-    rightLeg = plantedLeg(1, (28 - hipOffset) * S, 0);
-  }
-  if (p.sitSeated) {
-    const foldY = hipY + 12 * S;
-    leftLeg = {
-      knee: { x: 18 * S, y: hipY + 7 * S },
-      foot: { x: 44 * S, y: foldY },
-    };
-    rightLeg = {
-      knee: { x: 42 * S, y: hipY + 9 * S },
-      foot: { x: 10 * S, y: foldY + 2 * S },
-    };
-  }
-  drawLegChain(leftLeg);
-  drawLegChain(rightLeg);
-  if (p.danceMotionAlpha && p.danceMotionAlpha > 0) {
-    const side = (p.danceHipOffset ?? 0) >= 0 ? -1 : 1;
-    ctx.save();
-    ctx.globalAlpha = p.danceMotionAlpha;
-    ctx.strokeStyle = "rgba(42,42,42,0.55)";
-    ctx.lineWidth = Math.max(1, 1.2 * S);
-    for (const [dx, dy, len] of [[18, -2, 13], [24, 8, 16], [16, 18, 11]] as const) {
-      ctx.beginPath();
-      ctx.moveTo(side * dx * S, hipY + dy * S);
-      ctx.quadraticCurveTo(side * (dx + 8) * S, hipY + (dy - 4) * S, side * (dx + len) * S, hipY + (dy + 2) * S);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-  if (p.sitSeated) {
-    const footStroke = 11 * S;
-    for (const foot of [leftLeg.foot, rightLeg.foot]) {
-      ctx.beginPath();
-      ctx.moveTo(foot.x - 2 * S, foot.y);
-      ctx.lineTo(foot.x + footStroke, foot.y);
-      ctx.stroke();
-    }
-  }
-
-  if (p.skateboardVisible) {
-    const deckCX = 0;
-    const deckCY = deckTopY;
-    const deckW = 70 * S;
-    const deckH = 8 * S;
-    const upturn = 5 * S;
-    ctx.save();
-    ctx.translate(deckCX, deckCY);
-    ctx.rotate(p.skateboardTilt ?? 0);
-    ctx.fillStyle = "#f5ecd8";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 2 * S);
-    ctx.beginPath();
-    ctx.moveTo(-deckW / 2, 0);
-    ctx.quadraticCurveTo(-deckW / 2 + 8 * S, -upturn, -deckW / 2 + 16 * S, 0);
-    ctx.lineTo(deckW / 2 - 16 * S, 0);
-    ctx.quadraticCurveTo(deckW / 2 - 8 * S, -upturn, deckW / 2, 0);
-    ctx.lineTo(deckW / 2 - 5 * S, deckH);
-    ctx.lineTo(-deckW / 2 + 5 * S, deckH);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = "#2a2a2a";
-    [-22 * S, 22 * S].forEach((wx) => {
-      ctx.beginPath();
-      ctx.arc(wx, deckH + 5 * S, 4 * S, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    if (p.skateSparkAlpha && p.skateSparkAlpha > 0) {
-      ctx.save();
-      ctx.globalAlpha = p.skateSparkAlpha;
-      ctx.strokeStyle = "#ffbf2f";
-      ctx.lineWidth = Math.max(1, 1.6 * S);
-      for (const [dx, dy] of [[-42, 8], [-48, 1], [-38, 16]] as const) {
-        ctx.beginPath();
-        ctx.moveTo(-deckW / 2 - 2 * S, deckH + 4 * S);
-        ctx.lineTo(-deckW / 2 + dx * S * 0.32, deckH + dy * S * 0.65);
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-    if (p.skateMotionAlpha && p.skateMotionAlpha > 0) {
-      ctx.save();
-      ctx.globalAlpha = p.skateMotionAlpha;
-      ctx.strokeStyle = "rgba(42,42,42,0.45)";
-      ctx.lineWidth = Math.max(1, 1.2 * S);
-      for (const y of [-14, 16]) {
-        ctx.beginPath();
-        ctx.moveTo(-28 * S, y * S);
-        ctx.lineTo(-48 * S, (y + 4) * S);
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-    ctx.restore();
-  }
-
-  // Torso + neck + head all rotate together with bodyLean (e.g. the flip's full-rotation spin)
-  ctx.save();
-  ctx.translate(0, hipY);
-  ctx.rotate(p.bodyLean);
-
-  const torsoTopY = -torsoLen;
-  const shoulderY = -torsoLen * 0.85;
-  let lArmA = p.leftArmA, rArmA = p.rightArmA;
-  let lForeA = p.leftForeA, rForeA = p.rightForeA;
-
-  // Override pointing arm; other arm hangs relaxed (not tucked inward)
-  if (p.pointTargetBX !== undefined && p.pointTargetBY !== undefined) {
-    const shoulderBY = p.boardY - (CHAR_HIP_RAW - (p.skateCrouch ?? 0) + CHAR_TORSO_RAW * 0.85);
-    const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
-    const tdyCanvas = p.pointTargetBY - shoulderBY;
-    const mag = Math.hypot(tdxLocal, tdyCanvas);
-    if (mag > 0) {
-      // Negated to match drawArm's negated sin() below (same outward-positive convention as legs)
-      const pointAngle = -Math.atan2(tdxLocal, tdyCanvas);
-      if (tdxLocal >= 0) {
-        rArmA = pointAngle; rForeA = pointAngle;
-        lArmA = CHAR_RELAX_ARM_A;  lForeA = CHAR_RELAX_FORE_A;
-      } else {
-        lArmA = pointAngle; lForeA = pointAngle;
-        rArmA = -CHAR_RELAX_ARM_A;  rForeA = -CHAR_RELAX_FORE_A;
-      }
-    }
-  }
-  if (jackedRestPose && p.pointTargetBX === undefined) {
-    lArmA = Math.max(lArmA, 0.35);
-    rArmA = Math.min(rArmA, -0.35);
-  }
-  const jackedTorsoClearance = 0.28;
-  if (isJacked) {
-    if (lArmA > 0 && lArmA < jackedTorsoClearance) lArmA = jackedTorsoClearance;
-    if (rArmA < 0 && rArmA > -jackedTorsoClearance) rArmA = -jackedTorsoClearance;
-  }
-
-  const drawArm = (armA: number, foreA: number) => {
-    const sOff = 0;
-    const ex = sOff - Math.sin(armA) * armLen;
-    const ey = shoulderY + Math.cos(armA) * armLen;
-    const hx = ex - Math.sin(foreA) * armLen;
-    const hy = ey + Math.cos(foreA) * armLen;
-    ctx.beginPath();
-    ctx.moveTo(sOff, shoulderY);
-    ctx.lineTo(ex, ey);
-    ctx.lineTo(hx, hy);
-    ctx.stroke();
-  };
-
-  const addP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x + b.x, y: a.y + b.y });
-  const subP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x - b.x, y: a.y - b.y });
-  const mulP = (a: LocalPoint, n: number): LocalPoint => ({ x: a.x * n, y: a.y * n });
-  const armVector = (angle: number, len: number): LocalPoint => ({ x: -Math.sin(angle) * len, y: Math.cos(angle) * len });
-  const normalOf = (start: LocalPoint, end: LocalPoint): LocalPoint => {
-    const dx = end.x - start.x;
-    const dy = end.y - start.y;
-    const len = Math.max(0.001, Math.hypot(dx, dy));
-    return { x: -dy / len, y: dx / len };
-  };
-  const unitP = (pnt: LocalPoint): LocalPoint => {
-    const len = Math.max(0.001, Math.hypot(pnt.x, pnt.y));
-    return { x: pnt.x / len, y: pnt.y / len };
-  };
-  const dotP = (a: LocalPoint, b: LocalPoint) => a.x * b.x + a.y * b.y;
-  const buildJackedJoints = () => {
-    const hipP: LocalPoint = { x: 0, y: 0 };
-    const neckP: LocalPoint = { x: 0, y: torsoTopY };
-    const axis = subP(neckP, hipP);
-    const axisLen = Math.max(0.001, Math.hypot(axis.x, axis.y));
-    const axisUnit = { x: axis.x / axisLen, y: axis.y / axisLen };
-    const U = { x: -axisUnit.y, y: axisUnit.x };
-    const L = Math.max(axisLen, headR * 6) * jackedPulse;
-    const at = (t: number) => addP(hipP, mulP(axis, t));
-    const shoulderCenter = at(0.88);
-    const shoulderL = addP(shoulderCenter, mulP(U, -0.28 * L));
-    const shoulderR = addP(shoulderCenter, mulP(U, 0.28 * L));
-    const elbowL = addP(shoulderL, armVector(lArmA, armLen));
-    const handL = addP(elbowL, armVector(lForeA, armLen));
-    const elbowR = addP(shoulderR, armVector(rArmA, armLen));
-    const handR = addP(elbowR, armVector(rForeA, armLen));
-    return { hipP, neckP, axis, axisUnit, U, L, at, shoulderL, shoulderR, elbowL, elbowR, handL, handR };
-  };
-  const drawJackedArmWorld = (side: "left" | "right", joints: ReturnType<typeof buildJackedJoints>) => {
-    const shoulder = side === "left" ? joints.shoulderL : joints.shoulderR;
-    const elbow = side === "left" ? joints.elbowL : joints.elbowR;
-    const hand = side === "left" ? joints.handL : joints.handR;
-    const armA = side === "left" ? lArmA : rArmA;
-    const foreA = side === "left" ? lForeA : rForeA;
-    const away = unitP(subP(shoulder, joints.at(0.82)));
-    const upperN0 = normalOf(shoulder, elbow);
-    const foreN0 = normalOf(elbow, hand);
-    const upperN = dotP(upperN0, away) >= 0 ? upperN0 : mulP(upperN0, -1);
-    const foreN = dotP(foreN0, away) >= 0 ? foreN0 : mulP(foreN0, -1);
-    const shoulderW = 0.2 * joints.L;
-    const elbowW = 0.13 * joints.L;
-    const wristW = 0.05 * joints.L;
-    const bend = Math.abs(foreA - armA);
-    const peak = bend > 0.7 ? clamp((bend - 0.7) / 1.0, 0, 1) * 0.04 * joints.L : 0;
-    const elbowNotch = 0.025 * joints.L;
-    const shoulderOuter = addP(shoulder, mulP(upperN, shoulderW / 2));
-    const elbowOuter = addP(elbow, mulP(upperN, elbowW / 2 - elbowNotch));
-    const wristOuter = addP(hand, mulP(foreN, wristW / 2));
-    const wristInner = addP(hand, mulP(foreN, -wristW / 2));
-    const elbowInner = addP(elbow, mulP(upperN, -elbowW * 0.43 - elbowNotch));
-    const shoulderInner = addP(shoulder, mulP(upperN, -shoulderW / 2));
-    const upperMid = addP(mulP(shoulderOuter, 0.5), mulP(elbowOuter, 0.5));
-    const bicepPeak = addP(upperMid, mulP(upperN, peak));
-    const foreOuterCtrl = addP(mulP(elbowOuter, 0.52), mulP(wristOuter, 0.48));
-    const foreInnerCtrl = addP(mulP(elbowInner, 0.52), mulP(wristInner, 0.48));
-    const upperInnerCtrl = addP(mulP(shoulderInner, 0.5), mulP(elbowInner, 0.5));
-    ctx.beginPath();
-    ctx.moveTo(shoulderOuter.x, shoulderOuter.y);
-    ctx.quadraticCurveTo(bicepPeak.x, bicepPeak.y, elbowOuter.x, elbowOuter.y);
-    ctx.quadraticCurveTo(foreOuterCtrl.x, foreOuterCtrl.y, wristOuter.x, wristOuter.y);
-    ctx.quadraticCurveTo(hand.x, hand.y, wristInner.x, wristInner.y);
-    ctx.quadraticCurveTo(foreInnerCtrl.x, foreInnerCtrl.y, elbowInner.x, elbowInner.y);
-    ctx.quadraticCurveTo(upperInnerCtrl.x, upperInnerCtrl.y, shoulderInner.x, shoulderInner.y);
-    ctx.quadraticCurveTo(shoulder.x, shoulder.y, shoulderOuter.x, shoulderOuter.y);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.save();
-    ctx.strokeStyle = "rgba(42,42,42,0.72)";
-    ctx.lineWidth = Math.max(1, 1.15 * S);
-    const notchStart = addP(addP(shoulder, mulP(upperN, shoulderW * 0.34)), mulP(unitP(subP(elbow, shoulder)), 0.03 * joints.L));
-    const notchMid = addP(addP(shoulder, mulP(upperN, shoulderW * 0.22)), mulP(unitP(subP(elbow, shoulder)), 0.095 * joints.L));
-    const notchEnd = addP(addP(shoulder, mulP(upperN, shoulderW * 0.37)), mulP(unitP(subP(elbow, shoulder)), 0.16 * joints.L));
-    ctx.beginPath();
-    ctx.moveTo(notchStart.x, notchStart.y);
-    ctx.quadraticCurveTo(notchMid.x, notchMid.y, notchEnd.x, notchEnd.y);
-    ctx.stroke();
-    ctx.restore();
-  };
-  const drawJackedTorsoWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
-    const { hipP, neckP, axis, axisUnit, U, L, at } = joints;
-    const waistL = addP(hipP, mulP(U, 0.13 * L));
-    const waistR = addP(hipP, mulP(U, -0.13 * L));
-    const cutL = addP(at(0.35), mulP(U, 0.19 * L));
-    const cutR = addP(at(0.35), mulP(U, -0.19 * L));
-    const latL = addP(at(0.72), mulP(U, 0.36 * L));
-    const latR = addP(at(0.72), mulP(U, -0.36 * L));
-    const trapDrop = mulP(axisUnit, -0.04 * L);
-    const trapL = addP(addP(neckP, mulP(U, 0.18 * L)), trapDrop);
-    const trapR = addP(addP(neckP, mulP(U, -0.18 * L)), trapDrop);
-    const top = addP(neckP, trapDrop);
-    const trapPeakL = addP(addP(neckP, mulP(U, 0.08 * L)), mulP(axisUnit, 0.02 * L));
-    const trapPeakR = addP(addP(neckP, mulP(U, -0.08 * L)), mulP(axisUnit, 0.02 * L));
-    const lBow1 = addP(at(0.2), mulP(U, 0.18 * L));
-    const lBow2 = addP(at(0.55), mulP(U, 0.34 * L));
-    const lTrap1 = addP(at(0.9), mulP(U, 0.3 * L));
-    const lTrap2 = addP(neckP, mulP(U, 0.24 * L));
-    const rTrap2 = addP(neckP, mulP(U, -0.24 * L));
-    const rTrap1 = addP(at(0.9), mulP(U, -0.3 * L));
-    const rBow2 = addP(at(0.55), mulP(U, -0.34 * L));
-    const rBow1 = addP(at(0.2), mulP(U, -0.18 * L));
-    const waistCtrl = addP(hipP, mulP(axis, -0.03));
-    ctx.fillStyle = "#e4d6c4";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = lw;
-    ctx.beginPath();
-    ctx.moveTo(waistL.x, waistL.y);
-    ctx.quadraticCurveTo(lBow1.x, lBow1.y, cutL.x, cutL.y);
-    ctx.bezierCurveTo(lBow2.x, lBow2.y, addP(at(0.66), mulP(U, 0.38 * L)).x, addP(at(0.66), mulP(U, 0.38 * L)).y, latL.x, latL.y);
-    ctx.bezierCurveTo(lTrap1.x, lTrap1.y, lTrap2.x, lTrap2.y, trapL.x, trapL.y);
-    ctx.lineTo(trapPeakL.x, trapPeakL.y);
-    ctx.quadraticCurveTo(top.x, top.y, trapPeakR.x, trapPeakR.y);
-    ctx.lineTo(trapR.x, trapR.y);
-    ctx.bezierCurveTo(rTrap2.x, rTrap2.y, rTrap1.x, rTrap1.y, latR.x, latR.y);
-    ctx.bezierCurveTo(addP(at(0.66), mulP(U, -0.38 * L)).x, addP(at(0.66), mulP(U, -0.38 * L)).y, rBow2.x, rBow2.y, cutR.x, cutR.y);
-    ctx.quadraticCurveTo(rBow1.x, rBow1.y, waistR.x, waistR.y);
-    ctx.quadraticCurveTo(waistCtrl.x, waistCtrl.y, waistL.x, waistL.y);
-    ctx.closePath();
-    ctx.stroke();
-    ctx.save();
-    ctx.strokeStyle = "rgba(42,42,42,0.58)";
-    ctx.lineWidth = Math.max(1, 1.45 * S);
-    const pecGapTop = at(0.88);
-    const pecGapBottom = at(0.72);
-    ctx.beginPath();
-    ctx.moveTo(pecGapTop.x, pecGapTop.y);
-    ctx.lineTo(pecGapBottom.x, pecGapBottom.y);
-    ctx.stroke();
-    for (const side of [1, -1] as const) {
-      const topInner = addP(at(0.9), mulP(U, side * 0.08 * L));
-      const topOuter = addP(at(0.86), mulP(U, side * 0.3 * L));
-      const bottomOuter = addP(at(0.7), mulP(U, side * 0.3 * L));
-      const bottomInner = addP(at(0.7), mulP(U, side * 0.07 * L));
-      const outerBow = addP(at(0.78), mulP(U, side * 0.34 * L));
-      const bottomCtrl = addP(at(0.69), mulP(U, side * 0.18 * L));
-      ctx.beginPath();
-      ctx.moveTo(topInner.x, topInner.y);
-      ctx.quadraticCurveTo(topOuter.x, topOuter.y, outerBow.x, outerBow.y);
-      ctx.quadraticCurveTo(bottomOuter.x, bottomOuter.y, bottomOuter.x, bottomOuter.y);
-      ctx.quadraticCurveTo(bottomCtrl.x, bottomCtrl.y, bottomInner.x, bottomInner.y);
-      ctx.stroke();
-    }
-    ctx.strokeStyle = "rgba(42,42,42,0.42)";
-    ctx.lineWidth = Math.max(1, 1.05 * S);
-    const sternumTop = pecGapBottom;
-    const sternumBottom = at(0.58);
-    ctx.beginPath();
-    ctx.moveTo(sternumTop.x, sternumTop.y);
-    ctx.lineTo(sternumBottom.x, sternumBottom.y);
-    ctx.stroke();
-    const absYs = [0.52, 0.42, 0.32];
-    for (const t of absYs) {
-      const center = at(t);
-      const left = addP(center, mulP(U, -0.08 * L));
-      const right = addP(center, mulP(U, 0.08 * L));
-      const sag = addP(center, mulP(axisUnit, -0.018 * L));
-      ctx.beginPath();
-      ctx.moveTo(left.x, left.y);
-      ctx.quadraticCurveTo(sag.x, sag.y, right.x, right.y);
-      ctx.stroke();
-    }
-    const midlineTop = at(0.6);
-    const midlineBottom = at(0.24);
-    ctx.beginPath();
-    ctx.moveTo(midlineTop.x, midlineTop.y);
-    ctx.lineTo(midlineBottom.x, midlineBottom.y);
-    ctx.stroke();
-    ctx.restore();
-  };
-  const drawJackedShoulderCapsWorld = (joints: ReturnType<typeof buildJackedJoints>) => {
-    ctx.fillStyle = "#e4d6c4";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = lw;
-    for (const shoulder of [joints.shoulderL, joints.shoulderR]) {
-      ctx.beginPath();
-      ctx.arc(shoulder.x, shoulder.y, 0.1 * joints.L, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    }
-  };
-
-  if (isJacked) {
-    ctx.fillStyle = "#e4d6c4";
-    ctx.strokeStyle = "#2a2a2a";
-    const frontIsRight = facing >= 0;
-    const joints = buildJackedJoints();
-    if (frontIsRight) drawJackedArmWorld("left", joints);
-    else drawJackedArmWorld("right", joints);
-    drawJackedTorsoWorld(joints);
-    drawJackedShoulderCapsWorld(joints);
-    if (frontIsRight) drawJackedArmWorld("right", joints);
-    else drawJackedArmWorld("left", joints);
-  } else if (effectiveSkin === "styled") {
-    const shoulderHalf = 19 * S;
-    const waistHalf = 9 * S;
-    ctx.save();
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = "#fff3dc";
-    ctx.lineWidth = Math.max(1.5, 2.4 * S);
-    ctx.beginPath();
-    ctx.moveTo(-shoulderHalf, shoulderY);
-    ctx.quadraticCurveTo(-16 * S, -torsoLen * 0.48, -waistHalf, 0);
-    ctx.lineTo(waistHalf, 0);
-    ctx.quadraticCurveTo(16 * S, -torsoLen * 0.48, shoulderHalf, shoulderY);
-    ctx.quadraticCurveTo(0, -torsoLen * 1.08, -shoulderHalf, shoulderY);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-    ctx.save();
-    ctx.lineWidth = Math.max(lw * 1.28, 4 * S);
-    drawArm(lArmA, lForeA);
-    drawArm(rArmA, rForeA);
-    ctx.restore();
-  } else {
-    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
-    drawArm(lArmA, lForeA);
-    drawArm(rArmA, rForeA);
-  }
-
-  if (p.popcornAlpha && p.popcornAlpha > 0) {
-    const bucketX = (p.popcornX ?? 18) * S;
-    const bucketY = (p.popcornY ?? -18) * S;
-    ctx.save();
-    ctx.globalAlpha = p.popcornAlpha;
-    ctx.translate(bucketX, bucketY);
-    ctx.fillStyle = "#fff4c2";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 1.6 * S);
-    ctx.beginPath();
-    ctx.moveTo(-12 * S, -10 * S);
-    ctx.lineTo(12 * S, -10 * S);
-    ctx.lineTo(8 * S, 15 * S);
-    ctx.lineTo(-8 * S, 15 * S);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = "#ff5e3a";
-    for (const x of [-5, 5]) {
-      ctx.beginPath();
-      ctx.rect(x * S - 2 * S, -8 * S, 4 * S, 20 * S);
-      ctx.fill();
-    }
-    ctx.fillStyle = "#fffdf5";
-    for (const [x, y, r] of [[-9, -14, 4], [-2, -16, 5], [5, -15, 4], [11, -13, 3]] as const) {
-      ctx.beginPath();
-      ctx.arc(x * S, y * S, r * S, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
-  if (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0)) {
-    ctx.save();
-    ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
-    ctx.rotate(launcherMount.angle);
-    ctx.fillStyle = "#8B5A2B";
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 1.3 * S);
-    ctx.beginPath();
-    ctx.roundRect(-launcherMount.w * 0.78, -launcherMount.h / 2, launcherMount.w, launcherMount.h, 2 * S);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // Neck/head chain. Positive headTilt angles the head back/up from the neck joint; the head
-  // remains a plain circle, but the neck/head center shifts so the upward-thinking pose reads.
-  const neckTopX = -Math.sin(headTilt) * neckLen;
-  const neckTopY = torsoTopY - Math.cos(headTilt) * neckLen;
-  ctx.save();
-  if (isJacked) ctx.lineWidth = Math.max(lw * 1.6, 5 * S);
-  ctx.beginPath(); ctx.moveTo(0, torsoTopY); ctx.lineTo(neckTopX, neckTopY); ctx.stroke();
-  ctx.restore();
-
-  // Head — blank circle by default; optional cropped face image clips into the same tilted head,
-  // adopting the crop oval's aspect ratio (headRX/headRY) instead of staying perfectly round.
-  const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
-  const headCY = neckTopY - Math.cos(headTilt) * headRY;
-  if (hasFace && characterFace?.image) {
-    ctx.save();
-    ctx.translate(headCX, headCY);
-    ctx.rotate(headTilt);
-    ctx.beginPath();
-    ctx.ellipse(0, 0, headRX, headRY, 0, 0, Math.PI * 2);
-    ctx.clip();
-    if (facing < 0) ctx.scale(-1, 1);
-    ctx.drawImage(characterFace.image, -headRX, -headRY, headRX * 2, headRY * 2);
-    ctx.restore();
-  } else {
-    // Blank default head keeps its outline; a custom face's clipped image edge IS the head edge.
-    ctx.beginPath(); ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2); ctx.stroke();
-  }
-
-  // Emoji emote
-  if (p.emojiText && p.emojiAlpha && p.emojiAlpha > 0) {
-    ctx.save();
-    ctx.globalAlpha = p.emojiAlpha;
-    ctx.font = `${Math.max(12, 80 * S)}px serif`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "bottom";
-    ctx.scale(1 / facing, 1);
-    ctx.fillText(p.emojiText, headCX * facing, headCY - headRY - 12 * S);
-    ctx.restore();
-  }
-
-  if (p.surpriseAlpha && p.surpriseAlpha > 0) {
-    ctx.save();
-    ctx.globalAlpha = p.surpriseAlpha;
-    ctx.strokeStyle = "#2a2a2a";
-    ctx.lineWidth = Math.max(1, 1.5 * S);
-    for (const [x, y] of [[-22, -12], [0, -22], [22, -12]] as const) {
-      ctx.beginPath();
-      ctx.moveTo(headCX + x * S * 0.6, headCY - headRY + y * S);
-      ctx.lineTo(headCX + x * S, headCY - headRY + (y - 16) * S);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  if (p.sparkleAlpha && p.sparkleAlpha > 0) {
-    const drawStar = (x: number, y: number, r: number) => {
-      ctx.beginPath();
-      ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
-      ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
-      ctx.moveTo(x - r * 0.65, y - r * 0.65); ctx.lineTo(x + r * 0.65, y + r * 0.65);
-      ctx.moveTo(x - r * 0.65, y + r * 0.65); ctx.lineTo(x + r * 0.65, y - r * 0.65);
-      ctx.stroke();
-    };
-    ctx.save();
-    ctx.globalAlpha = p.sparkleAlpha;
-    ctx.strokeStyle = "#c8a200";
-    ctx.lineWidth = Math.max(1, 1.4 * S);
-    drawStar(-34 * S, shoulderY - 10 * S, 6 * S);
-    drawStar(34 * S, shoulderY - 16 * S, 7 * S);
-    drawStar(18 * S, shoulderY - 42 * S, 5 * S);
-    ctx.restore();
-  }
-
-  ctx.restore(); // un-lean (torso/neck/head/arms)
-
-  if (p.grappleImpact && p.grappleImpact > 0) {
-    ctx.save();
-    ctx.globalAlpha = p.grappleImpact;
-    ctx.strokeStyle = "#8B5A2B";
-    ctx.lineWidth = Math.max(1, 1.5 * S);
-    for (const x of [-12, 0, 12]) {
-      ctx.beginPath();
-      ctx.moveTo(x * S, 2 * S);
-      ctx.lineTo((x + Math.sign(x || 1) * 6) * S, 14 * S);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  ctx.restore(); // top-level
-}
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -4046,6 +3228,7 @@ export default function Board2Page() {
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
+  const streamGuestEntitiesRef = useRef<Map<string, CharacterEntity>>(new Map());
   const streamGuestSeqRef = useRef<Map<string, number>>(new Map());
   const streamGuestClockOffsetsRef = useRef<Map<string, number>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -4593,6 +3776,7 @@ export default function Board2Page() {
     streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt, reason: options?.reason ?? "instant", hostName: options?.hostName } });
     streamGuestFramesRef.current.delete(guestId);
     streamRenderedGuestFramesRef.current.delete(guestId);
+    streamGuestEntitiesRef.current.delete(guestId);
     streamGuestSeqRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
     streamEliminationsRef.current.delete(guestId);
@@ -4967,6 +4151,7 @@ export default function Board2Page() {
       streamSessionIdRef.current = "";
       streamGuestFramesRef.current.clear();
       streamRenderedGuestFramesRef.current.clear();
+      streamGuestEntitiesRef.current.clear();
       streamGuestSeqRef.current.clear();
       streamGuestClockOffsetsRef.current.clear();
       streamGuestFacesRef.current.clear();
@@ -5049,6 +4234,8 @@ export default function Board2Page() {
             if (!activeGuestIds.has(guestId)) {
               streamGuestFramesRef.current.delete(guestId);
               streamRenderedGuestFramesRef.current.delete(guestId);
+              streamGuestEntitiesRef.current.delete(guestId);
+              streamGuestSeqRef.current.delete(guestId);
               streamGuestClockOffsetsRef.current.delete(guestId);
               streamEliminationsRef.current.delete(guestId);
               streamChokeStatesRef.current.delete(guestId);
@@ -5066,6 +4253,8 @@ export default function Board2Page() {
               streamChokeStatesRef.current.delete(guest.guestId);
               streamGuestFramesRef.current.delete(guest.guestId);
               streamRenderedGuestFramesRef.current.delete(guest.guestId);
+              streamGuestEntitiesRef.current.delete(guest.guestId);
+              streamGuestSeqRef.current.delete(guest.guestId);
               playWeaponHitCountsRef.current.delete(guest.guestId);
               playEliminationKickSentRef.current.delete(guest.guestId);
             }
@@ -5239,6 +4428,8 @@ export default function Board2Page() {
       if (!activeFrame) {
         streamRenderedGuestFramesRef.current.delete(frame.guestId);
         streamGuestFramesRef.current.delete(frame.guestId);
+        streamGuestEntitiesRef.current.delete(frame.guestId);
+        streamGuestSeqRef.current.delete(frame.guestId);
         if (!playEliminationKickSentRef.current.has(frame.guestId)) {
           playEliminationKickSentRef.current.add(frame.guestId);
           kickStreamGuest(frame.guestId, { reason: "elimination_tommygun", hostName: session?.user?.name || "Host" });
@@ -5262,18 +4453,34 @@ export default function Board2Page() {
       if (existingIndex >= 0) streamGuestCharacterDebugRef.current[existingIndex] = row;
       else streamGuestCharacterDebugRef.current.push(row);
       refreshStreamDebugRows(performance.now());
-      drawSharedStreamCharacter(
+      let entity = streamGuestEntitiesRef.current.get(frame.guestId);
+      if (!entity) {
+        entity = new CharacterEntity({
+          id: frame.guestId,
+          isHost: false,
+          name: frame.name,
+          skin: streamGuestSkinRef.current,
+          physique: frame.physique ?? "slim",
+        });
+        streamGuestEntitiesRef.current.set(frame.guestId, entity);
+      }
+      entity.identity = {
+        ...entity.identity,
+        name: frame.name,
+        skin: streamGuestSkinRef.current,
+        physique: smoothed.physique ?? "slim",
+      };
+      entity.setGuestFrame(smoothed, clockOffset, streamGuestSkinRef.current);
+      entity.draw({
         ctx,
-        guestCharacterForRender(smoothed, clockOffset, { guestSkinOverride: streamGuestSkinRef.current }),
-        streamGuestFacesRef.current.get(frame.guestId) ?? null,
-        streamGuestSignsRef.current.get(frame.guestId) ?? null,
         cam,
         sf,
-        W,
-        H,
-        1,
-        now,
-      );
+        width: W,
+        height: H,
+        face: streamGuestFacesRef.current.get(frame.guestId) ?? null,
+        sign: streamGuestSignsRef.current.get(frame.guestId) ?? null,
+        renderTimeMs: now,
+      });
     }
   }, [kickStreamGuest, session?.user?.name]);
 
@@ -5363,7 +4570,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
         live.c1.currentPose = pose;
-        drawCharacterToCanvas(
+        drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current), true,
           cam, sf, W, H, live.c1.initX, live.c1.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
@@ -5371,7 +4578,8 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
             : null,
           characterSkinRef.current,
-          pose
+          pose,
+          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
         );
       }
       if (live.c2.enabled) {
@@ -5379,7 +4587,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
         live.c2.currentPose = pose;
-        drawCharacterToCanvas(
+        drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current), true,
           cam, sf, W, H, live.c2.initX, live.c2.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
@@ -5387,30 +4595,35 @@ export default function Board2Page() {
             ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
             : null,
           characterSkin2Ref.current,
-          pose
+          pose,
+          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
         );
       }
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
-      drawCharacterToCanvas(
+      drawBoardCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
           : null,
-        characterSkinRef.current
+        characterSkinRef.current,
+        null,
+        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
-      drawCharacterToCanvas(
+      drawBoardCharacterToCanvas(
         ctx, time, resolvedCharActions2Ref.current, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
           : null,
-        characterSkin2Ref.current
+        characterSkin2Ref.current,
+        null,
+        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
     }
     if (currentAnnotations.length > 0) {
@@ -9910,7 +9123,7 @@ export default function Board2Page() {
         renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
-        drawCharacterToCanvas(
+        drawBoardCharacterToCanvas(
           ctx,
           playDrawTime,
           playDrawResolved,
@@ -9928,7 +9141,8 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
             : null,
           characterSkinRef.current,
-          playPose
+          playPose,
+          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
         );
         for (const shot of playWeaponShotsRef.current) {
           drawWeaponProjectile(ctx, shot, playCameraRef.current, sf, canvas.width, canvas.height, nowMs);

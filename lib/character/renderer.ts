@@ -1,5 +1,5 @@
-import { isStreamActionType, resolveStreamSkin, type CharacterSkin, type GuestCharacterFrame, type SpawnDoor, type StreamCamera, type StreamCharacterFrame, type StreamEliminationMessage } from "./stream";
-import { STREAM_CHARACTER_GEOMETRY, characterConstructionParams } from "./character/geometry";
+import { isStreamActionType, resolveStreamSkin, type CharacterSkin, type GuestCharacterFrame, type SpawnDoor, type StreamCamera, type StreamCharacterFrame, type StreamEliminationMessage } from "../stream";
+import { STREAM_CHARACTER_GEOMETRY, characterConstructionParams } from "./geometry";
 
 export { STREAM_CHARACTER_GEOMETRY };
 export const streamCharacterConstructionParams = characterConstructionParams;
@@ -258,7 +258,7 @@ export function drawPoptropicaPlayCharacter(
 }
 
 // Stream/render adapter exports live in this shared renderer module so /board2 and /stream cannot drift.
-export const RENDERER_VERSION = "board2-shared-renderer-2026-07-18-d";
+export const RENDERER_VERSION = "board2-character-entity-renderer-2026-07-18-e";
 
 export type SharedCharacter = {
   id: string;

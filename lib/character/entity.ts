@@ -3,7 +3,7 @@ import {
   guestCharacterForRender,
   hostCharacterForRender,
   type SharedCharacter,
-} from "../play-character-renderer";
+} from "./renderer";
 import {
   type CharacterSkin,
   type GuestCharacterFrame,
