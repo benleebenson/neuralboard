@@ -169,12 +169,12 @@ export type StreamParticipantPresence = {
   guestSkin?: CharacterSkin;
   physique?: "slim" | "jacked";
   signDataUrl?: string;
-  signActive?: boolean;
   joinedAt: number;
 };
 
 export type GuestCharacterFrame = {
   kind: "guest-state";
+  seq?: number;
   streamId: string;
   sessionId: string;
   sentAt: number;
@@ -219,16 +219,6 @@ export type StreamEliminationMessage = {
   seed: number;
   shooter: { x: number; y: number; facing: 1 | -1 };
   target: { x: number; y: number };
-};
-
-export type StreamWeaponStateMessage = {
-  kind: "weapon_state";
-  streamId: string;
-  sessionId: string;
-  sentAt: number;
-  armed: boolean;
-  shooter: { x: number; y: number; facing: 1 | -1 };
-  aim: { x: number; y: number };
 };
 
 export type StreamShotFiredMessage = {
@@ -279,11 +269,17 @@ export type StreamSnapshotMessage = {
 
 export type StreamFrameMessage = {
   kind: "frame";
+  seq?: number;
   streamId: string;
   sessionId: string;
   sentAt: number;
   camera: StreamCamera;
-  guestSkin?: "stick" | "styled";
+  guestSkin?: CharacterSkin;
+  weapon?: {
+    armed: boolean;
+    aim?: { x: number; y: number };
+    shooter?: { x: number; y: number; facing: 1 | -1 };
+  };
   characters: StreamCharacterFrame[];
 };
 
@@ -294,7 +290,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamWeaponStateMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

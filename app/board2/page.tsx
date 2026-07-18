@@ -22,7 +22,6 @@ import {
   StreamShotFiredMessage,
   StreamSnapshotMessage,
   StreamWeaponHitMessage,
-  StreamWeaponStateMessage,
   streamChannelName,
   resolveStreamSkin,
 } from "@/lib/stream";
@@ -4040,12 +4039,14 @@ export default function Board2Page() {
   const streamChannelRef = useRef<RealtimeChannel | null>(null);
   const streamSessionIdRef = useRef("");
   const streamLastFrameAtRef = useRef(0);
+  const streamFrameSeqRef = useRef(0);
   const streamLastDebugFrameAtRef = useRef(0);
   const streamSnapshotQueuedRef = useRef(false);
   const streamSnapshotBusyRef = useRef(false);
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
+  const streamGuestSeqRef = useRef<Map<string, number>>(new Map());
   const streamGuestClockOffsetsRef = useRef<Map<string, number>>(new Map());
   const streamGuestFacesRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const streamGuestSignsRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -4481,6 +4482,7 @@ export default function Board2Page() {
     if (wallMs - streamLastFrameAtRef.current < 1000 / STREAM_FPS) return;
     streamLastFrameAtRef.current = wallMs;
     const sentAt = Date.now();
+    const seq = ++streamFrameSeqRef.current;
     const characters = playModeRef.current
       ? (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
           const state = id === "c1" ? playPhysicsRef.current : null;
@@ -4559,11 +4561,26 @@ export default function Board2Page() {
       event: "frame",
       payload: {
         kind: "frame",
+        seq,
         streamId: STREAM_OWNER_USER_ID,
         sessionId: streamSessionIdRef.current,
         sentAt,
         camera: cam,
         guestSkin: streamGuestSkinRef.current,
+        weapon: playModeRef.current && playPhysicsRef.current
+          ? {
+              armed: playWeaponArmedRef.current,
+              shooter: {
+                x: playPhysicsRef.current.x,
+                y: playPhysicsRef.current.y,
+                facing: playPhysicsRef.current.facing,
+              },
+              aim: playCursorRef.current ?? {
+                x: playPhysicsRef.current.x + playPhysicsRef.current.facing * 400,
+                y: playPhysicsRef.current.y - 115,
+              },
+            }
+          : { armed: false },
         characters,
       },
     });
@@ -4576,6 +4593,7 @@ export default function Board2Page() {
     streamChannelRef.current?.send({ type: "broadcast", event: "kick", payload: { kind: "kick", streamId: STREAM_OWNER_USER_ID, sessionId: streamSessionIdRef.current, guestId, sentAt, reason: options?.reason ?? "instant", hostName: options?.hostName } });
     streamGuestFramesRef.current.delete(guestId);
     streamRenderedGuestFramesRef.current.delete(guestId);
+    streamGuestSeqRef.current.delete(guestId);
     streamGuestClockOffsetsRef.current.delete(guestId);
     streamEliminationsRef.current.delete(guestId);
     streamChokeStatesRef.current.delete(guestId);
@@ -4949,6 +4967,7 @@ export default function Board2Page() {
       streamSessionIdRef.current = "";
       streamGuestFramesRef.current.clear();
       streamRenderedGuestFramesRef.current.clear();
+      streamGuestSeqRef.current.clear();
       streamGuestClockOffsetsRef.current.clear();
       streamGuestFacesRef.current.clear();
       streamGuestSignsRef.current.clear();
@@ -4962,6 +4981,7 @@ export default function Board2Page() {
     if (!streamSessionIdRef.current) {
       streamSessionIdRef.current = generateId();
       streamLastFrameAtRef.current = 0;
+      streamFrameSeqRef.current = 0;
       streamLastDebugFrameAtRef.current = 0;
       streamDebugLog("session start", {
         channel: channelName,
@@ -4988,6 +5008,12 @@ export default function Board2Page() {
               streamDebugLog("ignore tombstoned guest-state", { guestId: frame.guestId, frameSentAt: frame.sentAt, tombstoneAt });
               return;
             }
+            const previousSeq = streamGuestSeqRef.current.get(frame.guestId) ?? -1;
+            if (frame.seq !== undefined && frame.seq <= previousSeq) {
+              streamDebugLog("drop stale guest-state", { guestId: frame.guestId, seq: frame.seq, previousSeq });
+              return;
+            }
+            if (frame.seq !== undefined) streamGuestSeqRef.current.set(frame.guestId, frame.seq);
             if (validGuestSignDataUrl(frame.signDataUrl) && streamGuestSignsRef.current.get(frame.guestId)?.src !== frame.signDataUrl) {
               const image = new Image();
               image.src = frame.signDataUrl;
@@ -9417,16 +9443,9 @@ export default function Board2Page() {
     const now = Date.now();
     if (!force && now - playWeaponLastStateAtRef.current < 1000 / STREAM_FPS) return;
     playWeaponLastStateAtRef.current = now;
-    const payload: StreamWeaponStateMessage = {
-      kind: "weapon_state",
-      streamId: STREAM_OWNER_USER_ID,
-      sessionId: streamSessionIdRef.current,
-      sentAt: now,
-      armed: playWeaponArmedRef.current,
-      shooter: { x: state.x, y: state.y, facing: state.facing },
-      aim: playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 },
-    };
-    streamChannelRef.current?.send({ type: "broadcast", event: "weapon_state", payload });
+    // Weapon/verb state is authoritative in the sequenced frame stream. Keep this
+    // hook for local throttling only so old weapon_state broadcasts cannot linger.
+    streamDebugLog("weapon state folded into frame packet", { armed: playWeaponArmedRef.current });
   }
 
   function distancePointToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
