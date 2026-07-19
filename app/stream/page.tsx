@@ -9,14 +9,40 @@ import { CharacterEntity, type CharacterEntityIdentity, type CharacterWeaponStat
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 
 type Mode = "landing" | "watch" | "join" | "guest";
-type GuestPhysics = { x: number; y: number; vx: number; vy: number; targetX: number | null; targetY: number | null; facing: 1 | -1; grounded: boolean; surfaceId: string | null; action: GuestCharacterFrame["actionType"]; actionStarted: number; emote?: string; spawnAt: number; frozenUntil?: number; eliminatedBy?: string; physique: "slim" | "jacked" };
+type GuestPhysics = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  targetX: number | null;
+  targetY: number | null;
+  facing: 1 | -1;
+  grounded: boolean;
+  surfaceId: string | null;
+  action: GuestCharacterFrame["actionType"];
+  actionStarted: number;
+  actionDurationMs?: number;
+  actionFromX?: number;
+  actionFromY?: number;
+  actionTargetX?: number;
+  actionTargetY?: number;
+  emote?: string;
+  spawnAt: number;
+  frozenUntil?: number;
+  eliminatedBy?: string;
+  physique: "slim" | "jacked";
+};
 const BOARD_W = 4000;
 const GUEST_RESPAWN_BELOW_LOWEST_SURFACE = 650;
 const GUEST_VERB_SET = new Set<string>(GUEST_VERBS);
 const GUEST_DEFAULT_SKIN: "stick" | "styled" = "stick";
+const GUEST_WALK_SPEED = 420;
+const GUEST_RUN_SPEED = 720;
+const GUEST_SKATE_ROLL_SPEED = 560;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 type StreamSurface = StreamSnapshotMessage["clips"][number];
+const GUEST_PLANNED_TRAVEL = new Set<GuestCharacterFrame["actionType"]>(["jump", "flip", "grapple", "skateTo", "wallClimb", "zipline"]);
 
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:guest]", ...args);
@@ -128,11 +154,13 @@ function lowestGuestSurfaceBottom(snapshot: StreamSnapshotMessage): number {
     : snapshot.spawnDoor?.y ?? snapshot.board.height;
 }
 
-function guestActionDuration(action: GuestCharacterFrame["actionType"]): number {
+function guestActionDuration(action: GuestCharacterFrame["actionType"], distance = 0, heightDelta = 0): number {
   if (action === "flip") return 0.95;
   if (action === "jump") return 1.1;
-  if (action === "grapple" || action === "zipline") return 1.3;
-  if (action === "skateTo" || action === "wallClimb") return 1.5;
+  if (action === "grapple") return 1.8;
+  if (action === "zipline") return clamp(distance / 650, 0.8, 2.5);
+  if (action === "skateTo") return Math.max(1.2, Math.min(4.5, distance / GUEST_SKATE_ROLL_SPEED + 0.8));
+  if (action === "wallClimb") return clamp(Math.abs(heightDelta) / 350 + 0.8, 0.9, 2.8);
   if (action === "dance") return 2.5;
   if (action === "pullUps") return 2.6;
   if (action === "mirrorCheck") return 1.6;
@@ -145,7 +173,7 @@ function guestActionDuration(action: GuestCharacterFrame["actionType"]): number 
 
 function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, sessionId: string, now: number, seq: number, skin: "stick" | "styled", signDataUrl?: string, signActive = false): GuestCharacterFrame {
   const sentAt = Date.now();
-  const duration = guestActionDuration(p.action);
+  const duration = (p.actionDurationMs ?? guestActionDuration(p.action) * 1000) / 1000;
   const progress = clamp((now - p.actionStarted) / Math.max(1, duration * 1000), 0, 1.4);
   return {
     kind: "guest-state",
@@ -162,12 +190,85 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
     actionProgress: progress,
     actionStartTime: sentAt - progress * duration * 1000,
     actionDuration: duration,
+    actionParams: p.actionTargetX !== undefined ? {
+      fromX: p.actionFromX,
+      fromY: p.actionFromY,
+      targetX: p.actionTargetX,
+      targetY: p.actionTargetY,
+    } : undefined,
     skin,
     physique: p.physique,
     signDataUrl,
     signActive: !!signDataUrl && signActive,
     emote: p.emote,
   };
+}
+
+function clearGuestActionPlan(p: GuestPhysics) {
+  p.actionDurationMs = undefined;
+  p.actionFromX = undefined;
+  p.actionFromY = undefined;
+  p.actionTargetX = undefined;
+  p.actionTargetY = undefined;
+}
+
+function startGuestStationaryAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], now = performance.now()) {
+  p.vx = 0;
+  p.vy = 0;
+  p.targetX = null;
+  p.targetY = null;
+  p.action = action;
+  p.actionStarted = now;
+  clearGuestActionPlan(p);
+  p.actionDurationMs = guestActionDuration(action) * 1000;
+}
+
+function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], targetX: number, targetY: number, now = performance.now()) {
+  const fromX = p.x;
+  const fromY = p.y;
+  const dx = targetX - fromX;
+  const dy = targetY - fromY;
+  const dist = Math.hypot(dx, dy);
+  p.facing = Math.abs(dx) > 4 ? (dx >= 0 ? 1 : -1) : p.facing;
+  p.targetX = null;
+  p.targetY = null;
+  p.action = action;
+  p.actionStarted = now;
+  p.actionDurationMs = guestActionDuration(action, dist, dy) * 1000;
+  p.actionFromX = fromX;
+  p.actionFromY = fromY;
+  p.actionTargetX = targetX;
+  p.actionTargetY = targetY;
+  p.vx = dx / Math.max(0.001, p.actionDurationMs / 1000);
+  p.vy = dy / Math.max(0.001, p.actionDurationMs / 1000);
+  p.grounded = action === "skateTo";
+  p.surfaceId = null;
+}
+
+function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: StreamSurface[]): boolean {
+  if (p.actionTargetX === undefined || p.actionTargetY === undefined || p.actionFromX === undefined || p.actionFromY === undefined || !p.actionDurationMs || !GUEST_PLANNED_TRAVEL.has(p.action)) return false;
+  const rawT = clamp((now - p.actionStarted) / Math.max(1, p.actionDurationMs), 0, 1);
+  const t = p.action === "grapple" || p.action === "zipline" ? 1 - Math.pow(1 - rawT, 2.2) : rawT;
+  const prevX = p.x;
+  const prevY = p.y;
+  p.x = lerp(p.actionFromX, p.actionTargetX, t);
+  p.y = lerp(p.actionFromY, p.actionTargetY, t);
+  p.vx = (p.x - prevX) / Math.max(0.001, 1 / 60);
+  p.vy = (p.y - prevY) / Math.max(0.001, 1 / 60);
+  if (Math.abs(p.actionTargetX - p.actionFromX) > 4) p.facing = p.actionTargetX >= p.actionFromX ? 1 : -1;
+  p.grounded = p.action === "skateTo" ? rawT < 0.58 || rawT > 0.82 : false;
+  if (rawT >= 1) {
+    p.x = p.actionTargetX;
+    p.y = p.actionTargetY;
+    p.vx = 0;
+    p.vy = 0;
+    p.grounded = true;
+    p.surfaceId = findGuestSupport(p.x, p.y, surfaces)?.id ?? null;
+    p.action = "idle";
+    p.actionStarted = now;
+    clearGuestActionPlan(p);
+  }
+  return true;
 }
 
 function hostDebugRow(ch: StreamFrameMessage["characters"][number], faceAspect?: number, hasFace = false): StreamCharacterDebugRow {
@@ -227,11 +328,11 @@ export default function StreamPage() {
     channel.on("broadcast",{event:"snapshot"},({payload})=>{streamDebugLog("snapshot broadcast",{sessionId:(payload as StreamSnapshotMessage).sessionId,clips:(payload as StreamSnapshotMessage).clips?.length});snapshotRef.current=payload as StreamSnapshotMessage;setSnapshot(snapshotRef.current);setLive(true);setStatus("live");})
       .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const previousSeq=latestHost.current?.seq??-1;if(frame.seq!==undefined&&frame.seq<=previousSeq){streamDebugLog("drop stale host frame",{seq:frame.seq,previousSeq});return;}if(frame.guestSkin){hostGuestSkin.current=frame.guestSkin;setGuestSkinLabel(frame.guestSkin);}const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(frame.weapon)weaponState.current=frame.weapon;if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{seq:frame.seq,sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),renderer:RENDERER_VERSION,guestSkin:hostGuestSkin.current,weapon:frame.weapon,characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
       .on("broadcast",{event:"guest-state"},({payload})=>{const f=payload as GuestCharacterFrame;if(f.sessionId===latestHost.current?.sessionId||!latestHost.current){const prevSeq=remoteGuestSeq.current.get(f.guestId)??-1;if(f.seq!==undefined&&f.seq<=prevSeq){streamDebugLog("drop stale guest-state",{guestId:f.guestId,seq:f.seq,prevSeq});return;}if(f.seq!==undefined)remoteGuestSeq.current.set(f.guestId,f.seq);if(validSignDataUrl(f.signDataUrl))cacheSignImage(f.guestId,f.signDataUrl);const measured=Date.now()-f.sentAt;const prev=remoteClockOffsets.current.get(f.guestId)??measured;remoteClockOffsets.current.set(f.guestId,prev*.85+measured*.15);remoteGuests.current.set(f.guestId,{...f,receivedAt:Date.now()});}})
-      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;}})
+      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;clearGuestActionPlan(p);}})
       .on("broadcast",{event:"weapon_state"},({payload})=>{streamDebugLog("ignore legacy weapon_state; frame.weapon is authoritative",payload);})
       .on("broadcast",{event:"shot_fired"},({payload})=>{streamDebugLog("shot_fired received",(payload as StreamShotFiredMessage).shotId);weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
-      .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
-      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();}}})
+      .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
+      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
       .on("broadcast",{event:"remove-sign"},({payload})=>{const msg=payload as {guestId?:string};if(msg.guestId===guestId){signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);void refreshGuestPresence(false,undefined);}})
       .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);remoteGuestSeq.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
@@ -241,10 +342,10 @@ export default function StreamPage() {
   useEffect(()=>{if(!snapshot)return;const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl&&!faceCache.current.has(ch.id)){const img=new Image();img.src=ch.faceDataUrl;faceCache.current.set(ch.id,img);}},[snapshot]);
 
   const beginGuest=async()=>{const safe=cleanName(name);if(!safe){setJoinError("Enter a short, appropriate name.");return;}const guests=participants.filter(p=>p.role==="guest");if(guests.length>=MAX_GUESTS){setJoinError("This room is full.");return;}if(!snapshot)return;nameRef.current=safe;if(face&&!faceCache.current.has(guestId)){const img=new Image();img.src=face;faceCache.current.set(guestId,img);}if(signDataUrlRef.current)cacheSignImage(guestId,signDataUrlRef.current);const spawn=resolveGuestSpawn(snapshot);physics.current={x:spawn.x,y:spawn.y,vx:0,vy:0,targetX:null,targetY:null,facing:1,grounded:spawn.grounded,surfaceId:spawn.surfaceId,action:"idle",actionStarted:performance.now(),spawnAt:performance.now(),physique:"slim"};camera.current={cameraX:spawn.x,cameraY:spawn.y-120,boardZoom:1.35};guestSeq.current=0;const joinedAt=Date.now();const presence={role:"guest",isHost:false,guestId,name:safe,faceDataUrl:face,skin:hostGuestSkin.current,physique:"slim",signDataUrl:validSignDataUrl(signDataUrlRef.current)?signDataUrlRef.current:undefined,joinedAt} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channelRef.current?.track(presence);setMode("guest");setJoinError("");};
-  const emote=()=>{const p=physics.current;if(!p||!GUEST_VERB_SET.has("emote"))return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];p.action="emote";p.actionStarted=performance.now();};
-  const flipGuestTo=(targetX?:number,targetY?:number)=>{const p=physics.current;if(!p||!p.grounded)return;const dx=targetX!==undefined?targetX-p.x:p.facing*520;p.facing=dx>=0?1:-1;p.vx=clamp(Math.abs(dx)*1.35,420,760)*p.facing;p.vy=-clamp(targetY!==undefined?680+Math.max(0,p.y-targetY)*.55:760,700,900);p.grounded=false;p.surfaceId=null;p.targetX=targetX??p.x+p.facing*520;p.targetY=targetY??p.y;p.action="flip";p.actionStarted=performance.now();};
+  const emote=()=>{const p=physics.current;if(!p||!GUEST_VERB_SET.has("emote"))return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];startGuestStationaryAction(p,"emote");};
+  const flipGuestTo=(targetX?:number,targetY?:number)=>{const p=physics.current;if(!p||!p.grounded)return;startGuestPlannedAction(p,"flip",targetX??p.x+p.facing*520,targetY??p.y);};
   const guestTargetVerb=(): GuestCharacterFrame["actionType"]|null=>{const keys=guestHeldKeys.current;if(keys.has("g"))return"grapple";if(keys.has("s"))return"skateTo";if(keys.has("c"))return"wallClimb";if(keys.has("z"))return"zipline";return null;};
-  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number)=>{const p=physics.current;if(!p)return;const dx=targetX-p.x;const height=Math.max(0,p.y-targetY);p.facing=dx>=0?1:-1;p.targetX=null;p.targetY=null;p.action=action;p.actionStarted=performance.now();p.vx=clamp(Math.abs(dx)*1.2,360,780)*p.facing;p.vy=action==="grapple"||action==="zipline"?-clamp(620+height*.35,620,860):action==="wallClimb"?-clamp(520+height*.3,520,760):action==="skateTo"?-360:p.vy;p.grounded=false;p.surfaceId=null;};
+  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY);};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
 
   useEffect(() => {
@@ -291,17 +392,21 @@ export default function StreamPage() {
             p.targetY = null;
             p.grounded = false;
             p.action = "forceChoke";
+            clearGuestActionPlan(p);
           }
-          const target = p.targetX;
           const frozen = (p.frozenUntil !== undefined && Date.now() < p.frozenUntil) || held?.phase === "hold";
           if (p.action === "emote" && now - p.actionStarted > 1500) {
             p.action = "idle";
             p.emote = undefined;
+            clearGuestActionPlan(p);
           }
-          if (p.action === "dance" && now - p.actionStarted > 2500) p.action = "idle";
-          if (["pullUps","mirrorCheck","sitAndWatch","grapple","skateTo","wallClimb","zipline"].includes(p.action) && now - p.actionStarted > guestActionDuration(p.action) * 1000) p.action = "idle";
-          if (p.action === "flip" && now - p.actionStarted > 950 && p.grounded) p.action = "idle";
-          if (target !== null && !frozen) {
+          if (["dance","pullUps","mirrorCheck","sitAndWatch"].includes(p.action) && now - p.actionStarted > (p.actionDurationMs ?? guestActionDuration(p.action) * 1000)) {
+            p.action = "idle";
+            clearGuestActionPlan(p);
+          }
+          const planned = !frozen && held?.phase !== "hold" && updateGuestPlannedAction(p, now, surfaces);
+          const target = p.targetX;
+          if (!planned && target !== null && !frozen) {
             const dx = target - p.x;
             if (Math.abs(dx) < 14) {
               p.vx = 0;
@@ -309,14 +414,15 @@ export default function StreamPage() {
               if (p.grounded) p.action = "idle";
             } else {
               p.facing = dx > 0 ? 1 : -1;
-              p.vx = p.facing * (Math.abs(dx) > 280 ? 620 : 330);
+              const speed = Math.abs(dx) > 280 ? GUEST_RUN_SPEED : GUEST_WALK_SPEED;
+              p.vx = p.facing * speed;
               if (p.grounded) p.action = Math.abs(dx) > 280 ? "run" : "walk";
             }
-          } else if (frozen) {
+          } else if (!planned && frozen) {
             p.vx = 0;
             p.targetX = null;
           }
-          if (held?.phase !== "hold") {
+          if (!planned && held?.phase !== "hold") {
             if (p.grounded) {
               const support = surfaces.find((s) => s.id === p.surfaceId);
               if (!support || p.x < support.boardX || p.x > support.boardX + support.boardW) {
@@ -493,8 +599,8 @@ export default function StreamPage() {
     return () => cancelAnimationFrame(raf);
   }, [guestId, mode, hostCam, snapshot]);
 
-  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=streamSurfaces(snapshot).filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){issueGuestTargetVerb(verb,targetX,targetY);return;}const dx=targetX-p.x;const wantsArc=p.grounded&&(rawY<p.y-90||Math.abs(dx)>520|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}p.targetX=targetX;p.targetY=targetY;};
-  useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance")){p.action="dance";p.actionStarted=performance.now();p.vx=0;p.targetX=null;}if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps")){p.action="pullUps";p.actionStarted=performance.now();p.vx=0;p.targetX=null;}if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){p.action="mirrorCheck";p.actionStarted=performance.now();p.vx=0;p.targetX=null;p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch")){p.action="sitAndWatch";p.actionStarted=performance.now();p.vx=0;p.targetX=null;}};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
+  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=streamSurfaces(snapshot).filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){issueGuestTargetVerb(verb,targetX,targetY);return;}const dx=targetX-p.x;const wantsArc=p.grounded&&(rawY<p.y-90||Math.abs(dx)>520|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
+  useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance"))startGuestStationaryAction(p,"dance");if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps"))startGuestStationaryAction(p,"pullUps");if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){startGuestStationaryAction(p,"mirrorCheck");p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch"))startGuestStationaryAction(p,"sitAndWatch");};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
   useEffect(()=>{if(signOpen)requestAnimationFrame(clearSignCanvas);},[signOpen]);
   const signPoint=(e:React.PointerEvent<HTMLCanvasElement>)=>{const rect=e.currentTarget.getBoundingClientRect();return{x:(e.clientX-rect.left)*(e.currentTarget.width/rect.width),y:(e.clientY-rect.top)*(e.currentTarget.height/rect.height)};};
   const drawSignStroke=(e:React.PointerEvent<HTMLCanvasElement>,start=false)=>{const c=e.currentTarget,ctx=c.getContext("2d"),p=signPoint(e);if(!ctx)return;if(start){signDrawingRef.current=true;c.setPointerCapture(e.pointerId);ctx.beginPath();ctx.moveTo(p.x,p.y);return;}if(!signDrawingRef.current)return;ctx.lineCap="round";ctx.lineJoin="round";ctx.lineWidth=signErase?18:5;ctx.strokeStyle=signErase?"#fffdf4":signColor;ctx.lineTo(p.x,p.y);ctx.stroke();};

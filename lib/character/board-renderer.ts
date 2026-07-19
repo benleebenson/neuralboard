@@ -364,6 +364,22 @@ export function drawBoardCharacterToCanvas(
     }
     ctx.restore();
   }
+  if (p.chokeMotionAlpha && p.chokeMotionAlpha > 0) {
+    ctx.save();
+    ctx.globalAlpha = p.chokeMotionAlpha;
+    ctx.strokeStyle = "rgba(42,42,42,0.58)";
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    ctx.lineCap = "round";
+    for (const foot of [leftLeg.foot, rightLeg.foot]) {
+      for (const [dx, dy, len] of [[-18, -6, 12], [16, 4, 10]] as const) {
+        ctx.beginPath();
+        ctx.moveTo(foot.x + dx * S, foot.y + dy * S);
+        ctx.quadraticCurveTo(foot.x + (dx * 0.75) * S, foot.y + (dy - 8) * S, foot.x + (dx + Math.sign(dx) * len) * S, foot.y + (dy - 2) * S);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
   if (p.sitSeated) {
     const footStroke = 11 * S;
     for (const foot of [leftLeg.foot, rightLeg.foot]) {

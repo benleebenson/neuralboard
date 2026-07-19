@@ -181,6 +181,7 @@ function entityPoseFromHostFrame(frame: StreamCharacterFrame, identity: Characte
     progress: actionProgressFromFrame(frame.progress, frame.actionStartTime, frame.actionDuration, clockOffsetMs),
     emoji: frame.emoji,
     physique: frame.physique ?? identity.physique,
+    seed: hash01(`${frame.id}:${frame.actionStartTime ?? 0}:${frame.actionType}`),
   });
 }
 
@@ -197,6 +198,7 @@ function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: Characte
     emoji: frame.emote,
     physique: frame.physique ?? identity.physique,
     signActive: frame.signActive,
+    seed: hash01(`${frame.guestId}:${frame.actionStartTime ?? 0}:${frame.actionType}`),
   });
 }
 
@@ -211,6 +213,7 @@ function streamPoseFallback(args: {
   emoji?: string;
   physique: "slim" | "jacked";
   signActive?: boolean;
+  seed?: number;
 }): BoardCharPoseResult {
   const p = clamp(args.progress, 0, 1.4);
   const pose = standingBoardPose(args.x, args.y, args.facing, p * Math.PI * 2);
@@ -309,6 +312,30 @@ function streamPoseFallback(args: {
       pose.rightShinA = 0.82;
     }
   }
+  if (args.actionType === "skateTo") {
+    const phase = p * Math.PI * 2;
+    const airT = clamp((p - 0.48) / 0.24, 0, 1);
+    const landT = clamp((p - 0.72) / 0.28, 0, 1);
+    const pedal = Math.sin(phase * 3.2);
+    pose.skateboardVisible = p < 0.94;
+    pose.skateFootMode = airT > 0 && airT < 1 ? "air" : Math.abs(pedal) > 0.35 && p < 0.45 ? "left-push" : "both-planted";
+    pose.skateCrouch = p < 0.42 ? 7 : airT > 0 && airT < 1 ? 12 : lerp(18, 6, landT);
+    pose.skateboardTilt = airT > 0 && airT < 0.35 ? lerp(-0.45, 0, airT / 0.35) : p > 0.42 && p < 0.5 ? -0.45 * clamp((p - 0.42) / 0.08, 0, 1) : 0;
+    pose.skateSparkAlpha = p > 0.43 && p < 0.58 ? 1 - clamp((p - 0.43) / 0.15, 0, 1) : 0;
+    pose.skateMotionAlpha = airT > 0 && airT < 1 ? Math.max(0, 1 - Math.abs(airT - 0.5) / 0.35) : 0;
+    pose.airY = airT > 0 && airT < 1 ? -88 * 4 * airT * (1 - airT) : 0;
+    pose.bodyLean = p < 0.5 ? 0.14 * args.facing : -0.08 * args.facing * (1 - landT);
+    pose.leftArmA = 0.22 + Math.sin(phase) * 0.12;
+    pose.rightArmA = -0.22 + Math.sin(phase + Math.PI) * 0.12;
+    pose.leftForeA = 0.16;
+    pose.rightForeA = -0.16;
+    if (pose.skateFootMode === "air") {
+      pose.leftLegA = 0.32;
+      pose.rightLegA = -0.28;
+      pose.leftShinA = 0.58;
+      pose.rightShinA = -0.58;
+    }
+  }
   if (args.actionType === "emote" || args.actionType === "forceChoke") {
     if (args.actionType === "emote") {
       pose.emojiText = args.emoji;
@@ -317,12 +344,30 @@ function streamPoseFallback(args: {
       pose.rightArmA = -0.66;
       pose.rightForeA = -1.35;
     } else {
-      pose.airY = -48 + Math.sin(p * Math.PI * 10) * 4;
-      pose.surpriseAlpha = 0.6;
-      pose.leftArmA = 0.72;
-      pose.rightArmA = -0.72;
-      pose.leftForeA = 1.1;
-      pose.rightForeA = -1.1;
+      const seed = args.seed ?? 0.37;
+      const lift = clamp(p / 0.26, 0, 1);
+      const bothHands = clamp((p - 0.2) / 0.22, 0, 1);
+      const struggle = p * 16 + seed * Math.PI * 2;
+      pose.airY = -lerp(18, 78, lift) + Math.sin(struggle * 1.3) * 4;
+      pose.headTilt = 0.16 * lift;
+      pose.surpriseAlpha = Math.max(0, 0.75 * (1 - p * 0.8));
+      pose.bodyLean = Math.sin(struggle * 0.53) * 0.035;
+      const leftTarget = { arm: 0.74, fore: -2.42 };
+      const rightTarget = { arm: -0.74, fore: 2.42 };
+      const firstIsRight = args.facing >= 0;
+      const leftReach = firstIsRight ? bothHands : lift;
+      const rightReach = firstIsRight ? lift : bothHands;
+      pose.leftArmA = lerp(0.25, leftTarget.arm, leftReach);
+      pose.leftForeA = lerp(0.18, leftTarget.fore, leftReach);
+      pose.rightArmA = lerp(-0.25, rightTarget.arm, rightReach);
+      pose.rightForeA = lerp(-0.18, rightTarget.fore, rightReach);
+      const leftKick = Math.sin(struggle * 1.25);
+      const rightKick = Math.sin(struggle * 1.25 + Math.PI + seed);
+      pose.leftLegA = 0.08 + leftKick * 0.3;
+      pose.rightLegA = -0.08 + rightKick * 0.3;
+      pose.leftShinA = -0.28 + Math.max(0, leftKick) * 0.58;
+      pose.rightShinA = 0.28 - Math.max(0, rightKick) * 0.58;
+      pose.chokeMotionAlpha = 0.35 + Math.max(Math.abs(leftKick), Math.abs(rightKick)) * 0.35;
     }
   }
   if (args.signActive) {
@@ -417,6 +462,15 @@ function drawEntityLabel(ctx: CanvasRenderingContext2D, entity: CharacterEntity,
 }
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+function hash01(value: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
 
 export function identityFromPresence(p: StreamParticipantPresence, fallbackId: string): CharacterEntityIdentity {
   return {
