@@ -18,9 +18,9 @@ const LAUNCHER_ALWAYS_VISIBLE = true;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
-type BoardResolvedCharAction = Record<string, any>;
-type BoardCharSurfaceClip = Record<string, any>;
-type BoardCharPoseResult = Record<string, any>;
+export type BoardResolvedCharAction = Record<string, any>;
+export type BoardCharSurfaceClip = Record<string, any>;
+export type BoardCharPoseResult = Record<string, any>;
 
 export type BoardCharacterDrawEvaluators = {
   evalCharAtTime: (time: number, resolved: BoardResolvedCharAction[], initX: number, initY: number, clips: BoardCharSurfaceClip[], authoredAnimations: Record<string, unknown>, hasFace: boolean, faceAspect: number) => BoardCharPoseResult;
@@ -846,4 +846,3 @@ export function drawBoardCharacterToCanvas(
 
   ctx.restore(); // top-level
 }
-

@@ -46,7 +46,6 @@ import {
   projectilePoint,
   streamCharacterConstructionParams,
 } from "@/lib/character/renderer";
-import { drawBoardCharacterToCanvas } from "@/lib/character/board-renderer";
 import { CharacterEntity } from "@/lib/character/entity";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -3697,6 +3696,7 @@ export default function Board2Page() {
             actionStartTime: sentAt - actionProgress * actionDuration * 1000,
             actionDuration,
             velocity: { x: state?.vx ?? 0, y: state?.vy ?? 0 },
+            boardPose: pose ?? undefined,
             emoji: pose?.emojiText,
             emojiAlpha: pose?.emojiAlpha,
           };
@@ -3722,6 +3722,7 @@ export default function Board2Page() {
             actionStartTime: sentAt - progress * duration * 1000,
             actionDuration: duration,
             velocity: { x: 0, y: 0 },
+            boardPose: pose,
             emoji: pose.emojiText,
             emojiAlpha: pose.emojiAlpha,
           };
@@ -4570,7 +4571,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
         live.c1.currentPose = pose;
-        drawBoardCharacterToCanvas(
+        CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current), true,
           cam, sf, W, H, live.c1.initX, live.c1.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
@@ -4587,7 +4588,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
         live.c2.currentPose = pose;
-        drawBoardCharacterToCanvas(
+        CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current), true,
           cam, sf, W, H, live.c2.initX, live.c2.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
@@ -4601,7 +4602,7 @@ export default function Board2Page() {
       }
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
-      drawBoardCharacterToCanvas(
+      CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolvedCharActionsRef.current, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
@@ -4614,7 +4615,7 @@ export default function Board2Page() {
       );
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
-      drawBoardCharacterToCanvas(
+      CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolvedCharActions2Ref.current, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
@@ -9123,7 +9124,7 @@ export default function Board2Page() {
         renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
-        drawBoardCharacterToCanvas(
+        CharacterEntity.drawBoardCharacterToCanvas(
           ctx,
           playDrawTime,
           playDrawResolved,

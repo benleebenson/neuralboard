@@ -50,6 +50,8 @@ export type StreamCharacterDebugRow = {
   construction?: Record<string, number | string | boolean>;
 };
 
+export type StreamBoardPose = Record<string, number | string | boolean | null | undefined>;
+
 export function isCharacterSkin(value: unknown): value is CharacterSkin {
   return value === "stick" || value === "styled";
 }
@@ -153,6 +155,7 @@ export type StreamCharacterFrame = {
   actionDuration?: number;
   velocity?: { x: number; y: number };
   actionParams?: Record<string, number | string | boolean | null | undefined>;
+  boardPose?: StreamBoardPose;
   emoji?: string;
   emojiAlpha?: number;
 };
@@ -188,6 +191,7 @@ export type GuestCharacterFrame = {
   actionStartTime?: number;
   actionDuration?: number;
   actionParams?: Record<string, number | string | boolean | null | undefined>;
+  boardPose?: StreamBoardPose;
   skin?: "stick" | "styled";
   physique?: "slim" | "jacked";
   signDataUrl?: string;
