@@ -604,6 +604,49 @@ function findFreeBoardPos(
   };
 }
 
+function findFreeBoardPosNearHost(
+  existing: Array<{ boardX?: number; boardY?: number; boardW?: number; boardH?: number }>,
+  clipW: number,
+  clipH: number,
+  hostX: number,
+  hostY: number,
+  facing: 1 | -1 = 1
+): { boardX: number; boardY: number } {
+  const visuals = existing.filter((c) => c.boardX !== undefined);
+  const overlaps = (bx: number, by: number, pad: number) =>
+    visuals.some(
+      (c) =>
+        !(
+          bx + clipW + pad < c.boardX! ||
+          bx > c.boardX! + c.boardW! + pad ||
+          by + clipH + pad < c.boardY! ||
+          by > c.boardY! + c.boardH! + pad
+        )
+    );
+  const candidateFromCenter = (cx: number, cy: number) => ({
+    boardX: clamp(cx - clipW / 2, 0, BOARD_W - clipW),
+    boardY: clamp(cy - clipH / 2, 0, BOARD_H - clipH),
+  });
+  const side = facing || 1;
+  const centers: Array<{ dx: number; dy: number }> = [
+    { dx: side * 300, dy: -Math.min(180, clipH * 0.25) },
+    { dx: side * 500, dy: -Math.min(220, clipH * 0.2) },
+    { dx: side * 180, dy: -Math.min(360, clipH * 0.55) },
+    { dx: side * 420, dy: 180 },
+    { dx: side * 600, dy: 40 },
+    { dx: 0, dy: -Math.min(520, clipH * 0.7) },
+    { dx: -side * 300, dy: -Math.min(180, clipH * 0.25) },
+  ];
+  for (const pad of [BOARD_CLIP_PAD, 0]) {
+    for (const { dx, dy } of centers) {
+      if (Math.hypot(dx, dy) > 680) continue;
+      const { boardX, boardY } = candidateFromCenter(hostX + dx, hostY + dy);
+      if (!overlaps(boardX, boardY, pad)) return { boardX, boardY };
+    }
+  }
+  return findFreeBoardPos(existing, clipW, clipH, clamp(hostX + side * 420, 0, BOARD_W), clamp(hostY - clipH * 0.35, 0, BOARD_H));
+}
+
 function parseDurationSec(d: string | number | undefined): number {
   if (typeof d === "number") return isFinite(d) ? d : 0;
   if (!d) return 0;
@@ -2976,6 +3019,7 @@ export default function Board2Page() {
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playCleanUi, setPlayCleanUi] = useState(false);
   const [playCleanMenuOpen, setPlayCleanMenuOpen] = useState(false);
+  const [playAddMenuOpen, setPlayAddMenuOpen] = useState(false);
   const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
   const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
@@ -3245,6 +3289,7 @@ export default function Board2Page() {
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
   const faceCropDragRef = useRef<{ mode: "move" | "resize"; corner?: FaceCropCorner; startX: number; startY: number; orig: typeof faceCrop; rectW: number; rectH: number } | null>(null);
   const playModeRef = useRef(false);
+  const playOverlayInputActiveRef = useRef(false);
   const playTimeRef = useRef(0);
   const playWallStartRef = useRef(0);
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
@@ -3909,6 +3954,17 @@ export default function Board2Page() {
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
   useEffect(() => { playModeRef.current = playMode; }, [playMode]);
   useEffect(() => { playWeaponArmedRef.current = playWeaponArmed; }, [playWeaponArmed]);
+  useEffect(() => {
+    playOverlayInputActiveRef.current = playMode && (ytModalOpen || playAddMenuOpen);
+    if (playOverlayInputActiveRef.current) {
+      playHeldKeysRef.current.clear();
+      playPointerRef.current = null;
+      const state = playPhysicsRef.current;
+      if (state) {
+        state.vx = 0;
+      }
+    }
+  }, [playMode, ytModalOpen, playAddMenuOpen]);
   // Resolved character actions are COMPUTED, not stored — this useMemo recomputes from scratch
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
   // array reference), characterActions (manual edits), or characterMode change. There is no way
@@ -5242,6 +5298,19 @@ export default function Board2Page() {
     return { w: 800, h: 600 };
   }
 
+  function findBoardPosForNewMedia(
+    existing: Array<{ boardX?: number; boardY?: number; boardW?: number; boardH?: number }>,
+    clipW: number,
+    clipH: number
+  ): { boardX: number; boardY: number } {
+    const state = playModeRef.current ? playPhysicsRef.current : null;
+    if (state) {
+      return findFreeBoardPosNearHost(existing, clipW, clipH, state.x, state.y, state.facing);
+    }
+    const { camX, camY } = getVisibleBoardCenter();
+    return findFreeBoardPos(existing, clipW, clipH, camX, camY);
+  }
+
   async function addClipAndPlaceOnBoard(item: MediaItem) {
     // Wait for image to load so we get natural dimensions
     if (item.type === "image") {
@@ -5254,14 +5323,13 @@ export default function Board2Page() {
       }
     }
     const { w, h } = getMediaDimensions(item.url, item.type);
-    const { camX, camY } = getVisibleBoardCenter();
     const clipId = generateId();
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
     if (item.type === "video") createVideoElement(clipId, item.url);
     setClips((prev) => {
       const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
-      const pos = findFreeBoardPos(prev, w, h, camX, camY);
+      const pos = findBoardPosForNewMedia(prev, w, h);
       return [
         ...prev,
         {
@@ -5659,6 +5727,27 @@ export default function Board2Page() {
     }
   }
 
+  function openPlayAddMenu() {
+    setPlayCleanMenuOpen(false);
+    setPlayAddMenuOpen((v) => !v);
+  }
+
+  function triggerPlayMediaUpload() {
+    setPlayAddMenuOpen(false);
+    playHeldKeysRef.current.clear();
+    playPointerRef.current = null;
+    mediaUploadRef.current?.click();
+  }
+
+  function openPlayYoutubeModal() {
+    setPlayAddMenuOpen(false);
+    setYtView("search");
+    setYtTab("search");
+    setYtSelected(null);
+    setYtError("");
+    setYtModalOpen(true);
+  }
+
   // ─ YouTube ────────────────────────────────────────────────────────────────
 
   async function handleYtSearch(shortsOnlyOverride?: boolean) {
@@ -5748,13 +5837,12 @@ export default function Board2Page() {
         if (meta.w > 0 && !videoDimsRef.current.has(blobUrl)) {
           videoDimsRef.current.set(blobUrl, { w: meta.w, h: meta.h });
         }
-        const { camX, camY } = getVisibleBoardCenter();
         setClips((prev) => {
           const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
           const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
           const pos = (placeholderBoardX !== undefined && placeholderBoardY !== undefined)
             ? { boardX: placeholderBoardX, boardY: placeholderBoardY }
-            : findFreeBoardPos(prev, meta.w, meta.h, camX, camY);
+            : findBoardPosForNewMedia(prev, meta.w, meta.h);
           return [...prev, {
             id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
             startTime: endTime, duration: clipDuration, layer,
@@ -9197,11 +9285,19 @@ export default function Board2Page() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName;
-      const inInput = tag === "INPUT" || tag === "TEXTAREA";
-      if (playModeRef.current && !inInput) {
-        if (e.code === "Escape") { e.preventDefault(); exitPlayMode(); return; }
-        playHeldKeysRef.current.add(e.code);
+	      const tag = (e.target as HTMLElement).tagName;
+	      const inInput = tag === "INPUT" || tag === "TEXTAREA";
+	      if (playModeRef.current && !inInput) {
+	        if (playOverlayInputActiveRef.current) {
+	          if (e.code === "Escape") {
+	            e.preventDefault();
+	            setPlayAddMenuOpen(false);
+	            setYtModalOpen(false);
+	          }
+	          return;
+	        }
+	        if (e.code === "Escape") { e.preventDefault(); exitPlayMode(); return; }
+	        playHeldKeysRef.current.add(e.code);
         if (e.repeat) return;
         if (e.code === "KeyQ") {
           e.preventDefault();
@@ -9667,6 +9763,163 @@ export default function Board2Page() {
     );
   }
 
+  function renderPlayYoutubeModal() {
+    if (!ytModalOpen) return null;
+    const selectResult = (r: YtSearchResult) => {
+      const maxSec = parseDurationSec(r.duration);
+      const initEnd = Math.min(30, maxSec || 30);
+      setYtSelected(r);
+      setYtStart(0); setYtStartInput("0:00");
+      setYtEnd(initEnd); setYtEndInput(formatTimestamp(initEnd));
+      ytRangeRef.current = { start: 0, end: initEnd };
+      setYtView("trim");
+    };
+    return (
+      <div
+        onClick={(e) => { if (e.target === e.currentTarget) setYtModalOpen(false); }}
+        style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.48)", zIndex: 9, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}
+      >
+        <div style={{ width: 620, maxWidth: "calc(100vw - 28px)", maxHeight: "86dvh", display: "flex", flexDirection: "column", overflow: "hidden", background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
+          <div style={{ padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 900 }}>{ytView === "trim" ? `▶ TRIM ${(ytSelected?.title ?? "YouTube clip").slice(0, 42)}` : "▶ ADD YOUTUBE WHILE LIVE"}</div>
+            <button type="button" onClick={() => setYtModalOpen(false)} style={{ ...miniButton, marginLeft: "auto", padding: "2px 8px", fontSize: 14 }}>×</button>
+          </div>
+          <div style={{ padding: 14, overflowY: "auto" }}>
+            {ytView === "search" ? (
+              <>
+                <div style={{ display: "flex", marginBottom: 12, borderBottom: "1.5px solid #2a2a2a" }}>
+                  {(["search", "paste"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      type="button"
+                      onClick={() => { setYtTab(tab); setYtError(""); }}
+                      style={{ fontFamily: "monospace", padding: "6px 13px", fontSize: 11, fontWeight: ytTab === tab ? 900 : 600, background: ytTab === tab ? "#2a2a2a" : "transparent", color: ytTab === tab ? "#fffdf5" : "#2a2a2a", border: "none", cursor: "pointer" }}
+                    >
+                      {tab === "search" ? "Search" : "Paste URL"}
+                    </button>
+                  ))}
+                </div>
+                {ytTab === "paste" ? (
+                  <>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <input
+                        autoFocus
+                        type="text"
+                        value={ytUrlInput}
+                        onChange={(e) => setYtUrlInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") handleYtPasteUrl(); }}
+                        placeholder="https://www.youtube.com/watch?v=..."
+                        style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                      />
+                      <button type="button" onClick={handleYtPasteUrl} style={{ ...miniButton, padding: "8px 14px", fontSize: 12, fontWeight: 900 }}>Next</button>
+                    </div>
+                    {ytError && <div style={{ color: "#cc2200", fontSize: 11, marginTop: 8 }}>{ytError}</div>}
+                  </>
+                ) : (
+                  <>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                      <input
+                        autoFocus
+                        type="text"
+                        value={ytQuery}
+                        onChange={(e) => setYtQuery(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") handleYtSearch(); }}
+                        placeholder="search YouTube..."
+                        style={{ flex: 1, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "#fffdf5", outline: "none", boxShadow: "2px 2px 0 #2a2a2a" }}
+                      />
+                      <button type="button" onClick={() => handleYtSearch()} disabled={ytLoading} style={{ ...miniButton, padding: "8px 14px", fontSize: 12, fontWeight: 900, opacity: ytLoading ? 0.5 : 1 }}>{ytLoading ? "..." : "Search"}</button>
+                    </div>
+                    {ytError && <div style={{ color: "#cc2200", fontSize: 11, marginBottom: 8 }}>{ytError}</div>}
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+                      {ytResults.map((r) => (
+                        <button
+                          key={r.id}
+                          type="button"
+                          onClick={() => selectResult(r)}
+                          style={{ padding: 0, textAlign: "left", border: "1.5px solid #2a2a2a", background: "#fffdf5", boxShadow: "2px 2px 0 #2a2a2a", cursor: "pointer", overflow: "hidden", fontFamily: "monospace", color: "#2a2a2a" }}
+                        >
+                          {r.thumbnail && <img src={r.thumbnail} alt="" style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#111" }} />}
+                          <div style={{ padding: "6px 7px" }}>
+                            <div style={{ fontSize: 10, fontWeight: 900, lineHeight: 1.3, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } as React.CSSProperties}>{r.title ?? "(no title)"}</div>
+                            <div style={{ fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>{r.duration != null ? (typeof r.duration === "number" ? formatTimestamp(r.duration) : r.duration) : ""}</div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </>
+            ) : ytSelected ? (() => {
+              const maxSec = parseDurationSec(ytSelected.duration) || 600;
+              const clipLen = Math.max(0, ytEnd - ytStart);
+              return (
+                <>
+                  <div style={{ marginBottom: 12, background: "#000", lineHeight: 0 }}>
+                    <iframe
+                      src={`https://www.youtube.com/embed/${ytSelected.id}?start=${Math.floor(ytStart)}&autoplay=0`}
+                      style={{ width: "100%", aspectRatio: "16/9", border: "none" }}
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                    />
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 140px", gap: 10, alignItems: "end" }}>
+                    <label style={{ fontSize: 10, fontWeight: 900 }}>
+                      Start
+                      <input
+                        type="text"
+                        value={ytStartInput}
+                        onChange={(e) => {
+                          setYtStartInput(e.target.value);
+                          const parsed = parseTimestampSec(e.target.value);
+                          if (parsed === null) return;
+                          const nextStart = clamp(parsed, 0, Math.max(0, maxSec - 0.5));
+                          const nextEnd = clamp(Math.max(ytRangeRef.current.end, nextStart + 0.5), nextStart + 0.5, Math.min(maxSec, nextStart + 30));
+                          ytRangeRef.current = { start: nextStart, end: nextEnd };
+                          setYtStart(nextStart);
+                          setYtEnd(nextEnd);
+                          setYtEndInput(formatTimestamp(nextEnd));
+                        }}
+                        onBlur={() => setYtStartInput(formatTimestamp(ytStart))}
+                        style={{ display: "block", marginTop: 4, width: "100%", boxSizing: "border-box", fontFamily: "monospace", fontSize: 12, padding: "7px 8px", border: "1.5px solid #2a2a2a", background: "#fffdf5" }}
+                      />
+                    </label>
+                    <label style={{ fontSize: 10, fontWeight: 900 }}>
+                      End
+                      <input
+                        type="text"
+                        value={ytEndInput}
+                        onChange={(e) => {
+                          setYtEndInput(e.target.value);
+                          const parsed = parseTimestampSec(e.target.value);
+                          if (parsed === null) return;
+                          const nextEnd = clamp(parsed, ytRangeRef.current.start + 0.5, Math.min(maxSec, ytRangeRef.current.start + 30));
+                          ytRangeRef.current.end = nextEnd;
+                          setYtEnd(nextEnd);
+                        }}
+                        onBlur={() => setYtEndInput(formatTimestamp(ytEnd))}
+                        style={{ display: "block", marginTop: 4, width: "100%", boxSizing: "border-box", fontFamily: "monospace", fontSize: 12, padding: "7px 8px", border: "1.5px solid #2a2a2a", background: "#fffdf5" }}
+                      />
+                    </label>
+                    <div style={{ fontSize: 10, color: "#6a6a6a", lineHeight: 1.5 }}>
+                      Clip: {formatTimestamp(clipLen)}<br />
+                      Max: {formatTimestamp(maxSec)}
+                    </div>
+                  </div>
+                </>
+              );
+            })() : null}
+          </div>
+          {ytView === "trim" && (
+            <div style={{ padding: "10px 14px", borderTop: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 8 }}>
+              <button type="button" onClick={() => { setYtView("search"); setYtSelected(null); setYtError(""); }} style={{ ...miniButton, padding: "6px 12px", fontSize: 11 }}>Back</button>
+              <button type="button" onClick={handleYtConfirm} style={{ ...miniButton, marginLeft: "auto", padding: "6px 16px", fontSize: 12, fontWeight: 900, background: "#c8f135" }}>Add to live board</button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   // ─── Image placeholder preview modal ────────────────────────────────────────
 
   function renderImagePreviewModal() {
@@ -9752,10 +10005,11 @@ export default function Board2Page() {
 
   if (playMode) {
     return (
-      <div style={{ position: "fixed", inset: 0, zIndex: 10000, overflow: "hidden", background: "#111" }}>
-        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-        <canvas
-          ref={playCanvasRef}
+	      <div style={{ position: "fixed", inset: 0, zIndex: 10000, overflow: "hidden", background: "#111" }}>
+	        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
+	        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
+	        <canvas
+	          ref={playCanvasRef}
           width={playViewport.width}
           height={playViewport.height}
           onPointerDown={handlePlayPointerDown}
@@ -9775,10 +10029,25 @@ export default function Board2Page() {
           onClick={() => setPlayCleanMenuOpen((v) => !v)}
           style={{ position: "fixed", top: 14, right: 14, zIndex: 6, padding: "7px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.78)", opacity: 0.72, boxShadow: "2px 2px 0 rgba(42,42,42,0.55)", fontFamily: "monospace", fontWeight: 900, cursor: "pointer" }}
         >
-          ☰
-        </button>
-        {playCleanMenuOpen && (
-          <div style={{ position: "fixed", top: 50, right: 14, zIndex: 6, minWidth: 170, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+	          ☰
+	        </button>
+	        <button
+	          type="button"
+	          onClick={openPlayAddMenu}
+	          style={{ position: "fixed", top: 14, left: playCleanUi ? 78 : 154, zIndex: 6, width: 34, height: 32, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.78)", opacity: 0.72, boxShadow: "2px 2px 0 rgba(42,42,42,0.55)", fontFamily: "monospace", fontSize: 18, fontWeight: 900, lineHeight: "28px", cursor: "pointer" }}
+	          title="Add media while live"
+	        >
+	          +
+	        </button>
+	        {playAddMenuOpen && (
+	          <div style={{ position: "fixed", top: 52, left: playCleanUi ? 78 : 154, zIndex: 7, minWidth: 190, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.96)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, color: "#2a2a2a", overflow: "hidden" }}>
+	            <button type="button" onClick={triggerPlayMediaUpload} style={{ width: "100%", padding: "9px 10px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer" }}>📷 Add image</button>
+	            <button type="button" onClick={openPlayYoutubeModal} style={{ width: "100%", padding: "9px 10px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer" }}>▶️ Add YouTube</button>
+	            <div style={{ padding: "8px 10px", borderTop: "1px solid rgba(42,42,42,0.2)", color: "#6a6a6a", lineHeight: 1.45 }}>📋 Paste with Cmd/Ctrl+V</div>
+	          </div>
+	        )}
+	        {playCleanMenuOpen && (
+	          <div style={{ position: "fixed", top: 50, right: 14, zIndex: 6, minWidth: 170, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
             <button type="button" onClick={() => setPlayCleanUi((v) => !v)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>{playCleanUi ? "Show chrome" : "Hide chrome"}</button>
             <button type="button" onClick={() => playCanvasRef.current?.parentElement?.requestFullscreen?.()} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>Fullscreen</button>
             <button type="button" onClick={exitPlayMode} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, color: "#8b2b20", cursor: "pointer" }}>Exit Play Mode</button>
@@ -9832,12 +10101,19 @@ export default function Board2Page() {
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
               Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · click/hold fires while armed<br />Hold G/S/C/Z + click for grapple/skate/climb/zipline<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
-            </div>
-          )}
-        </div>}
-      </div>
-    );
-  }
+	            </div>
+	          )}
+	        </div>}
+	        {renderPlayYoutubeModal()}
+	        {renderDownloadToasts()}
+	        {toast && (
+	          <div style={{ position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 10001, background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace", fontSize: 11, padding: "8px 14px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135" }}>
+	            {toast}
+	          </div>
+	        )}
+	      </div>
+	    );
+	  }
 
   // Mobile Top 5 Tinder flow — takes over the entire mobile experience.
   // mobileDesktopOverride lets the user escape to the desktop UI.
