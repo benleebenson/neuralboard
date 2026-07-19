@@ -26,6 +26,7 @@ type GuestPhysics = {
   actionFromY?: number;
   actionTargetX?: number;
   actionTargetY?: number;
+  actionParams?: Record<string, number | string | boolean | null | undefined>;
   emote?: string;
   spawnAt: number;
   frozenUntil?: number;
@@ -39,10 +40,20 @@ const GUEST_DEFAULT_SKIN: "stick" | "styled" = "stick";
 const GUEST_WALK_SPEED = 420;
 const GUEST_RUN_SPEED = 720;
 const GUEST_SKATE_ROLL_SPEED = 560;
+const GUEST_PHASE_TIME_SCALE = 1.2;
+const GUEST_SKATE_MOUNT_SEC = 0.3 * GUEST_PHASE_TIME_SCALE;
+const GUEST_SKATE_LAND_SEC = 0.4 * GUEST_PHASE_TIME_SCALE;
+const GUEST_SKATE_EDGE_MARGIN = 50;
+const GUEST_SKATE_LANDING_ROLLOUT_PX = 90;
+const GUEST_SKATE_MIN_POP_HEIGHT = 80;
+const GUEST_SKATE_MAX_POP_HEIGHT = 140;
+const GUEST_SKATE_POP_CLEARANCE = 60;
+const GUEST_SKATE_PREP_SEC = 0.25 * GUEST_PHASE_TIME_SCALE;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 type StreamSurface = StreamSnapshotMessage["clips"][number];
 const GUEST_PLANNED_TRAVEL = new Set<GuestCharacterFrame["actionType"]>(["jump", "flip", "grapple", "skateTo", "wallClimb", "zipline"]);
+const GUEST_AUTO_STOW_ACTIONS = new Set<GuestCharacterFrame["actionType"]>(["grapple", "skateTo", "wallClimb", "zipline", "forceChoke", "eliminated"]);
 
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:guest]", ...args);
@@ -125,6 +136,56 @@ function findGuestSupport(x: number, y: number, surfaces: StreamSurface[]): Stre
     .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
 }
 
+function clampInsideGuestSurface(surface: StreamSurface, x: number, pad = GUEST_SKATE_EDGE_MARGIN): number {
+  const innerPad = Math.min(pad, Math.max(0, surface.boardW / 2 - 1));
+  return clamp(x, surface.boardX + innerPad, surface.boardX + surface.boardW - innerPad);
+}
+
+function guestSkateParams(fromX: number, fromY: number, targetX: number, targetY: number, surfaces: StreamSurface[], targetSurface?: StreamSurface): Record<string, number | string | boolean> | undefined {
+  const source = findGuestSupport(fromX, fromY, surfaces);
+  const target = targetSurface ?? findGuestSupport(targetX, targetY, surfaces);
+  if (!source || !target || source.id === target.id) return undefined;
+  const sourceCenterX = source.boardX + source.boardW / 2;
+  const targetCenterX = target.boardX + target.boardW / 2;
+  const facing: 1 | -1 = targetCenterX >= sourceCenterX ? 1 : -1;
+  const edgeX = facing === 1 ? source.boardX + source.boardW - GUEST_SKATE_EDGE_MARGIN : source.boardX + GUEST_SKATE_EDGE_MARGIN;
+  const targetHoldX = clampInsideGuestSurface(target, targetX, GUEST_SKATE_EDGE_MARGIN);
+  const gapEndX = clampInsideGuestSurface(target, targetHoldX - facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
+  const finalX = clampInsideGuestSurface(target, gapEndX + facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
+  const rollDistance = Math.abs(edgeX - fromX);
+  const ollyDistance = Math.abs(gapEndX - edgeX);
+  const heightDelta = target.boardY - source.boardY;
+  const verticalClimb = Math.max(0, source.boardY - target.boardY);
+  const peakHeight = clamp(verticalClimb + GUEST_SKATE_POP_CLEARANCE, GUEST_SKATE_MIN_POP_HEIGHT, GUEST_SKATE_MAX_POP_HEIGHT);
+  return {
+    plan: "skateTo",
+    facing,
+    startX: fromX,
+    startY: source.boardY,
+    edgeX,
+    launchY: source.boardY,
+    gapEndX,
+    landingY: target.boardY,
+    finalX,
+    rollDistance,
+    ollyDistance,
+    heightDelta,
+    peakHeight,
+    targetSurfaceId: target.id,
+    sourceSurfaceId: source.id,
+  };
+}
+
+function guestGrappleParams(fromX: number, fromY: number, targetX: number, targetY: number, surfaces: StreamSurface[]): Record<string, number | string | boolean> {
+  const landingY = findGuestSupport(targetX, targetY, surfaces)?.boardY ?? targetY;
+  return {
+    plan: "grapple",
+    anchorX: fromX + (targetX - fromX) * 0.55,
+    anchorY: Math.min(fromY, landingY) - 380,
+    landingY,
+  };
+}
+
 function nearestGuestSurface(x: number, y: number, surfaces: StreamSurface[]): StreamSurface | undefined {
   return [...surfaces].sort((a, b) => {
     const ax = clamp(x, a.boardX + 24, a.boardX + a.boardW - 24);
@@ -191,6 +252,7 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
     actionStartTime: sentAt - progress * duration * 1000,
     actionDuration: duration,
     actionParams: p.actionTargetX !== undefined ? {
+      ...(p.actionParams ?? {}),
       fromX: p.actionFromX,
       fromY: p.actionFromY,
       targetX: p.actionTargetX,
@@ -210,6 +272,7 @@ function clearGuestActionPlan(p: GuestPhysics) {
   p.actionFromY = undefined;
   p.actionTargetX = undefined;
   p.actionTargetY = undefined;
+  p.actionParams = undefined;
 }
 
 function startGuestStationaryAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], now = performance.now()) {
@@ -223,11 +286,15 @@ function startGuestStationaryAction(p: GuestPhysics, action: GuestCharacterFrame
   p.actionDurationMs = guestActionDuration(action) * 1000;
 }
 
-function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], targetX: number, targetY: number, now = performance.now()) {
+function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], targetX: number, targetY: number, surfaces: StreamSurface[] = [], targetSurface?: StreamSurface, now = performance.now()) {
   const fromX = p.x;
   const fromY = p.y;
-  const dx = targetX - fromX;
-  const dy = targetY - fromY;
+  const skateParams = action === "skateTo" ? guestSkateParams(fromX, fromY, targetX, targetY, surfaces, targetSurface) : undefined;
+  const grappleParams = action === "grapple" ? guestGrappleParams(fromX, fromY, targetX, targetY, surfaces) : undefined;
+  const effectiveTargetX = typeof skateParams?.finalX === "number" ? skateParams.finalX : targetX;
+  const effectiveTargetY = typeof skateParams?.landingY === "number" ? skateParams.landingY : (typeof grappleParams?.landingY === "number" ? grappleParams.landingY : targetY);
+  const dx = effectiveTargetX - fromX;
+  const dy = effectiveTargetY - fromY;
   const dist = Math.hypot(dx, dy);
   p.facing = Math.abs(dx) > 4 ? (dx >= 0 ? 1 : -1) : p.facing;
   p.targetX = null;
@@ -237,26 +304,128 @@ function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["a
   p.actionDurationMs = guestActionDuration(action, dist, dy) * 1000;
   p.actionFromX = fromX;
   p.actionFromY = fromY;
-  p.actionTargetX = targetX;
-  p.actionTargetY = targetY;
+  p.actionTargetX = effectiveTargetX;
+  p.actionTargetY = effectiveTargetY;
+  p.actionParams = {
+    ...(skateParams ?? grappleParams ?? {}),
+    fromX,
+    fromY,
+    targetX,
+    targetY,
+    effectiveTargetX,
+    effectiveTargetY,
+    durationSec: p.actionDurationMs / 1000,
+  };
   p.vx = dx / Math.max(0.001, p.actionDurationMs / 1000);
   p.vy = dy / Math.max(0.001, p.actionDurationMs / 1000);
   p.grounded = action === "skateTo";
   p.surfaceId = null;
 }
 
+function numParam(params: Record<string, number | string | boolean | null | undefined> | undefined, key: string): number | undefined {
+  const value = params?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function guestSkateTiming(params: Record<string, number | string | boolean | null | undefined>, durationSec: number) {
+  const rollDistance = numParam(params, "rollDistance") ?? 1;
+  const ollyDistance = numParam(params, "ollyDistance") ?? 1;
+  const naturalRoll = Math.max(0.05 * GUEST_PHASE_TIME_SCALE, rollDistance / GUEST_SKATE_ROLL_SPEED);
+  const naturalAir = Math.max(0.08 * GUEST_PHASE_TIME_SCALE, ollyDistance / GUEST_SKATE_ROLL_SPEED);
+  const fixed = GUEST_SKATE_MOUNT_SEC + GUEST_SKATE_LAND_SEC;
+  let mountDur = GUEST_SKATE_MOUNT_SEC;
+  let landDur = GUEST_SKATE_LAND_SEC;
+  let rollDur = naturalRoll;
+  let airDur = naturalAir;
+  if (durationSec >= fixed + 0.12) {
+    const variableBudget = Math.max(0.12, durationSec - fixed);
+    const variableNatural = Math.max(0.001, naturalRoll + naturalAir);
+    rollDur = variableBudget * (naturalRoll / variableNatural);
+    airDur = variableBudget * (naturalAir / variableNatural);
+  } else {
+    const naturalTotal = fixed + naturalRoll + naturalAir;
+    const scale = durationSec / Math.max(0.001, naturalTotal);
+    mountDur *= scale;
+    landDur *= scale;
+    rollDur *= scale;
+    airDur *= scale;
+  }
+  const mountEnd = mountDur;
+  const airStart = mountDur + rollDur;
+  const airEnd = airStart + airDur;
+  const prepDur = Math.min(GUEST_SKATE_PREP_SEC, Math.max(0, rollDur), rollDistance > 0 ? (Math.min(120, rollDistance) / rollDistance) * rollDur : 0);
+  return { mountDur, landDur, rollDur, airDur, mountEnd, airStart, airEnd, prepDur };
+}
+
+function guestPlannedRootPosition(p: GuestPhysics, rawT: number): { x: number; y: number; grounded: boolean } | null {
+  if (!p.actionParams || p.actionTargetX === undefined || p.actionTargetY === undefined || p.actionFromX === undefined || p.actionFromY === undefined || !p.actionDurationMs) return null;
+  if (p.action === "skateTo" && p.actionParams.plan === "skateTo") {
+    const durationSec = p.actionDurationMs / 1000;
+    const timing = guestSkateTiming(p.actionParams, durationSec);
+    const elapsed = rawT * durationSec;
+    const startX = numParam(p.actionParams, "startX") ?? p.actionFromX;
+    const startY = numParam(p.actionParams, "startY") ?? p.actionFromY;
+    const edgeX = numParam(p.actionParams, "edgeX") ?? p.actionTargetX;
+    const gapEndX = numParam(p.actionParams, "gapEndX") ?? p.actionTargetX;
+    const finalX = numParam(p.actionParams, "finalX") ?? p.actionTargetX;
+    const landingY = numParam(p.actionParams, "landingY") ?? p.actionTargetY;
+    const peakHeight = numParam(p.actionParams, "peakHeight") ?? 100;
+    const heightDelta = numParam(p.actionParams, "heightDelta") ?? 0;
+    if (elapsed < timing.mountEnd) return { x: startX, y: startY, grounded: true };
+    if (elapsed < timing.airStart) {
+      const rollT = timing.rollDur > 0 ? clamp((elapsed - timing.mountEnd) / timing.rollDur, 0, 1) : 1;
+      return { x: lerp(startX, edgeX, rollT), y: startY, grounded: true };
+    }
+    if (elapsed < timing.airEnd) {
+      const airElapsed = Math.max(0, elapsed - timing.airStart);
+      const T = Math.max(0.001, timing.airDur);
+      const t = clamp(airElapsed / T, 0, 1);
+      const g = Math.pow((Math.sqrt(2 * peakHeight) + Math.sqrt(Math.max(0.001, 2 * (peakHeight + heightDelta)))) / T, 2);
+      const v0 = -Math.sqrt(2 * g * peakHeight);
+      return {
+        x: lerp(edgeX, gapEndX, t),
+        y: startY + v0 * airElapsed + 0.5 * g * airElapsed * airElapsed,
+        grounded: false,
+      };
+    }
+    const landT = timing.landDur > 0 ? clamp((elapsed - timing.airEnd) / timing.landDur, 0, 1) : 1;
+    const rolloutT = clamp(landT / 0.68, 0, 1);
+    return { x: lerp(gapEndX, finalX, rolloutT), y: landingY, grounded: true };
+  }
+  if (p.action === "grapple" && p.actionParams.plan === "grapple") {
+    const progress = rawT;
+    const pullStart = 0.32;
+    const releaseDetach = 0.85;
+    const freefallEnd = 0.93;
+    const landingY = numParam(p.actionParams, "landingY") ?? p.actionTargetY;
+    if (progress < pullStart) return { x: p.actionFromX, y: p.actionFromY, grounded: true };
+    if (progress < releaseDetach) {
+      const zipT = 1 - Math.pow(1 - clamp((progress - pullStart) / (releaseDetach - pullStart), 0, 1), 3);
+      const sag = Math.sin(Math.PI * zipT) * 28;
+      return { x: lerp(p.actionFromX, p.actionTargetX, zipT), y: lerp(p.actionFromY, landingY - 60, zipT) + sag, grounded: false };
+    }
+    if (progress < freefallEnd) {
+      const t = (progress - releaseDetach) / (freefallEnd - releaseDetach);
+      return { x: p.actionTargetX, y: lerp(landingY - 60, landingY, t * t), grounded: false };
+    }
+    return { x: p.actionTargetX, y: landingY, grounded: true };
+  }
+  return null;
+}
+
 function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: StreamSurface[]): boolean {
   if (p.actionTargetX === undefined || p.actionTargetY === undefined || p.actionFromX === undefined || p.actionFromY === undefined || !p.actionDurationMs || !GUEST_PLANNED_TRAVEL.has(p.action)) return false;
   const rawT = clamp((now - p.actionStarted) / Math.max(1, p.actionDurationMs), 0, 1);
+  const plannedRoot = guestPlannedRootPosition(p, rawT);
   const t = p.action === "grapple" || p.action === "zipline" ? 1 - Math.pow(1 - rawT, 2.2) : rawT;
   const prevX = p.x;
   const prevY = p.y;
-  p.x = lerp(p.actionFromX, p.actionTargetX, t);
-  p.y = lerp(p.actionFromY, p.actionTargetY, t);
+  p.x = plannedRoot?.x ?? lerp(p.actionFromX, p.actionTargetX, t);
+  p.y = plannedRoot?.y ?? lerp(p.actionFromY, p.actionTargetY, t);
   p.vx = (p.x - prevX) / Math.max(0.001, 1 / 60);
   p.vy = (p.y - prevY) / Math.max(0.001, 1 / 60);
   if (Math.abs(p.actionTargetX - p.actionFromX) > 4) p.facing = p.actionTargetX >= p.actionFromX ? 1 : -1;
-  p.grounded = p.action === "skateTo" ? rawT < 0.58 || rawT > 0.82 : false;
+  p.grounded = plannedRoot?.grounded ?? (p.action === "skateTo" ? rawT < 0.58 || rawT > 0.82 : false);
   if (rawT >= 1) {
     p.x = p.actionTargetX;
     p.y = p.actionTargetY;
@@ -328,11 +497,11 @@ export default function StreamPage() {
     channel.on("broadcast",{event:"snapshot"},({payload})=>{streamDebugLog("snapshot broadcast",{sessionId:(payload as StreamSnapshotMessage).sessionId,clips:(payload as StreamSnapshotMessage).clips?.length});snapshotRef.current=payload as StreamSnapshotMessage;setSnapshot(snapshotRef.current);setLive(true);setStatus("live");})
       .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const previousSeq=latestHost.current?.seq??-1;if(frame.seq!==undefined&&frame.seq<=previousSeq){streamDebugLog("drop stale host frame",{seq:frame.seq,previousSeq});return;}if(frame.guestSkin){hostGuestSkin.current=frame.guestSkin;setGuestSkinLabel(frame.guestSkin);}const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(frame.weapon)weaponState.current=frame.weapon;if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{seq:frame.seq,sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),renderer:RENDERER_VERSION,guestSkin:hostGuestSkin.current,weapon:frame.weapon,characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
       .on("broadcast",{event:"guest-state"},({payload})=>{const f=payload as GuestCharacterFrame;if(f.sessionId===latestHost.current?.sessionId||!latestHost.current){const prevSeq=remoteGuestSeq.current.get(f.guestId)??-1;if(f.seq!==undefined&&f.seq<=prevSeq){streamDebugLog("drop stale guest-state",{guestId:f.guestId,seq:f.seq,prevSeq});return;}if(f.seq!==undefined)remoteGuestSeq.current.set(f.guestId,f.seq);if(validSignDataUrl(f.signDataUrl))cacheSignImage(f.guestId,f.signDataUrl);const measured=Date.now()-f.sentAt;const prev=remoteClockOffsets.current.get(f.guestId)??measured;remoteClockOffsets.current.set(f.guestId,prev*.85+measured*.15);remoteGuests.current.set(f.guestId,{...f,receivedAt:Date.now()});}})
-      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;clearGuestActionPlan(p);}})
+      .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){signActiveRef.current=false;setSignActive(false);p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;clearGuestActionPlan(p);void refreshGuestPresence(false);}})
       .on("broadcast",{event:"weapon_state"},({payload})=>{streamDebugLog("ignore legacy weapon_state; frame.weapon is authoritative",payload);})
       .on("broadcast",{event:"shot_fired"},({payload})=>{streamDebugLog("shot_fired received",(payload as StreamShotFiredMessage).shotId);weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
       .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
-      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
+      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
       .on("broadcast",{event:"remove-sign"},({payload})=>{const msg=payload as {guestId?:string};if(msg.guestId===guestId){signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);void refreshGuestPresence(false,undefined);}})
       .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);remoteGuestSeq.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
@@ -345,7 +514,7 @@ export default function StreamPage() {
   const emote=()=>{const p=physics.current;if(!p||!GUEST_VERB_SET.has("emote"))return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];startGuestStationaryAction(p,"emote");};
   const flipGuestTo=(targetX?:number,targetY?:number)=>{const p=physics.current;if(!p||!p.grounded)return;startGuestPlannedAction(p,"flip",targetX??p.x+p.facing*520,targetY??p.y);};
   const guestTargetVerb=(): GuestCharacterFrame["actionType"]|null=>{const keys=guestHeldKeys.current;if(keys.has("g"))return"grapple";if(keys.has("s"))return"skateTo";if(keys.has("c"))return"wallClimb";if(keys.has("z"))return"zipline";return null;};
-  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY);};
+  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number,surfaces:StreamSurface[]=[],targetSurface?:StreamSurface)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY,surfaces,targetSurface);};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
 
   useEffect(() => {
@@ -599,7 +768,7 @@ export default function StreamPage() {
     return () => cancelAnimationFrame(raf);
   }, [guestId, mode, hostCam, snapshot]);
 
-  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const surfaces=streamSurfaces(snapshot).filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){issueGuestTargetVerb(verb,targetX,targetY);return;}const dx=targetX-p.x;const wantsArc=p.grounded&&(rawY<p.y-90||Math.abs(dx)>520|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
+  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;const allSurfaces=streamSurfaces(snapshot);const surfaces=allSurfaces.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){if(GUEST_AUTO_STOW_ACTIONS.has(verb)&&signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}issueGuestTargetVerb(verb,targetX,targetY,allSurfaces,destination);return;}const dx=targetX-p.x;const wantsArc=p.grounded&&(rawY<p.y-90||Math.abs(dx)>520|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
   useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance"))startGuestStationaryAction(p,"dance");if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps"))startGuestStationaryAction(p,"pullUps");if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){startGuestStationaryAction(p,"mirrorCheck");p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch"))startGuestStationaryAction(p,"sitAndWatch");};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
   useEffect(()=>{if(signOpen)requestAnimationFrame(clearSignCanvas);},[signOpen]);
   const signPoint=(e:React.PointerEvent<HTMLCanvasElement>)=>{const rect=e.currentTarget.getBoundingClientRect();return{x:(e.clientX-rect.left)*(e.currentTarget.width/rect.width),y:(e.clientY-rect.top)*(e.currentTarget.height/rect.height)};};

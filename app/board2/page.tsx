@@ -1544,6 +1544,7 @@ type CharPoseResult = {
   emojiAlpha?: number;
   pointTargetBX?: number;
   pointTargetBY?: number;
+  forceHandOpen?: boolean;
   grappleAnchorBX?: number;
   grappleAnchorBY?: number;
   grappleRopeAlpha?: number;
@@ -3672,9 +3673,10 @@ export default function Board2Page() {
           const resolved = runtime?.enabled ? liveResolvedActions(runtime, clipsRef.current) : [];
           const t = runtime?.enabled ? liveRuntimeSeconds(runtime, wallMs) : 0;
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
-          const pose = runtime?.enabled && state
+          let pose = runtime?.enabled && state
             ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
+          if (pose && id === "c1") pose = applyPlayForceChokePose(pose);
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = active?.type ?? (!state
             ? "idle"
@@ -8613,6 +8615,24 @@ export default function Board2Page() {
     return true;
   }
 
+  function applyPlayForceChokePose(pose: CharPoseResult): CharPoseResult {
+    const choke = playForceChokeRef.current;
+    if (!choke) return pose;
+    const facing: 1 | -1 = choke.position.x >= pose.boardX ? 1 : -1;
+    return {
+      ...pose,
+      facing,
+      bodyLean: pose.bodyLean + 0.08 * facing,
+      pointTargetBX: choke.position.x,
+      pointTargetBY: choke.position.y - 78,
+      forceHandOpen: true,
+      leftArmA: facing >= 0 ? 0.42 : pose.leftArmA,
+      leftForeA: facing >= 0 ? 0.14 : pose.leftForeA,
+      rightArmA: facing < 0 ? -0.42 : pose.rightArmA,
+      rightForeA: facing < 0 ? -0.14 : pose.rightForeA,
+    };
+  }
+
   function playAimFacing(current: 1 | -1, originX: number, originY: number, aim?: { x: number; y: number } | null): 1 | -1 {
     if (!aim) return current;
     const dx = aim.x - originX;
@@ -9114,6 +9134,7 @@ export default function Board2Page() {
         state.facing = playAimFacing(state.facing, state.x, state.y - 110, aim);
         playPose = applyPlayWeaponPose(playPose, state);
       }
+      playPose = applyPlayForceChokePose(playPose);
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
       const target = playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom };
       const follow = 1 - Math.exp(-dt * 5.5);

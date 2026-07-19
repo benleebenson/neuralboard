@@ -497,6 +497,29 @@ export function drawBoardCharacterToCanvas(
     ctx.lineTo(hx, hy);
     ctx.stroke();
   };
+  const handPointForArm = (armA: number, foreA: number): LocalPoint => {
+    const ex = -Math.sin(armA) * armLen;
+    const ey = shoulderY + Math.cos(armA) * armLen;
+    return {
+      x: ex - Math.sin(foreA) * armLen,
+      y: ey + Math.cos(foreA) * armLen,
+    };
+  };
+  const drawOpenHand = (armA: number, foreA: number) => {
+    const hand = handPointForArm(armA, foreA);
+    const angle = Math.atan2(-Math.sin(foreA), Math.cos(foreA)) - Math.PI / 2;
+    ctx.save();
+    ctx.translate(hand.x, hand.y);
+    ctx.rotate(angle);
+    ctx.lineWidth = Math.max(1, 1.2 * S);
+    for (const spread of [-0.38, 0, 0.38]) {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.cos(spread) * 11 * S, Math.sin(spread) * 11 * S);
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
 
   const addP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x + b.x, y: a.y + b.y });
   const subP = (a: LocalPoint, b: LocalPoint): LocalPoint => ({ x: a.x - b.x, y: a.y - b.y });
@@ -721,6 +744,11 @@ export function drawBoardCharacterToCanvas(
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
     drawArm(lArmA, lForeA);
     drawArm(rArmA, rForeA);
+  }
+  if (p.forceHandOpen && p.pointTargetBX !== undefined) {
+    const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
+    if (tdxLocal >= 0) drawOpenHand(rArmA, rForeA);
+    else drawOpenHand(lArmA, lForeA);
   }
 
   if (p.popcornAlpha && p.popcornAlpha > 0) {

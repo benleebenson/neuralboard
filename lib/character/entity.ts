@@ -1,4 +1,5 @@
 import { drawBoardCharacterToCanvas, type BoardCharPoseResult } from "./board-renderer";
+import { STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { FORWARD_TUCK_FLIP_KEYFRAMES, sampleAnimation, type Pose } from "../characterAnimations";
 import {
   type CharacterSkin,
@@ -179,6 +180,7 @@ function entityPoseFromHostFrame(frame: StreamCharacterFrame, identity: Characte
     facing: frame.facing,
     actionType: frame.actionType,
     progress: actionProgressFromFrame(frame.progress, frame.actionStartTime, frame.actionDuration, clockOffsetMs),
+    actionParams: frame.actionParams,
     emoji: frame.emoji,
     physique: frame.physique ?? identity.physique,
     seed: hash01(`${frame.id}:${frame.actionStartTime ?? 0}:${frame.actionType}`),
@@ -195,6 +197,7 @@ function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: Characte
     facing: frame.facing,
     actionType: frame.actionType,
     progress: actionProgressFromFrame(frame.actionProgress, frame.actionStartTime, frame.actionDuration, clockOffsetMs),
+    actionParams: frame.actionParams,
     emoji: frame.emote,
     physique: frame.physique ?? identity.physique,
     signActive: frame.signActive,
@@ -210,6 +213,7 @@ function streamPoseFallback(args: {
   facing: 1 | -1;
   actionType: string;
   progress: number;
+  actionParams?: Record<string, number | string | boolean | null | undefined>;
   emoji?: string;
   physique: "slim" | "jacked";
   signActive?: boolean;
@@ -217,6 +221,10 @@ function streamPoseFallback(args: {
 }): BoardCharPoseResult {
   const p = clamp(args.progress, 0, 1.4);
   const pose = standingBoardPose(args.x, args.y, args.facing, p * Math.PI * 2);
+  const param = (key: string, fallback = 0) => {
+    const value = args.actionParams?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  };
   const moving = ["walk", "run", "walkTo", "runTo"].includes(args.actionType) || Math.abs(args.vx) > 45;
   if (moving) {
     const run = args.actionType === "run" || args.actionType === "runTo" || Math.abs(args.vx) > 520;
@@ -231,7 +239,7 @@ function streamPoseFallback(args: {
     pose.leftForeA = 0.1;
     pose.rightForeA = -0.1;
   }
-  if (["jump", "jumpTo", "grapple", "zipline", "wallClimb"].includes(args.actionType)) {
+  if (["jump", "jumpTo", "zipline", "wallClimb"].includes(args.actionType) || (args.actionType === "grapple" && args.actionParams?.plan !== "grapple")) {
     pose.airY = -150 * 4 * Math.min(1, p) * (1 - Math.min(1, p));
     pose.bodyLean = 0.08 * args.facing;
     pose.leftLegA = p < 0.7 ? -0.5 : 0.25;
@@ -313,18 +321,55 @@ function streamPoseFallback(args: {
     }
   }
   if (args.actionType === "skateTo") {
-    const phase = p * Math.PI * 2;
-    const airT = clamp((p - 0.48) / 0.24, 0, 1);
-    const landT = clamp((p - 0.72) / 0.28, 0, 1);
+    const durationSec = Math.max(0.001, param("durationSec", 1.8));
+    const timing = entitySkateTiming(args.actionParams, durationSec);
+    const elapsed = Math.min(1, p) * durationSec;
+    const startX = param("startX", args.x);
+    const startY = param("startY", args.y);
+    const edgeX = param("edgeX", args.x);
+    const gapEndX = param("gapEndX", args.x);
+    const finalX = param("finalX", args.x);
+    const landingY = param("landingY", args.y);
+    const heightDelta = param("heightDelta", landingY - startY);
+    const peakHeight = param("peakHeight", 100);
+    const facing = (param("facing", args.facing) >= 0 ? 1 : -1) as 1 | -1;
+    let phaseProgress = p;
+    let airT = 0;
+    let landT = 0;
+    pose.facing = facing;
+    pose.boardX = startX;
+    pose.boardY = startY;
+    if (elapsed < timing.mountEnd) {
+      phaseProgress = timing.mountDur > 0 ? elapsed / timing.mountDur : 1;
+    } else if (elapsed < timing.airStart) {
+      const rollT = timing.rollDur > 0 ? clamp((elapsed - timing.mountEnd) / timing.rollDur, 0, 1) : 1;
+      pose.boardX = lerp(startX, edgeX, rollT);
+      phaseProgress = param("rollDistance", 0) > 0 ? Math.abs(pose.boardX - startX) / 400 : rollT;
+    } else if (elapsed < timing.airEnd) {
+      const airElapsed = elapsed - timing.airStart;
+      const T = Math.max(0.001, timing.airDur);
+      airT = clamp(airElapsed / T, 0, 1);
+      const g = Math.pow((Math.sqrt(2 * peakHeight) + Math.sqrt(Math.max(0.001, 2 * (peakHeight + heightDelta)))) / T, 2);
+      const v0 = -Math.sqrt(2 * g * peakHeight);
+      pose.boardX = lerp(edgeX, gapEndX, airT);
+      pose.boardY = startY;
+      pose.airY = v0 * airElapsed + 0.5 * g * airElapsed * airElapsed;
+      phaseProgress = airT;
+    } else {
+      landT = timing.landDur > 0 ? clamp((elapsed - timing.airEnd) / timing.landDur, 0, 1) : 1;
+      pose.boardX = lerp(gapEndX, finalX, clamp(landT / 0.68, 0, 1));
+      pose.boardY = landingY;
+      phaseProgress = landT;
+    }
+    const phase = phaseProgress * Math.PI * 2;
     const pedal = Math.sin(phase * 3.2);
-    pose.skateboardVisible = p < 0.94;
-    pose.skateFootMode = airT > 0 && airT < 1 ? "air" : Math.abs(pedal) > 0.35 && p < 0.45 ? "left-push" : "both-planted";
-    pose.skateCrouch = p < 0.42 ? 7 : airT > 0 && airT < 1 ? 12 : lerp(18, 6, landT);
+    pose.skateboardVisible = elapsed < timing.airEnd + timing.landDur * 0.72;
+    pose.skateFootMode = airT > 0 && airT < 1 ? "air" : Math.abs(pedal) > 0.35 && elapsed < timing.airStart - timing.prepDur ? "left-push" : "both-planted";
+    pose.skateCrouch = elapsed < timing.airStart ? 7 : airT > 0 && airT < 1 ? 12 : lerp(18, 6, landT);
     pose.skateboardTilt = airT > 0 && airT < 0.35 ? lerp(-0.45, 0, airT / 0.35) : p > 0.42 && p < 0.5 ? -0.45 * clamp((p - 0.42) / 0.08, 0, 1) : 0;
-    pose.skateSparkAlpha = p > 0.43 && p < 0.58 ? 1 - clamp((p - 0.43) / 0.15, 0, 1) : 0;
+    pose.skateSparkAlpha = elapsed >= timing.airStart - 0.1 && elapsed <= timing.airStart + 0.15 ? 1 - clamp((elapsed - timing.airStart) / 0.15, 0, 1) : 0;
     pose.skateMotionAlpha = airT > 0 && airT < 1 ? Math.max(0, 1 - Math.abs(airT - 0.5) / 0.35) : 0;
-    pose.airY = airT > 0 && airT < 1 ? -88 * 4 * airT * (1 - airT) : 0;
-    pose.bodyLean = p < 0.5 ? 0.14 * args.facing : -0.08 * args.facing * (1 - landT);
+    pose.bodyLean = elapsed < timing.airStart ? 0.14 * facing : -0.08 * facing * (1 - landT);
     pose.leftArmA = 0.22 + Math.sin(phase) * 0.12;
     pose.rightArmA = -0.22 + Math.sin(phase + Math.PI) * 0.12;
     pose.leftForeA = 0.16;
@@ -334,6 +379,50 @@ function streamPoseFallback(args: {
       pose.rightLegA = -0.28;
       pose.leftShinA = 0.58;
       pose.rightShinA = -0.58;
+    }
+  }
+  if (args.actionType === "grapple" && args.actionParams?.plan === "grapple") {
+    const anchorX = param("anchorX", args.x - args.facing * 260);
+    const anchorY = param("anchorY", args.y - 320);
+    const targetX = param("effectiveTargetX", args.x);
+    const landingY = param("landingY", args.y);
+    const facing: 1 | -1 = targetX >= param("fromX", args.x) ? 1 : -1;
+    const prepEnd = 0.12;
+    const fireEnd = 0.22;
+    const pullStart = 0.32;
+    const releaseDetach = 0.85;
+    const freefallEnd = 0.93;
+    const zipT = p <= pullStart ? 0 : p >= releaseDetach ? 1 : 1 - Math.pow(1 - clamp((p - pullStart) / (releaseDetach - pullStart), 0, 1), 3);
+    pose.facing = facing;
+    pose.grappleAnchorBX = anchorX;
+    pose.grappleAnchorBY = anchorY;
+    pose.grappleRopeAlpha = p < prepEnd ? 0 : p < fireEnd ? clamp((p - prepEnd) / (fireEnd - prepEnd), 0, 1) : p < releaseDetach ? 1 : 0;
+    pose.grappleHookT = p < fireEnd ? 0.15 : p < pullStart ? clamp((p - fireEnd) / (pullStart - fireEnd), 0, 1) : 1;
+    pose.grappleTaut = p >= pullStart && p < releaseDetach;
+    if (p >= pullStart && p < releaseDetach) {
+      pose.boardX = lerp(param("fromX", args.x), targetX, zipT);
+      pose.boardY = lerp(param("fromY", args.y), landingY - 60, zipT) + Math.sin(Math.PI * zipT) * 28;
+    } else if (p >= releaseDetach && p < freefallEnd) {
+      const fallT = (p - releaseDetach) / (freefallEnd - releaseDetach);
+      pose.boardX = targetX;
+      pose.boardY = lerp(landingY - 60, landingY, fallT * fallT);
+    } else if (p >= freefallEnd) {
+      pose.boardX = targetX;
+      pose.boardY = landingY;
+    }
+    const aim = entityAimAngle(pose.boardX, pose.boardY, facing, anchorX, anchorY);
+    pose.bodyLean = (p < pullStart ? -0.06 : -0.55 * (1 - zipT)) * facing;
+    if (facing >= 0) {
+      pose.rightArmA = aim; pose.rightForeA = aim;
+      pose.leftArmA = 0.42; pose.leftForeA = 0.18;
+    } else {
+      pose.leftArmA = aim; pose.leftForeA = aim;
+      pose.rightArmA = -0.42; pose.rightForeA = -0.18;
+    }
+    if (p >= pullStart && p < releaseDetach) {
+      pose.leftLegA = lerp(0.55, -0.32, zipT);
+      pose.rightLegA = lerp(0.42, 0.72, zipT);
+      pose.headBob = -2;
     }
   }
   if (args.actionType === "emote" || args.actionType === "forceChoke") {
@@ -371,10 +460,17 @@ function streamPoseFallback(args: {
     }
   }
   if (args.signActive) {
-    pose.leftArmA = 1.05;
-    pose.rightArmA = -1.05;
-    pose.leftForeA = 0.65;
-    pose.rightForeA = -0.65;
+    if (args.facing >= 0) {
+      pose.rightArmA = -1.2;
+      pose.rightForeA = -1.42;
+      pose.leftArmA = 0.38;
+      pose.leftForeA = 0.12;
+    } else {
+      pose.leftArmA = 1.2;
+      pose.leftForeA = 1.42;
+      pose.rightArmA = -0.38;
+      pose.rightForeA = -0.12;
+    }
   }
   return pose;
 }
@@ -425,14 +521,22 @@ function drawEntitySign(
   renderTimeMs: number,
 ) {
   if (!imageReady(sign) || !entity.guestFrame?.signActive || !entity.pose) return;
-  const sx = (entity.pose.boardX - cam.cameraX) * sf + W / 2;
-  const sy = (entity.pose.boardY - cam.cameraY) * sf + H / 2;
-  const sway = Math.sin(renderTimeMs / 420 + entity.id.length) * 4 * sf;
+  const grip = entityHandPoint(entity.pose, entity.pose.facing >= 0 ? "right" : "left", cam, sf, W, H);
+  const sway = Math.sin(renderTimeMs / 420 + entity.id.length) * 0.04;
   const w = 132 * sf;
   const h = 88 * sf;
+  const post = 48 * sf;
   ctx.save();
-  ctx.translate(sx + sway, sy - 250 * sf);
-  ctx.rotate(Math.sin(renderTimeMs / 650) * 0.025);
+  ctx.translate(grip.x, grip.y);
+  ctx.rotate(grip.angle + sway);
+  ctx.strokeStyle = "#6f4a24";
+  ctx.lineWidth = Math.max(2, 5 * sf);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(0, 8 * sf);
+  ctx.lineTo(0, -post - h * 0.42);
+  ctx.stroke();
+  ctx.translate(0, -post - h * 0.92);
   ctx.fillStyle = "#fffdf4";
   ctx.strokeStyle = "#27221f";
   ctx.lineWidth = Math.max(1.5, 3 * sf);
@@ -449,6 +553,49 @@ function drawEntitySign(
   ctx.restore();
 }
 
+function entityHandPoint(
+  pose: BoardCharPoseResult,
+  side: "left" | "right",
+  cam: StreamCamera,
+  sf: number,
+  W: number,
+  H: number,
+): { x: number; y: number; angle: number } {
+  const g = STREAM_CHARACTER_GEOMETRY;
+  const sx = (pose.boardX - cam.cameraX) * sf + W / 2;
+  const sy = (pose.boardY - cam.cameraY) * sf + H / 2;
+  const armLen = g.armRaw * sf;
+  const torsoLen = g.torsoRaw * sf;
+  const hipY = (-g.hipRaw + (pose.skateboardVisible ? (pose.skateCrouch ?? 6) : 0)) * sf + (pose.headBob ?? 0) * sf * 0.25;
+  const shoulderY = -torsoLen * g.shoulderFactor;
+  const armA = side === "right" ? pose.rightArmA : pose.leftArmA;
+  const foreA = side === "right" ? pose.rightForeA : pose.leftForeA;
+  const elbowX = -Math.sin(armA) * armLen;
+  const elbowY = shoulderY + Math.cos(armA) * armLen;
+  const handX = elbowX - Math.sin(foreA) * armLen;
+  const handY = elbowY + Math.cos(foreA) * armLen;
+  const lean = pose.bodyLean ?? 0;
+  const cos = Math.cos(lean);
+  const sin = Math.sin(lean);
+  const leanX = handX * cos - handY * sin;
+  const leanY = handX * sin + handY * cos;
+  let localX = leanX;
+  let localY = hipY + leanY;
+  if (pose.spinAngle) {
+    const spinCenterY = hipY - torsoLen / 2;
+    const relY = localY - spinCenterY;
+    const spinCos = Math.cos(pose.spinAngle);
+    const spinSin = Math.sin(pose.spinAngle);
+    localX = leanX * spinCos - relY * spinSin;
+    localY = leanX * spinSin + relY * spinCos + spinCenterY;
+  }
+  return {
+    x: sx + localX * pose.facing,
+    y: sy + (pose.airY ?? 0) * sf + localY,
+    angle: (pose.spinAngle ?? 0) + lean * pose.facing,
+  };
+}
+
 function drawEntityLabel(ctx: CanvasRenderingContext2D, entity: CharacterEntity, cam: StreamCamera, sf: number, W: number, H: number) {
   if (!entity.identity.name || !entity.pose) return;
   const sx = (entity.pose.boardX - cam.cameraX) * sf + W / 2;
@@ -463,6 +610,46 @@ function drawEntityLabel(ctx: CanvasRenderingContext2D, entity: CharacterEntity,
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+function entitySkateTiming(params: Record<string, number | string | boolean | null | undefined> | undefined, durationSec: number) {
+  const num = (key: string, fallback = 0) => {
+    const value = params?.[key];
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  };
+  const phaseScale = 1.2;
+  const mountBase = 0.3 * phaseScale;
+  const landBase = 0.4 * phaseScale;
+  const rollDistance = num("rollDistance", 1);
+  const ollyDistance = num("ollyDistance", 1);
+  const rollNatural = Math.max(0.05 * phaseScale, rollDistance / 560);
+  const airNatural = Math.max(0.08 * phaseScale, ollyDistance / 560);
+  let mountDur = mountBase;
+  let landDur = landBase;
+  let rollDur = rollNatural;
+  let airDur = airNatural;
+  if (durationSec >= mountBase + landBase + 0.12) {
+    const variableBudget = Math.max(0.12, durationSec - mountBase - landBase);
+    const variableNatural = Math.max(0.001, rollNatural + airNatural);
+    rollDur = variableBudget * (rollNatural / variableNatural);
+    airDur = variableBudget * (airNatural / variableNatural);
+  } else {
+    const scale = durationSec / Math.max(0.001, mountBase + landBase + rollNatural + airNatural);
+    mountDur *= scale;
+    landDur *= scale;
+    rollDur *= scale;
+    airDur *= scale;
+  }
+  const mountEnd = mountDur;
+  const airStart = mountDur + rollDur;
+  const airEnd = airStart + airDur;
+  const prepDur = Math.min(0.25 * phaseScale, Math.max(0, rollDur), rollDistance > 0 ? (Math.min(120, rollDistance) / rollDistance) * rollDur : 0);
+  return { mountDur, landDur, rollDur, airDur, mountEnd, airStart, airEnd, prepDur };
+}
+function entityAimAngle(boardX: number, boardY: number, facing: 1 | -1, targetX: number, targetY: number): number {
+  const shoulderY = boardY - 129;
+  const dxLocal = (targetX - boardX) * facing;
+  const dy = targetY - shoulderY;
+  return -Math.atan2(dxLocal, dy);
+}
 function hash01(value: string): number {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i++) {
