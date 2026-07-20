@@ -7,6 +7,7 @@ import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { RENDERER_VERSION, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
 import { CharacterEntity, type CharacterEntityIdentity, type CharacterWeaponState } from "@/lib/character/entity";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
+import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 
 type Mode = "landing" | "watch" | "join" | "guest";
 type GuestPhysics = {
@@ -51,6 +52,8 @@ const GUEST_SKATE_POP_CLEARANCE = 60;
 const GUEST_SKATE_PREP_SEC = 0.25 * GUEST_PHASE_TIME_SCALE;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
+type FullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
+type FullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
 type StreamSurface = StreamSnapshotMessage["clips"][number];
 const GUEST_PLANNED_TRAVEL = new Set<GuestCharacterFrame["actionType"]>(["jump", "flip", "grapple", "skateTo", "wallClimb", "zipline"]);
 const GUEST_AUTO_STOW_ACTIONS = new Set<GuestCharacterFrame["actionType"]>(["grapple", "skateTo", "wallClimb", "zipline", "forceChoke", "eliminated"]);
@@ -477,11 +480,11 @@ function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" |
 }
 
 export default function StreamPage() {
-  const canvasRef=useRef<HTMLCanvasElement>(null), signCanvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>()), signCache=useRef(new Map<string,HTMLImageElement>());
+  const containerRef=useRef<HTMLElement>(null), canvasRef=useRef<HTMLCanvasElement>(null), signCanvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>()), signCache=useRef(new Map<string,HTMLImageElement>());
   const characterEntities=useRef(new Map<string,CharacterEntity>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteGuestSeq=useRef(new Map<string,number>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<CharacterWeaponState|null>(null), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), guestSeq=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const signDataUrlRef=useRef<string|undefined>(undefined), signActiveRef=useRef(false), signDrawingRef=useRef(false);
-  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[guestHudOpen,setGuestHudOpen]=useState(false);
+  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[wheelOpen,setWheelOpen]=useState(false),[wheelMenuOpen,setWheelMenuOpen]=useState(false),[debugOpen,setDebugOpen]=useState(false),[maximize,setMaximize]=useState(false),[nativeFullscreen,setNativeFullscreen]=useState(false);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const renderDebugRowsRef=useRef<StreamCharacterDebugRow[]>([]), renderDebugOverlayAt=useRef(0);
   const [renderDebugRows,setRenderDebugRows]=useState<StreamCharacterDebugRow[]>([]);
@@ -516,6 +519,10 @@ export default function StreamPage() {
   const guestTargetVerb=(): GuestCharacterFrame["actionType"]|null=>{const keys=guestHeldKeys.current;if(keys.has("g"))return"grapple";if(keys.has("s"))return"skateTo";if(keys.has("c"))return"wallClimb";if(keys.has("z"))return"zipline";return null;};
   const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number,surfaces:StreamSurface[]=[],targetSurface?:StreamSurface)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY,surfaces,targetSurface);};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
+  const dismissWheel=()=>{setWheelOpen(false);setWheelMenuOpen(false);};
+  const exitFullscreen=useCallback(async()=>{const doc=document as FullscreenDocument;if(document.fullscreenElement||doc.webkitFullscreenElement){if(document.exitFullscreen)await document.exitFullscreen();else await doc.webkitExitFullscreen?.();}setMaximize(false);setNativeFullscreen(false);},[]);
+  const toggleFullscreen=useCallback(async()=>{const doc=document as FullscreenDocument;if(document.fullscreenElement||doc.webkitFullscreenElement||maximize){await exitFullscreen();return;}const target=containerRef.current as FullscreenElement|null;if(!target)return;if(target.requestFullscreen){await target.requestFullscreen();setNativeFullscreen(true);}else if(target.webkitRequestFullscreen){await target.webkitRequestFullscreen();setNativeFullscreen(true);}else setMaximize(true);},[exitFullscreen,maximize]);
+  useEffect(()=>{const changed=()=>setNativeFullscreen(Boolean(document.fullscreenElement||(document as FullscreenDocument).webkitFullscreenElement));document.addEventListener("fullscreenchange",changed);document.addEventListener("webkitfullscreenchange",changed);return()=>{document.removeEventListener("fullscreenchange",changed);document.removeEventListener("webkitfullscreenchange",changed);};},[]);
 
   useEffect(() => {
     if (mode !== "watch" && mode !== "guest") return;
@@ -776,40 +783,28 @@ export default function StreamPage() {
   const signModal=signOpen?<div style={{position:"fixed",inset:0,zIndex:30,background:"rgba(0,0,0,.38)",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"monospace"}}><section style={{...card,width:360}}><h3 style={{marginTop:0}}>Make a sign</h3><canvas ref={signCanvasRef} width={300} height={200} onPointerDown={e=>drawSignStroke(e,true)} onPointerMove={drawSignStroke} onPointerUp={e=>{signDrawingRef.current=false;e.currentTarget.releasePointerCapture(e.pointerId);}} style={{width:"100%",height:220,border:"2px solid #2a2a2a",background:"#fffdf4",touchAction:"none",cursor:signErase?"cell":"crosshair"}}/><input maxLength={40} value={signText} onChange={e=>setSignText(e.target.value)} placeholder="Optional sign text" style={input}/><div style={{display:"flex",gap:6,marginTop:8}}>{["#27221f","#d82727","#285ca8","#2f8a3c"].map(c=><button key={c} onClick={()=>{setSignColor(c);setSignErase(false);}} style={{...button,marginTop:0,width:42,height:34,background:c,color:c}}>{c===signColor&&!signErase?"✓":""}</button>)}<button style={{...button,marginTop:0,width:80}} onClick={()=>setSignErase(v=>!v)}>{signErase?"Pen":"Eraser"}</button></div><button style={{...button,background:"#c8f135"}} onClick={()=>void bakeSign()}>Confirm</button><button style={button} onClick={()=>setSignOpen(false)}>Cancel</button></section></div>:null;
 
   if(mode==="join")return <main style={landing}><section style={card}><h2>Join as character</h2><input autoFocus maxLength={GUEST_NAME_MAX_LENGTH} value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={input}/><label style={{...button,display:"block",textAlign:"center",marginTop:10}}>Optional face<input hidden type="file" accept="image/*" onChange={async e=>{const f=e.target.files?.[0];if(f)setFace(await bakeFace(f));}}/></label>{face&&<img src={face} alt="Face preview" style={{width:48,height:56,display:"block",margin:"10px auto"}}/>}<p style={{fontSize:10,color:"#8b2b20"}}>{joinError}</p><button style={{...button,background:"#c8f135"}} onClick={beginGuest}>Spawn</button><button style={button} onClick={()=>setMode("landing")}>Cancel</button></section></main>;
-  if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":status==="reconnecting"?"RECONNECTING":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":status==="reconnecting"?"reconnecting…":joinError||"No active stream right now."}</p>{DEBUG_STREAM&&<div style={{fontSize:10,lineHeight:1.45,color:"#6a6a6a",background:"#f5ecd8",border:"1px solid rgba(42,42,42,.22)",padding:7,marginBottom:10}}>channel: {streamChannelName(STREAM_OWNER_USER_ID)} | subscribe: {subscribeStatus} | presence: {participants.length}</div>}<button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
+  if(mode==="landing")return <main style={landing}><section style={card}><div style={{fontSize:11,color:live?"#228b22":"#8a6a00",fontWeight:700}}>{live?"LIVE":status==="ended"?"STREAM ENDED":status==="reconnecting"?"RECONNECTING":"OFFLINE"}</div><h1>{STREAM_OWNER_NAME}</h1><p>{live?"Choose how to enter the live board.":status==="reconnecting"?"reconnecting…":joinError||"No active stream right now."}</p><button disabled={!live||!snapshot} style={button} onClick={()=>setMode("watch")}>Watch</button><button disabled={!live||!snapshot} style={{...button,background:live?"#c8f135":"#ddd"}} onClick={()=>setMode("join")}>Join as character ({participants.filter(p=>p.role==="guest").length}/{MAX_GUESTS})</button></section></main>;
+  const choose=(fn:()=>void)=>{fn();dismissWheel();};
+  const toggleSign=()=>{if(!signDataUrlRef.current){setSignOpen(true);return;}const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);};
+  const wheelItems=mode==="guest"?[
+    {label:"Emote",icon:"☺",onSelect:()=>choose(emote)},
+    {label:signActive?"Lower sign":"Sign",icon:"▱",onSelect:()=>choose(toggleSign)},
+    {label:"Camera",icon:"◉",onSelect:()=>choose(()=>setHostCam(v=>!v))},
+    {label:"Tomato",icon:"●",disabled:true,onSelect:()=>{}},
+    {label:"Menu",icon:"☰",onSelect:()=>setWheelMenuOpen(true)},
+  ]:[{label:"Menu",icon:"☰",onSelect:()=>setWheelMenuOpen(true)}];
+  const menuItems=[
+    {label:nativeFullscreen||maximize?"Exit fullscreen":"Fullscreen",icon:"⛶",onSelect:()=>choose(()=>void toggleFullscreen())},
+    ...(DEBUG_STREAM?[{label:"Debug",icon:"⌁",onSelect:()=>choose(()=>setDebugOpen(v=>!v))}]:[]),
+    {label:"Leave",icon:"←",onSelect:()=>choose(()=>void leave())},
+  ];
   return (
-    <main style={{ position: "fixed", inset: 0, overflow: "hidden", background: "#f5ecd8" }}>
+    <main ref={containerRef} style={{ position: "fixed", inset: 0, zIndex:maximize?2147483000:undefined, overflow: "hidden", background: "#f5ecd8" }}>
       <canvas ref={canvasRef} onClick={clickCanvas} style={{ width: "100vw", height: "100vh", display: "block", cursor: mode === "guest" && !hostCam ? "crosshair" : "default" }} />
-      {mode === "guest" ? (
-        <div style={{ position: "fixed", top: 12, left: 12, zIndex: 10, fontFamily: "monospace", color: "#2a2a2a" }}>
-          <button aria-label="Open guest menu" style={{ ...pill, width: 42, height: 36, opacity: 0.82 }} onClick={() => setGuestHudOpen((v) => !v)}>☰</button>
-          {guestHudOpen && (
-            <div style={{ ...card, width: "min(330px, calc(100vw - 24px))", marginTop: 8, padding: 12, fontSize: 12, lineHeight: 1.4 }}>
-              <div style={{ fontWeight: 800, marginBottom: 8 }}>{name}</div>
-              <div>Click move · long/high clicks auto-flip</div>
-              <div>G grapple · S skate · C climb · Z zip</div>
-              <div>D dance · P pull · M mirror · T sit</div>
-              <div>E emote · H sign · V camera</div>
-              <button style={button} onClick={() => setHostCam((v) => !v)}>{hostCam ? "Follow me" : "Host cam"} · V</button>
-              <button style={button} onClick={emote}>Emote · E</button>
-              <button style={button} onClick={() => setSignOpen(true)}>Sign</button>
-              <button style={button} onClick={() => { const next = !signActiveRef.current; signActiveRef.current = next; setSignActive(next); void refreshGuestPresence(next); }}>{signActive ? "Lower sign" : "Hold sign"} · H</button>
-              <button style={button} onClick={leave}>Leave</button>
-            </div>
-          )}
-          {DEBUG_STREAM && (
-            <span style={{ ...pill, display: "block", marginTop: 8, maxWidth: "min(760px, calc(100vw - 24px))", lineHeight: 1.35 }}>
-              renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}
-              {renderDebugRows.map((row) => <span key={`${row.isHost ? "h" : "g"}-${row.id}`} style={{ display: "block" }}>{row.id} {row.isHost ? "host" : "guest"} pub:{row.skinPublished ?? "∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx !== undefined ? ` dx:${Math.round(row.travelDx)}` : ""}{row.rotationDirection ? ` rot:${row.rotationDirection}` : ""}{row.construction ? ` h:${row.construction.characterHeight} head:${row.construction.headRadiusX}/${row.construction.headRadiusY} torso:${row.construction.torsoLength} arm:${row.construction.armLength} stroke:${row.construction.strokeWidth}` : ""}</span>)}
-            </span>
-          )}
-        </div>
-      ) : (
-        <div style={{ position: "fixed", top: 12, left: 12, display: "flex", gap: 8, fontFamily: "monospace", alignItems: "flex-start", flexWrap: "wrap", maxWidth: "calc(100vw - 24px)" }}>
-          <span style={pill}>LIVE · {STREAM_OWNER_NAME}</span>
-          {DEBUG_STREAM && <span style={{ ...pill, maxWidth: 760, lineHeight: 1.35 }}>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}{renderDebugRows.map((row) => <span key={`${row.isHost ? "h" : "g"}-${row.id}`} style={{ display: "block" }}>{row.id} {row.isHost ? "host" : "guest"} pub:{row.skinPublished ?? "∅"} res:{row.skinResolved} src:{row.skinSource} act:{row.actionType}@{row.actionProgress.toFixed(2)} phys:{row.physique}{row.travelDx !== undefined ? ` dx:${Math.round(row.travelDx)}` : ""}{row.rotationDirection ? ` rot:${row.rotationDirection}` : ""}{row.construction ? ` h:${row.construction.characterHeight} head:${row.construction.headRadiusX}/${row.construction.headRadiusY} torso:${row.construction.torsoLength} arm:${row.construction.armLength} stroke:${row.construction.strokeWidth}` : ""}</span>)}</span>}
-        </div>
-      )}
+      {!maximize&&<div style={{position:"fixed",top:"max(12px, env(safe-area-inset-top))",left:"max(12px, env(safe-area-inset-left))",display:"flex",gap:8,fontFamily:"monospace"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span><button type="button" aria-label="Fullscreen" style={{...pill,cursor:"pointer"}} onClick={()=>void toggleFullscreen()}>⛶</button></div>}
+      {maximize?<button type="button" onClick={()=>void exitFullscreen()} style={{...pill,position:"fixed",top:10,right:10}}>✕</button>:<button type="button" aria-label="Open action wheel" onClick={()=>setWheelOpen(true)} style={wheelTriggerStyle}>✦</button>}
+      <ActionWheel open={wheelOpen&&!maximize} items={wheelItems} onDismiss={dismissWheel} menuOpen={wheelMenuOpen} menuItems={menuItems}/>
+      {DEBUG_STREAM&&debugOpen&&<aside data-stream-debug-overlay style={{position:"fixed",left:12,bottom:12,zIndex:10040,width:"min(760px, calc(100vw - 24px))",maxHeight:"40vh",overflowY:"auto",padding:10,border:"2px solid #2a2a2a",background:"rgba(255,253,245,.96)",fontFamily:"monospace",fontSize:10}}><button onClick={()=>setDebugOpen(false)} style={{float:"right",border:0,background:"transparent"}}>✕</button>renderer: {RENDERER_VERSION} · guest skin: {guestSkinLabel}{renderDebugRows.map(row=><div key={`${row.isHost?"h":"g"}-${row.id}`}>{row.id} {row.isHost?"host":"guest"} pub:{row.skinPublished??"∅"} res:{row.skinResolved} act:{row.actionType}@{row.actionProgress.toFixed(2)}</div>)}</aside>}
       {signModal}
     </main>
   );

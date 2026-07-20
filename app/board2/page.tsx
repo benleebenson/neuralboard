@@ -5,6 +5,7 @@ import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ProGated } from "@/app/components/ProGated";
+import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import {
@@ -57,6 +58,8 @@ import {
   occupancyWindowAt,
 } from "@/lib/character-camera";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, STREAM_OWNER_USER_ID } from "./config";
+type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
+type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -3019,6 +3022,12 @@ export default function Board2Page() {
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playCleanUi, setPlayCleanUi] = useState(false);
   const [playCleanMenuOpen, setPlayCleanMenuOpen] = useState(false);
+  const [playWheelOpen, setPlayWheelOpen] = useState(false);
+  const [playWheelMenuOpen, setPlayWheelMenuOpen] = useState(false);
+  const [playDebugOpen, setPlayDebugOpen] = useState(false);
+  const [playParticipantsOpen, setPlayParticipantsOpen] = useState(false);
+  const [playMaximize, setPlayMaximize] = useState(false);
+  const [playNativeFullscreen, setPlayNativeFullscreen] = useState(false);
   const [playAddMenuOpen, setPlayAddMenuOpen] = useState(false);
   const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
   const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
@@ -3137,6 +3146,7 @@ export default function Board2Page() {
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const playCanvasRef = useRef<HTMLCanvasElement>(null);
+  const playContainerRef = useRef<HTMLDivElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const clipsRef = useRef<Clip[]>(clips);
@@ -8937,6 +8947,10 @@ export default function Board2Page() {
     requestAnimationFrame(() => drawFrameRef.current(editorPlayheadBeforePlayRef.current));
   }
 
+  function dismissPlayWheel() { setPlayWheelOpen(false); setPlayWheelMenuOpen(false); }
+  async function exitPlayFullscreen() { const doc=document as BoardFullscreenDocument;if(document.fullscreenElement||doc.webkitFullscreenElement){if(document.exitFullscreen)await document.exitFullscreen();else await doc.webkitExitFullscreen?.();}setPlayMaximize(false);setPlayNativeFullscreen(false); }
+  async function togglePlayFullscreen() { const doc=document as BoardFullscreenDocument;if(document.fullscreenElement||doc.webkitFullscreenElement||playMaximize){await exitPlayFullscreen();return;}const target=playContainerRef.current as BoardFullscreenElement|null;if(!target)return;if(target.requestFullscreen){await target.requestFullscreen();setPlayNativeFullscreen(true);}else if(target.webkitRequestFullscreen){await target.webkitRequestFullscreen();setPlayNativeFullscreen(true);}else setPlayMaximize(true); }
+
   function steerPlayCharacter(clientX: number, clientY: number, canvas: HTMLCanvasElement) {
     const rect = canvas.getBoundingClientRect();
     const cam = playCameraRef.current;
@@ -10004,8 +10018,24 @@ export default function Board2Page() {
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
   if (playMode) {
+    const choosePlayWheel=(fn:()=>void)=>{fn();dismissPlayWheel();};
+    const playWheelItems=[
+      {label:"Weapon",icon:"⌁",onSelect:()=>choosePlayWheel(()=>{const next=!playWeaponArmedRef.current;playWeaponArmedRef.current=next;setPlayWeaponArmed(next);broadcastWeaponState(true);})},
+      {label:"Tomato",icon:"●",disabled:true,onSelect:()=>{}},
+      {label:"Bazooka",icon:"◁",disabled:true,onSelect:()=>{}},
+      {label:"Camera",icon:"◉",onSelect:()=>choosePlayWheel(()=>setPlaySceneShot(v=>!v))},
+      {label:"Menu",icon:"☰",onSelect:()=>setPlayWheelMenuOpen(true)},
+    ];
+    const playWheelMenuItems=[
+      {label:playNativeFullscreen||playMaximize?"Exit fullscreen":"Fullscreen",icon:"⛶",onSelect:()=>choosePlayWheel(()=>void togglePlayFullscreen())},
+      ...(DEBUG_STREAM?[{label:"Debug",icon:"⌁",onSelect:()=>choosePlayWheel(()=>setPlayDebugOpen(v=>!v))}]:[]),
+      {label:"Clear splats (soon)",icon:"⌫",disabled:true,onSelect:()=>{}},
+      {label:"Participants",icon:"♟",onSelect:()=>choosePlayWheel(()=>setPlayParticipantsOpen(v=>!v))},
+      {label:"Exit Play Mode",icon:"←",onSelect:()=>choosePlayWheel(exitPlayMode)},
+    ];
     return (
-	      <div style={{ position: "fixed", inset: 0, zIndex: 10000, overflow: "hidden", background: "#111" }}>
+	      <div ref={playContainerRef} data-play-maximize={playMaximize||undefined} style={{ position: "fixed", inset: 0, zIndex: playMaximize?2147483000:10000, overflow: "hidden", background: "#111" }}>
+	        <style>{`[data-play-maximize] > :not(canvas):not(style):not([data-max-exit]){display:none!important}`}</style>
 	        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
 	        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
 	        <canvas
@@ -10024,21 +10054,21 @@ export default function Board2Page() {
           }}
           style={{ display: "block", width: "100vw", height: "100dvh", cursor: "crosshair", touchAction: "none" }}
         />
-        <button
+        {!playMaximize&&<button
           type="button"
           onClick={() => setPlayCleanMenuOpen((v) => !v)}
           style={{ position: "fixed", top: 14, right: 14, zIndex: 6, padding: "7px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.78)", opacity: 0.72, boxShadow: "2px 2px 0 rgba(42,42,42,0.55)", fontFamily: "monospace", fontWeight: 900, cursor: "pointer" }}
         >
 	          ☰
-	        </button>
-	        <button
+	        </button>}
+	        {!playCleanUi&&!playMaximize&&<button
 	          type="button"
 	          onClick={openPlayAddMenu}
 	          style={{ position: "fixed", top: 14, left: playCleanUi ? 78 : 154, zIndex: 6, width: 34, height: 32, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.78)", opacity: 0.72, boxShadow: "2px 2px 0 rgba(42,42,42,0.55)", fontFamily: "monospace", fontSize: 18, fontWeight: 900, lineHeight: "28px", cursor: "pointer" }}
 	          title="Add media while live"
 	        >
 	          +
-	        </button>
+	        </button>}
 	        {playAddMenuOpen && (
 	          <div style={{ position: "fixed", top: 52, left: playCleanUi ? 78 : 154, zIndex: 7, minWidth: 190, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.96)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, color: "#2a2a2a", overflow: "hidden" }}>
 	            <button type="button" onClick={triggerPlayMediaUpload} style={{ width: "100%", padding: "9px 10px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer" }}>📷 Add image</button>
@@ -10049,7 +10079,8 @@ export default function Board2Page() {
 	        {playCleanMenuOpen && (
 	          <div style={{ position: "fixed", top: 50, right: 14, zIndex: 6, minWidth: 170, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
             <button type="button" onClick={() => setPlayCleanUi((v) => !v)} style={{ width: "100%", padding: "8px 9px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>{playCleanUi ? "Show chrome" : "Hide chrome"}</button>
-            <button type="button" onClick={() => playCanvasRef.current?.parentElement?.requestFullscreen?.()} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>Fullscreen</button>
+            <button type="button" onClick={() => void togglePlayFullscreen()} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, cursor: "pointer" }}>Fullscreen</button>
+            {DEBUG_STREAM&&<button type="button" onClick={()=>setPlayDebugOpen(v=>!v)} style={{width:"100%",padding:"8px 9px",border:"none",borderTop:"1px solid rgba(42,42,42,.2)",background:"transparent",textAlign:"left",fontFamily:"inherit",fontWeight:800,cursor:"pointer"}}>Debug</button>}
             <button type="button" onClick={exitPlayMode} style={{ width: "100%", padding: "8px 9px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 800, color: "#8b2b20", cursor: "pointer" }}>Exit Play Mode</button>
           </div>
         )}
@@ -10065,8 +10096,9 @@ export default function Board2Page() {
         <div style={{ position: "fixed", top: 14, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
           {streamPublishing ? "LIVE" : "LOCAL"}
         </div>
-        {DEBUG_STREAM && (
-          <div style={{ position: "fixed", top: 48, left: playCleanUi ? 14 : 90, zIndex: 2, maxWidth: 560, padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.9)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
+        {DEBUG_STREAM && playDebugOpen && !playMaximize && (
+          <div data-stream-debug-overlay style={{ position: "fixed", bottom: 12, left: 12, zIndex: 10040, width:"min(560px, calc(100vw - 24px))", maxHeight:"40vh", overflowY:"auto", padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.96)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
+            <button onClick={()=>setPlayDebugOpen(false)} style={{float:"right",border:0,background:"transparent"}}>✕</button>
             renderer: {RENDERER_VERSION} · flip: {playFlipDebugRef.current ? `f ${playFlipDebugRef.current.facing} r ${playFlipDebugRef.current.rotationDirection} dx ${Math.round(playFlipDebugRef.current.travelDx)}` : "idle"}
             {streamCharacterDebugRows.map((row) => (
               <div key={`${row.isHost ? "h" : "g"}-${row.id}`}>
@@ -10090,7 +10122,7 @@ export default function Board2Page() {
             ))}
           </div>
         </div>}
-        {!playCleanUi && <div style={{ position: "fixed", right: 58, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
+	        {!playCleanUi && <div style={{ position: "fixed", right: 58, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
           <button
             type="button"
             onClick={() => setPlayLegendOpen((v) => !v)}
@@ -10104,6 +10136,9 @@ export default function Board2Page() {
 	            </div>
 	          )}
 	        </div>}
+	        {!playMaximize&&<><button type="button" aria-label="Open action wheel" onClick={()=>setPlayWheelOpen(true)} style={{...wheelTriggerStyle,bottom:playAddMenuOpen?86:wheelTriggerStyle.bottom}}>✦</button><ActionWheel open={playWheelOpen} items={playWheelItems} onDismiss={dismissPlayWheel} menuOpen={playWheelMenuOpen} menuItems={playWheelMenuItems}/></>}
+	        {playMaximize&&<button data-max-exit type="button" aria-label="Exit maximize" onClick={()=>void exitPlayFullscreen()} style={{position:"fixed",top:"max(10px, env(safe-area-inset-top))",right:"max(10px, env(safe-area-inset-right))",zIndex:10050,width:38,height:38,border:"2px solid #2a2a2a",background:"#fffdf5"}}>✕</button>}
+	        {playParticipantsOpen&&!playMaximize&&<aside style={{position:"fixed",top:64,right:14,zIndex:10025,minWidth:190,padding:10,border:"2px solid #2a2a2a",background:"#fffdf5",fontFamily:"'Patrick Hand', cursive"}}><button onClick={()=>setPlayParticipantsOpen(false)} style={{float:"right",border:0,background:"transparent"}}>✕</button><strong>Participants ({streamGuests.length})</strong>{streamGuests.map(g=><div key={g.guestId}>{g.name}</div>)}</aside>}
 	        {renderPlayYoutubeModal()}
 	        {renderDownloadToasts()}
 	        {toast && (
