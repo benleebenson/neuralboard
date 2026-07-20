@@ -6,7 +6,7 @@ import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/boa
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { RENDERER_VERSION, drawBazookaHeld, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { raycastSolid, type TerrainClip } from "@/lib/character/terrain";
+import { groundProfileY, raycastSolid, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
@@ -35,6 +35,9 @@ type GuestPhysics = {
   frozenUntil?: number;
   eliminatedBy?: string;
   physique: "slim" | "jacked";
+  terrainSlope?: number;
+  terrainLeftFootY?: number;
+  terrainRightFootY?: number;
 };
 const BOARD_W = 4000;
 const GUEST_RESPAWN_BELOW_LOWEST_SURFACE = 650;
@@ -146,17 +149,20 @@ function clampInsideGuestSurface(surface: StreamSurface, x: number, pad = GUEST_
   return clamp(x, surface.boardX + innerPad, surface.boardX + surface.boardW - innerPad);
 }
 
-function guestSkateParams(fromX: number, fromY: number, targetX: number, targetY: number, surfaces: StreamSurface[], targetSurface?: StreamSurface): Record<string, number | string | boolean> | undefined {
+function guestSkateParams(fromX: number, fromY: number, targetX: number, targetY: number, surfaces: StreamSurface[], targetSurface?: StreamSurface, craters: readonly StreamCrater[] = []): Record<string, number | string | boolean> | undefined {
   const source = findGuestSupport(fromX, fromY, surfaces);
   const target = targetSurface ?? findGuestSupport(targetX, targetY, surfaces);
-  if (!source || !target || source.id === target.id) return undefined;
+  if (!source || !target) return undefined;
   const sourceCenterX = source.boardX + source.boardW / 2;
   const targetCenterX = target.boardX + target.boardW / 2;
   const facing: 1 | -1 = targetCenterX >= sourceCenterX ? 1 : -1;
-  const edgeX = facing === 1 ? source.boardX + source.boardW - GUEST_SKATE_EDGE_MARGIN : source.boardX + GUEST_SKATE_EDGE_MARGIN;
+  let edgeX = facing === 1 ? source.boardX + source.boardW - GUEST_SKATE_EDGE_MARGIN : source.boardX + GUEST_SKATE_EDGE_MARGIN;
   const targetHoldX = clampInsideGuestSurface(target, targetX, GUEST_SKATE_EDGE_MARGIN);
-  const gapEndX = clampInsideGuestSurface(target, targetHoldX - facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
-  const finalX = clampInsideGuestSurface(target, gapEndX + facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
+  let gapEndX = clampInsideGuestSurface(target, targetHoldX - facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
+  let finalX = clampInsideGuestSurface(target, gapEndX + facing * GUEST_SKATE_LANDING_ROLLOUT_PX, GUEST_SKATE_EDGE_MARGIN);
+  const gaps=craters.filter(crater=>crater.clipId===source.id&&Math.abs(crater.cy)<crater.r).map(crater=>{const half=Math.sqrt(crater.r**2-crater.cy**2);return{left:source.boardX+crater.cx-half,right:source.boardX+crater.cx+half,width:half*2};}).filter(gap=>facing===1?gap.left>fromX&&gap.left<targetX:gap.right<fromX&&gap.right>targetX).sort((a,b)=>facing===1?a.left-b.left:b.right-a.right);
+  const terrainGap=gaps[0];
+  if(terrainGap){edgeX=facing===1?terrainGap.left:terrainGap.right;gapEndX=facing===1?terrainGap.right:terrainGap.left;if(terrainGap.width>120)finalX=gapEndX=edgeX+facing*90;else finalX=gapEndX+facing*GUEST_SKATE_LANDING_ROLLOUT_PX;}else if(source.id===target.id)return undefined;
   const rollDistance = Math.abs(edgeX - fromX);
   const ollyDistance = Math.abs(gapEndX - edgeX);
   const heightDelta = target.boardY - source.boardY;
@@ -166,11 +172,11 @@ function guestSkateParams(fromX: number, fromY: number, targetX: number, targetY
     plan: "skateTo",
     facing,
     startX: fromX,
-    startY: source.boardY,
+    startY: groundProfileY(surfaces as TerrainClip[],craters,fromX)?.y??source.boardY,
     edgeX,
-    launchY: source.boardY,
+    launchY: groundProfileY(surfaces as TerrainClip[],craters,edgeX)?.y??source.boardY,
     gapEndX,
-    landingY: target.boardY,
+    landingY: groundProfileY(surfaces as TerrainClip[],craters,gapEndX)?.y??target.boardY,
     finalX,
     rollDistance,
     ollyDistance,
@@ -178,6 +184,8 @@ function guestSkateParams(fromX: number, fromY: number, targetX: number, targetY
     peakHeight,
     targetSurfaceId: target.id,
     sourceSurfaceId: source.id,
+    terrainGapWidth: terrainGap?.width??0,
+    terrainAutoOllie: !!terrainGap&&terrainGap.width<=120,
   };
 }
 
@@ -256,12 +264,15 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
     actionProgress: progress,
     actionStartTime: sentAt - progress * duration * 1000,
     actionDuration: duration,
-    actionParams: p.actionTargetX !== undefined ? {
+    actionParams: p.actionTargetX !== undefined || p.terrainSlope !== undefined ? {
       ...(p.actionParams ?? {}),
       fromX: p.actionFromX,
       fromY: p.actionFromY,
       targetX: p.actionTargetX,
       targetY: p.actionTargetY,
+      terrainSlope: p.terrainSlope,
+      terrainLeftFootY:p.terrainLeftFootY,
+      terrainRightFootY:p.terrainRightFootY,
     } : undefined,
     skin,
     physique: p.physique,
@@ -291,10 +302,10 @@ function startGuestStationaryAction(p: GuestPhysics, action: GuestCharacterFrame
   p.actionDurationMs = guestActionDuration(action) * 1000;
 }
 
-function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], targetX: number, targetY: number, surfaces: StreamSurface[] = [], targetSurface?: StreamSurface, now = performance.now()) {
+function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["actionType"], targetX: number, targetY: number, surfaces: StreamSurface[] = [], targetSurface?: StreamSurface, now = performance.now(), craters: readonly StreamCrater[] = []) {
   const fromX = p.x;
   const fromY = p.y;
-  const skateParams = action === "skateTo" ? guestSkateParams(fromX, fromY, targetX, targetY, surfaces, targetSurface) : undefined;
+  const skateParams = action === "skateTo" ? guestSkateParams(fromX, fromY, targetX, targetY, surfaces, targetSurface, craters) : undefined;
   const grappleParams = action === "grapple" ? guestGrappleParams(fromX, fromY, targetX, targetY, surfaces) : undefined;
   const effectiveTargetX = typeof skateParams?.finalX === "number" ? skateParams.finalX : targetX;
   const effectiveTargetY = typeof skateParams?.landingY === "number" ? skateParams.landingY : (typeof grappleParams?.landingY === "number" ? grappleParams.landingY : targetY);
@@ -325,6 +336,7 @@ function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["a
   p.vy = dy / Math.max(0.001, p.actionDurationMs / 1000);
   p.grounded = action === "skateTo";
   p.surfaceId = null;
+  if(skateParams?.terrainAutoOllie)streamDebugLog("terrain auto-ollie guest",{gapWidth:skateParams.terrainGapWidth,popPoint:skateParams.edgeX,path:"existing-skate-pop-land"});
 }
 
 function numParam(params: Record<string, number | string | boolean | null | undefined> | undefined, key: string): number | undefined {
@@ -362,7 +374,7 @@ function guestSkateTiming(params: Record<string, number | string | boolean | nul
   return { mountDur, landDur, rollDur, airDur, mountEnd, airStart, airEnd, prepDur };
 }
 
-function guestPlannedRootPosition(p: GuestPhysics, rawT: number): { x: number; y: number; grounded: boolean } | null {
+function guestPlannedRootPosition(p: GuestPhysics, rawT: number, surfaces: StreamSurface[] = [], craters: readonly StreamCrater[] = []): { x: number; y: number; grounded: boolean } | null {
   if (!p.actionParams || p.actionTargetX === undefined || p.actionTargetY === undefined || p.actionFromX === undefined || p.actionFromY === undefined || !p.actionDurationMs) return null;
   if (p.action === "skateTo" && p.actionParams.plan === "skateTo") {
     const durationSec = p.actionDurationMs / 1000;
@@ -379,7 +391,8 @@ function guestPlannedRootPosition(p: GuestPhysics, rawT: number): { x: number; y
     if (elapsed < timing.mountEnd) return { x: startX, y: startY, grounded: true };
     if (elapsed < timing.airStart) {
       const rollT = timing.rollDur > 0 ? clamp((elapsed - timing.mountEnd) / timing.rollDur, 0, 1) : 1;
-      return { x: lerp(startX, edgeX, rollT), y: startY, grounded: true };
+      const probeX=lerp(startX,edgeX,rollT),profile=groundProfileY(surfaces as TerrainClip[],craters,probeX),slopeSpeed=1+clamp((profile?.slope??0)*(edgeX>=startX?1:-1)*.15,-.15,.15),x=lerp(startX,edgeX,clamp(rollT*slopeSpeed,0,1));
+      return { x, y: groundProfileY(surfaces as TerrainClip[],craters,x)?.y??startY, grounded: true };
     }
     if (elapsed < timing.airEnd) {
       const airElapsed = Math.max(0, elapsed - timing.airStart);
@@ -395,7 +408,8 @@ function guestPlannedRootPosition(p: GuestPhysics, rawT: number): { x: number; y
     }
     const landT = timing.landDur > 0 ? clamp((elapsed - timing.airEnd) / timing.landDur, 0, 1) : 1;
     const rolloutT = clamp(landT / 0.68, 0, 1);
-    return { x: lerp(gapEndX, finalX, rolloutT), y: landingY, grounded: true };
+    const x=lerp(gapEndX,finalX,rolloutT);
+    return { x, y: groundProfileY(surfaces as TerrainClip[],craters,x)?.y??landingY, grounded: true };
   }
   if (p.action === "grapple" && p.actionParams.plan === "grapple") {
     const progress = rawT;
@@ -418,10 +432,10 @@ function guestPlannedRootPosition(p: GuestPhysics, rawT: number): { x: number; y
   return null;
 }
 
-function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: StreamSurface[]): boolean {
+function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: StreamSurface[], craters: readonly StreamCrater[] = []): boolean {
   if (p.actionTargetX === undefined || p.actionTargetY === undefined || p.actionFromX === undefined || p.actionFromY === undefined || !p.actionDurationMs || !GUEST_PLANNED_TRAVEL.has(p.action)) return false;
   const rawT = clamp((now - p.actionStarted) / Math.max(1, p.actionDurationMs), 0, 1);
-  const plannedRoot = guestPlannedRootPosition(p, rawT);
+  const plannedRoot = guestPlannedRootPosition(p, rawT, surfaces, craters);
   const t = p.action === "grapple" || p.action === "zipline" ? 1 - Math.pow(1 - rawT, 2.2) : rawT;
   const prevX = p.x;
   const prevY = p.y;
@@ -431,13 +445,16 @@ function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: Stream
   p.vy = (p.y - prevY) / Math.max(0.001, 1 / 60);
   if (Math.abs(p.actionTargetX - p.actionFromX) > 4) p.facing = p.actionTargetX >= p.actionFromX ? 1 : -1;
   p.grounded = plannedRoot?.grounded ?? (p.action === "skateTo" ? rawT < 0.58 || rawT > 0.82 : false);
+  if(p.grounded){const profile=groundProfileY(surfaces as TerrainClip[],craters,p.x);if(profile){p.y=lerp(p.y,profile.y,.3);p.terrainSlope=profile.slope;p.surfaceId=profile.imageId;p.terrainLeftFootY=(groundProfileY(surfaces as TerrainClip[],craters,p.x-14)?.y??profile.y)-profile.y;p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],craters,p.x+14)?.y??profile.y)-profile.y;}}
   if (rawT >= 1) {
     p.x = p.actionTargetX;
-    p.y = p.actionTargetY;
+    const completionGround=groundProfileY(surfaces as TerrainClip[],craters,p.x);
+    p.y = completionGround?.y??p.actionTargetY;
     p.vx = 0;
     p.vy = 0;
     p.grounded = true;
-    p.surfaceId = findGuestSupport(p.x, p.y, surfaces)?.id ?? null;
+    p.surfaceId = completionGround?.imageId??findGuestSupport(p.x, p.y, surfaces)?.id??null;
+    p.terrainSlope=completionGround?.slope??0;
     p.action = "idle";
     p.actionStarted = now;
     clearGuestActionPlan(p);
@@ -507,7 +524,7 @@ export default function StreamPage() {
       .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){signActiveRef.current=false;setSignActive(false);p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;clearGuestActionPlan(p);void refreshGuestPresence(false);}})
       .on("broadcast",{event:"weapon_state"},({payload})=>{streamDebugLog("ignore legacy weapon_state; frame.weapon is authoritative",payload);})
       .on("broadcast",{event:"shot_fired"},({payload})=>{streamDebugLog("shot_fired received",(payload as StreamShotFiredMessage).shotId);weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
-      .on("broadcast",{event:"bazooka_fire"},({payload})=>{const event=payload as StreamBazookaFireMessage;const clips=(snapshotRef.current?.clips.filter(c=>c.type==="image")??[]) as TerrainClip[],impact=raycastSolid(clips,cratersRef.current,event.from,event.target),impactPoint=impact?.point??event.target,visualEvent:BazookaVisualEvent={...event,target:impactPoint,fizzle:!impact};bazookaEventsRef.current=[...bazookaEventsRef.current,visualEvent].slice(-12);const clip=impact?clips.find(candidate=>candidate.id===impact.imageId):undefined,impactDelay=Math.max(0,event.startTime+Math.hypot(impactPoint.x-event.from.x,impactPoint.y-event.from.y)/1100*1000-Date.now());window.setTimeout(()=>{if(event.startTime<repairAtRef.current)return;if(clip&&impact){const crater=craterForImpact(clip,impact.point,event.seed);cratersRef.current=[...cratersRef.current.filter(c=>c.clipId!==clip.id),...cratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];streamDebugLog("bazooka impact guest",impact.point);streamDebugLog("bazooka crater guest",crater);}else streamDebugLog("bazooka fizzle guest",impactPoint);const p=physics.current;if(p&&impact&&Math.hypot(p.x-impact.point.x,p.y-90-impact.point.y)<140){p.vx+=(p.x<impact.point.x?-1:1)*320;p.vy=-280;p.grounded=false;p.action="jump";}},impactDelay);streamDebugLog("bazooka fire guest",event);})
+      .on("broadcast",{event:"bazooka_fire"},({payload})=>{const event=payload as StreamBazookaFireMessage;const clips=(snapshotRef.current?.clips.filter(c=>c.type==="image")??[]) as TerrainClip[],impact=raycastSolid(clips,cratersRef.current,event.from,event.target),impactPoint=impact?.point??event.target,visualEvent:BazookaVisualEvent={...event,target:impactPoint,fizzle:!impact};bazookaEventsRef.current=[...bazookaEventsRef.current,visualEvent].slice(-12);const clip=impact?clips.find(candidate=>candidate.id===impact.imageId):undefined,impactDelay=Math.max(0,event.startTime+Math.hypot(impactPoint.x-event.from.x,impactPoint.y-event.from.y)/1100*1000-Date.now());window.setTimeout(()=>{if(event.startTime<repairAtRef.current)return;if(clip&&impact){const crater=craterForImpact(clip,impact.point,event.seed);cratersRef.current=[...cratersRef.current.filter(c=>c.clipId!==clip.id),...cratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];streamDebugLog("bazooka impact guest",impact.point);streamDebugLog("bazooka crater guest",crater);const p=physics.current,profile=p&&groundProfileY(clips,cratersRef.current,p.x),base=profile&&clips.find(c=>c.id===profile.imageId);if(p&&profile&&base)streamDebugLog("terrain standing guest",{x:p.x,groundY:profile.y,baseTopY:base.boardY,depth:profile.y-base.boardY,slope:profile.slope});}else streamDebugLog("bazooka fizzle guest",impactPoint);const p=physics.current;if(p&&impact&&Math.hypot(p.x-impact.point.x,p.y-90-impact.point.y)<140){p.vx+=(p.x<impact.point.x?-1:1)*320;p.vy=-280;p.grounded=false;p.action="jump";}},impactDelay);streamDebugLog("bazooka fire guest",event);})
       .on("broadcast",{event:"repair_board"},({payload})=>{repairAtRef.current=(payload as {sentAt:number}).sentAt;cratersRef.current=[];streamDebugLog("repair board guest");})
       .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
       .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
@@ -523,7 +540,7 @@ export default function StreamPage() {
   const emote=()=>{const p=physics.current;if(!p||!GUEST_VERB_SET.has("emote"))return;p.emote=GUEST_EMOTES[emoteIndex.current++%GUEST_EMOTES.length];startGuestStationaryAction(p,"emote");};
   const flipGuestTo=(targetX?:number,targetY?:number)=>{const p=physics.current;if(!p||!p.grounded)return;startGuestPlannedAction(p,"flip",targetX??p.x+p.facing*520,targetY??p.y);};
   const guestTargetVerb=(): GuestCharacterFrame["actionType"]|null=>{const keys=guestHeldKeys.current;if(keys.has("g"))return"grapple";if(keys.has("s"))return"skateTo";if(keys.has("c"))return"wallClimb";if(keys.has("z"))return"zipline";return null;};
-  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number,surfaces:StreamSurface[]=[],targetSurface?:StreamSurface)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY,surfaces,targetSurface);};
+  const issueGuestTargetVerb=(action:GuestCharacterFrame["actionType"],targetX:number,targetY:number,surfaces:StreamSurface[]=[],targetSurface?:StreamSurface)=>{const p=physics.current;if(!p)return;startGuestPlannedAction(p,action,targetX,targetY,surfaces,targetSurface,performance.now(),cratersRef.current);};
   const leave=async()=>{await channelRef.current?.track({role:"viewer",joinedAt:Date.now()} satisfies StreamParticipantPresence);physics.current=null;setMode("landing");};
   const dismissWheel=()=>{setWheelOpen(false);setWheelMenuOpen(false);};
   const exitFullscreen=useCallback(async()=>{const doc=document as FullscreenDocument;if(document.fullscreenElement||doc.webkitFullscreenElement){if(document.exitFullscreen)await document.exitFullscreen();else await doc.webkitExitFullscreen?.();}setMaximize(false);setNativeFullscreen(false);},[]);
@@ -586,7 +603,7 @@ export default function StreamPage() {
             p.action = "idle";
             clearGuestActionPlan(p);
           }
-          const planned = !frozen && held?.phase !== "hold" && updateGuestPlannedAction(p, now, surfaces);
+          const planned = !frozen && held?.phase !== "hold" && updateGuestPlannedAction(p, now, surfaces, cratersRef.current);
           const target = p.targetX;
           if (!planned && target !== null && !frozen) {
             const dx = target - p.x;
@@ -606,27 +623,37 @@ export default function StreamPage() {
           }
           if (!planned && held?.phase !== "hold") {
             if (p.grounded) {
-              const support = surfaces.find((s) => s.id === p.surfaceId);
-              if (!support || p.x < support.boardX || p.x > support.boardX + support.boardW) {
+              const ground = groundProfileY(surfaces as TerrainClip[], cratersRef.current, p.x);
+              if (!ground||(p.surfaceId!==null&&ground.imageId!==p.surfaceId&&ground.y>p.y+8)) {
                 p.grounded = false;
                 p.surfaceId = null;
                 p.vy = 30;
+                streamDebugLog("terrain fall guest", { x: p.x, fromY: p.y });
+              } else {
+                p.y = lerp(p.y, ground.y, 1 - Math.exp(-dt * 14));
+                p.surfaceId = ground.imageId;
+                p.terrainSlope = ground.slope;
+                p.terrainLeftFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x-14)?.y??ground.y)-ground.y;
+                p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x+14)?.y??ground.y)-ground.y;
               }
             }
+            if(p.grounded&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
             p.x += p.vx * dt;
             if (!p.grounded) {
               const previousY = p.y;
               p.vy = Math.min(1200, p.vy + 1850 * dt);
               const nextY = p.y + p.vy * dt;
-              const landing = surfaces
-                .filter((s) => p.x >= s.boardX + 10 && p.x <= s.boardX + s.boardW - 10 && previousY <= s.boardY && nextY >= s.boardY)
-                .sort((a, b) => a.boardY - b.boardY)[0];
-              if (landing) {
-                p.y = landing.boardY;
+              const landing = groundProfileY(surfaces as TerrainClip[], cratersRef.current, p.x);
+              if (landing && previousY <= landing.y && nextY >= landing.y) {
+                p.y = landing.y;
                 p.vy = 0;
                 p.grounded = true;
-                p.surfaceId = landing.id;
+                p.surfaceId = landing.imageId;
+                p.terrainSlope = landing.slope;
+                p.terrainLeftFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x-14)?.y??landing.y)-landing.y;
+                p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x+14)?.y??landing.y)-landing.y;
                 p.action = p.targetX === null ? "idle" : p.action;
+                streamDebugLog("terrain landing guest", { x: p.x, groundY: landing.y, slope: landing.slope });
               } else {
                 p.y = nextY;
               }

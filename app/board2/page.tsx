@@ -52,7 +52,7 @@ import {
   streamCharacterConstructionParams,
 } from "@/lib/character/renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
+import { groundProfileY, raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -350,7 +350,7 @@ function rocketRayEnd(from: TerrainPoint, cursor: TerrainPoint, boardW = BOARD_W
   return { x: from.x + ux * distance, y: from.y + uy * distance };
 }
 
-function terrainClips(clips: readonly Clip[]): TerrainClip[] {
+function rocketTerrainClips(clips: readonly Clip[]): TerrainClip[] {
   return clips.flatMap((clip) => clip.type === "image" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
     ? [{ id: clip.id, type: clip.type, boardX: clip.boardX, boardY: clip.boardY, boardW: clip.boardW, boardH: clip.boardH }]
     : []);
@@ -926,20 +926,13 @@ function getCharInitPos(clips: { boardX?: number; boardY?: number; boardW?: numb
 function resolveGroundY(
   x: number,
   desiredY: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { id?: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  craters: readonly StreamCrater[] = []
 ): number {
-  const PAD = 40; // don't stand on the extreme corners of an image
-  const candidates = clips.filter((c) =>
-    c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined &&
-    (c.type === "image" || c.type === "video") &&
-    x >= c.boardX! + PAD && x <= c.boardX! + (c.boardW ?? 0) - PAD &&
-    c.boardY! <= desiredY  // top edge must be at or above the target point
-  );
-  if (candidates.length === 0) return desiredY;
-  // When clips overlap horizontally (stacked images), stand on the topmost one (smallest boardY).
-  // Among all candidates whose top edge is <= desiredY, pick the one with the LARGEST boardY
-  // (highest top edge, closest to desiredY from above).
-  return Math.max(...candidates.map((c) => c.boardY!));
+  const terrain = clips.flatMap((clip, index): TerrainClip[] => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined && (clip.type === "image" || clip.type === "video")
+    ? [{ id: clip.id ?? `surface-${index}`, type: clip.type, boardX: clip.boardX, boardY: clip.boardY, boardW: clip.boardW, boardH: clip.boardH }]
+    : []);
+  return groundProfileY(terrain, craters, x)?.y ?? desiredY;
 }
 
 // Snap a board position to the top surface of the clip under x (for action placement).
@@ -1014,6 +1007,8 @@ type SkateToPlan = {
   mountEnd: number;
   airStart: number;
   airEnd: number;
+  terrainGapWidth: number;
+  terrainAutoOllie: boolean;
 };
 
 function isBoardSurface(c: CharSurfaceClip): c is RequiredSurfaceClip {
@@ -1095,10 +1090,11 @@ function resolveStandingSlot(
   targetClipId: string | undefined,
   clips: CharSurfaceClip[],
   blockers: CharacterBlockerTimeline[] = [],
-  laneBias = 0
+  laneBias = 0,
+  craters: readonly StreamCrater[] = []
 ): { x: number; y: number } {
   const surface = findStandingSurfaceForTarget(desiredX, desiredY, targetClipId, clips);
-  const groundY = surface ? surface.boardY : resolveGroundY(desiredX, desiredY, clips);
+  const groundY = resolveGroundY(desiredX, surface?.boardY ?? desiredY, clips, craters);
   const baseX = surface ? clampInsideClipX(surface, desiredX + laneBias, 50) : desiredX + laneBias;
   const offsets = [0, 70, -70, 140, -140];
   const minSeps = [90, 55];
@@ -1107,8 +1103,8 @@ function resolveStandingSlot(
     const sampleStart = Math.max(timeStart, blocker.entranceTime);
     const sampleEnd = Math.max(sampleStart, timeEnd);
     for (let t = sampleStart; t <= sampleEnd + 0.001; t += 0.25) {
-      const pose = evalCharAtTime(t, blocker.resolved, blocker.initX, blocker.initY, clips);
-      const sameSurface = Math.abs(resolveGroundY(pose.boardX, pose.boardY, clips) - groundY) < 8 || Math.abs(pose.boardY - groundY) < 8;
+      const pose = evalCharAtTime(t, blocker.resolved, blocker.initX, blocker.initY, clips, {}, false, 1, craters);
+      const sameSurface = Math.abs(resolveGroundY(pose.boardX, pose.boardY, clips, craters) - groundY) < 8 || Math.abs(pose.boardY - groundY) < 8;
       if (sameSurface && Math.abs(pose.boardX - candidateX) < minSep) return true;
     }
     return false;
@@ -1158,26 +1154,41 @@ function viewportEntranceSpawn(
   };
 }
 
-function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]): SkateToPlan | null {
+function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[], craters: readonly StreamCrater[] = []): SkateToPlan | null {
   const tx = active.targetX ?? active.fromX;
   const ty = active.targetY ?? active.fromY;
   const source = findSurfaceAtFeet(active.fromX, active.fromY, clips);
   const target = findTargetSurface(active, tx, ty, clips);
-  if (!source || !target || source === target) return null;
+  if (!source || !target) return null;
 
   const sourceCenterX = source.boardX + source.boardW / 2;
   const targetCenterX = target.boardX + target.boardW / 2;
   const facing: 1 | -1 = targetCenterX >= sourceCenterX ? 1 : -1;
-  const edgeX = facing === 1
+  let edgeX = facing === 1
     ? source.boardX + source.boardW - SKATE_EDGE_MARGIN
     : source.boardX + SKATE_EDGE_MARGIN;
   const targetHoldX = clampInsideClipX(target, tx, SKATE_EDGE_MARGIN);
   const desiredLandingX = targetHoldX - facing * SKATE_LANDING_ROLLOUT_PX;
-  const gapEndX = clampInsideClipX(target, desiredLandingX, SKATE_EDGE_MARGIN);
-  const finalX = clampInsideClipX(target, gapEndX + facing * SKATE_LANDING_ROLLOUT_PX, SKATE_EDGE_MARGIN);
+  let gapEndX = clampInsideClipX(target, desiredLandingX, SKATE_EDGE_MARGIN);
+  let finalX = clampInsideClipX(target, gapEndX + facing * SKATE_LANDING_ROLLOUT_PX, SKATE_EDGE_MARGIN);
   const rolloutDistance = Math.abs(finalX - gapEndX);
-  const startY = source.boardY;
-  const landingY = target.boardY;
+  const sourceGround = groundProfileY([source as TerrainClip], craters, active.fromX);
+  const startY = sourceGround?.y ?? source.boardY;
+  let landingY = groundProfileY([target as TerrainClip], craters, gapEndX)?.y ?? target.boardY;
+  const topGaps = craters.filter((crater) => crater.clipId === source.id && Math.abs(crater.cy) < crater.r).map((crater) => {
+    const half = Math.sqrt(crater.r ** 2 - crater.cy ** 2);
+    return { left: source.boardX + crater.cx - half, right: source.boardX + crater.cx + half, width: half * 2 };
+  }).filter((gap) => facing === 1 ? gap.left > active.fromX && gap.left < tx : gap.right < active.fromX && gap.right > tx).sort((a,b)=>facing===1?a.left-b.left:b.right-a.right);
+  const terrainGap = topGaps[0];
+  if (terrainGap) {
+    edgeX = facing === 1 ? terrainGap.left : terrainGap.right;
+    gapEndX = facing === 1 ? terrainGap.right : terrainGap.left;
+    if (terrainGap.width > 120) finalX = gapEndX = edgeX + facing * 90;
+    else finalX = gapEndX + facing * SKATE_LANDING_ROLLOUT_PX;
+    landingY = resolveGroundY(gapEndX, startY, clips, craters);
+  } else if (source === target) {
+    return null;
+  }
   const rollDistance = Math.abs(edgeX - active.fromX);
   const ollyDistance = Math.abs(gapEndX - edgeX);
   const heightDelta = landingY - startY;
@@ -1243,17 +1254,20 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[]):
     mountEnd,
     airStart,
     airEnd,
+    terrainGapWidth: terrainGap?.width ?? 0,
+    terrainAutoOllie: !!terrainGap && terrainGap.width <= 120,
   };
 }
 
 function resolvedActionRestPosition(
   action: ResolvedCharAction,
-  clips: CharSurfaceClip[]
+  clips: CharSurfaceClip[],
+  craters: readonly StreamCrater[] = []
 ): { x: number; y: number } {
-  const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips) : null;
+  const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips, craters) : null;
   if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
   if (CHAR_STATIONARY_TARGET_TYPES.has(action.type) && action.targetX !== undefined) {
-    const targetY = resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips);
+    const targetY = resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips, craters);
     const dist = Math.hypot(action.targetX - action.fromX, targetY - action.fromY);
     if (dist < CHAR_STATIONARY_NEAR_TARGET_PX) return { x: action.fromX, y: action.fromY };
     return {
@@ -1298,7 +1312,8 @@ type StationaryRuntime =
 function stationaryRuntimeForAction(
   active: ResolvedCharAction,
   clips: CharSurfaceClip[],
-  time: number
+  time: number,
+  craters: readonly StreamCrater[] = []
 ): StationaryRuntime {
   if (!CHAR_STATIONARY_TARGET_TYPES.has(active.type) || active.targetX === undefined) {
     const elapsed = time - active.startTime;
@@ -1314,7 +1329,7 @@ function stationaryRuntimeForAction(
   }
 
   const targetX = active.targetX;
-  const targetY = resolveGroundY(targetX, active.targetY ?? active.fromY, clips);
+  const targetY = resolveGroundY(targetX, active.targetY ?? active.fromY, clips, craters);
   const distance = Math.hypot(targetX - active.fromX, targetY - active.fromY);
   const elapsed = time - active.startTime;
   if (distance < CHAR_STATIONARY_NEAR_TARGET_PX) {
@@ -1393,7 +1408,8 @@ function resolveCharActions(
   initY: number,
   clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
   blockers: CharacterBlockerTimeline[] = [],
-  laneBias = 0
+  laneBias = 0,
+  craters: readonly StreamCrater[] = []
 ): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
@@ -1405,7 +1421,7 @@ function resolveCharActions(
     let targetX = a.targetX ?? resolvedTarget?.x;
     let targetY = a.targetY ?? resolvedTarget?.y;
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
-      const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0);
+      const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters);
       targetX = slot.x;
       targetY = slot.y;
     }
@@ -1414,7 +1430,7 @@ function resolveCharActions(
     const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
     result.push(resolvedAction);
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
-      const rest = resolvedActionRestPosition(resolvedAction, clips);
+      const rest = resolvedActionRestPosition(resolvedAction, clips, craters);
       x = rest.x; y = rest.y;
     }
     // pointAt/explainGesture/idle don't change position; stationary target actions may end at
@@ -1630,6 +1646,8 @@ type CharPoseResult = {
   skateboardTilt?: number;
   skateSparkAlpha?: number;
   skateMotionAlpha?: number;
+  terrainLeftFootY?: number;
+  terrainRightFootY?: number;
   pullUpBarAlpha?: number;
   pullUpBarBX?: number;
   pullUpBarBY?: number;
@@ -1911,13 +1929,19 @@ function travelPoseBetween(
   targetY: number,
   progress: number,
   clips: CharSurfaceClip[],
-  running = false
+  running = false,
+  craters: readonly StreamCrater[] = []
 ): CharPoseResult {
   const distance = Math.hypot(targetX - fromX, targetY - fromY);
   const travelProgress = distanceTravelProgress(progress, distance);
-  const bx = lerp(fromX, targetX, travelProgress);
+  let bx = lerp(fromX, targetX, travelProgress);
   const rawBy = lerp(fromY, targetY, travelProgress);
-  const by = resolveGroundY(bx, rawBy, clips);
+  const terrain=clips.filter(isBoardSurface) as TerrainClip[];
+  let profile = groundProfileY(terrain, craters, bx);
+  let autoJumpY=0;
+  if(!profile){let left:null|{x:number;y:number}=null,right:null|{x:number;y:number}=null;for(let d=6;d<=126&&!left;d+=6){const p=groundProfileY(terrain,craters,bx-d);if(p)left={x:bx-d,y:p.y};}for(let d=6;d<=126&&!right;d+=6){const p=groundProfileY(terrain,craters,bx+d);if(p)right={x:bx+d,y:p.y};}if(left&&right&&right.x-left.x<=120){const gapT=clamp((bx-left.x)/(right.x-left.x),0,1);profile={y:lerp(left.y,right.y,gapT),imageId:"terrain-gap",slope:0};autoJumpY=-70*4*gapT*(1-gapT);}else{const lip=targetX>=fromX?left:right;if(lip){bx=lip.x;profile=groundProfileY(terrain,craters,bx);}}}
+  if(profile&&Math.abs(profile.slope)>Math.tan(50*Math.PI/180)){const downhill=profile.slope>0?1:-1;for(let d=4;d<=60;d+=4){const candidate=groundProfileY(terrain,craters,bx+downhill*d);if(candidate&&Math.abs(candidate.slope)<=Math.tan(50*Math.PI/180)){bx+=downhill*d;profile=candidate;break;}}}
+  const by = profile?.y ?? rawBy;
   const facing: 1 | -1 = targetX >= fromX ? 1 : -1;
   const stridePx = running ? 180 : 145;
   const phase = travelProgress * Math.max(1, distance / stridePx) * Math.PI * 2;
@@ -1928,14 +1952,14 @@ function travelPoseBetween(
   return {
     boardX: bx, boardY: by, facing,
     headBob: -bounce,
-    bodyLean: (running ? 0.16 : 0.055) * facing,
+    bodyLean: (running ? 0.16 : 0.055) * facing + clamp((profile?.slope ?? 0) * .4, -.12, .12),
     leftLegA: Math.sin(phase) * swing - leftPlant * 0.08,
     rightLegA: Math.sin(phase + Math.PI) * swing - rightPlant * 0.08,
     leftArmA: Math.sin(phase + Math.PI) * (running ? 0.62 : 0.4),
     rightArmA: Math.sin(phase) * (running ? 0.62 : 0.4),
     leftForeA: 0.1 + leftPlant * (running ? 0.48 : 0.28),
     rightForeA: -0.1 - rightPlant * (running ? 0.48 : 0.28),
-    airY: 0,
+    airY: autoJumpY,
   };
 }
 
@@ -1947,7 +1971,8 @@ function evalCharPoseRaw(
   clips: CharSurfaceClip[],
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
-  faceAspect = 1
+  faceAspect = 1,
+  craters: readonly StreamCrater[] = []
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
   // Relaxed arms stay visibly away from the torso; the idle bob below is head/breathing only.
@@ -1973,7 +1998,7 @@ function evalCharPoseRaw(
       if (end <= time && end > lastEnd) {
         lastEnd = end;
         if (actionCanChangeRestPosition(a.type) && a.targetX !== undefined) {
-          const rest = resolvedActionRestPosition(a, clips);
+          const rest = resolvedActionRestPosition(a, clips, craters);
           rx = rest.x; ry = rest.y;
         } else {
           rx = a.fromX; ry = a.fromY;
@@ -1989,7 +2014,7 @@ function evalCharPoseRaw(
   const authoredPose = slotName
     ? sampleAnimation(authoredAnimations[slotName], authoredProgressForAction(active, progress))
     : null;
-  const stationaryRuntime = stationaryRuntimeForAction(active, clips, time);
+  const stationaryRuntime = stationaryRuntimeForAction(active, clips, time, craters);
   if (stationaryRuntime.hasTarget && stationaryRuntime.phase === "travel") {
     return travelPoseBetween(
       time,
@@ -1999,7 +2024,8 @@ function evalCharPoseRaw(
       stationaryRuntime.targetY,
       clamp((time - active.startTime) / stationaryRuntime.travelDuration, 0, 1),
       clips,
-      stationaryRuntime.running
+      stationaryRuntime.running,
+      craters
     );
   }
   const stationaryActive = stationaryRuntime.action;
@@ -2009,7 +2035,7 @@ function evalCharPoseRaw(
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const speed = Math.hypot(tx - active.fromX, ty - active.fromY) / Math.max(0.001, active.duration);
-    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips, speed > 520), authoredPose);
+    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips, speed > 520, craters), authoredPose);
   }
 
   if (active.type === "jumpTo") {
@@ -2060,14 +2086,14 @@ function evalCharPoseRaw(
   }
 
   if (active.type === "skateTo") {
-    const plan = buildSkateToPlan(active, clips);
+    const plan = buildSkateToPlan(active, clips, craters);
     if (!plan) {
       return applyAuthoredPose(idlePose(active.fromX, active.fromY), sampleAnimation(authoredAnimations.idle, 0));
     }
     if (plan.tooHighTarget) {
       const tx = active.targetX ?? active.fromX;
       const ty = active.targetY ?? active.fromY;
-      const landingY = resolveGroundY(tx, ty, clips);
+      const landingY = resolveGroundY(tx, ty, clips, craters);
       const bx = lerp(active.fromX, tx, progress);
       const by = lerp(active.fromY, landingY, progress);
       const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
@@ -2107,9 +2133,16 @@ function evalCharPoseRaw(
       skateCrouch = lerp(4, 8, t);
     } else if (elapsed < plan.airStart) {
       const rollElapsed = elapsed - plan.mountEnd;
-      const rollT = plan.rollDur > 0 ? clamp(rollElapsed / plan.rollDur, 0, 1) : 1;
+      const baseRollT = plan.rollDur > 0 ? clamp(rollElapsed / plan.rollDur, 0, 1) : 1;
+      const probeX=lerp(plan.startX,plan.edgeX,baseRollT),probe=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,probeX);
+      const slopeSpeed=1+clamp((probe?.slope??0)*plan.facing*.15,-.15,.15);
+      const rollT=clamp(baseRollT*slopeSpeed,0,1);
       bx = lerp(plan.startX, plan.edgeX, rollT);
-      by = plan.startY;
+      const rollGround=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx);
+      by = rollGround?.y??plan.startY;
+      const behind=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx-plan.facing*20)?.y??by;
+      const ahead=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx+plan.facing*20)?.y??by;
+      skateboardTilt=Math.atan2(ahead-behind,40)*plan.facing;
       const prepStart = Math.max(plan.mountEnd, plan.airStart - plan.prepDur);
       if (plan.prepDur > 0 && elapsed >= prepStart) {
         const prepT = clamp((elapsed - prepStart) / plan.prepDur, 0, 1);
@@ -2150,7 +2183,7 @@ function evalCharPoseRaw(
       const t = plan.landDur > 0 ? clamp((elapsed - plan.airEnd) / plan.landDur, 0, 1) : 1;
       const rolloutT = clamp(t / 0.68, 0, 1);
       bx = plan.gapEndX + (plan.finalX - plan.gapEndX) * rolloutT;
-      by = plan.landingY;
+      by = resolveGroundY(bx,plan.landingY,clips,craters);
       skateboardVisible = t < 0.72;
       pose = t < 0.68
         ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.68))
@@ -2185,7 +2218,7 @@ function evalCharPoseRaw(
     // Anchor point: above and between start+end, biased toward destination
     const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
     const anchorBY = Math.min(active.fromY, ty) - 380;
-    const landingY = resolveGroundY(tx, ty, clips);
+    const landingY = resolveGroundY(tx, ty, clips, craters);
     const PREP_END = 0.12;
     const FIRE_END = 0.22;
     const PULL_START = 0.32;
@@ -2312,7 +2345,7 @@ function evalCharPoseRaw(
     // is intentionally piecewise: slow prep/takeoff, fastest through the tight tuck, then eased
     // open into a flat 2π landing. The draw step rotates around mid-torso, not the feet.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
-    const landingY = resolveGroundY(tx, ty, clips);
+    const landingY = resolveGroundY(tx, ty, clips, craters);
     const bx = active.entranceFlip
       ? lerp(active.fromX, tx, easeOutQuad(progress))
       : lerp(active.fromX, tx, progress);
@@ -2371,7 +2404,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const groundY = resolveGroundY(a.fromX, a.targetY ?? a.fromY, clips);
+    const groundY = resolveGroundY(a.fromX, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const STEP_END = 0.12;
     const LOWER_END = 0.3;
@@ -2526,7 +2559,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const APPROACH_END = 0.1;
     const HANG_END = 0.15;
@@ -2629,7 +2662,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     let pose = standingCharPose(tx, ty, facing, time);
     let surpriseAlpha = 0;
@@ -2714,7 +2747,7 @@ function evalCharPoseRaw(
   if (active.type === "dance") {
     const a = stationaryActive;
     const tx = a.targetX ?? a.fromX;
-    const groundY = resolveGroundY(tx, a.targetY ?? a.fromY, clips);
+    const groundY = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const elapsed = Math.max(0, stationaryElapsed);
     const edge = Math.min(1, elapsed / 0.22, (a.duration - elapsed) / 0.22);
@@ -2836,12 +2869,13 @@ function evalCharAtTime(
   clips: CharSurfaceClip[],
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
-  faceAspect = 1
+  faceAspect = 1,
+  craters: readonly StreamCrater[] = []
 ): CharPoseResult {
-  const base = evalCharPoseRaw(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
+  const base = evalCharPoseRaw(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters);
   const dt = MOMENTUM_SAMPLE_DT;
   const sampleRoot = (t: number) => {
-    const p = evalCharPoseRaw(Math.max(0, t), resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
+    const p = evalCharPoseRaw(Math.max(0, t), resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters);
     return { x: p.boardX, y: p.boardY + p.airY };
   };
   const r0 = sampleRoot(time);
@@ -2912,6 +2946,8 @@ function evalCharAtTime(
     rightLegA: base.rightLegA - offset * 0.82,
     momentumScaleX: scaleX,
     momentumScaleY: scaleY,
+    terrainLeftFootY:(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX-14)?.y??base.boardY)-base.boardY,
+    terrainRightFootY:(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX+14)?.y??base.boardY)-base.boardY,
   };
 }
 
@@ -2919,8 +2955,8 @@ function liveRuntimeSeconds(runtime: LiveCharacterRuntime, wallMs: number): numb
   return Math.max(0, (wallMs - runtime.startWallMs) / 1000);
 }
 
-function liveResolvedActions(runtime: LiveCharacterRuntime, clips: Clip[]): ResolvedCharAction[] {
-  return resolveCharActions(runtime.actions, runtime.initX, runtime.initY, clips);
+function liveResolvedActions(runtime: LiveCharacterRuntime, clips: Clip[], craters: readonly StreamCrater[] = []): ResolvedCharAction[] {
+  return resolveCharActions(runtime.actions, runtime.initX, runtime.initY, clips, [], 0, craters);
 }
 
 function evalLiveCharacterAtWallTime(
@@ -2929,11 +2965,12 @@ function evalLiveCharacterAtWallTime(
   clips: Clip[],
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
-  faceAspect = 1
+  faceAspect = 1,
+  craters: readonly StreamCrater[] = []
 ): CharPoseResult {
   const t = liveRuntimeSeconds(runtime, wallMs);
-  const resolved = liveResolvedActions(runtime, clips);
-  let pose = evalCharAtTime(t, resolved, runtime.initX, runtime.initY, clips, authoredAnimations, hasFace, faceAspect);
+  const resolved = liveResolvedActions(runtime, clips, craters);
+  let pose = evalCharAtTime(t, resolved, runtime.initX, runtime.initY, clips, authoredAnimations, hasFace, faceAspect, craters);
   if (runtime.blendFromPose && runtime.blendStartWallMs > 0) {
     const blendT = clamp((wallMs - runtime.blendStartWallMs) / Math.max(0.001, runtime.blendDuration * 1000), 0, 1);
     if (blendT < 1) pose = lerpCharPose(runtime.blendFromPose, pose, blendT);
@@ -3369,7 +3406,7 @@ export default function Board2Page() {
     const runtime = liveCharactersRef.current[id];
     const hasFace = id === "c2" ? !!(characterFace2Ref.current && characterFace2ImageRef.current) : !!(characterFaceRef.current && characterFaceImageRef.current);
     const faceAspect = id === "c2" ? clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6) : clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-    const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+    const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
     runtime.currentPose = pose;
     return pose;
   }, []);
@@ -3382,7 +3419,7 @@ export default function Board2Page() {
       ? evalCharAtTime(playheadRef.current, resolvedCharActions2Ref.current, fallback.x, fallback.y, clipsRef.current, authoredAnimationsRef.current)
       : evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, fallback.x, fallback.y, clipsRef.current, authoredAnimationsRef.current));
     const startX = Number.isFinite(pose.boardX) ? pose.boardX : center.x;
-    const startY = Number.isFinite(pose.boardY) ? pose.boardY : resolveGroundY(center.x, center.y, clipsRef.current);
+    const startY = Number.isFinite(pose.boardY) ? pose.boardY : resolveGroundY(center.x, center.y, clipsRef.current, streamCratersRef.current);
     liveCharactersRef.current[id] = {
       ...liveCharactersRef.current[id],
       enabled: true,
@@ -3422,7 +3459,7 @@ export default function Board2Page() {
     }
     const currentPose = livePoseFor(id, now);
     const startX = currentPose.boardX;
-    const startY = resolveGroundY(startX, currentPose.boardY, clipsRef.current);
+    const startY = resolveGroundY(startX, currentPose.boardY, clipsRef.current, streamCratersRef.current);
     const t0 = 0;
     const mk = (type: CharacterAction["type"], duration: number, tx = startX, ty = startY): CharacterAction => ({
       id: generateId(),
@@ -3759,11 +3796,11 @@ export default function Board2Page() {
       ? (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
           const state = id === "c1" ? playPhysicsRef.current : null;
           const runtime = id === "c1" ? playActionRuntimeRef.current : null;
-          const resolved = runtime?.enabled ? liveResolvedActions(runtime, clipsRef.current) : [];
+          const resolved = runtime?.enabled ? liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current) : [];
           const t = runtime?.enabled ? liveRuntimeSeconds(runtime, wallMs) : 0;
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
           let pose = runtime?.enabled && state
-            ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current))
+            ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
           if (pose && id === "c1") pose = applyPlayForceChokePose(pose);
           const moving = state ? Math.abs(state.vx) > 40 : false;
@@ -3795,9 +3832,9 @@ export default function Board2Page() {
       : (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
           const runtime = liveCharactersRef.current[id];
           const t = liveRuntimeSeconds(runtime, wallMs);
-          const resolved = liveResolvedActions(runtime, clipsRef.current);
+          const resolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
-          const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current);
+          const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
           const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
           const duration = active?.duration ?? 2;
           return {
@@ -4672,10 +4709,10 @@ export default function Board2Page() {
       if (live.c1.enabled) {
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+        const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c1.currentPose = pose;
         CharacterEntity.drawBoardCharacterToCanvas(
-          ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current), true,
+          ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c1.initX, live.c1.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
           characterFaceRef.current && characterFaceImageRef.current
@@ -4689,10 +4726,10 @@ export default function Board2Page() {
       if (live.c2.enabled) {
         const hasFace = !!(characterFace2Ref.current && characterFace2ImageRef.current);
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
-        const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+        const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c2.currentPose = pose;
         CharacterEntity.drawBoardCharacterToCanvas(
-          ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current), true,
+          ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c2.initX, live.c2.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
           characterFace2Ref.current && characterFace2ImageRef.current
@@ -8533,7 +8570,7 @@ export default function Board2Page() {
     if (runtime?.enabled && runtime.actions.length > 0) {
       const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
       const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-      const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+      const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
       runtime.currentPose = pose;
       return pose;
     }
@@ -8585,12 +8622,17 @@ export default function Board2Page() {
       playFlipDebugRef.current = null;
     }
 
-    const pose = evalCharAtTime(sampleTime, resolved, 0, state.y, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+    const pose = evalCharAtTime(sampleTime, resolved, 0, state.y, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
+    const terrain=clipsRef.current.filter(isBoardSurface).map(({id,type,boardX,boardY,boardW,boardH})=>({id:id??"surface",type,boardX,boardY,boardW,boardH})) as TerrainClip[];
+    const directGround=groundProfileY(terrain,streamCratersRef.current,state.x),slope=directGround?.slope??0;
     return {
       ...pose,
       boardX: state.x,
       boardY: state.y,
       facing: state.facing,
+      bodyLean: pose.bodyLean+clamp(slope*.4,-.12,.12),
+      terrainLeftFootY:(groundProfileY(terrain,streamCratersRef.current,state.x-14)?.y??state.y)-state.y,
+      terrainRightFootY:(groundProfileY(terrain,streamCratersRef.current,state.x+14)?.y??state.y)-state.y,
       airY: 0,
       emojiText: state.action === "emote" ? "🤔" : pose.emojiText,
       emojiAlpha: state.action === "emote" ? 1 : pose.emojiAlpha,
@@ -8607,7 +8649,7 @@ export default function Board2Page() {
     if (command === "stop") {
       playActionRuntimeRef.current = null;
       state.x = startX;
-      state.y = resolveGroundY(startX, startY, clipsRef.current);
+      state.y = resolveGroundY(startX, startY, clipsRef.current, streamCratersRef.current);
       state.vx = 0;
       state.vy = 0;
       state.grounded = true;
@@ -8660,6 +8702,7 @@ export default function Board2Page() {
       action = { ...mk("emote", 2, startX, startY), emoji: LIVE_EMOTES[(emojiIndex - 1) % LIVE_EMOTES.length] };
     }
     if (!action) return;
+    if(action.type==="skateTo"){const plan=buildSkateToPlan({...action,fromX:startX,fromY:startY},clipsRef.current,streamCratersRef.current);if(plan?.terrainAutoOllie)streamDebugLog("terrain auto-ollie host",{gapWidth:plan.terrainGapWidth,popPoint:plan.edgeX,path:"existing-skate-pop-land"});}
 
     state.x = startX;
     state.y = startY;
@@ -8904,8 +8947,8 @@ export default function Board2Page() {
   }
 
   function firePlayBazooka() {
-    const state=playPhysicsRef.current,cursor=playCursorRef.current;if(!state||!cursor||!playBazookaArmedRef.current||!streamSessionIdRef.current)return;const now=Date.now();if(now-playBazookaLastFireAtRef.current<1200)return;playBazookaLastFireAtRef.current=now;const from=playWeaponOrigin(state),target=rocketRayEnd(from,cursor),seed=Math.floor(Math.random()*1_000_000),clips=terrainClips(clipsRef.current),impact=raycastSolid(clips,streamCratersRef.current,from,target);const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:now,startTime:now,from,target,seed},visualEvent:BazookaVisualEvent={...event,target:impact?.point??target,fizzle:!impact};playBazookaEventsRef.current=[...playBazookaEventsRef.current,visualEvent].slice(-12);
-    if(impact){const clip=clips.find(candidate=>candidate.id===impact.imageId)!;const crater=craterForImpact(clip,impact.point,seed),impactDelay=Math.hypot(impact.point.x-from.x,impact.point.y-from.y)/1100*1000;window.setTimeout(()=>{if(event.startTime<streamRepairAtRef.current)return;streamCratersRef.current=[...streamCratersRef.current.filter(c=>c.clipId!==clip.id),...streamCratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];streamDebugLog("bazooka impact host",impact.point);streamDebugLog("bazooka crater host",crater);void publishStreamSnapshot();},impactDelay);}else streamDebugLog("bazooka fizzle host",target);
+    const state=playPhysicsRef.current,cursor=playCursorRef.current;if(!state||!cursor||!playBazookaArmedRef.current||!streamSessionIdRef.current)return;const now=Date.now();if(now-playBazookaLastFireAtRef.current<1200)return;playBazookaLastFireAtRef.current=now;const from=playWeaponOrigin(state),target=rocketRayEnd(from,cursor),seed=Math.floor(Math.random()*1_000_000),clips=rocketTerrainClips(clipsRef.current),impact=raycastSolid(clips,streamCratersRef.current,from,target);const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:now,startTime:now,from,target,seed},visualEvent:BazookaVisualEvent={...event,target:impact?.point??target,fizzle:!impact};playBazookaEventsRef.current=[...playBazookaEventsRef.current,visualEvent].slice(-12);
+    if(impact){const clip=clips.find(candidate=>candidate.id===impact.imageId)!;const crater=craterForImpact(clip,impact.point,seed),impactDelay=Math.hypot(impact.point.x-from.x,impact.point.y-from.y)/1100*1000;window.setTimeout(()=>{if(event.startTime<streamRepairAtRef.current)return;streamCratersRef.current=[...streamCratersRef.current.filter(c=>c.clipId!==clip.id),...streamCratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];streamDebugLog("bazooka impact host",impact.point);streamDebugLog("bazooka crater host",crater);const standing=playPhysicsRef.current,profile=standing&&groundProfileY(rocketTerrainClips(clipsRef.current),streamCratersRef.current,standing.x),base=profile&&clipsRef.current.find(c=>c.id===profile.imageId);if(standing&&profile&&base?.boardY!==undefined)streamDebugLog("terrain standing host",{x:standing.x,groundY:profile.y,baseTopY:base.boardY,depth:profile.y-base.boardY,slope:profile.slope});void publishStreamSnapshot();},impactDelay);}else streamDebugLog("bazooka fizzle host",target);
     state.x-=state.facing*12;state.vx-=state.facing*90;streamChannelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});streamDebugLog("bazooka fire host",event);
   }
 
@@ -9129,6 +9172,7 @@ export default function Board2Page() {
 
   function updatePlayPhysics(state: PlayCharacterState, dt: number, canvas: HTMLCanvasElement) {
     const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
+    const terrain = surfaces.map(({id,type,boardX,boardY,boardW,boardH})=>({id,type,boardX,boardY,boardW,boardH})) as TerrainClip[];
     if (state.action !== "none" && playTimeRef.current >= state.actionUntil) state.action = "none";
     if(playBazookaArmedRef.current){const keys=playHeldKeysRef.current;if(keys.has("KeyA")){state.vx=-PLAY_WALK_SPEED;state.facing=-1;}else if(keys.has("KeyD")){state.vx=PLAY_WALK_SPEED;state.facing=1;}if(keys.has("KeyW")&&state.grounded){state.vy=-PLAY_JUMP_SPEED;state.grounded=false;state.surfaceId=null;}if(keys.has("KeyS"))state.vx*=.6;}
     const pointer = playPointerRef.current;
@@ -9148,18 +9192,20 @@ export default function Board2Page() {
     }
 
     if (state.grounded) {
-      const support = surfaces.find((surface) => surface.id === state.surfaceId);
-      const onSupport = support && state.x >= support.boardX + 12 && state.x <= support.boardX + support.boardW - 12;
-      if (!onSupport) {
+      const ground = groundProfileY(terrain,streamCratersRef.current,state.x);
+      if (!ground||(state.surfaceId!==null&&ground.imageId!==state.surfaceId&&ground.y>state.y+8)) {
         state.grounded = false;
         state.surfaceId = null;
         state.vy = 35;
         state.airborneAt = playTimeRef.current;
+        streamDebugLog("terrain fall host",{x:state.x,fromY:state.y});
       } else {
-        state.y = support.boardY;
+        state.y=lerp(state.y,ground.y,1-Math.exp(-dt*14));
+        state.surfaceId=ground.imageId;
       }
     }
 
+    if(state.grounded&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
     const previousY = state.y;
     state.x += state.vx * dt;
     if (!state.grounded) {
@@ -9184,15 +9230,13 @@ export default function Board2Page() {
       }
       const nextY = state.y + state.vy * dt;
       if (state.vy >= 0) {
-        const landing = surfaces
-          .filter((surface) => state.x >= surface.boardX + 18 && state.x <= surface.boardX + surface.boardW - 18)
-          .filter((surface) => previousY <= surface.boardY && nextY >= surface.boardY)
-          .sort((a, b) => a.boardY - b.boardY)[0];
-        if (landing) {
-          state.y = landing.boardY;
+        const landing=groundProfileY(terrain,streamCratersRef.current,state.x);
+        if (landing&&previousY<=landing.y&&nextY>=landing.y) {
+          state.y = landing.y;
           state.vy = 0;
           state.grounded = true;
-          state.surfaceId = landing.id ?? null;
+          state.surfaceId = landing.imageId;
+          streamDebugLog("terrain landing host",{x:state.x,groundY:landing.y,slope:landing.slope});
           state.spin = 0;
           state.airborneAt = undefined;
           state.landedAt = playTimeRef.current;
@@ -9253,21 +9297,21 @@ export default function Board2Page() {
       if (runtime?.enabled && runtime.actions.length > 0) {
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        playPose = evalLiveCharacterAtWallTime(runtime, wall, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect);
+        playPose = evalLiveCharacterAtWallTime(runtime, wall, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         runtime.currentPose = playPose;
         playDrawTime = liveRuntimeSeconds(runtime, wall);
-        playDrawResolved = liveResolvedActions(runtime, clipsRef.current);
+        playDrawResolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
         state.x = playPose.boardX;
         state.y = playPose.boardY;
         state.facing = playPose.facing;
         state.vx = 0;
         state.vy = 0;
         state.grounded = !playPose.grappleRopeAlpha && !playPose.skateboardVisible && !playPose.spinAngle;
-        state.surfaceId = findSurfaceAtFeet(state.x, resolveGroundY(state.x, state.y, clipsRef.current), clipsRef.current)?.id ?? null;
+        state.surfaceId = findSurfaceAtFeet(state.x, resolveGroundY(state.x, state.y, clipsRef.current, streamCratersRef.current), clipsRef.current)?.id ?? null;
         const lastAction = playDrawResolved[playDrawResolved.length - 1];
         if (lastAction && playDrawTime > lastAction.startTime + lastAction.duration + LIVE_BLEND_SEC) {
           state.x = playPose.boardX;
-          state.y = resolveGroundY(playPose.boardX, playPose.boardY, clipsRef.current);
+          state.y = resolveGroundY(playPose.boardX, playPose.boardY, clipsRef.current, streamCratersRef.current);
           state.grounded = true;
           state.surfaceId = findSurfaceAtFeet(state.x, state.y, clipsRef.current)?.id ?? null;
           playActionRuntimeRef.current = null;

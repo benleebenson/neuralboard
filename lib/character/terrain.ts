@@ -14,8 +14,8 @@ export type GroundProfile = { y: number; imageId: string; slope: number };
 const RAY_STEP_PX = 6;
 const STANDABLE_MARGIN_PX = 40;
 
-function imageClips(clips: readonly TerrainClip[]) {
-  return clips.filter((clip) => clip.type === undefined || clip.type === "image");
+function solidClips(clips: readonly TerrainClip[]) {
+  return clips.filter((clip) => clip.type === undefined || clip.type === "image" || clip.type === "video");
 }
 
 function cratersFor(craters: readonly TerrainCrater[], imageId: string) {
@@ -31,7 +31,7 @@ function pointIsSolidInClip(clip: TerrainClip, craters: readonly TerrainCrater[]
 
 /** Returns the topmost image containing analytic solid material at a world point. */
 export function solidAt(clips: readonly TerrainClip[], craters: readonly TerrainCrater[], worldPoint: TerrainPoint): string | null {
-  const images = imageClips(clips);
+  const images = solidClips(clips);
   for (let index = images.length - 1; index >= 0; index -= 1) {
     if (pointIsSolidInClip(images[index], craters, worldPoint)) return images[index].id;
   }
@@ -82,7 +82,7 @@ function surfaceYForClip(clip: TerrainClip, craters: readonly TerrainCrater[], x
 /** Returns the highest standable image surface at x, including crater bowls and punch-through fallthrough. */
 export function groundProfileY(clips: readonly TerrainClip[], craters: readonly TerrainCrater[], x: number): GroundProfile | null {
   let best: GroundProfile | null = null;
-  for (const clip of imageClips(clips)) {
+  for (const clip of solidClips(clips)) {
     const y = surfaceYForClip(clip, craters, x);
     if (y === null || (best && y >= best.y)) continue;
     const left = surfaceYForClip(clip, craters, x - 1);

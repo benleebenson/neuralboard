@@ -324,6 +324,7 @@ export function drawBoardCharacterToCanvas(
   const effectiveRightLegA = jackedRestPose ? Math.min(p.rightLegA, -0.18) : p.rightLegA;
   let leftLeg = angledLeg(effectiveLeftLegA, p.leftShinA ?? (effectiveLeftLegA + p.leftForeA * 0.5));
   let rightLeg = angledLeg(effectiveRightLegA, p.rightShinA ?? (effectiveRightLegA + p.rightForeA * 0.5));
+  if(!p.skateboardVisible&&!p.airY&&(Number.isFinite(p.terrainLeftFootY)||Number.isFinite(p.terrainRightFootY))){leftLeg=plantedLeg(-1,-14*S,(p.terrainLeftFootY??0)*S);rightLeg=plantedLeg(1,14*S,(p.terrainRightFootY??0)*S);}
   if (p.skateboardVisible) {
     if (p.skateFootMode === "left-push") {
       rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);

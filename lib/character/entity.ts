@@ -472,6 +472,13 @@ function streamPoseFallback(args: {
       pose.rightForeA = -0.12;
     }
   }
+  const terrainSlope=param("terrainSlope",0);
+  pose.bodyLean+=clamp(terrainSlope*.4,-.12,.12);
+  pose.leftLegA+=clamp(terrainSlope*.06,-.08,.08);
+  pose.rightLegA+=clamp(terrainSlope*.06,-.08,.08);
+  pose.terrainLeftFootY=param("terrainLeftFootY",0);
+  pose.terrainRightFootY=param("terrainRightFootY",0);
+  if(args.actionType==="skateTo"&&pose.skateFootMode!=="air")pose.skateboardTilt=Math.atan(terrainSlope);
   return pose;
 }
 
