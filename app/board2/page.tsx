@@ -938,7 +938,8 @@ function resolveGroundY(
 // Snap a board position to the top surface of the clip under x (for action placement).
 function snapToClipTop(
   tx: number, ty: number,
-  clips: { boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[]
+  clips: { id?: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  craters: readonly StreamCrater[] = []
 ): { x: number; y: number } {
   const PAD = 40;
   const candidates = clips.filter((c) =>
@@ -954,7 +955,7 @@ function snapToClipTop(
   if (hit) {
     // Clamp x to the inner span (not on extreme edges)
     const cx = Math.max(hit.boardX! + PAD, Math.min(hit.boardX! + (hit.boardW ?? 0) - PAD, tx));
-    return { x: cx, y: hit.boardY! };
+    return { x: cx, y: resolveGroundY(cx, ty, clips, craters) };
   }
   return { x: tx, y: ty };
 }
@@ -3440,7 +3441,7 @@ export default function Board2Page() {
     if (!rect) return null;
     const rawX = (clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
     const rawY = (clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
-    const snapped = snapToClipTop(rawX, rawY, clipsRef.current);
+    const snapped = snapToClipTop(rawX, rawY, clipsRef.current, streamCratersRef.current);
     const surface = clipsRef.current
       .find((c): c is Clip & RequiredSurfaceClip =>
         isBoardSurface(c) &&
@@ -8554,7 +8555,7 @@ export default function Board2Page() {
     const sf = cam.boardZoom * rect.width / BOARD_W;
     const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
     const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
-    const snapped = snapToClipTop(rawX, rawY, clipsRef.current);
+    const snapped = snapToClipTop(rawX, rawY, clipsRef.current, streamCratersRef.current);
     const surface = clipsRef.current.find((c): c is Clip & RequiredSurfaceClip =>
       isBoardSurface(c) &&
       rawX >= c.boardX &&
