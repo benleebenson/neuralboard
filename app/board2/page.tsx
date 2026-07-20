@@ -51,7 +51,8 @@ import {
   projectilePoint,
   streamCharacterConstructionParams,
 } from "@/lib/character/renderer";
-import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage } from "@/lib/character/craters";
+import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
+import { raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -333,6 +334,27 @@ const LAYER_H = 22;
 const TRACK_H = N_LAYERS * LAYER_H; // 110
 const TIMELINE_H = 370;
 const NARRATION_TRACK_H = 44;
+
+function rocketRayEnd(from: TerrainPoint, cursor: TerrainPoint, boardW = BOARD_W, boardH = BOARD_H): TerrainPoint {
+  const dx = cursor.x - from.x;
+  const dy = cursor.y - from.y;
+  const length = Math.hypot(dx, dy);
+  if (length === 0) return { ...from };
+  const ux = dx / length;
+  const uy = dy / length;
+  const limits = [
+    ux > 0 ? (boardW - from.x) / ux : ux < 0 ? -from.x / ux : Infinity,
+    uy > 0 ? (boardH - from.y) / uy : uy < 0 ? -from.y / uy : Infinity,
+  ].filter((value) => value >= 0);
+  const distance = Math.min(...limits);
+  return { x: from.x + ux * distance, y: from.y + uy * distance };
+}
+
+function terrainClips(clips: readonly Clip[]): TerrainClip[] {
+  return clips.flatMap((clip) => clip.type === "image" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
+    ? [{ id: clip.id, type: clip.type, boardX: clip.boardX, boardY: clip.boardY, boardW: clip.boardW, boardH: clip.boardH }]
+    : []);
+}
 const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const BOARD_RESIZE_PX = 10;
@@ -3317,7 +3339,7 @@ export default function Board2Page() {
   const playWeaponArmedRef = useRef(false);
   const playBazookaArmedRef = useRef(false);
   const playBazookaLastFireAtRef = useRef(0);
-  const playBazookaEventsRef = useRef<StreamBazookaFireMessage[]>([]);
+  const playBazookaEventsRef = useRef<BazookaVisualEvent[]>([]);
   const streamCratersRef = useRef<StreamCrater[]>([]);
   const streamRepairAtRef = useRef(0);
   const playWeaponShotsRef = useRef<PlayWeaponShot[]>([]);
@@ -8882,9 +8904,8 @@ export default function Board2Page() {
   }
 
   function firePlayBazooka() {
-    const state=playPhysicsRef.current,target=playCursorRef.current;if(!state||!target||!playBazookaArmedRef.current||!streamSessionIdRef.current)return;const now=Date.now();if(now-playBazookaLastFireAtRef.current<1200)return;playBazookaLastFireAtRef.current=now;const from=playWeaponOrigin(state),seed=Math.floor(Math.random()*1_000_000);const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:now,startTime:now,from,target:{...target},seed};playBazookaEventsRef.current=[...playBazookaEventsRef.current,event].slice(-12);
-    const clip=clipsRef.current.filter(c=>c.type==="image"&&c.boardX!==undefined&&c.boardY!==undefined&&c.boardW!==undefined&&c.boardH!==undefined&&target.x>=c.boardX&&target.x<=c.boardX+c.boardW&&target.y>=c.boardY&&target.y<=c.boardY+c.boardH).sort((a,b)=>(b.layer??1)-(a.layer??1))[0];
-    if(clip){const crater=craterForImpact({id:clip.id,boardX:clip.boardX!,boardY:clip.boardY!,boardW:clip.boardW!,boardH:clip.boardH!},target,seed),impactDelay=Math.hypot(target.x-from.x,target.y-from.y)/1100*1000;window.setTimeout(()=>{if(event.startTime<streamRepairAtRef.current)return;streamCratersRef.current=[...streamCratersRef.current.filter(c=>c.clipId!==clip.id),...streamCratersRef.current.filter(c=>c.clipId===clip.id).slice(-11),crater];streamDebugLog("bazooka crater host",crater);void publishStreamSnapshot();},impactDelay);}
+    const state=playPhysicsRef.current,cursor=playCursorRef.current;if(!state||!cursor||!playBazookaArmedRef.current||!streamSessionIdRef.current)return;const now=Date.now();if(now-playBazookaLastFireAtRef.current<1200)return;playBazookaLastFireAtRef.current=now;const from=playWeaponOrigin(state),target=rocketRayEnd(from,cursor),seed=Math.floor(Math.random()*1_000_000),clips=terrainClips(clipsRef.current),impact=raycastSolid(clips,streamCratersRef.current,from,target);const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:now,startTime:now,from,target,seed},visualEvent:BazookaVisualEvent={...event,target:impact?.point??target,fizzle:!impact};playBazookaEventsRef.current=[...playBazookaEventsRef.current,visualEvent].slice(-12);
+    if(impact){const clip=clips.find(candidate=>candidate.id===impact.imageId)!;const crater=craterForImpact(clip,impact.point,seed),impactDelay=Math.hypot(impact.point.x-from.x,impact.point.y-from.y)/1100*1000;window.setTimeout(()=>{if(event.startTime<streamRepairAtRef.current)return;streamCratersRef.current=[...streamCratersRef.current.filter(c=>c.clipId!==clip.id),...streamCratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];streamDebugLog("bazooka impact host",impact.point);streamDebugLog("bazooka crater host",crater);void publishStreamSnapshot();},impactDelay);}else streamDebugLog("bazooka fizzle host",target);
     state.x-=state.facing*12;state.vx-=state.facing*90;streamChannelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});streamDebugLog("bazooka fire host",event);
   }
 
