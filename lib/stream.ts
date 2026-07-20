@@ -161,6 +161,9 @@ export type StreamCharacterFrame = {
 };
 
 export type SpawnDoor = { x: number; y: number };
+export type StreamCrater = { clipId: string; cx: number; cy: number; r: number; seed: number };
+export type StreamBazookaFireMessage = { kind:"bazooka_fire";sequenceType:"bazookaFire";streamId:string;sessionId:string;sentAt:number;startTime:number;from:{x:number;y:number};target:{x:number;y:number};seed:number };
+export type StreamRepairBoardMessage = { kind:"repair_board";streamId:string;sessionId:string;sentAt:number };
 
 export type StreamParticipantPresence = {
   role: "host" | "viewer" | "guest";
@@ -269,6 +272,7 @@ export type StreamSnapshotMessage = {
   clips: StreamClip[];
   annotations: StreamAnnotation[];
   characters: StreamCharacterSnapshot[];
+  craters?: StreamCrater[];
 };
 
 export type StreamFrameMessage = {
@@ -281,6 +285,7 @@ export type StreamFrameMessage = {
   guestSkin?: CharacterSkin;
   weapon?: {
     armed: boolean;
+    kind?: "tommy" | "bazooka";
     aim?: { x: number; y: number };
     shooter?: { x: number; y: number; facing: 1 | -1 };
   };
@@ -294,7 +299,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage | StreamBazookaFireMessage | StreamRepairBoardMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

@@ -23,6 +23,9 @@ import {
   StreamShotFiredMessage,
   StreamSnapshotMessage,
   StreamWeaponHitMessage,
+  StreamBazookaFireMessage,
+  StreamCrater,
+  StreamRepairBoardMessage,
   streamChannelName,
   resolveStreamSkin,
 } from "@/lib/stream";
@@ -42,11 +45,13 @@ import {
   drawPlacedSpawnDoor,
   drawPlaySpawnDoor,
   drawTommyGunHeld,
+  drawBazookaHeld,
   drawWeaponProjectile,
   eliminationFrameForGuest,
   projectilePoint,
   streamCharacterConstructionParams,
 } from "@/lib/character/renderer";
+import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage } from "@/lib/character/craters";
 import { CharacterEntity } from "@/lib/character/entity";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
@@ -3020,6 +3025,7 @@ export default function Board2Page() {
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
+  const [playBazookaArmed, setPlayBazookaArmed] = useState(false);
   const [playCleanUi, setPlayCleanUi] = useState(false);
   const [playCleanMenuOpen, setPlayCleanMenuOpen] = useState(false);
   const [playWheelOpen, setPlayWheelOpen] = useState(false);
@@ -3309,6 +3315,11 @@ export default function Board2Page() {
   const playPhysicsRef = useRef<PlayCharacterState | null>(null);
   const playActionRuntimeRef = useRef<LiveCharacterRuntime | null>(null);
   const playWeaponArmedRef = useRef(false);
+  const playBazookaArmedRef = useRef(false);
+  const playBazookaLastFireAtRef = useRef(0);
+  const playBazookaEventsRef = useRef<StreamBazookaFireMessage[]>([]);
+  const streamCratersRef = useRef<StreamCrater[]>([]);
+  const streamRepairAtRef = useRef(0);
   const playWeaponShotsRef = useRef<PlayWeaponShot[]>([]);
   const playWeaponHitCountsRef = useRef<Map<string, number>>(new Map());
   const playWeaponLastShotAtRef = useRef(0);
@@ -3613,6 +3624,7 @@ export default function Board2Page() {
       spawnDoor: spawnDoorRef.current,
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
+      craters: streamCratersRef.current,
       characters: [
         { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: "stick", physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
         { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: "stick", physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
@@ -3810,7 +3822,8 @@ export default function Board2Page() {
         guestSkin: streamGuestSkinRef.current,
         weapon: playModeRef.current && playPhysicsRef.current
           ? {
-              armed: playWeaponArmedRef.current,
+              armed: playWeaponArmedRef.current || playBazookaArmedRef.current,
+              kind: playBazookaArmedRef.current ? "bazooka" : "tommy",
               shooter: {
                 x: playPhysicsRef.current.x,
                 y: playPhysicsRef.current.y,
@@ -4581,7 +4594,7 @@ export default function Board2Page() {
       if (clip.type === "image") {
         const img = imgCacheRef.current.get(clip.sourceUrl);
         if (img?.complete && img.naturalWidth > 0) {
-          ctx.drawImage(img, sx - sw / 2, sy - sh / 2, sw, sh);
+          drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,streamCratersRef.current.filter(crater=>crater.clipId===clip.id));
         }
       } else {
         const vid = videoElsRef.current.get(clip.id);
@@ -8868,6 +8881,15 @@ export default function Board2Page() {
     streamChannelRef.current?.send({ type: "broadcast", event: "shot_fired", payload });
   }
 
+  function firePlayBazooka() {
+    const state=playPhysicsRef.current,target=playCursorRef.current;if(!state||!target||!playBazookaArmedRef.current||!streamSessionIdRef.current)return;const now=Date.now();if(now-playBazookaLastFireAtRef.current<1200)return;playBazookaLastFireAtRef.current=now;const from=playWeaponOrigin(state),seed=Math.floor(Math.random()*1_000_000);const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:now,startTime:now,from,target:{...target},seed};playBazookaEventsRef.current=[...playBazookaEventsRef.current,event].slice(-12);
+    const clip=clipsRef.current.filter(c=>c.type==="image"&&c.boardX!==undefined&&c.boardY!==undefined&&c.boardW!==undefined&&c.boardH!==undefined&&target.x>=c.boardX&&target.x<=c.boardX+c.boardW&&target.y>=c.boardY&&target.y<=c.boardY+c.boardH).sort((a,b)=>(b.layer??1)-(a.layer??1))[0];
+    if(clip){const crater=craterForImpact({id:clip.id,boardX:clip.boardX!,boardY:clip.boardY!,boardW:clip.boardW!,boardH:clip.boardH!},target,seed),impactDelay=Math.hypot(target.x-from.x,target.y-from.y)/1100*1000;window.setTimeout(()=>{if(event.startTime<streamRepairAtRef.current)return;streamCratersRef.current=[...streamCratersRef.current.filter(c=>c.clipId!==clip.id),...streamCratersRef.current.filter(c=>c.clipId===clip.id).slice(-11),crater];streamDebugLog("bazooka crater host",crater);void publishStreamSnapshot();},impactDelay);}
+    state.x-=state.facing*12;state.vx-=state.facing*90;streamChannelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});streamDebugLog("bazooka fire host",event);
+  }
+
+  function repairBoard(){streamCratersRef.current=[];streamRepairAtRef.current=Date.now();const payload:StreamRepairBoardMessage={kind:"repair_board",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:streamRepairAtRef.current};streamChannelRef.current?.send({type:"broadcast",event:"repair_board",payload});void publishStreamSnapshot();}
+
   function updatePlayWeaponShots(nowMs: number, previousNowMs: number) {
     if (playWeaponShotsRef.current.length === 0) return;
     const survivors: PlayWeaponShot[] = [];
@@ -8921,6 +8943,7 @@ export default function Board2Page() {
     playEliminationKickSentRef.current.clear();
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
+    setPlayBazookaArmed(false); playBazookaArmedRef.current=false; playBazookaEventsRef.current=[];
     setPlaySceneShot(false);
     setPlayMode(true);
     setIsPlaying(false);
@@ -8941,6 +8964,7 @@ export default function Board2Page() {
     playWeaponShotsRef.current = [];
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
+    setPlayBazookaArmed(false); playBazookaArmedRef.current=false; playBazookaEventsRef.current=[];
     broadcastWeaponState(true);
     setPlayhead(editorPlayheadBeforePlayRef.current);
     playheadRef.current = editorPlayheadBeforePlayRef.current;
@@ -8983,13 +9007,15 @@ export default function Board2Page() {
     if (e.button === 2) return;
     const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
     if (point) playCursorRef.current = { x: point.rawX, y: point.rawY };
+    if (playBazookaArmedRef.current) { e.preventDefault(); firePlayBazooka(); return; }
     const guest = point ? guestAtPlayPoint(point) : null;
     if (guest) {
       e.preventDefault();
       e.currentTarget.setPointerCapture(e.pointerId);
-      if (playWeaponArmedRef.current) {
+      if (playWeaponArmedRef.current || playBazookaArmedRef.current) {
         playWeaponArmedRef.current = false;
         setPlayWeaponArmed(false);
+        playBazookaArmedRef.current=false;setPlayBazookaArmed(false);
         playWeaponShotsRef.current = [];
         broadcastWeaponState(true);
       }
@@ -9083,6 +9109,7 @@ export default function Board2Page() {
   function updatePlayPhysics(state: PlayCharacterState, dt: number, canvas: HTMLCanvasElement) {
     const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
     if (state.action !== "none" && playTimeRef.current >= state.actionUntil) state.action = "none";
+    if(playBazookaArmedRef.current){const keys=playHeldKeysRef.current;if(keys.has("KeyA")){state.vx=-PLAY_WALK_SPEED;state.facing=-1;}else if(keys.has("KeyD")){state.vx=PLAY_WALK_SPEED;state.facing=1;}if(keys.has("KeyW")&&state.grounded){state.vy=-PLAY_JUMP_SPEED;state.grounded=false;state.surfaceId=null;}if(keys.has("KeyS"))state.vx*=.6;}
     const pointer = playPointerRef.current;
     if (playWeaponArmedRef.current && state.action === "none") {
       applyArmedKeyboardMovement(state);
@@ -9231,7 +9258,7 @@ export default function Board2Page() {
         playPose = sharedPlayPoseFromPhysics(state, now);
       }
       updatePlayWeaponShots(nowMs, previousNowMs);
-      if (playWeaponArmedRef.current) {
+      if (playWeaponArmedRef.current || playBazookaArmedRef.current) {
         const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
         state.facing = playAimFacing(state.facing, state.x, state.y - 110, aim);
         playPose = applyPlayWeaponPose(playPose, state);
@@ -9244,6 +9271,7 @@ export default function Board2Page() {
       evaluateVideoPlaybackStates(editorPlayheadBeforePlayRef.current, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, { audioMode: "preview" });
       const ctx = canvas.getContext("2d");
       if (ctx) {
+        const shake=bazookaShake(playBazookaEventsRef.current,nowMs);ctx.save();ctx.translate(shake.x,shake.y);
         renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
@@ -9285,7 +9313,10 @@ export default function Board2Page() {
             recoil,
           );
         }
+        if(playBazookaArmedRef.current){const recoilAge=nowMs-playBazookaLastFireAtRef.current,recoil=recoilAge<260?Math.sin((1-recoilAge/260)*Math.PI)*9:0;drawBazookaHeld(ctx,{x:state.x,y:state.y,facing:state.facing},playCursorRef.current??{x:state.x+state.facing*400,y:state.y-115},playCameraRef.current,sf,canvas.width,canvas.height,recoil);}
+        for(const event of playBazookaEventsRef.current)drawBazookaEffect(ctx,event,playCameraRef.current,sf,canvas.width,canvas.height,nowMs);
         drawStreamGuestsToCtx(ctx, playCameraRef.current, sf, canvas.width, canvas.height);
+        ctx.restore();
       }
       broadcastWeaponState();
       publishStreamFrame(wall);
@@ -9315,6 +9346,7 @@ export default function Board2Page() {
         if (e.repeat) return;
         if (e.code === "KeyQ") {
           e.preventDefault();
+          if(playBazookaArmedRef.current){playBazookaArmedRef.current=false;setPlayBazookaArmed(false);return;}
           setPlayWeaponArmed((armed) => {
             const next = !armed;
             playWeaponArmedRef.current = next;
@@ -9329,6 +9361,7 @@ export default function Board2Page() {
           e.preventDefault();
           return;
         }
+        if(playBazookaArmedRef.current&&["KeyW","KeyA","KeyS","KeyD"].includes(e.code)){e.preventDefault();return;}
         if (["KeyG", "KeyS", "KeyC", "KeyZ"].includes(e.code)) { e.preventDefault(); return; }
         if (e.code === "KeyD") { e.preventDefault(); issuePlayCharacterAction("dance"); return; }
         if (e.code === "KeyF") {
@@ -10020,9 +10053,9 @@ export default function Board2Page() {
   if (playMode) {
     const choosePlayWheel=(fn:()=>void)=>{fn();dismissPlayWheel();};
     const playWheelItems=[
-      {label:"Weapon",icon:"⌁",onSelect:()=>choosePlayWheel(()=>{const next=!playWeaponArmedRef.current;playWeaponArmedRef.current=next;setPlayWeaponArmed(next);broadcastWeaponState(true);})},
+      {label:"Weapon",icon:"⌁",onSelect:()=>choosePlayWheel(()=>{const next=!playWeaponArmedRef.current;playBazookaArmedRef.current=false;setPlayBazookaArmed(false);playWeaponArmedRef.current=next;setPlayWeaponArmed(next);broadcastWeaponState(true);})},
       {label:"Tomato",icon:"●",disabled:true,onSelect:()=>{}},
-      {label:"Bazooka",icon:"◁",disabled:true,onSelect:()=>{}},
+      {label:"Bazooka",icon:"◁",onSelect:()=>choosePlayWheel(()=>{const next=!playBazookaArmedRef.current;playWeaponArmedRef.current=false;setPlayWeaponArmed(false);playBazookaArmedRef.current=next;setPlayBazookaArmed(next);broadcastWeaponState(true);})},
       {label:"Camera",icon:"◉",onSelect:()=>choosePlayWheel(()=>setPlaySceneShot(v=>!v))},
       {label:"Menu",icon:"☰",onSelect:()=>setPlayWheelMenuOpen(true)},
     ];
@@ -10030,6 +10063,7 @@ export default function Board2Page() {
       {label:playNativeFullscreen||playMaximize?"Exit fullscreen":"Fullscreen",icon:"⛶",onSelect:()=>choosePlayWheel(()=>void togglePlayFullscreen())},
       ...(DEBUG_STREAM?[{label:"Debug",icon:"⌁",onSelect:()=>choosePlayWheel(()=>setPlayDebugOpen(v=>!v))}]:[]),
       {label:"Clear splats (soon)",icon:"⌫",disabled:true,onSelect:()=>{}},
+      {label:"Repair board",icon:"✧",onSelect:()=>choosePlayWheel(repairBoard)},
       {label:"Participants",icon:"♟",onSelect:()=>choosePlayWheel(()=>setPlayParticipantsOpen(v=>!v))},
       {label:"Exit Play Mode",icon:"←",onSelect:()=>choosePlayWheel(exitPlayMode)},
     ];
