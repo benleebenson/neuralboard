@@ -8,6 +8,7 @@ import { RENDERER_VERSION, drawBazookaHeld, drawEliminationSequence, drawTommyGu
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
+import { isGrounded } from "@/lib/character/grounding";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 
@@ -273,6 +274,7 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
       terrainSlope: p.terrainSlope,
       terrainLeftFootY:p.terrainLeftFootY,
       terrainRightFootY:p.terrainRightFootY,
+      terrainGrounded:p.grounded,
     } : undefined,
     skin,
     physique: p.physique,
@@ -334,7 +336,7 @@ function startGuestPlannedAction(p: GuestPhysics, action: GuestCharacterFrame["a
   };
   p.vx = dx / Math.max(0.001, p.actionDurationMs / 1000);
   p.vy = dy / Math.max(0.001, p.actionDurationMs / 1000);
-  p.grounded = action === "skateTo";
+  p.grounded = isGrounded({actionType:action,explicitGrounded:action==="skateTo"?true:undefined,skateAirborne:false});
   p.surfaceId = null;
   if(skateParams?.terrainAutoOllie)streamDebugLog("terrain auto-ollie guest",{gapWidth:skateParams.terrainGapWidth,popPoint:skateParams.edgeX,path:"existing-skate-pop-land"});
 }
@@ -444,7 +446,7 @@ function updateGuestPlannedAction(p: GuestPhysics, now: number, surfaces: Stream
   p.vx = (p.x - prevX) / Math.max(0.001, 1 / 60);
   p.vy = (p.y - prevY) / Math.max(0.001, 1 / 60);
   if (Math.abs(p.actionTargetX - p.actionFromX) > 4) p.facing = p.actionTargetX >= p.actionFromX ? 1 : -1;
-  p.grounded = plannedRoot?.grounded ?? (p.action === "skateTo" ? rawT < 0.58 || rawT > 0.82 : false);
+  p.grounded = isGrounded({actionType:p.action,explicitGrounded:plannedRoot?.grounded,skateAirborne:p.action==="skateTo"&&plannedRoot?.grounded===false,grappleAirborne:p.action==="grapple"&&plannedRoot?.grounded===false});
   if(p.grounded){const profile=groundProfileY(surfaces as TerrainClip[],craters,p.x);if(profile){p.y=lerp(p.y,profile.y,.3);p.terrainSlope=profile.slope;p.surfaceId=profile.imageId;p.terrainLeftFootY=(groundProfileY(surfaces as TerrainClip[],craters,p.x-14)?.y??profile.y)-profile.y;p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],craters,p.x+14)?.y??profile.y)-profile.y;}}
   if (rawT >= 1) {
     p.x = p.actionTargetX;

@@ -11,7 +11,8 @@ export type TerrainClip = {
 export type TerrainHit = { point: TerrainPoint; imageId: string; normalHint: TerrainPoint };
 export type GroundProfile = { y: number; imageId: string; slope: number };
 
-const RAY_STEP_PX = 6;
+const RAY_STEP_PX = 1;
+const RAY_REFINE_PX = 0.5;
 const STANDABLE_MARGIN_PX = 40;
 
 function solidClips(clips: readonly TerrainClip[]) {
@@ -38,7 +39,7 @@ export function solidAt(clips: readonly TerrainClip[], craters: readonly Terrain
   return null;
 }
 
-/** Marches a segment in samples no farther than 6px apart and returns its first solid hit. */
+/** Marches in samples no farther than 1px apart, then refines the entry boundary to within 0.5px. */
 export function raycastSolid(clips: readonly TerrainClip[], craters: readonly TerrainCrater[], from: TerrainPoint, to: TerrainPoint): TerrainHit | null {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
@@ -49,11 +50,24 @@ export function raycastSolid(clips: readonly TerrainClip[], craters: readonly Te
   }
   const sampleCount = Math.max(1, Math.ceil(distance / RAY_STEP_PX));
   const normalHint = { x: -dx / distance, y: -dy / distance };
+  let previousT = 0;
   for (let sample = 0; sample <= sampleCount; sample += 1) {
     const t = sample / sampleCount;
     const point = { x: from.x + dx * t, y: from.y + dy * t };
     const imageId = solidAt(clips, craters, point);
-    if (imageId) return { point, imageId, normalHint };
+    if (imageId) {
+      let outsideT = previousT;
+      let insideT = t;
+      while ((insideT - outsideT) * distance > RAY_REFINE_PX) {
+        const midT = (outsideT + insideT) / 2;
+        const mid = { x: from.x + dx * midT, y: from.y + dy * midT };
+        if (solidAt(clips, craters, mid)) insideT = midT;
+        else outsideT = midT;
+      }
+      const refined = { x: from.x + dx * insideT, y: from.y + dy * insideT };
+      return { point: refined, imageId: solidAt(clips, craters, refined) ?? imageId, normalHint };
+    }
+    previousT = t;
   }
   return null;
 }

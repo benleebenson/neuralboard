@@ -1,4 +1,5 @@
 import { drawBoardCharacterToCanvas, type BoardCharPoseResult } from "./board-renderer";
+import { isGrounded } from "./grounding";
 import { STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { FORWARD_TUCK_FLIP_KEYFRAMES, sampleAnimation, type Pose } from "../characterAnimations";
 import {
@@ -478,6 +479,8 @@ function streamPoseFallback(args: {
   pose.rightLegA+=clamp(terrainSlope*.06,-.08,.08);
   pose.terrainLeftFootY=param("terrainLeftFootY",0);
   pose.terrainRightFootY=param("terrainRightFootY",0);
+  pose.actionType=args.actionType;
+  pose.terrainGrounded=isGrounded({actionType:args.actionType,explicitGrounded:typeof args.actionParams?.terrainGrounded==="boolean"?args.actionParams.terrainGrounded:undefined,airY:pose.airY,skateAirborne:pose.skateFootMode==="air",grappleAirborne:args.actionType==="grapple"&&p>=.32&&p<.93});
   if(args.actionType==="skateTo"&&pose.skateFootMode!=="air")pose.skateboardTilt=Math.atan(terrainSlope);
   return pose;
 }

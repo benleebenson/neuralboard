@@ -1,5 +1,5 @@
 import type { CharacterSkin } from "../stream";
-import { STREAM_CHARACTER_GEOMETRY } from "./geometry";
+import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
 const CHAR_TORSO_RAW = STREAM_CHARACTER_GEOMETRY.torsoRaw;
@@ -66,7 +66,7 @@ export function drawBoardCharacterToCanvas(
   // Raw (unscaled) body proportions — single source of truth reused below for both the S-scaled
   // draw geometry and the raw board-space magic numbers (grapple hand height, pointAt shoulder
   // height) that need to stay in sync with them.
-  const legLen = 38 * S;
+  const legLen = STREAM_CHARACTER_GEOMETRY.legRaw * S;
   const torsoLen = CHAR_TORSO_RAW * S;
   const neckLen = CHAR_NECK_RAW * S * (isJacked ? 0.72 : 1);
   const armLen = CHAR_ARM_RAW * S;
@@ -289,26 +289,7 @@ export function drawBoardCharacterToCanvas(
     };
   };
   const plantedLeg = (side: -1 | 1, footX: number, footY: number): { knee: LocalPoint; foot: LocalPoint } => {
-    const hip: LocalPoint = { x: 0, y: hipY };
-    const dx = footX - hip.x;
-    const dy = footY - hip.y;
-    const maxReach = legLen * 2 - 0.001;
-    const d = clamp(Math.hypot(dx, dy), 0.001, maxReach);
-    const ux = dx / Math.max(0.001, Math.hypot(dx, dy));
-    const uy = dy / Math.max(0.001, Math.hypot(dx, dy));
-    const reachableFoot = {
-      x: hip.x + ux * d,
-      y: hip.y + uy * d,
-    };
-    const mid = { x: (hip.x + reachableFoot.x) / 2, y: (hip.y + reachableFoot.y) / 2 };
-    const h = Math.sqrt(Math.max(0, legLen * legLen - (d / 2) * (d / 2)));
-    const px = -uy;
-    const py = ux;
-    const bendSign = side === -1 ? 1 : -1;
-    return {
-      knee: { x: mid.x + px * h * bendSign, y: mid.y + py * h * bendSign },
-      foot: { x: footX, y: footY },
-    };
+    return solveFixedLegChain({x:0,y:hipY},{x:footX,y:footY},side,legLen);
   };
   const drawLegChain = (leg: { knee: LocalPoint; foot: LocalPoint }) => {
     ctx.beginPath();
@@ -324,7 +305,7 @@ export function drawBoardCharacterToCanvas(
   const effectiveRightLegA = jackedRestPose ? Math.min(p.rightLegA, -0.18) : p.rightLegA;
   let leftLeg = angledLeg(effectiveLeftLegA, p.leftShinA ?? (effectiveLeftLegA + p.leftForeA * 0.5));
   let rightLeg = angledLeg(effectiveRightLegA, p.rightShinA ?? (effectiveRightLegA + p.rightForeA * 0.5));
-  if(!p.skateboardVisible&&!p.airY&&(Number.isFinite(p.terrainLeftFootY)||Number.isFinite(p.terrainRightFootY))){leftLeg=plantedLeg(-1,-14*S,(p.terrainLeftFootY??0)*S);rightLeg=plantedLeg(1,14*S,(p.terrainRightFootY??0)*S);}
+  if(p.terrainGrounded===true&&!p.skateboardVisible&&(Number.isFinite(p.terrainLeftFootY)||Number.isFinite(p.terrainRightFootY))){leftLeg=plantedLeg(-1,-14*S,(p.terrainLeftFootY??0)*S);rightLeg=plantedLeg(1,14*S,(p.terrainRightFootY??0)*S);}
   if (p.skateboardVisible) {
     if (p.skateFootMode === "left-push") {
       rightLeg = plantedLeg(1, rightDeckFootX, deckTopY);
@@ -340,15 +321,10 @@ export function drawBoardCharacterToCanvas(
   }
   if (p.sitSeated) {
     const foldY = hipY + 12 * S;
-    leftLeg = {
-      knee: { x: 18 * S, y: hipY + 7 * S },
-      foot: { x: 44 * S, y: foldY },
-    };
-    rightLeg = {
-      knee: { x: 42 * S, y: hipY + 9 * S },
-      foot: { x: 10 * S, y: foldY + 2 * S },
-    };
+    leftLeg = plantedLeg(-1, 44 * S, foldY);
+    rightLeg = plantedLeg(1, 10 * S, foldY + 2 * S);
   }
+  if(process.env.NODE_ENV!=="production")for(const [side,leg] of [["left",leftLeg],["right",rightLeg]] as const){const thigh=Math.hypot(leg.knee.x,leg.knee.y-hipY),shin=Math.hypot(leg.foot.x-leg.knee.x,leg.foot.y-leg.knee.y);if(Math.abs(thigh-legLen)>1||Math.abs(shin-legLen)>1)console.error("[character:bone-length-violation]",{side,expected:legLen,thigh,shin,action:p.actionType??"unknown"});}
   drawLegChain(leftLeg);
   drawLegChain(rightLeg);
   if (p.danceMotionAlpha && p.danceMotionAlpha > 0) {

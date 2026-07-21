@@ -14,6 +14,35 @@ export const STREAM_CHARACTER_GEOMETRY = {
   launcherStickHeightRaw: 8,
 } as const;
 
+export type LegPoint = { x: number; y: number };
+export type SolvedLegChain = { knee: LegPoint; foot: LegPoint };
+
+/** Two-bone IK with immutable segment lengths and a slightly bent maximum reach. */
+export function solveFixedLegChain(
+  hip: LegPoint,
+  target: LegPoint,
+  side: -1 | 1,
+  segmentLength: number = STREAM_CHARACTER_GEOMETRY.legRaw,
+): SolvedLegChain {
+  const dx = target.x - hip.x;
+  const dy = target.y - hip.y;
+  const rawDistance = Math.max(0.001, Math.hypot(dx, dy));
+  const distance = Math.min(rawDistance, segmentLength * 2 * 0.98);
+  const unitX = dx / rawDistance;
+  const unitY = dy / rawDistance;
+  const foot = { x: hip.x + unitX * distance, y: hip.y + unitY * distance };
+  const mid = { x: (hip.x + foot.x) / 2, y: (hip.y + foot.y) / 2 };
+  const bendHeight = Math.sqrt(Math.max(0, segmentLength ** 2 - (distance / 2) ** 2));
+  const bendSign = side === -1 ? 1 : -1;
+  return {
+    knee: {
+      x: mid.x - unitY * bendHeight * bendSign,
+      y: mid.y + unitX * bendHeight * bendSign,
+    },
+    foot,
+  };
+}
+
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
 export function characterConstructionParams(

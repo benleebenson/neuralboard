@@ -14,7 +14,9 @@ export function drawCrateredImage(ctx:CanvasRenderingContext2D,img:CanvasImageSo
   if(!craters.length){ctx.drawImage(img,x,y,w,h);return;}
   const canvas=document.createElement("canvas");canvas.width=Math.max(1,Math.ceil(w));canvas.height=Math.max(1,Math.ceil(h));const c=canvas.getContext("2d");if(!c)return;
   c.drawImage(img,0,0,canvas.width,canvas.height);
-  for(const crater of craters){const cx=crater.cx/boardW*canvas.width,cy=crater.cy/boardH*canvas.height,r=crater.r/Math.min(boardW,boardH)*Math.min(canvas.width,canvas.height);c.save();craterPath(c,cx,cy,r,crater.seed);c.globalCompositeOperation="destination-out";c.fill();c.restore();c.save();craterPath(c,cx,cy,r*1.05,crater.seed);c.strokeStyle="#2a2a2a";c.globalAlpha=.88;c.lineWidth=Math.max(2,r*.13);c.stroke();craterPath(c,cx,cy,r*1.18,crater.seed+17);c.strokeStyle="rgba(42,42,42,.28)";c.lineWidth=Math.max(3,r*.16);c.stroke();c.restore();}
+  const scaled=craters.map(crater=>({crater,cx:crater.cx/boardW*canvas.width,cy:crater.cy/boardH*canvas.height,r:crater.r/Math.min(boardW,boardH)*Math.min(canvas.width,canvas.height)}));
+  for(const {crater,cx,cy,r} of scaled){c.save();craterPath(c,cx,cy,r,crater.seed);c.globalCompositeOperation="destination-out";c.fill();c.restore();}
+  const scorch=document.createElement("canvas");scorch.width=canvas.width;scorch.height=canvas.height;const s=scorch.getContext("2d");if(s){for(const {crater,cx,cy,r} of scaled){s.save();craterPath(s,cx,cy,r*1.05,crater.seed);s.strokeStyle="#2a2a2a";s.globalAlpha=.88;s.lineWidth=Math.max(2,r*.13);s.stroke();craterPath(s,cx,cy,r*1.18,crater.seed+17);s.strokeStyle="rgba(42,42,42,.28)";s.lineWidth=Math.max(3,r*.16);s.stroke();s.restore();}s.globalCompositeOperation="destination-in";s.drawImage(canvas,0,0);c.drawImage(scorch,0,0);}
   ctx.drawImage(canvas,x,y,w,h);
 }
 

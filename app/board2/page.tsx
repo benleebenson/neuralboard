@@ -54,6 +54,7 @@ import {
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
+import { isGrounded } from "@/lib/character/grounding";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -1649,6 +1650,8 @@ type CharPoseResult = {
   skateMotionAlpha?: number;
   terrainLeftFootY?: number;
   terrainRightFootY?: number;
+  terrainGrounded?: boolean;
+  actionType?: string;
   pullUpBarAlpha?: number;
   pullUpBarBX?: number;
   pullUpBarBY?: number;
@@ -2219,7 +2222,7 @@ function evalCharPoseRaw(
     // Anchor point: above and between start+end, biased toward destination
     const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
     const anchorBY = Math.min(active.fromY, ty) - 380;
-    const landingY = resolveGroundY(tx, ty, clips, craters);
+    const landingY = active.targetY ?? ty;
     const PREP_END = 0.12;
     const FIRE_END = 0.22;
     const PULL_START = 0.32;
@@ -2346,7 +2349,7 @@ function evalCharPoseRaw(
     // is intentionally piecewise: slow prep/takeoff, fastest through the tight tuck, then eased
     // open into a flat 2π landing. The draw step rotates around mid-torso, not the feet.
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
-    const landingY = resolveGroundY(tx, ty, clips, craters);
+    const landingY = active.targetY ?? ty;
     const bx = active.entranceFlip
       ? lerp(active.fromX, tx, easeOutQuad(progress))
       : lerp(active.fromX, tx, progress);
@@ -2892,6 +2895,7 @@ function evalCharAtTime(
   const active = resolved.find((a) => time >= a.startTime && time < a.startTime + a.duration);
   const actionAge = active ? time - active.startTime : Infinity;
   const actionTail = active ? active.startTime + active.duration - time : Infinity;
+  const terrainGrounded=isGrounded({actionType:active?.type??"idle",airY:base.airY,skateAirborne:base.skateFootMode==="air",grappleAirborne:active?.type==="grapple"&&actionAge>=active.duration*.32&&actionAge<active.duration*.93});
   const leanEase = Math.min(1, actionAge * LEAN_RESPONSE_HZ, actionTail * LEAN_RESPONSE_HZ);
   const leanExtra = clamp(velocity.x * LEAN_K, -LEAN_MAX, LEAN_MAX) * easeInOutCubic(clamp(leanEase, 0, 1)) * intensity;
 
@@ -2947,8 +2951,10 @@ function evalCharAtTime(
     rightLegA: base.rightLegA - offset * 0.82,
     momentumScaleX: scaleX,
     momentumScaleY: scaleY,
-    terrainLeftFootY:(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX-14)?.y??base.boardY)-base.boardY,
-    terrainRightFootY:(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX+14)?.y??base.boardY)-base.boardY,
+    actionType:active?.type??"idle",
+    terrainGrounded,
+    terrainLeftFootY:terrainGrounded?(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX-14)?.y??base.boardY)-base.boardY:0,
+    terrainRightFootY:terrainGrounded?(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX+14)?.y??base.boardY)-base.boardY:0,
   };
 }
 
@@ -8632,6 +8638,8 @@ export default function Board2Page() {
       boardY: state.y,
       facing: state.facing,
       bodyLean: pose.bodyLean+clamp(slope*.4,-.12,.12),
+      actionType:state.grounded?(moving?"walk":"idle"):"punchThroughFall",
+      terrainGrounded:isGrounded({actionType:state.grounded?(moving?"walk":"idle"):"punchThroughFall",explicitGrounded:state.grounded,airY:pose.airY}),
       terrainLeftFootY:(groundProfileY(terrain,streamCratersRef.current,state.x-14)?.y??state.y)-state.y,
       terrainRightFootY:(groundProfileY(terrain,streamCratersRef.current,state.x+14)?.y??state.y)-state.y,
       airY: 0,
@@ -9307,7 +9315,7 @@ export default function Board2Page() {
         state.facing = playPose.facing;
         state.vx = 0;
         state.vy = 0;
-        state.grounded = !playPose.grappleRopeAlpha && !playPose.skateboardVisible && !playPose.spinAngle;
+        state.grounded = isGrounded({actionType:playPose.actionType??"idle",explicitGrounded:playPose.terrainGrounded,airY:playPose.airY,skateAirborne:playPose.skateFootMode==="air",grappleAirborne:!!playPose.grappleRopeAlpha});
         state.surfaceId = findSurfaceAtFeet(state.x, resolveGroundY(state.x, state.y, clipsRef.current, streamCratersRef.current), clipsRef.current)?.id ?? null;
         const lastAction = playDrawResolved[playDrawResolved.length - 1];
         if (lastAction && playDrawTime > lastAction.startTime + lastAction.duration + LIVE_BLEND_SEC) {
