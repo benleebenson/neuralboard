@@ -196,8 +196,17 @@ type CharacterAction = {
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
 
-const AUTHORED_BAZOOKA_FIRE_FRACTION = 0.42;
+const AUTHORED_BAZOOKA_PICKUP_FIRE_FRACTION = 0.58;
+const AUTHORED_BAZOOKA_CHAINED_FIRE_FRACTION = 0.3;
 const AUTHORED_BAZOOKA_RANGE = 8000;
+
+function authoredBazookaIsChained(action: ResolvedCharAction, actions: readonly ResolvedCharAction[]): boolean {
+  return actions.some((candidate) => candidate.id !== action.id && candidate.type === "bazooka" && Math.abs(candidate.startTime + candidate.duration - action.startTime) <= 0.02);
+}
+
+function authoredBazookaFireFraction(action: ResolvedCharAction, actions: readonly ResolvedCharAction[]): number {
+  return authoredBazookaIsChained(action, actions) ? AUTHORED_BAZOOKA_CHAINED_FIRE_FRACTION : AUTHORED_BAZOOKA_PICKUP_FIRE_FRACTION;
+}
 
 function authoredBazookaSeed(id: string): number {
   let hash = 2166136261;
@@ -212,17 +221,19 @@ function authoredBazookaTimeline(
   initialCraters: readonly StreamCrater[] = [],
 ): { craters: StreamCrater[]; events: BazookaVisualEvent[] } {
   const terrain = clips.filter((clip) => clip.type === "image" && clip.boardX !== undefined) as Array<Clip & Required<Pick<Clip, "boardX" | "boardY" | "boardW" | "boardH">>>;
-  const actions = actionGroups.flat().filter((action) => action.type === "bazooka" && action.targetX !== undefined && action.targetY !== undefined)
-    .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+  const actions = actionGroups.flatMap((group) => group.filter((action) => action.type === "bazooka" && action.targetX !== undefined && action.targetY !== undefined)
+    .map((action) => ({ action, fireFraction: authoredBazookaFireFraction(action, group) })))
+    .sort((a, b) => a.action.startTime - b.action.startTime || a.action.id.localeCompare(b.action.id));
   const craters = [...initialCraters];
   const events: BazookaVisualEvent[] = [];
-  for (const action of actions) {
-    const fireTime = action.startTime + action.duration * AUTHORED_BAZOOKA_FIRE_FRACTION;
+  for (const entry of actions) {
+    const { action, fireFraction } = entry;
+    const fireTime = action.startTime + action.duration * fireFraction;
     const dx = action.targetX! - action.fromX;
-    const dy = action.targetY! - (action.fromY - 110);
+    const dy = action.targetY! - (action.fromY - 118);
     const length = Math.max(1, Math.hypot(dx, dy));
     const direction = { x: dx / length, y: dy / length };
-    const from = { x: action.fromX + direction.x * 101, y: action.fromY - 110 + direction.y * 101 };
+    const from = { x: action.fromX + direction.x * 111, y: action.fromY - 118 + direction.y * 111 };
     const far = { x: from.x + direction.x * AUTHORED_BAZOOKA_RANGE, y: from.y + direction.y * AUTHORED_BAZOOKA_RANGE };
     const hit = raycastSolid(terrain as TerrainClip[], craters, from, far);
     const target = hit?.point ?? far;
@@ -2626,17 +2637,21 @@ function evalCharPoseRaw(
     const targetX = active.targetX ?? active.fromX + 400;
     const targetY = active.targetY ?? active.fromY - 110;
     const facing: 1 | -1 = targetX >= active.fromX ? 1 : -1;
-    const brace = Math.sin(clamp((progress - 0.34) / 0.18, 0, 1) * Math.PI) * 0.12;
+    const chained = authoredBazookaIsChained(active, resolved);
+    const pickup = chained ? 1 : clamp(progress / 0.46, 0, 1);
+    const bend = chained ? 0 : Math.sin(pickup * Math.PI);
+    const fireFraction = authoredBazookaFireFraction(active, resolved);
+    const brace = Math.sin(clamp((progress - fireFraction + 0.08) / 0.16, 0, 1) * Math.PI) * 0.12;
     return {
       ...idlePose(active.fromX, active.fromY),
       facing,
       hideArms: true,
-      bodyLean: facing * (0.05 - brace),
-      headBob: brace * 18,
-      leftLegA: 0.2,
-      rightLegA: -0.2,
-      leftShinA: 0.3,
-      rightShinA: -0.3,
+      bodyLean: facing * (0.05 + bend * 0.48 - brace),
+      headBob: bend * 34 + brace * 18,
+      leftLegA: 0.2 + bend * 0.5,
+      rightLegA: -0.2 - bend * 0.5,
+      leftShinA: 0.3 + bend * 0.46,
+      rightShinA: -0.3 - bend * 0.46,
       pointTargetBX: targetX,
       pointTargetBY: targetY,
     };
@@ -4857,8 +4872,8 @@ export default function Board2Page() {
       );
       const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const recoilAge=time-(active.startTime+active.duration*AUTHORED_BAZOOKA_FIRE_FRACTION),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0;
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil);
+        const fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:clamp((time-active.startTime)/(active.duration*.46),0,1);
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup);
       }
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
@@ -4877,8 +4892,8 @@ export default function Board2Page() {
       );
       const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const recoilAge=time-(active.startTime+active.duration*AUTHORED_BAZOOKA_FIRE_FRACTION),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0;
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil);
+        const fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:clamp((time-active.startTime)/(active.duration*.46),0,1);
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup);
       }
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
@@ -12418,10 +12433,26 @@ export default function Board2Page() {
                     }
                     if (!characterAddMode || characterAddMode === "emote") return;
                     if (characterAddMode === "bazooka" && clickedSurface?.type !== "image") return;
+                    let actionStartTime = playheadRef.current;
+                    if (characterAddMode === "bazooka") {
+                      const ownerActions = activeCharacterIdRef.current === "c2" ? characterActions2Ref.current : characterActionsRef.current;
+                      const bazookaActions = ownerActions.filter((action) => action.type === "bazooka").sort((a,b)=>a.startTime-b.startTime);
+                      let advanced = true;
+                      while (advanced) {
+                        advanced = false;
+                        for (const action of bazookaActions) {
+                          const end = action.startTime + action.duration;
+                          if (action.startTime <= actionStartTime + 0.02 && end > actionStartTime + 0.02) {
+                            actionStartTime = end;
+                            advanced = true;
+                          }
+                        }
+                      }
+                    }
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
-                      startTime: playheadRef.current,
+                      startTime: actionStartTime,
                       duration: durationMap[characterAddMode] ?? 1.5,
                       targetX: Math.round(characterAddMode === "bazooka" ? rawBx : snapped.x),
                       targetY: Math.round(characterAddMode === "bazooka" ? rawBy : snapped.y),
