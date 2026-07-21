@@ -196,6 +196,22 @@ type CharacterAction = {
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
 
+function nextAvailableCharacterActionStart(
+  actions: readonly CharacterAction[],
+  requestedStart: number,
+  duration: number,
+): number {
+  let start = requestedStart;
+  // Re-check after every move because skipping one action can land inside another.
+  for (;;) {
+    const conflict = actions
+      .filter((action) => action.startTime < start + duration - 0.001 && action.startTime + action.duration > start + 0.001)
+      .sort((a, b) => (a.startTime + a.duration) - (b.startTime + b.duration))[0];
+    if (!conflict) return start;
+    start = Math.max(start, conflict.startTime + conflict.duration);
+  }
+}
+
 const AUTHORED_BAZOOKA_PICKUP_FIRE_FRACTION = 0.7;
 const AUTHORED_BAZOOKA_CHAINED_FIRE_FRACTION = 0.3;
 const AUTHORED_BAZOOKA_RANGE = 8000;
@@ -3322,6 +3338,8 @@ export default function Board2Page() {
     : clips.some((clip) => clip.boardX !== undefined || clip.type === "pan" || clip.type === "characterZoom");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
+  const mobileBoardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
   const playCanvasRef = useRef<HTMLCanvasElement>(null);
   const playContainerRef = useRef<HTMLDivElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
@@ -4961,6 +4979,78 @@ export default function Board2Page() {
   }, [renderToCtx]);
 
   useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
+
+  const drawCharacterBoardOverlay = useCallback((canvas: HTMLCanvasElement, time: number) => {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!showCharacterRef.current && !showCharacter2Ref.current) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    const W = canvas.width;
+    const H = canvas.height;
+    const sf = W / BOARD_W;
+    const cam = { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
+    const currentClips = clipsRef.current;
+    const authoredBazooka = authoredBazookaTimeline(
+      time,
+      [resolvedCharActionsRef.current, resolvedCharActions2Ref.current],
+      currentClips,
+      streamCratersRef.current,
+    );
+
+    const drawEditorCharacter = (
+      resolved: ResolvedCharAction[],
+      enabled: boolean,
+      initX: number,
+      faceSettings: CharacterFaceSettings | null,
+      faceImage: HTMLImageElement | null,
+      skin: CharacterSkin,
+    ) => {
+      if (!enabled) return;
+      const pose = evalCharAtTime(
+        time, resolved, initX, charInitYRef.current, currentClips, authoredAnimationsRef.current,
+        !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
+      );
+      CharacterEntity.drawBoardCharacterToCanvas(
+        ctx, time, resolved, true, cam, sf, W, H, initX, charInitYRef.current,
+        currentClips, -Infinity, authoredAnimationsRef.current,
+        faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect } : null,
+        skin, pose,
+        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any },
+      );
+      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      if (active?.targetX === undefined || active.targetY === undefined) return;
+      const progress = clamp((time - active.startTime) / active.duration, 0, 1);
+      const fireFraction = authoredBazookaFireFraction(active, resolved);
+      const recoilAge = time - (active.startTime + active.duration * fireFraction);
+      const recoil = recoilAge >= 0 && recoilAge < 0.26 ? Math.sin((1 - recoilAge / 0.26) * Math.PI) * 9 : 0;
+      const pickup = authoredBazookaIsChained(active, resolved) ? 1 : authoredBazookaPickupProgress(progress);
+      drawBazookaHeld(
+        ctx,
+        { x: pose.boardX, y: pose.boardY, facing: pose.facing },
+        { x: active.targetX, y: active.targetY },
+        cam, sf, W, H, recoil, pickup,
+        { bodyLean: pose.bodyLean, headBob: pose.headBob },
+      );
+    };
+
+    drawEditorCharacter(
+      resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current,
+      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current,
+    );
+    drawEditorCharacter(
+      resolvedCharActions2Ref.current, showCharacter2Ref.current, charInitXRef.current + 60,
+      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current,
+    );
+    for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
+  }, []);
+
+  useEffect(() => {
+    for (const canvas of [boardCharacterCanvasRef.current, mobileBoardCharacterCanvasRef.current]) {
+      if (canvas) drawCharacterBoardOverlay(canvas, playhead);
+    }
+  }, [clips, drawCharacterBoardOverlay, playhead, resolvedCharActions, resolvedCharActions2, showCharacter, showCharacter2, characterFace, characterFace2, characterSkin, characterSkin2]);
 
   // ─ Video audio routing ────────────────────────────────────────────────────
 
@@ -10534,6 +10624,14 @@ export default function Board2Page() {
               );
             })}
 
+            <canvas
+              ref={mobileBoardCharacterCanvasRef}
+              width={BOARD_W}
+              height={BOARD_H}
+              aria-label="Characters on board"
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}
+            />
+
             {/* Neural Search placeholders — not yet downloaded, tap to trim & add */}
             {AI_FEATURES_ENABLED && neuralPlaceholders.map((ph) => (
               <div
@@ -11729,6 +11827,14 @@ export default function Board2Page() {
                   );
                 })}
 
+                <canvas
+                  ref={boardCharacterCanvasRef}
+                  width={BOARD_W}
+                  height={BOARD_H}
+                  aria-label="Characters on board"
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}
+                />
+
                 {/* Neural Search placeholders — not yet downloaded, click to trim & add */}
                 {AI_FEATURES_ENABLED && neuralPlaceholders.map((ph) => (
                   <div
@@ -12443,18 +12549,7 @@ export default function Board2Page() {
                     let actionStartTime = playheadRef.current;
                     if (characterAddMode === "bazooka") {
                       const ownerActions = activeCharacterIdRef.current === "c2" ? characterActions2Ref.current : characterActionsRef.current;
-                      const bazookaActions = ownerActions.filter((action) => action.type === "bazooka").sort((a,b)=>a.startTime-b.startTime);
-                      let advanced = true;
-                      while (advanced) {
-                        advanced = false;
-                        for (const action of bazookaActions) {
-                          const end = action.startTime + action.duration;
-                          if (action.startTime <= actionStartTime + 0.02 && end > actionStartTime + 0.02) {
-                            actionStartTime = end;
-                            advanced = true;
-                          }
-                        }
-                      }
+                      actionStartTime = nextAvailableCharacterActionStart(ownerActions, actionStartTime, durationMap.bazooka);
                     }
                     const newAction: CharacterAction = {
                       id: generateId(),
