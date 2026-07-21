@@ -196,9 +196,15 @@ type CharacterAction = {
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
 
-const AUTHORED_BAZOOKA_PICKUP_FIRE_FRACTION = 0.58;
+const AUTHORED_BAZOOKA_PICKUP_FIRE_FRACTION = 0.7;
 const AUTHORED_BAZOOKA_CHAINED_FIRE_FRACTION = 0.3;
 const AUTHORED_BAZOOKA_RANGE = 8000;
+const AUTHORED_BAZOOKA_LIFT_START = 0.32;
+const AUTHORED_BAZOOKA_LIFT_END = 0.58;
+
+function authoredBazookaPickupProgress(progress: number): number {
+  return clamp((progress - AUTHORED_BAZOOKA_LIFT_START) / (AUTHORED_BAZOOKA_LIFT_END - AUTHORED_BAZOOKA_LIFT_START), 0, 1);
+}
 
 function authoredBazookaIsChained(action: ResolvedCharAction, actions: readonly ResolvedCharAction[]): boolean {
   return actions.some((candidate) => candidate.id !== action.id && candidate.type === "bazooka" && Math.abs(candidate.startTime + candidate.duration - action.startTime) <= 0.02);
@@ -2638,8 +2644,9 @@ function evalCharPoseRaw(
     const targetY = active.targetY ?? active.fromY - 110;
     const facing: 1 | -1 = targetX >= active.fromX ? 1 : -1;
     const chained = authoredBazookaIsChained(active, resolved);
-    const pickup = chained ? 1 : clamp(progress / 0.46, 0, 1);
-    const bend = chained ? 0 : Math.sin(pickup * Math.PI);
+    const bendDown = clamp(progress / 0.28, 0, 1);
+    const standUp = clamp((progress - 0.56) / 0.14, 0, 1);
+    const bend = chained ? 0 : (bendDown * bendDown * (3 - 2 * bendDown)) * (1 - standUp * standUp * (3 - 2 * standUp));
     const fireFraction = authoredBazookaFireFraction(active, resolved);
     const brace = Math.sin(clamp((progress - fireFraction + 0.08) / 0.16, 0, 1) * Math.PI) * 0.12;
     return {
@@ -4872,8 +4879,8 @@ export default function Board2Page() {
       );
       const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:clamp((time-active.startTime)/(active.duration*.46),0,1);
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup);
+        const progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
       }
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
@@ -4892,8 +4899,8 @@ export default function Board2Page() {
       );
       const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:clamp((time-active.startTime)/(active.duration*.46),0,1);
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup);
+        const progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
       }
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);

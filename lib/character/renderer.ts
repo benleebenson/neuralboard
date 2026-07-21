@@ -198,7 +198,7 @@ export function drawTommyGunHeld(
   ctx.restore();
 }
 
-export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y:number;facing:1|-1},aimBoard:{x:number;y:number},cam:StreamCamera,sf:number,W:number,H:number,recoilPx=0,pickupProgress=1){
+export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y:number;facing:1|-1},aimBoard:{x:number;y:number},cam:StreamCamera,sf:number,W:number,H:number,recoilPx=0,pickupProgress=1,bodyPose?:{bodyLean?:number;headBob?:number}){
   const sx=(shooter.x-cam.cameraX)*sf+W/2,sy=(shooter.y-cam.cameraY)*sf+H/2,ax=(aimBoard.x-cam.cameraX)*sf+W/2,ay=(aimBoard.y-cam.cameraY)*sf+H/2,rawDx=ax-sx;
   const dir=Math.abs(rawDx)<Math.tan(8*Math.PI/180)*Math.abs(ay-(sy-118*sf))?shooter.facing:rawDx>=0?1:-1;
   const aim=Math.atan2(ay-(sy-118*sf),Math.abs(rawDx)),pickup=clamp(pickupProgress,0,1),lift=pickup*pickup*(3-2*pickup),rotation=aim*dir*lift;
@@ -206,11 +206,11 @@ export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y
   const heldCenter={x:sx+Math.cos(aim)*dir*(10-recoilPx)*sf,y:sy-118*sf+Math.sin(aim)*(10-recoilPx)*sf},groundCenter={x:sx+dir*34*sf,y:sy-17*sf};
   const tubeCenter={x:groundCenter.x+(heldCenter.x-groundCenter.x)*lift,y:groundCenter.y+(heldCenter.y-groundCenter.y)*lift};
   const point=(along:number,down:number)=>({x:tubeCenter.x+ux*along*sf+downX*down*sf,y:tubeCenter.y+uy*along*sf+downY*down*sf});
-  const rearGrip=point(3,19),frontGrip=point(39,10),shoulderTrigger={x:sx+dir*14*sf,y:sy-118*sf},shoulderSupport={x:sx-dir*14*sf,y:sy-116*sf};
-  const solveArm=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const upper=44*sf,fore=42*sf,dx=hand.x-shoulder.x,dy=hand.y-shoulder.y,rawD=Math.max(.001,Math.hypot(dx,dy)),d=clamp(rawD,8*sf,upper+fore-.01),vx=dx/rawD,vy=dy/rawD,along=(upper*upper-fore*fore+d*d)/(2*d),height=Math.sqrt(Math.max(0,upper*upper-along*along)),base={x:shoulder.x+vx*along,y:shoulder.y+vy*along};return{x:base.x+(-vy)*height*bend,y:base.y+vx*height*bend};};
-  const armTo=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const elbow=solveArm(shoulder,hand,bend);ctx.beginPath();ctx.moveTo(shoulder.x,shoulder.y);ctx.lineTo(elbow.x,elbow.y);ctx.lineTo(hand.x,hand.y);ctx.stroke();};
+  const rearGrip=point(3,19),frontGrip=point(39,10),bodyLean=bodyPose?.bodyLean??0,hipY=(-76+(bodyPose?.headBob??0)*.25)*sf,shoulderLocalY=-53*.85*sf,shoulderCenter={x:sx-Math.sin(bodyLean)*shoulderLocalY*dir,y:sy+hipY+Math.cos(bodyLean)*shoulderLocalY},shoulderTrigger={x:shoulderCenter.x+dir*5*sf,y:shoulderCenter.y},shoulderSupport={x:shoulderCenter.x-dir*5*sf,y:shoulderCenter.y};
+  const solveArm=(shoulder:{x:number;y:number},target:{x:number;y:number},bend:1|-1)=>{const upper=44*sf,fore=42*sf,dx=target.x-shoulder.x,dy=target.y-shoulder.y,rawD=Math.max(.001,Math.hypot(dx,dy)),d=clamp(rawD,8*sf,(upper+fore)*.98),vx=dx/rawD,vy=dy/rawD,hand={x:shoulder.x+vx*d,y:shoulder.y+vy*d},along=(upper*upper-fore*fore+d*d)/(2*d),height=Math.sqrt(Math.max(0,upper*upper-along*along)),base={x:shoulder.x+vx*along,y:shoulder.y+vy*along},elbow={x:base.x+(-vy)*height*bend,y:base.y+vx*height*bend};return{elbow,hand};};
+  const armTo=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const solved=solveArm(shoulder,hand,bend);ctx.beginPath();ctx.moveTo(shoulder.x,shoulder.y);ctx.lineTo(solved.elbow.x,solved.elbow.y);ctx.lineTo(solved.hand.x,solved.hand.y);ctx.stroke();return solved.hand;};
   ctx.save();ctx.lineCap="round";ctx.lineJoin="round";ctx.strokeStyle="#171817";ctx.lineWidth=Math.max(1.5,3*sf);
-  armTo(shoulderSupport,frontGrip,dir>0?1:-1);armTo(shoulderTrigger,rearGrip,dir>0?-1:1);
+  const supportHand=armTo(shoulderSupport,frontGrip,dir>0?1:-1),triggerHand=armTo(shoulderTrigger,rearGrip,dir>0?-1:1);
   ctx.save();ctx.translate(tubeCenter.x,tubeCenter.y);ctx.rotate(rotation);ctx.scale(dir,1);
   ctx.fillStyle="#252924";ctx.beginPath();ctx.moveTo(-84*sf,-17*sf);ctx.lineTo(-70*sf,-13*sf);ctx.lineTo(-70*sf,13*sf);ctx.lineTo(-84*sf,17*sf);ctx.closePath();ctx.fill();ctx.stroke();
   ctx.fillStyle="#647052";ctx.beginPath();ctx.roundRect(-72*sf,-13*sf,164*sf,26*sf,6*sf);ctx.fill();ctx.stroke();
@@ -221,7 +221,7 @@ export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y
   ctx.strokeStyle="#ee7d16";ctx.lineWidth=Math.max(2,4*sf);ctx.beginPath();ctx.moveTo(8*sf,14*sf);ctx.lineTo(17*sf,24*sf);ctx.lineTo(25*sf,13*sf);ctx.stroke();
   ctx.strokeStyle="#171817";ctx.lineWidth=Math.max(1.5,3*sf);ctx.fillStyle="#252924";for(const sightX of [-18,4]){ctx.beginPath();ctx.roundRect(sightX*sf,-20*sf,8*sf,8*sf,2*sf);ctx.fill();ctx.stroke();}
   ctx.restore();
-  ctx.fillStyle="#171817";for(const hand of [frontGrip,rearGrip]){ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  ctx.fillStyle="#171817";for(const hand of [supportHand,triggerHand]){ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();}
   ctx.restore();
 }
 
