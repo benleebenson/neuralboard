@@ -223,7 +223,22 @@ function authoredBazookaPickupProgress(progress: number): number {
 }
 
 function authoredBazookaIsChained(action: ResolvedCharAction, actions: readonly ResolvedCharAction[]): boolean {
-  return actions.some((candidate) => candidate.id !== action.id && candidate.type === "bazooka" && Math.abs(candidate.startTime + candidate.duration - action.startTime) <= 0.02);
+  const previous = actions
+    .filter((candidate) => candidate.id !== action.id && candidate.startTime + candidate.duration <= action.startTime + 0.02)
+    .sort((a, b) => (b.startTime + b.duration) - (a.startTime + a.duration))[0];
+  return previous?.type === "bazooka";
+}
+
+function authoredBazookaDisplayAction(time: number, actions: readonly ResolvedCharAction[]): ResolvedCharAction | null {
+  const active = actions.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+  if (active) return active;
+  const previous = actions
+    .filter((action) => action.startTime + action.duration <= time)
+    .sort((a, b) => (b.startTime + b.duration) - (a.startTime + a.duration))[0];
+  const next = actions
+    .filter((action) => action.startTime > time)
+    .sort((a, b) => a.startTime - b.startTime)[0];
+  return previous?.type === "bazooka" && next?.type === "bazooka" ? next : null;
 }
 
 function authoredBazookaFireFraction(action: ResolvedCharAction, actions: readonly ResolvedCharAction[]): number {
@@ -2106,6 +2121,20 @@ function evalCharPoseRaw(
       }
     }
     const idle = idlePose(rx, ry);
+    const heldBazooka = authoredBazookaDisplayAction(time, resolved);
+    if (heldBazooka) {
+      const targetX = heldBazooka.targetX ?? rx + 400;
+      const targetY = heldBazooka.targetY ?? ry - 110;
+      const facing: 1 | -1 = targetX >= rx ? 1 : -1;
+      return {
+        ...idle,
+        facing,
+        hideArms: true,
+        bodyLean: facing * 0.05,
+        pointTargetBX: targetX,
+        pointTargetBY: targetY,
+      };
+    }
     return applyAuthoredPose(idle, sampleAnimation(authoredAnimations.idle, (time * 0.35) % 1));
   }
 
@@ -3340,6 +3369,9 @@ export default function Board2Page() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
   const mobileBoardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
+  const boardImageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const mobileBoardImageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const drawBoardImageOverlaysRef = useRef<(time: number) => void>(() => {});
   const playCanvasRef = useRef<HTMLCanvasElement>(null);
   const playContainerRef = useRef<HTMLDivElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
@@ -4895,9 +4927,9 @@ export default function Board2Page() {
         pose,
         { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
-      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+        const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
         drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
       }
     }
@@ -4915,9 +4947,9 @@ export default function Board2Page() {
         pose,
         { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
-      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+        const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
         drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
       }
     }
@@ -5019,13 +5051,14 @@ export default function Board2Page() {
         skin, pose,
         { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any },
       );
-      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX === undefined || active.targetY === undefined) return;
+      const isActive = time >= active.startTime && time < active.startTime + active.duration;
       const progress = clamp((time - active.startTime) / active.duration, 0, 1);
       const fireFraction = authoredBazookaFireFraction(active, resolved);
       const recoilAge = time - (active.startTime + active.duration * fireFraction);
-      const recoil = recoilAge >= 0 && recoilAge < 0.26 ? Math.sin((1 - recoilAge / 0.26) * Math.PI) * 9 : 0;
-      const pickup = authoredBazookaIsChained(active, resolved) ? 1 : authoredBazookaPickupProgress(progress);
+      const recoil = isActive && recoilAge >= 0 && recoilAge < 0.26 ? Math.sin((1 - recoilAge / 0.26) * Math.PI) * 9 : 0;
+      const pickup = !isActive || authoredBazookaIsChained(active, resolved) ? 1 : authoredBazookaPickupProgress(progress);
       drawBazookaHeld(
         ctx,
         { x: pose.boardX, y: pose.boardY, facing: pose.facing },
@@ -5046,11 +5079,43 @@ export default function Board2Page() {
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
   }, []);
 
+  const drawBoardImageOverlays = useCallback((time: number) => {
+    const currentClips = clipsRef.current;
+    const authoredBazooka = authoredBazookaTimeline(
+      time,
+      [resolvedCharActionsRef.current, resolvedCharActions2Ref.current],
+      currentClips,
+      streamCratersRef.current,
+    );
+    const shake = bazookaShake(authoredBazooka.events, time * 1000);
+    for (const clip of currentClips) {
+      if (clip.type !== "image" || clip.boardX === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+      const image = imgCacheRef.current.get(clip.sourceUrl);
+      for (const refs of [boardImageCanvasRefs.current, mobileBoardImageCanvasRefs.current]) {
+        const canvas = refs.get(clip.id);
+        if (!canvas) continue;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) continue;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.style.transform = `translate(${shake.x}px, ${shake.y}px)`;
+        if (image?.complete && image.naturalWidth > 0) {
+          drawCrateredImage(
+            ctx, image, 0, 0, canvas.width, canvas.height, clip.boardW, clip.boardH,
+            authoredBazooka.craters.filter((crater) => crater.clipId === clip.id),
+          );
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => { drawBoardImageOverlaysRef.current = drawBoardImageOverlays; }, [drawBoardImageOverlays]);
+
   useEffect(() => {
     for (const canvas of [boardCharacterCanvasRef.current, mobileBoardCharacterCanvasRef.current]) {
       if (canvas) drawCharacterBoardOverlay(canvas, playhead);
     }
-  }, [clips, drawCharacterBoardOverlay, playhead, resolvedCharActions, resolvedCharActions2, showCharacter, showCharacter2, characterFace, characterFace2, characterSkin, characterSkin2]);
+    drawBoardImageOverlays(playhead);
+  }, [clips, drawBoardImageOverlays, drawCharacterBoardOverlay, playhead, resolvedCharActions, resolvedCharActions2, showCharacter, showCharacter2, characterFace, characterFace2, characterSkin, characterSkin2]);
 
   // ─ Video audio routing ────────────────────────────────────────────────────
 
@@ -5489,7 +5554,10 @@ export default function Board2Page() {
     if (type === "image") {
       if (!imgCacheRef.current.has(url)) {
         const img = new Image();
-        img.onload = () => drawFrame(playheadRef.current);
+        img.onload = () => {
+          drawFrame(playheadRef.current);
+          drawBoardImageOverlaysRef.current(playheadRef.current);
+        };
         img.src = url;
         imgCacheRef.current.set(url, img);
       }
@@ -10602,7 +10670,16 @@ export default function Board2Page() {
                         <span style={{ color: "#ff9f5e", fontSize: Math.max(6, 7 * boardZoom), fontFamily: "monospace", textAlign: "center", pointerEvents: "none" }}>tap to re-download</span>
                       </div>
                     ) : clip.type === "image" ? (
-                      <img src={clip.sourceUrl} alt={clip.name} style={{ width: "100%", height: "100%", objectFit: "fill", display: "block" }} draggable={false} />
+                      <canvas
+                        ref={(canvas) => {
+                          if (canvas) mobileBoardImageCanvasRefs.current.set(clip.id, canvas);
+                          else mobileBoardImageCanvasRefs.current.delete(clip.id);
+                        }}
+                        width={Math.max(1, Math.round(clip.boardW!))}
+                        height={Math.max(1, Math.round(clip.boardH!))}
+                        aria-label={clip.name}
+                        style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center" }}
+                      />
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
                         <span style={{ color: "#7df5b0", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace" }}>▶ {clip.name}</span>
@@ -11789,11 +11866,15 @@ export default function Board2Page() {
                             <span style={{ color: "#ff9f5e", fontSize: 8, fontFamily: "monospace", textAlign: "center", pointerEvents: "none", padding: "0 4px" }}>click to re-download</span>
                           </div>
                         ) : clip.type === "image" ? (
-                          <img
-                            src={clip.sourceUrl}
-                            alt={clip.name}
-                            style={{ width: "100%", height: "100%", objectFit: "fill", display: "block", userSelect: "none", pointerEvents: "none" }}
-                            draggable={false}
+                          <canvas
+                            ref={(canvas) => {
+                              if (canvas) boardImageCanvasRefs.current.set(clip.id, canvas);
+                              else boardImageCanvasRefs.current.delete(clip.id);
+                            }}
+                            width={Math.max(1, Math.round(clip.boardW!))}
+                            height={Math.max(1, Math.round(clip.boardH!))}
+                            aria-label={clip.name}
+                            style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center" }}
                           />
                         ) : (
                           <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
