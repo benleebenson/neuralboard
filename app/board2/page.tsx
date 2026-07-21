@@ -1652,6 +1652,7 @@ type CharPoseResult = {
   terrainRightFootY?: number;
   terrainGrounded?: boolean;
   actionType?: string;
+  hideArms?: boolean;
   pullUpBarAlpha?: number;
   pullUpBarBX?: number;
   pullUpBarBY?: number;
@@ -3809,7 +3810,10 @@ export default function Board2Page() {
           let pose = runtime?.enabled && state
             ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
-          if (pose && id === "c1") pose = applyPlayForceChokePose(pose);
+          if (pose && id === "c1") {
+            if (playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
+            pose = applyPlayForceChokePose(pose);
+          }
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = active?.type ?? (!state
             ? "idle"
@@ -8836,6 +8840,7 @@ export default function Board2Page() {
     const armedPose: CharPoseResult = {
       ...pose,
       facing,
+      hideArms: playBazookaArmedRef.current,
       bodyLean: pose.bodyLean + 0.06 * facing,
       leftLegA: pose.leftLegA + 0.16,
       rightLegA: pose.rightLegA - 0.16,

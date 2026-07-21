@@ -689,12 +689,16 @@ export function drawBoardCharacterToCanvas(
     ctx.strokeStyle = "#2a2a2a";
     const frontIsRight = facing >= 0;
     const joints = buildJackedJoints();
-    if (frontIsRight) drawJackedArmWorld("left", joints);
-    else drawJackedArmWorld("right", joints);
+    if (!p.hideArms) {
+      if (frontIsRight) drawJackedArmWorld("left", joints);
+      else drawJackedArmWorld("right", joints);
+    }
     drawJackedTorsoWorld(joints);
     drawJackedShoulderCapsWorld(joints);
-    if (frontIsRight) drawJackedArmWorld("right", joints);
-    else drawJackedArmWorld("left", joints);
+    if (!p.hideArms) {
+      if (frontIsRight) drawJackedArmWorld("right", joints);
+      else drawJackedArmWorld("left", joints);
+    }
   } else if (effectiveSkin === "styled") {
     const shoulderHalf = 19 * S;
     const waistHalf = 9 * S;
@@ -712,17 +716,21 @@ export function drawBoardCharacterToCanvas(
     ctx.fill();
     ctx.stroke();
     ctx.restore();
-    ctx.save();
-    ctx.lineWidth = Math.max(lw * 1.28, 4 * S);
-    drawArm(lArmA, lForeA);
-    drawArm(rArmA, rForeA);
-    ctx.restore();
+    if (!p.hideArms) {
+      ctx.save();
+      ctx.lineWidth = Math.max(lw * 1.28, 4 * S);
+      drawArm(lArmA, lForeA);
+      drawArm(rArmA, rForeA);
+      ctx.restore();
+    }
   } else {
     ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -torsoLen); ctx.stroke();
-    drawArm(lArmA, lForeA);
-    drawArm(rArmA, rForeA);
+    if (!p.hideArms) {
+      drawArm(lArmA, lForeA);
+      drawArm(rArmA, rForeA);
+    }
   }
-  if (p.forceHandOpen && p.pointTargetBX !== undefined) {
+  if (!p.hideArms && p.forceHandOpen && p.pointTargetBX !== undefined) {
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
     if (tdxLocal >= 0) drawOpenHand(rArmA, rForeA);
     else drawOpenHand(lArmA, lForeA);
