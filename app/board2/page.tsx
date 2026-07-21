@@ -230,8 +230,8 @@ function authoredBazookaIsChained(action: ResolvedCharAction, actions: readonly 
 }
 
 function authoredBazookaDisplayAction(time: number, actions: readonly ResolvedCharAction[]): ResolvedCharAction | null {
-  const active = actions.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
-  if (active) return active;
+  const active = actions.find((action) => time >= action.startTime && time < action.startTime + action.duration);
+  if (active) return active.type === "bazooka" ? active : null;
   const previous = actions
     .filter((action) => action.startTime + action.duration <= time)
     .sort((a, b) => (b.startTime + b.duration) - (a.startTime + a.duration))[0];
