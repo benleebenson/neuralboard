@@ -199,10 +199,28 @@ export function drawTommyGunHeld(
 }
 
 export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y:number;facing:1|-1},aimBoard:{x:number;y:number},cam:StreamCamera,sf:number,W:number,H:number,recoilPx=0){
-  const sx=(shooter.x-cam.cameraX)*sf+W/2,sy=(shooter.y-cam.cameraY)*sf+H/2,ax=(aimBoard.x-cam.cameraX)*sf+W/2,ay=(aimBoard.y-cam.cameraY)*sf+H/2,rawDx=ax-sx;const dir=Math.abs(rawDx)<Math.tan(8*Math.PI/180)*Math.abs(ay-(sy-118*sf))?shooter.facing:rawDx>=0?1:-1;const aim=Math.atan2(ay-(sy-118*sf),Math.abs(rawDx)),ux=Math.cos(aim)*dir,uy=Math.sin(aim),chest={x:sx,y:sy-116*sf};const rearGrip={x:chest.x+ux*12*sf-ux*recoilPx*sf,y:chest.y+uy*12*sf-uy*recoilPx*sf},frontGrip={x:rearGrip.x+ux*58*sf,y:rearGrip.y+uy*58*sf},shoulderTrigger={x:sx+dir*14*sf,y:sy-118*sf},shoulderSupport={x:sx-dir*14*sf,y:sy-116*sf};
+  const sx=(shooter.x-cam.cameraX)*sf+W/2,sy=(shooter.y-cam.cameraY)*sf+H/2,ax=(aimBoard.x-cam.cameraX)*sf+W/2,ay=(aimBoard.y-cam.cameraY)*sf+H/2,rawDx=ax-sx;
+  const dir=Math.abs(rawDx)<Math.tan(8*Math.PI/180)*Math.abs(ay-(sy-118*sf))?shooter.facing:rawDx>=0?1:-1;
+  const aim=Math.atan2(ay-(sy-118*sf),Math.abs(rawDx)),ux=Math.cos(aim)*dir,uy=Math.sin(aim),downX=-Math.sin(aim),downY=Math.cos(aim);
+  const tubeCenter={x:sx+ux*(10-recoilPx)*sf,y:sy-118*sf+uy*(10-recoilPx)*sf};
+  const point=(along:number,down:number)=>({x:tubeCenter.x+ux*along*sf+downX*down*sf,y:tubeCenter.y+uy*along*sf+downY*down*sf});
+  const rearGrip=point(3,19),frontGrip=point(39,10),shoulderTrigger={x:sx+dir*14*sf,y:sy-118*sf},shoulderSupport={x:sx-dir*14*sf,y:sy-116*sf};
   const solveArm=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const upper=44*sf,fore=42*sf,dx=hand.x-shoulder.x,dy=hand.y-shoulder.y,rawD=Math.max(.001,Math.hypot(dx,dy)),d=clamp(rawD,8*sf,upper+fore-.01),vx=dx/rawD,vy=dy/rawD,along=(upper*upper-fore*fore+d*d)/(2*d),height=Math.sqrt(Math.max(0,upper*upper-along*along)),base={x:shoulder.x+vx*along,y:shoulder.y+vy*along};return{x:base.x+(-vy)*height*bend,y:base.y+vx*height*bend};};
-  const armTo=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const elbow=solveArm(shoulder,hand,bend);ctx.beginPath();ctx.moveTo(shoulder.x,shoulder.y);ctx.lineTo(elbow.x,elbow.y);ctx.lineTo(hand.x,hand.y);ctx.stroke();ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();};
-  ctx.save();ctx.lineCap="round";ctx.lineJoin="round";ctx.strokeStyle="#27221f";ctx.lineWidth=Math.max(1.5,3*sf);ctx.fillStyle="#f6d4b4";armTo(shoulderSupport,frontGrip,dir>0?1:-1);armTo(shoulderTrigger,rearGrip,dir>0?-1:1);ctx.translate(rearGrip.x-ux*34*sf,rearGrip.y-uy*34*sf);ctx.rotate(aim);ctx.scale(dir,1);ctx.fillStyle="#66705f";ctx.beginPath();ctx.roundRect(0,-14*sf,132*sf,28*sf,13*sf);ctx.fill();ctx.stroke();ctx.fillStyle="#424940";ctx.beginPath();ctx.roundRect(18*sf,13*sf,13*sf,29*sf,3*sf);ctx.fill();ctx.stroke();ctx.beginPath();ctx.arc(132*sf,0,18*sf,0,Math.PI*2);ctx.stroke();ctx.restore();
+  const armTo=(shoulder:{x:number;y:number},hand:{x:number;y:number},bend:1|-1)=>{const elbow=solveArm(shoulder,hand,bend);ctx.beginPath();ctx.moveTo(shoulder.x,shoulder.y);ctx.lineTo(elbow.x,elbow.y);ctx.lineTo(hand.x,hand.y);ctx.stroke();};
+  ctx.save();ctx.lineCap="round";ctx.lineJoin="round";ctx.strokeStyle="#171817";ctx.lineWidth=Math.max(1.5,3*sf);
+  armTo(shoulderSupport,frontGrip,dir>0?1:-1);armTo(shoulderTrigger,rearGrip,dir>0?-1:1);
+  ctx.save();ctx.translate(tubeCenter.x,tubeCenter.y);ctx.rotate(aim);ctx.scale(dir,1);
+  ctx.fillStyle="#252924";ctx.beginPath();ctx.moveTo(-84*sf,-17*sf);ctx.lineTo(-70*sf,-13*sf);ctx.lineTo(-70*sf,13*sf);ctx.lineTo(-84*sf,17*sf);ctx.closePath();ctx.fill();ctx.stroke();
+  ctx.fillStyle="#647052";ctx.beginPath();ctx.roundRect(-72*sf,-13*sf,164*sf,26*sf,6*sf);ctx.fill();ctx.stroke();
+  ctx.fillStyle="#7e8966";ctx.beginPath();ctx.roundRect(-57*sf,-9*sf,57*sf,8*sf,3*sf);ctx.fill();
+  ctx.fillStyle="#46503d";ctx.beginPath();ctx.roundRect(-67*sf,-13*sf,14*sf,26*sf,3*sf);ctx.fill();ctx.stroke();ctx.beginPath();ctx.roundRect(16*sf,-13*sf,13*sf,26*sf,3*sf);ctx.fill();ctx.stroke();ctx.beginPath();ctx.roundRect(82*sf,-15*sf,14*sf,30*sf,4*sf);ctx.fill();ctx.stroke();
+  ctx.fillStyle="#292d28";ctx.beginPath();ctx.roundRect(-88*sf,-18*sf,8*sf,36*sf,4*sf);ctx.fill();ctx.stroke();ctx.beginPath();ctx.roundRect(93*sf,-17*sf,8*sf,34*sf,4*sf);ctx.fill();ctx.stroke();
+  ctx.fillStyle="#394135";ctx.beginPath();ctx.roundRect(-2*sf,11*sf,13*sf,29*sf,3*sf);ctx.fill();ctx.stroke();ctx.beginPath();ctx.roundRect(31*sf,9*sf,12*sf,19*sf,3*sf);ctx.fill();ctx.stroke();
+  ctx.strokeStyle="#ee7d16";ctx.lineWidth=Math.max(2,4*sf);ctx.beginPath();ctx.moveTo(8*sf,14*sf);ctx.lineTo(17*sf,24*sf);ctx.lineTo(25*sf,13*sf);ctx.stroke();
+  ctx.strokeStyle="#171817";ctx.lineWidth=Math.max(1.5,3*sf);ctx.fillStyle="#252924";for(const sightX of [-18,4]){ctx.beginPath();ctx.roundRect(sightX*sf,-20*sf,8*sf,8*sf,2*sf);ctx.fill();ctx.stroke();}
+  ctx.restore();
+  ctx.fillStyle="#f6d4b4";for(const hand of [frontGrip,rearGrip]){ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  ctx.restore();
 }
 
 export function eliminationFrameForGuest(
