@@ -219,7 +219,7 @@ export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y
   ctx.strokeStyle="#ee7d16";ctx.lineWidth=Math.max(2,4*sf);ctx.beginPath();ctx.moveTo(8*sf,14*sf);ctx.lineTo(17*sf,24*sf);ctx.lineTo(25*sf,13*sf);ctx.stroke();
   ctx.strokeStyle="#171817";ctx.lineWidth=Math.max(1.5,3*sf);ctx.fillStyle="#252924";for(const sightX of [-18,4]){ctx.beginPath();ctx.roundRect(sightX*sf,-20*sf,8*sf,8*sf,2*sf);ctx.fill();ctx.stroke();}
   ctx.restore();
-  ctx.fillStyle="#f6d4b4";for(const hand of [frontGrip,rearGrip]){ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  ctx.fillStyle="#171817";for(const hand of [frontGrip,rearGrip]){ctx.beginPath();ctx.arc(hand.x,hand.y,7*sf,0,Math.PI*2);ctx.fill();ctx.stroke();}
   ctx.restore();
 }
 

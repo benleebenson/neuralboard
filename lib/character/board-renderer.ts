@@ -770,7 +770,7 @@ export function drawBoardCharacterToCanvas(
   }
 
   // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
-  if (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0)) {
+  if (!p.hideArms && (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0))) {
     ctx.save();
     ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
     ctx.rotate(launcherMount.angle);

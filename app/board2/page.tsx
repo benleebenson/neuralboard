@@ -174,11 +174,13 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 type CharacterAction = {
   id: string;
   type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
-      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "dance" | "idle";
+      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
   targetY?: number;
+  targetLocalX?: number;
+  targetLocalY?: number;
   targetClipId?: string;  // AI-choreographed actions target a clip id instead of raw coords — resolved
                            // to boardX/Y lazily in resolveCharActions so a clip move never staleifies it.
                            // Explicit targetX/Y (set by manual placement) always takes precedence.
@@ -192,7 +194,64 @@ type CharacterAction = {
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
 };
 
-type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
+type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
+
+const AUTHORED_BAZOOKA_FIRE_FRACTION = 0.42;
+const AUTHORED_BAZOOKA_RANGE = 8000;
+
+function authoredBazookaSeed(id: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < id.length; index += 1) hash = Math.imul(hash ^ id.charCodeAt(index), 16777619);
+  return hash >>> 0;
+}
+
+function authoredBazookaTimeline(
+  time: number,
+  actionGroups: readonly ResolvedCharAction[][],
+  clips: readonly Clip[],
+  initialCraters: readonly StreamCrater[] = [],
+): { craters: StreamCrater[]; events: BazookaVisualEvent[] } {
+  const terrain = clips.filter((clip) => clip.type === "image" && clip.boardX !== undefined) as Array<Clip & Required<Pick<Clip, "boardX" | "boardY" | "boardW" | "boardH">>>;
+  const actions = actionGroups.flat().filter((action) => action.type === "bazooka" && action.targetX !== undefined && action.targetY !== undefined)
+    .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+  const craters = [...initialCraters];
+  const events: BazookaVisualEvent[] = [];
+  for (const action of actions) {
+    const fireTime = action.startTime + action.duration * AUTHORED_BAZOOKA_FIRE_FRACTION;
+    const dx = action.targetX! - action.fromX;
+    const dy = action.targetY! - (action.fromY - 110);
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const direction = { x: dx / length, y: dy / length };
+    const from = { x: action.fromX + direction.x * 101, y: action.fromY - 110 + direction.y * 101 };
+    const far = { x: from.x + direction.x * AUTHORED_BAZOOKA_RANGE, y: from.y + direction.y * AUTHORED_BAZOOKA_RANGE };
+    const hit = raycastSolid(terrain as TerrainClip[], craters, from, far);
+    const target = hit?.point ?? far;
+    const seed = authoredBazookaSeed(action.id);
+    const impactTime = fireTime + Math.hypot(target.x - from.x, target.y - from.y) / 1100;
+    const event = {
+      kind: "bazooka_fire",
+      sequenceType: "bazookaFire",
+      streamId: "authored",
+      sessionId: "editor",
+      sentAt: fireTime * 1000,
+      startTime: fireTime * 1000,
+      from,
+      target,
+      seed,
+      fizzle: !hit,
+    } as BazookaVisualEvent;
+    if (time >= fireTime && time <= impactTime + 1.25) events.push(event);
+    if (hit && time >= impactTime) {
+      const clip = terrain.find((candidate) => candidate.id === hit.imageId);
+      if (clip) {
+        const crater = craterForImpact(clip, hit.point, seed);
+        const sameImage = craters.filter((candidate) => candidate.clipId === clip.id);
+        craters.splice(0, craters.length, ...craters.filter((candidate) => candidate.clipId !== clip.id), ...sameImage.slice(-23), crater);
+      }
+    }
+  }
+  return { craters, events };
+}
 
 type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
 
@@ -1399,6 +1458,9 @@ function resolveClipTarget(
   if (!c || c.boardX === undefined || c.boardY === undefined) return undefined;
   const cx = c.boardX + (c.boardW ?? 0) / 2;
   if (action.type === "pointAt") return { x: cx, y: c.boardY + (c.boardH ?? 0) * 0.35 };
+  if (action.type === "bazooka" && action.targetLocalX !== undefined && action.targetLocalY !== undefined) {
+    return { x: c.boardX + action.targetLocalX, y: c.boardY + action.targetLocalY };
+  }
   return { x: cx, y: c.boardY };
 }
 
@@ -1420,8 +1482,8 @@ function resolveCharActions(
     // Explicit targetX/Y (manual placement) always wins; otherwise resolve targetClipId against
     // the clip's current position (AI-choreographed actions).
     const resolvedTarget = resolveClipTarget(a, clips);
-    let targetX = a.targetX ?? resolvedTarget?.x;
-    let targetY = a.targetY ?? resolvedTarget?.y;
+    let targetX = a.type === "bazooka" ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
+    let targetY = a.type === "bazooka" ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
       const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters);
       targetX = slot.x;
@@ -2560,6 +2622,26 @@ function evalCharPoseRaw(
     }, authoredPose);
   }
 
+  if (active.type === "bazooka") {
+    const targetX = active.targetX ?? active.fromX + 400;
+    const targetY = active.targetY ?? active.fromY - 110;
+    const facing: 1 | -1 = targetX >= active.fromX ? 1 : -1;
+    const brace = Math.sin(clamp((progress - 0.34) / 0.18, 0, 1) * Math.PI) * 0.12;
+    return {
+      ...idlePose(active.fromX, active.fromY),
+      facing,
+      hideArms: true,
+      bodyLean: facing * (0.05 - brace),
+      headBob: brace * 18,
+      leftLegA: 0.2,
+      rightLegA: -0.2,
+      leftShinA: 0.3,
+      rightShinA: -0.3,
+      pointTargetBX: targetX,
+      pointTargetBY: targetY,
+    };
+  }
+
   if (active.type === "pullUps") {
     const a = stationaryActive;
     const p = stationaryProgress;
@@ -2862,7 +2944,7 @@ function evalCharPoseRaw(
 function momentumIntensityAt(time: number, resolved: ResolvedCharAction[]): number {
   const active = resolved.find((a) => time >= a.startTime && time < a.startTime + a.duration);
   if (!active) return 1;
-  if (["pullUps", "sitAndWatch", "mirrorCheck", "dance"].includes(active.type)) return 0.3;
+  if (["pullUps", "sitAndWatch", "mirrorCheck", "dance", "bazooka"].includes(active.type)) return 0.3;
   return 1;
 }
 
@@ -4653,6 +4735,14 @@ export default function Board2Page() {
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
     const sf = cam.boardZoom * W / BOARD_W;
+    const liveMode = liveControlEnabledRef.current;
+    const authoredBazooka = !liveMode && !playModeRef.current
+      ? authoredBazookaTimeline(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current], currentClips, streamCratersRef.current)
+      : { craters: [...streamCratersRef.current], events: [] as BazookaVisualEvent[] };
+    const renderCraters = authoredBazooka.craters;
+    const authoredShake = bazookaShake(authoredBazooka.events, time * 1000);
+    ctx.save();
+    ctx.translate(authoredShake.x, authoredShake.y);
     const sortedClips = [...currentClips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
@@ -4664,7 +4754,7 @@ export default function Board2Page() {
       if (clip.type === "image") {
         const img = imgCacheRef.current.get(clip.sourceUrl);
         if (img?.complete && img.naturalWidth > 0) {
-          drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,streamCratersRef.current.filter(crater=>crater.clipId===clip.id));
+          drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,renderCraters.filter(crater=>crater.clipId===clip.id));
         }
       } else {
         const vid = videoElsRef.current.get(clip.id);
@@ -4713,7 +4803,6 @@ export default function Board2Page() {
       }
     }
     ctx.globalAlpha = 1;
-    const liveMode = liveControlEnabledRef.current;
     if (liveMode) {
       const wallMs = liveWallMs ?? performance.now();
       const live = liveCharactersRef.current;
@@ -4753,34 +4842,50 @@ export default function Board2Page() {
       }
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
+      const resolved = resolvedCharActionsRef.current;
+      const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters);
       CharacterEntity.drawBoardCharacterToCanvas(
-        ctx, time, resolvedCharActionsRef.current, true,
+        ctx, time, resolved, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
           : null,
         characterSkinRef.current,
-        null,
+        pose,
         { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
+      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      if (active?.targetX !== undefined && active.targetY !== undefined) {
+        const recoilAge=time-(active.startTime+active.duration*AUTHORED_BAZOOKA_FIRE_FRACTION),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0;
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil);
+      }
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
+      const resolved = resolvedCharActions2Ref.current;
+      const pose = evalCharAtTime(time, resolved, charInitXRef.current + 60, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
       CharacterEntity.drawBoardCharacterToCanvas(
-        ctx, time, resolvedCharActions2Ref.current, showCharacter2Ref.current,
+        ctx, time, resolved, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
           : null,
         characterSkin2Ref.current,
-        null,
+        pose,
         { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
       );
+      const active = resolved.find((action) => action.type === "bazooka" && time >= action.startTime && time < action.startTime + action.duration);
+      if (active?.targetX !== undefined && active.targetY !== undefined) {
+        const recoilAge=time-(active.startTime+active.duration*AUTHORED_BAZOOKA_FIRE_FRACTION),recoil=recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0;
+        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil);
+      }
     }
+    for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
     if (currentAnnotations.length > 0) {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
+    ctx.restore();
   }, [drawStreamGuestsToCtx]);
 
   const drawFrame = useCallback((time: number) => {
@@ -12126,6 +12231,7 @@ export default function Board2Page() {
                                 { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
                                 { mode: "dance" as const, label: "Dance", title: "Click board to place a hip-shake dance action (2.5s)" },
                                 { mode: "pullUps" as const, label: "Pull-ups", title: "Click board to place a grounded pull-up bar action (4.0s)" },
+                                { mode: "bazooka" as const, label: "Bazooka", title: "Click an image to fire one terrain-damaging rocket (2.4s)" },
                                 { mode: "mirrorCheck" as const, label: "Mirror", title: "Click board to place a mirror-check transformation action (5.0s)" },
                                 { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
                             ]).map(({ mode, label, title }) => (
@@ -12289,6 +12395,7 @@ export default function Board2Page() {
                       pointAt: 2.0,
                       dance: 2.5,
                       pullUps: 4.0,
+                      bazooka: 2.4,
                       mirrorCheck: 5.0,
                       flip: 1.2,
                       zipline: 2.0,
@@ -12296,25 +12403,30 @@ export default function Board2Page() {
                       sitAndWatch: 2.0,
                     };
                     if (retargetCharActionId) {
+                      const existing = [...characterActionsRef.current, ...characterActions2Ref.current].find((action) => action.id === retargetCharActionId);
+                      if (existing?.type === "bazooka" && clickedSurface?.type !== "image") return;
                       const owner: CharacterId = characterActions2Ref.current.some((a) => a.id === retargetCharActionId) ? "c2" : "c1";
                       updateCharacterActionsFor(owner, (prev) => prev.map((a) => a.id === retargetCharActionId ? {
                         ...a,
-                        targetX: Math.round(snapped.x),
-                        targetY: Math.round(snapped.y),
-                        ...(a.type === "skateTo" && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
+                        targetX: Math.round(a.type === "bazooka" ? rawBx : snapped.x),
+                        targetY: Math.round(a.type === "bazooka" ? rawBy : snapped.y),
+                        ...(a.type === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
+                        ...(["skateTo", "bazooka"].includes(a.type) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
                       } : a));
                       setRetargetCharActionId(null);
                       return;
                     }
                     if (!characterAddMode || characterAddMode === "emote") return;
+                    if (characterAddMode === "bazooka" && clickedSurface?.type !== "image") return;
                     const newAction: CharacterAction = {
                       id: generateId(),
                       type: characterAddMode,
                       startTime: playheadRef.current,
                       duration: durationMap[characterAddMode] ?? 1.5,
-                      targetX: Math.round(snapped.x),
-                      targetY: Math.round(snapped.y),
-                      ...(characterAddMode === "skateTo" && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
+                      targetX: Math.round(characterAddMode === "bazooka" ? rawBx : snapped.x),
+                      targetY: Math.round(characterAddMode === "bazooka" ? rawBy : snapped.y),
+                      ...(characterAddMode === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
+                      ...(["skateTo", "bazooka"].includes(characterAddMode) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
                     };
                     updateCharacterActionsFor(activeCharacterIdRef.current, (prev) => [...prev, newAction]);
                     setCharacterAddMode(null);
@@ -12455,7 +12567,7 @@ export default function Board2Page() {
 
             {(selectedCharAction || characterPanelOpen) && (() => {
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
                 flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬", idle: "⏸",
               };
               const targetableAction = selectedCharAction && !["emote", "idle", "explainGesture"].includes(selectedCharAction.type);
@@ -12472,6 +12584,7 @@ export default function Board2Page() {
                 { mode: "dance", label: "Dance", title: "Click board to place a hip-shake dance loop" },
                 { mode: "emote", label: "Emote", title: "Choose an emoji and place it at the playhead" },
                 { mode: "pullUps", label: "Pull-ups", title: "Click board to place a grounded pull-up bar" },
+                { mode: "bazooka", label: "Bazooka", title: "Click an image to fire one terrain-damaging rocket" },
                 { mode: "mirrorCheck", label: "Mirror Check", title: "Click board to place a mirror-check transformation" },
               ];
               return (
@@ -13234,7 +13347,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (
@@ -13332,7 +13445,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
                     };
                     return (
