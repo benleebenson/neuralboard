@@ -3841,7 +3841,7 @@ export default function Board2Page() {
       streamId: STREAM_OWNER_USER_ID,
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
-      board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
+      board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#51240a" },
       spawnDoor: spawnDoorRef.current,
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
@@ -4803,7 +4803,7 @@ export default function Board2Page() {
     overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null,
     liveWallMs?: number
   ) => {
-    ctx.fillStyle = "#f5ecd8";
+    ctx.fillStyle = "#51240a";
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
     const sf = cam.boardZoom * W / BOARD_W;
@@ -8459,7 +8459,7 @@ export default function Board2Page() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         transcript,
-        board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f5ecd8" },
+        board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#51240a" },
         clips: sendClips,
       }),
     }).catch(() => null);
@@ -10642,7 +10642,7 @@ export default function Board2Page() {
           onPointerCancel={handleMobileBoardPointerUp}
         >
           {/* Board surface */}
-          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: "#f0ead6", border: "1.5px dashed rgba(42,42,42,0.2)" }}>
+          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: "#51240a", border: "1.5px dashed rgba(42,42,42,0.2)" }}>
             {clips.filter((c) => c.boardX !== undefined).map((clip) => {
               const isSel = clip.id === selectedClipId;
               return (
@@ -11819,7 +11819,7 @@ export default function Board2Page() {
                   top: boardPan.y,
                   width: BOARD_W * boardZoom,
                   height: BOARD_H * boardZoom,
-                  background: "#f5ecd8",
+                  background: "#51240a",
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
