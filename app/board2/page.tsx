@@ -109,12 +109,114 @@ type Clip = {
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
+  sourceOffsetSec?: number;
+  speechBubbles?: boolean;
+  transcriptSegments?: TranscriptSegment[];
   // youtube save/restore:
   youtubeId?: string;
   ytStart?: number;
   ytEnd?: number;
   needsRedownload?: boolean;
 };
+
+type TranscriptSegment = { start: number; end: number; text: string };
+type SpeechBubbleCue = TranscriptSegment & { index: number };
+
+function narrationSentenceCues(segments: readonly TranscriptSegment[]): SpeechBubbleCue[] {
+  const cues: SpeechBubbleCue[] = [];
+  let text = "";
+  let start = 0;
+  let end = 0;
+  const flush = () => {
+    const clean = text.trim();
+    if (clean) cues.push({ start, end, text: clean, index: cues.length });
+    text = "";
+  };
+  for (const segment of segments) {
+    const clean = segment.text.trim();
+    if (!clean) continue;
+    const parts = clean.match(/.*?[.!?](?:[\"')\]]+)?(?=\s|$)|.+$/g)?.map((part) => part.trim()).filter(Boolean) ?? [clean];
+    const totalChars = Math.max(1, parts.reduce((sum, part) => sum + part.length, 0));
+    let cursor = segment.start;
+    for (const part of parts) {
+      const partEnd = cursor + (segment.end - segment.start) * part.length / totalChars;
+      if (!text) start = cursor;
+      text = `${text} ${part}`.trim();
+      end = partEnd;
+      cursor = partEnd;
+      if (/[.!?][\"')\]]?$/.test(part) || text.length >= 105) flush();
+    }
+  }
+  flush();
+  return cues.map((cue, index, all) => ({ ...cue, end: all[index + 1]?.start ?? cue.end, index }));
+}
+
+function activeNarrationBubble(time: number, clips: readonly Clip[]): { cue: SpeechBubbleCue; clip: Clip } | null {
+  const clip = clips.find((candidate) => candidate.type === "narration" && candidate.speechBubbles && candidate.transcriptSegments?.length && time >= candidate.startTime && time < candidate.startTime + candidate.duration);
+  if (!clip?.transcriptSegments) return null;
+  const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
+  const cues = narrationSentenceCues(clip.transcriptSegments);
+  const cue = cues.find((candidate, index) => sourceTime >= candidate.start && sourceTime < (cues[index + 1]?.start ?? Math.max(candidate.end, (clip.sourceOffsetSec ?? 0) + clip.duration)));
+  return cue ? { cue, clip } : null;
+}
+
+function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number) {
+  const active = activeNarrationBubble(time, clips);
+  if (!active) return;
+  const { cue } = active;
+  const placements = [
+    { x: 0.08, y: 0.07, w: 0.56, tailX: 0.3 },
+    { x: 0.36, y: 0.08, w: 0.56, tailX: 0.72 },
+    { x: 0.16, y: 0.05, w: 0.68, tailX: 0.5 },
+    { x: 0.3, y: 0.14, w: 0.6, tailX: 0.66 },
+  ][cue.index % 4];
+  const fontSize = clamp(Math.round(width * 0.038), 22, 46);
+  const maxWidth = width * placements.w;
+  ctx.save();
+  ctx.font = `${fontSize}px 'Patrick Hand', 'Comic Sans MS', cursive`;
+  const words = cue.text.toUpperCase().split(/\s+/);
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(next).width > maxWidth - fontSize * 1.8) { lines.push(line); line = word; }
+    else line = next;
+  }
+  if (line) lines.push(line);
+  const lineHeight = fontSize * 1.08;
+  const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
+  const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
+  const x = clamp(width * placements.x, fontSize * 0.5, width - boxW - fontSize * 0.5);
+  const y = clamp(height * placements.y, fontSize * 0.4, height - boxH - fontSize * 2.2);
+  const radius = Math.min(boxH * 0.42, fontSize * 1.5);
+  ctx.shadowColor = "rgba(0,0,0,.12)";
+  ctx.shadowBlur = 3;
+  ctx.shadowOffsetX = 3;
+  ctx.shadowOffsetY = 3;
+  ctx.fillStyle = "rgba(255,255,252,.97)";
+  ctx.strokeStyle = "#171717";
+  ctx.lineWidth = Math.max(3, width * 0.004);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
+  ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
+  const tailBase = x + boxW * placements.tailX;
+  ctx.lineTo(tailBase + fontSize * 0.45, y + boxH);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.25, y + boxH + fontSize * 1.05, tailBase - fontSize * 0.6, y + boxH + fontSize * 1.45);
+  ctx.quadraticCurveTo(tailBase - fontSize * 0.05, y + boxH + fontSize * 0.55, tailBase - fontSize * 0.5, y + boxH);
+  ctx.lineTo(x + radius, y + boxH);
+  ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.stroke();
+  ctx.fillStyle = "#171717";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((item, index) => ctx.fillText(item, x + boxW / 2, y + fontSize * 0.75 + lineHeight * (index + 0.5)));
+  ctx.restore();
+}
 
 type CharacterFaceSettings = {
   faceBlobUrl: string;
@@ -3166,6 +3268,7 @@ export default function Board2Page() {
   });
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
+  const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
@@ -4966,6 +5069,7 @@ export default function Board2Page() {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
     ctx.restore();
+    drawNarrationSpeechBubble(ctx, time, currentClips, W, H);
   }, [drawStreamGuestsToCtx]);
 
   const drawFrame = useCallback((time: number) => {
@@ -5085,6 +5189,7 @@ export default function Board2Page() {
       characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current,
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
+    drawNarrationSpeechBubble(ctx, time, currentClips, W, H);
   }, []);
 
   const drawBoardImageOverlays = useCallback((time: number) => {
@@ -5471,7 +5576,7 @@ export default function Board2Page() {
             const bufNode = audioCtxCapture.createBufferSource();
             bufNode.buffer = buffer;
             bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, clipOffset), Math.max(0, buffer.duration - 0.01)));
+            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
             bufNode.onended = () => activeNarrationRef.current.delete(clipId);
             activeNarrationRef.current.set(clipId, { bufNode, gainNode });
           })
@@ -5519,7 +5624,7 @@ export default function Board2Page() {
             const bufNode = audioCtxCapture.createBufferSource();
             bufNode.buffer = buffer;
             bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, clipOffset), Math.max(0, buffer.duration - 0.01)));
+            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
             bufNode.onended = () => activeNarrationRef.current.delete(clipId);
             activeNarrationRef.current.set(clipId, { bufNode, gainNode });
           })
@@ -6098,6 +6203,42 @@ export default function Board2Page() {
       setToast(isVideoFile ? "Audio extracted from video" : "Narration added");
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to process file");
+    }
+  }
+
+  async function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
+    if (clip.type !== "narration") return;
+    if (!enabled) {
+      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: false } : item));
+      return;
+    }
+    if (clip.transcriptSegments?.length) {
+      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: true } : item));
+      return;
+    }
+    setTranscribingNarrationId(clip.id);
+    setToast("Transcribing narration for speech bubbles…");
+    try {
+      const audio: Blob = clip.audioBlob instanceof Blob
+        ? clip.audioBlob
+        : await fetch(clip.sourceUrl).then((response) => response.blob());
+      const form = new FormData();
+      form.append("audio", audio, `${clip.name || "narration"}.wav`);
+      const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Transcription failed");
+      const segments: TranscriptSegment[] = Array.isArray(data.segments)
+        ? data.segments
+            .map((segment: TranscriptSegment) => ({ start: Number(segment.start), end: Number(segment.end), text: String(segment.text ?? "").trim() }))
+            .filter((segment: TranscriptSegment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
+        : [];
+      if (!segments.length) throw new Error("No spoken narration was detected");
+      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: true, transcriptSegments: segments } : item));
+      setToast(`Speech bubbles created · ${narrationSentenceCues(segments).length} sentences`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not create speech bubbles");
+    } finally {
+      setTranscribingNarrationId(null);
     }
   }
 
@@ -7979,6 +8120,7 @@ export default function Board2Page() {
             ...c,
             startTime: newStart,
             duration: Math.max(0.1, drag.origStartTime + drag.origDuration - newStart),
+            ...(c.type === "narration" ? { sourceOffsetSec: (c.sourceOffsetSec ?? 0) + (newStart - drag.origStartTime) } : {}),
           };
         })
       );
@@ -8855,7 +8997,12 @@ export default function Board2Page() {
           const bufNode = exportAudioCtx.createBufferSource();
           bufNode.buffer = buffer;
           bufNode.connect(gainNode);
-          bufNode.start(exportStartAcTime + clip.startTime);
+          if (clip.type === "narration") {
+            const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
+            bufNode.start(exportStartAcTime + clip.startTime, offset, Math.min(clip.duration, buffer.duration - offset));
+          } else {
+            bufNode.start(exportStartAcTime + clip.startTime);
+          }
           // For video clips, stop at clip end (buffer may be longer than clip.duration)
           if (clip.type === "video") {
             bufNode.stop(exportStartAcTime + clip.startTime + clip.duration);
@@ -11000,8 +11147,9 @@ export default function Board2Page() {
                     onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); setMobileDrawer("props"); }}
                   >
                     <span style={{ position: "absolute", left: 4, right: HANDLE_W + 2, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#5a1530", pointerEvents: "none" }}>
-                      🎙 {clip.name}
+                      {clip.speechBubbles ? "💬" : "🎙"} {clip.name}
                     </span>
+                    {clip.speechBubbles && <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: 3, background: "#c8f135", pointerEvents: "none" }} />}
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.15)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
                   </div>
@@ -11110,6 +11258,15 @@ export default function Board2Page() {
                           style={{ width: "100%", accentColor: "#c8f135" }}
                         />
                       </div>
+                    )}
+                    {selectedClip.type === "narration" && (
+                      <button
+                        onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                        disabled={transcribingNarrationId === selectedClip.id}
+                        style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                      >
+                        {transcribingNarrationId === selectedClip.id ? "⟳ Transcribing…" : selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Add speech bubbles"}
+                      </button>
                     )}
                     {(selectedClip.type === "video" || selectedClip.type === "narration") && (
                       <div>
@@ -13315,6 +13472,16 @@ export default function Board2Page() {
                   />
                 </div>
 
+                {selectedClip.type === "narration" && (
+                  <button
+                    onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                    disabled={transcribingNarrationId === selectedClip.id}
+                    style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                  >
+                    {transcribingNarrationId === selectedClip.id ? "⟳ Whisper transcription…" : selectedClip.speechBubbles ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments ?? []).length}` : "💬 Add comic speech bubbles"}
+                  </button>
+                )}
+
                 {selectedClip.type !== "narration" && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
@@ -13637,8 +13804,18 @@ export default function Board2Page() {
                     )}
                     {/* Label */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#5a1530", pointerEvents: "none", zIndex: 4 }}>
-                      🎙 {clip.name} {clip.duration.toFixed(1)}s
+                      {clip.speechBubbles ? "💬" : "🎙"} {clip.name} {clip.duration.toFixed(1)}s
                     </span>
+                    {clip.speechBubbles && (
+                      <>
+                        <div style={{ position: "absolute", left: HANDLE_W, right: HANDLE_W, top: 0, height: 4, background: "#c8f135", pointerEvents: "none", zIndex: 4 }} />
+                        {narrationSentenceCues(clip.transcriptSegments ?? []).slice(1).map((cue) => {
+                          const local = cue.start - (clip.sourceOffsetSec ?? 0);
+                          if (local <= 0 || local >= clip.duration) return null;
+                          return <div key={`${clip.id}-${cue.index}`} style={{ position: "absolute", left: HANDLE_W + local / clip.duration * (clipPx - HANDLE_W * 2), top: 4, bottom: 0, borderLeft: "1px dashed rgba(42,42,42,.35)", pointerEvents: "none", zIndex: 3 }} />;
+                        })}
+                      </>
+                    )}
                     {/* Right resize handle */}
                     <div
                       style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}
@@ -14549,11 +14726,6 @@ function audioBufferToWav(buf: AudioBuffer): Blob {
 
 async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {
   const sorted = [...narrationClips].sort((a, b) => a.startTime - b.startTime);
-  if (sorted.length === 1) {
-    const clip = sorted[0];
-    if (clip.audioBlob) return clip.audioBlob;
-    return fetch(clip.sourceUrl).then((r) => r.blob());
-  }
   const tmpCtx = new AudioContext();
   const decoded: { clip: Clip; buffer: AudioBuffer }[] = [];
   try {
@@ -14578,7 +14750,8 @@ async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {
     const node = offCtx.createBufferSource();
     node.buffer = buffer;
     node.connect(offCtx.destination);
-    node.start(clip.startTime - firstStart);
+    const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
+    node.start(clip.startTime - firstStart, offset, Math.min(clip.duration, buffer.duration - offset));
   }
   const rendered = await offCtx.startRendering();
   return audioBufferToWav(rendered);
