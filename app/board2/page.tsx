@@ -88,7 +88,7 @@ function validGuestSignDataUrl(value?: string): value is string {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterZoom" | "narration";
+  type: "image" | "video" | "pan" | "characterZoom" | "customZoom" | "narration";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -472,6 +472,7 @@ const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
 const CHARACTER_ZOOM_CLIP_COLOR = "#c9d4ff";
+const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -3335,6 +3336,8 @@ export default function Board2Page() {
 
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
+  const [customZoomDrawMode, setCustomZoomDrawMode] = useState(false);
+  const [customZoomDrawPreview, setCustomZoomDrawPreview] = useState<BoardMarquee>(null);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -3410,6 +3413,7 @@ export default function Board2Page() {
   const timelineMarqueeRef = useRef<TimelineMarquee>(null);
   const boardMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
   const timelineMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
+  const customZoomDrawModeRef = useRef(false);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
   const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
   const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
@@ -3804,7 +3808,7 @@ export default function Board2Page() {
   }, []);
 
   const buildStreamClips = useCallback(async (maxLongEdge: number) => {
-    const streamable = clipsRef.current.filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.boardX !== undefined);
+    const streamable = clipsRef.current.filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.type !== "customZoom" && c.boardX !== undefined);
     return Promise.all(streamable.map(async (c) => {
       const isVideo = c.type === "video";
       const thumb = isVideo ? thumbnailImagesRef.current.get(c.id) ?? null : null;
@@ -4095,6 +4099,7 @@ export default function Board2Page() {
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { cameraModeRef.current = cameraMode; }, [cameraMode]);
   useEffect(() => { cameraKeyframeModeRef.current = cameraKeyframeMode; }, [cameraKeyframeMode]);
@@ -4828,6 +4833,9 @@ export default function Board2Page() {
         if (img?.complete && img.naturalWidth > 0) {
           drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,renderCraters.filter(crater=>crater.clipId===clip.id));
         }
+      } else if (clip.type === "customZoom") {
+        // No pixels of its own — it's purely a camera target, so whatever else is on the board
+        // at this position (or the bare board surface) shows through untouched.
       } else {
         const vid = videoElsRef.current.get(clip.id);
         const thumbEl = thumbnailImagesRef.current.get(clip.id);
@@ -5777,6 +5785,24 @@ export default function Board2Page() {
     const clip: Clip = { id, type: "characterZoom", name: "Character Zoom", sourceUrl: "", startTime, duration: 3, holdFraction: 0.65, layer: 1 };
     setClips((prev) => [...prev, clip]);
     setSelectedClipId(id);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  // A custom zoom clip carries no media of its own — boardX/Y/W/H mark a hand-drawn region of
+  // the board, and it flows through the same generic boardX-based camera-stop math (see
+  // generateCameraKeyframes) that real image/video clips use, so it zooms in at the correct
+  // aspect ratio without any special-casing there.
+  function addCustomZoomClip(boardX: number, boardY: number, boardW: number, boardH: number, atTime?: number) {
+    const id = generateId();
+    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+    const clip: Clip = {
+      id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
+      startTime, duration: 3, holdFraction: 0.65, layer: 1,
+      boardX: Math.round(boardX), boardY: Math.round(boardY),
+      boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
+    };
+    setClips((prev) => [...prev, clip]);
+    setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
@@ -7835,6 +7861,40 @@ export default function Board2Page() {
         }]);
       }
     };
+    window.addEventListener("pointerup", onUp);
+  }
+
+  // ─ Custom zoom box creation (glass pane) ──────────────────────────────────
+  // Same click-drag-release rectangle mechanic as the annotation tools above, but produces a
+  // Clip (type "customZoom") instead of an Annotation, and auto-disarms draw mode after one box.
+
+  function handleCustomZoomGlassPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.stopPropagation();
+    const container = boardContainerRef.current!;
+    const rect = container.getBoundingClientRect();
+    const startBX = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+    const startBY = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setCustomZoomDrawPreview({ startX: startBX, startY: startBY, currentX: startBX, currentY: startBY });
+    const onMove = (ev: PointerEvent) => {
+      const bx = (ev.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+      const by = (ev.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+      setCustomZoomDrawPreview({ startX: startBX, startY: startBY, currentX: bx, currentY: by });
+    };
+    const onUp = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      setCustomZoomDrawPreview(null);
+      setCustomZoomDrawMode(false);
+      const ex = (ev.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
+      const ey = (ev.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+      const minBX = Math.min(startBX, ex), maxBX = Math.max(startBX, ex);
+      const minBY = Math.min(startBY, ey), maxBY = Math.max(startBY, ey);
+      const bw = maxBX - minBX, bh = maxBY - minBY;
+      if (bw < 10 || bh < 10) return;
+      addCustomZoomClip(minBX, minBY, bw, bh);
+    };
+    window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
 
@@ -10655,7 +10715,7 @@ export default function Board2Page() {
                     top: clip.boardY! * boardZoom,
                     width: clip.boardW! * boardZoom,
                     height: clip.boardH! * boardZoom,
-                    border: isSel ? "2px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.4)",
+                    border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : "1.5px solid rgba(42,42,42,0.4)",
                     boxShadow: isSel ? "0 0 0 2px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : "1px 1px 4px rgba(42,42,42,0.2)",
                     touchAction: "none",
                   }}
@@ -10680,6 +10740,10 @@ export default function Board2Page() {
                         aria-label={clip.name}
                         style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center" }}
                       />
+                    ) : clip.type === "customZoom" ? (
+                      <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.35)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <span style={{ color: "#1c6fc9", fontSize: Math.max(10, 16 * boardZoom), pointerEvents: "none" }}>🔍</span>
+                      </div>
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
                         <span style={{ color: "#7df5b0", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace" }}>▶ {clip.name}</span>
@@ -10882,7 +10946,7 @@ export default function Board2Page() {
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -10907,7 +10971,7 @@ export default function Board2Page() {
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.name}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -11022,7 +11086,7 @@ export default function Board2Page() {
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     <div>
@@ -11335,7 +11399,7 @@ export default function Board2Page() {
 
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-        if (clip.type === "pan" || clip.type === "characterZoom") {
+        if (clip.type === "pan" || clip.type === "characterZoom" || clip.type === "customZoom") {
           manifestClips.push(rest);
         } else if (clip.youtubeId) {
           manifestClips.push({ ...rest, needsRedownload: true });
@@ -11444,7 +11508,7 @@ export default function Board2Page() {
 
       const loadedClips: Clip[] = [];
       for (const mc of (manifest.clips ?? [])) {
-        if (mc.type === "pan" || mc.type === "characterZoom") {
+        if (mc.type === "pan" || mc.type === "characterZoom" || mc.type === "customZoom") {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.needsRedownload) {
           loadedClips.push({ ...mc, sourceUrl: "" });
@@ -11670,6 +11734,16 @@ export default function Board2Page() {
               ◎ Zoom on character
             </button>
             <button
+              onClick={() => setCustomZoomDrawMode((v) => !v)}
+              style={{
+                ...sketchButton, background: CUSTOM_ZOOM_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700,
+                outline: customZoomDrawMode ? "2px solid #2e8fff" : "none", outlineOffset: -2,
+              }}
+              title="Click, then drag a box on the board to zoom into that exact region"
+            >
+              {customZoomDrawMode ? "🔍 Drag a box on the board…" : "🔍 Draw custom zoom"}
+            </button>
+            <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); }}
               style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
             >
@@ -11846,7 +11920,7 @@ export default function Board2Page() {
                         top: clip.boardY! * boardZoom,
                         width: clip.boardW! * boardZoom,
                         height: clip.boardH! * boardZoom,
-                        border: isSel ? "2px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.4)",
+                        border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : "1.5px solid rgba(42,42,42,0.4)",
                         boxShadow: isSel
                           ? "0 0 0 1px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)"
                           : "1px 1px 4px rgba(42,42,42,0.2)",
@@ -11876,6 +11950,10 @@ export default function Board2Page() {
                             aria-label={clip.name}
                             style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center" }}
                           />
+                        ) : clip.type === "customZoom" ? (
+                          <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.3)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <span style={{ color: "#1c6fc9", fontSize: 20, pointerEvents: "none" }}>🔍</span>
+                          </div>
                         ) : (
                           <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
                             <span style={{ color: "#7df5b0", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>▶ {clip.name}</span>
@@ -12199,6 +12277,23 @@ export default function Board2Page() {
                     onPointerDown={handleAnnotationGlassPointerDown}
                   />
                 )}
+
+                {/* Glass pane — drag a rectangle to create a Custom Zoom clip */}
+                {customZoomDrawMode && !isSpaceDown && (
+                  <div
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: "crosshair" }}
+                    onPointerDown={handleCustomZoomGlassPointerDown}
+                  />
+                )}
+                {customZoomDrawPreview && (() => {
+                  const x = Math.min(customZoomDrawPreview.startX, customZoomDrawPreview.currentX) * boardZoom;
+                  const y = Math.min(customZoomDrawPreview.startY, customZoomDrawPreview.currentY) * boardZoom;
+                  const w = Math.abs(customZoomDrawPreview.currentX - customZoomDrawPreview.startX) * boardZoom;
+                  const h = Math.abs(customZoomDrawPreview.currentY - customZoomDrawPreview.startY) * boardZoom;
+                  return (
+                    <div style={{ position: "absolute", left: x, top: y, width: w, height: h, border: "2px solid #2e8fff", background: "rgba(184,226,255,0.3)", pointerEvents: "none", zIndex: 21 }} />
+                  );
+                })()}
               </div>
 
               {/* Empty state */}
@@ -13174,7 +13269,7 @@ export default function Board2Page() {
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
@@ -13184,6 +13279,11 @@ export default function Board2Page() {
                 {selectedClip.type === "characterZoom" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#4a4a7a", background: CHARACTER_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Camera follows and zooms on the character
+                  </div>
+                )}
+                {selectedClip.type === "customZoom" && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#1c6fc9", background: CUSTOM_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+                    Zooms into a hand-drawn region of the board — drag the corners to adjust it
                   </div>
                 )}
                 {selectedClip.type === "narration" && (
@@ -13427,7 +13527,7 @@ export default function Board2Page() {
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const hf = clip.holdFraction ?? HOLD_FRACTION;
@@ -13482,7 +13582,7 @@ export default function Board2Page() {
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
