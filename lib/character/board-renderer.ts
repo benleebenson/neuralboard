@@ -821,6 +821,9 @@ export function drawBoardCharacterToCanvas(
     const tdxLocal = (p.pointTargetBX - p.boardX) * facing;
     if (tdxLocal >= 0) drawOpenHand(rArmA, rForeA);
     else drawOpenHand(lArmA, lForeA);
+  } else if (!p.hideArms && p.forceHandOpen && p.actionType === "explainGesture") {
+    drawOpenHand(lArmA, lForeA);
+    drawOpenHand(rArmA, rForeA);
   }
 
   if (p.popcornAlpha && p.popcornAlpha > 0) {

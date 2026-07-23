@@ -113,6 +113,7 @@ type Clip = {
   waveform?: number[];
   sourceOffsetSec?: number;
   speechBubbles?: boolean;
+  speechBubbleGestures?: boolean;
   transcriptSegments?: TranscriptSegment[];
   // youtube save/restore:
   youtubeId?: string;
@@ -174,7 +175,8 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   if (!active || !anchor) return;
   const { cue, clip } = active;
   const head = anchor ?? { x: width * 0.5, y: height * 0.42, facing: 1 as const };
-  const side = cue.index % 2 === 0 ? -head.facing : head.facing;
+  const sideSeed = seededRandom(`${clip.id}:${cue.index}:${cue.text}`);
+  const side = sideSeed < 0.5 ? -head.facing : head.facing;
   const fontSize = clamp(Math.round(width * 0.022), 15, 27);
   const maxWidth = clamp(width * 0.32, 170, 310);
   ctx.save();
@@ -191,8 +193,8 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
   const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
-  const centerX = head.x + side * fontSize * (4.9 + (cue.index % 2) * 0.55);
-  const centerY = head.y - fontSize * (4.8 + (cue.index % 3) * 0.28);
+  const centerX = head.x + side * fontSize * (4.7 + sideSeed * 0.9);
+  const centerY = head.y - fontSize * (4.65 + seededRandom(`${clip.id}:${cue.index}:bubble-y`) * 0.75);
   const x = clamp(centerX - boxW / 2, fontSize * 0.5, width - boxW - fontSize * 0.5);
   const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
@@ -313,9 +315,11 @@ type CharacterAction = {
                            // character before this action starts (see characterEntranceTime)
   aiGenerated?: boolean;  // produced by /api/board2/character-choreography — shown with a ✨ badge and
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
+  narrationGestureClipId?: string;
+  narrationGestureCueIndex?: number;
 };
 
-type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch";
+type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch" | "explainGesture";
 
 function nextAvailableCharacterActionStart(
   actions: readonly CharacterAction[],
@@ -1095,7 +1099,7 @@ const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
 // Stationary actions whose target is a place to perform the action. Runtime may spend the first
 // part of the same block walking in, but the timeline still stores one action.
-const CHAR_STATIONARY_TARGET_TYPES = new Set<CharacterAction["type"]>(["dance", "emote", "pullUps", "mirrorCheck", "sitAndWatch"]);
+const CHAR_STATIONARY_TARGET_TYPES = new Set<CharacterAction["type"]>(["dance", "emote", "pullUps", "mirrorCheck", "sitAndWatch", "explainGesture"]);
 const CHAR_STATIONARY_NEAR_TARGET_PX = 60;
 const CHAR_STATIONARY_RUN_DIST_PX = 600;
 const CHAR_STATIONARY_WALK_SPEED = 360;
@@ -1669,7 +1673,7 @@ function resolveCharActions(
       const rest = resolvedActionRestPosition(resolvedAction, clips, craters);
       x = rest.x; y = rest.y;
     }
-    // pointAt/explainGesture/idle don't change position; stationary target actions may end at
+    // pointAt/idle don't change position; stationary target actions may end at
     // their target after an evaluation-layer walk-in.
   }
   return result;
@@ -1684,6 +1688,38 @@ function mergeCharActions(derived: CharacterAction[], manual: CharacterAction[])
     )),
     ...manual,
   ].sort((a, b) => a.startTime - b.startTime);
+}
+
+function narrationSpeechGestureActions(
+  clip: Clip,
+  ownerActions: readonly CharacterAction[],
+  owner: CharacterId,
+): CharacterAction[] {
+  if (clip.type !== "narration" || !clip.speechBubbles || clip.speechBubbleGestures === false || !clip.transcriptSegments?.length) return [];
+  const offset = clip.sourceOffsetSec ?? 0;
+  const clipStart = clip.startTime;
+  const clipEnd = clip.startTime + clip.duration;
+  const existing = ownerActions.filter((action) => action.narrationGestureClipId !== clip.id);
+  return narrationSentenceCues(clip.transcriptSegments).flatMap((cue) => {
+    const startTime = clamp(clipStart + cue.start - offset, clipStart, clipEnd);
+    const endTime = clamp(clipStart + cue.end - offset, startTime, clipEnd);
+    const duration = Math.max(0, endTime - startTime);
+    if (duration < 0.35) return [];
+    const overlapsBusyAction = existing.some((action) => {
+      if (action.type === "idle" || action.type === "explainGesture") return false;
+      return startTime < action.startTime + action.duration - 0.001 && startTime + duration > action.startTime + 0.001;
+    });
+    if (overlapsBusyAction) return [];
+    return [{
+      id: `speech_${owner}_${clip.id}_${cue.index}`,
+      type: "explainGesture" as const,
+      startTime,
+      duration,
+      aiGenerated: true,
+      narrationGestureClipId: clip.id,
+      narrationGestureCueIndex: cue.index,
+    }];
+  });
 }
 
 // Derive character actions automatically from the clip timeline (auto-follow mode).
@@ -2779,32 +2815,37 @@ function evalCharPoseRaw(
   }
 
   if (active.type === "explainGesture") {
-    // Animated talking-with-hands loop for image holds: arms alternate raising to gesture height
-    // on independent, slightly-drifting periods (~1s each) so the beats don't lock into a
-    // metronome, punctuated by an occasional two-arm "you see?" spread. Feet stay planted; head
-    // bob / lean / leg weight-shift ride along with the beats to sell it as talking, not idling.
-    const lPhase = time * (Math.PI * 2 / 1.0) + Math.sin(time * 0.17) * 0.6;
-    const rPhase = time * (Math.PI * 2 / 1.15) + Math.PI + Math.sin(time * 0.13 + 1.7) * 0.5;
-    const lRaise = Math.pow(Math.max(0, Math.sin(lPhase)), 1.6);
-    const rRaise = Math.pow(Math.max(0, Math.sin(rPhase)), 1.6);
+    // Open-palmed talking gestures. Sentence-generated actions restart the beat, so the first
+    // bubble pop gets a clear "here's the point" lift before settling into alternating hands.
+    const localT = Math.max(0, time - active.startTime);
+    const cuePop = Math.max(0, 1 - localT / 0.34);
+    const seed = seededRandom(active.id);
+    const leftBeat = 0.5 + 0.5 * Math.sin(localT * (Math.PI * 2 / 1.05) + seed * Math.PI);
+    const rightBeat = 0.5 + 0.5 * Math.sin(localT * (Math.PI * 2 / 1.22) + Math.PI + seed * 4.1);
+    const lRaise = Math.pow(leftBeat, 1.75);
+    const rRaise = Math.pow(rightBeat, 1.75);
+    const spreadCycle = (localT + seed * 1.7) % 3.2;
+    const spread = Math.max(0, 1 - Math.abs(spreadCycle - 1.45) / 0.42);
+    const pointBeat = Math.max(0, 1 - Math.abs(((localT + 0.18) % 2.6) - 0.4) / 0.22);
 
-    // Two-arm spread roughly every ~4.3s (non-integer period to avoid syncing with the arm beats)
-    const spreadCycle = time % 4.3;
-    const spread = Math.max(0, 1 - Math.abs(spreadCycle - 2.0) / 0.5);
-
-    const leftArmA = CHAR_RELAX_ARM_A + lRaise * 0.95 + spread * 0.35;
-    const rightArmA = -CHAR_RELAX_ARM_A - rRaise * 0.95 - spread * 0.35;
-    const leftForeA = CHAR_RELAX_FORE_A + lRaise * 0.35 + spread * 0.15;
-    const rightForeA = -CHAR_RELAX_FORE_A - rRaise * 0.35 - spread * 0.15;
+    const leftArmA = 0.18 + lRaise * 0.64 + spread * 0.34 + cuePop * 0.42;
+    const rightArmA = -0.18 - rRaise * 0.64 - spread * 0.34 - pointBeat * 0.5 - cuePop * 0.18;
+    const leftForeA = 0.1 + lRaise * 0.55 + spread * 0.22 + cuePop * 0.18;
+    const rightForeA = -0.1 - rRaise * 0.55 - spread * 0.22 - pointBeat * 0.18 - cuePop * 0.1;
+    const facing: 1 | -1 = active.targetX !== undefined && Math.abs(active.targetX - active.fromX) > 3
+      ? active.targetX >= active.fromX ? 1 : -1
+      : 1;
 
     return applyAuthoredPose({
-      boardX: active.fromX, boardY: active.fromY, facing: 1,
-      headBob: Math.sin(time * 1.1) * 1.5 + (lRaise + rRaise) * 1.5,
-      bodyLean: Math.sin(time * 0.6) * 0.05 + (lRaise - rRaise) * 0.06,
-      leftLegA: 0.1 + Math.sin(time * 0.5) * 0.06,
-      rightLegA: -0.1 - Math.sin(time * 0.5 + 1.3) * 0.06,
+      boardX: active.fromX, boardY: active.fromY, facing,
+      headBob: Math.sin(localT * 2.2) * 1.2 + (lRaise + rRaise) * 1.05 - cuePop * 2,
+      bodyLean: Math.sin(localT * 0.9 + seed) * 0.035 + (lRaise - rRaise) * 0.045 + cuePop * 0.04,
+      headTilt: Math.sin(localT * 1.35 + seed * 2) * 0.045 + pointBeat * 0.035,
+      leftLegA: 0.1 + Math.sin(localT * 0.75) * 0.045,
+      rightLegA: -0.1 - Math.sin(localT * 0.75 + 1.3) * 0.045,
       leftArmA, rightArmA, leftForeA, rightForeA,
       airY: 0,
+      forceHandOpen: true,
     }, authoredPose);
   }
 
@@ -6010,6 +6051,8 @@ export default function Board2Page() {
     if (clip?.type === "narration") {
       stopNarrationAudio(clipId);
       URL.revokeObjectURL(clip.sourceUrl);
+      setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
+      setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
     }
     setClips((prev) => prev.filter((c) => c.id !== clipId));
     setSelectedClipIds((prev) => prev.filter((id) => id !== clipId));
@@ -6372,12 +6415,26 @@ export default function Board2Page() {
 
   async function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
     if (clip.type !== "narration") return;
+    const owner = activeCharacterIdRef.current;
+    const applyGestureActions = (updatedClip: Clip) => {
+      const resolvedOwnerActions = owner === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+      updateCharacterActionsFor(owner, (prev) => [
+        ...prev.filter((action) => action.narrationGestureClipId !== updatedClip.id),
+        ...narrationSpeechGestureActions(updatedClip, resolvedOwnerActions, owner),
+      ]);
+    };
     if (!enabled) {
       setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: false } : item));
+      setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
+      setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
       return;
     }
     if (clip.transcriptSegments?.length) {
-      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: true } : item));
+      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: clip.speechBubbleGestures !== false };
+      setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
+      if (updatedClip.speechBubbleGestures) applyGestureActions(updatedClip);
+      if (owner === "c2") setShowCharacter2(true);
+      else setShowCharacter(true);
       return;
     }
     setTranscribingNarrationId(clip.id);
@@ -6397,13 +6454,35 @@ export default function Board2Page() {
             .filter((segment: TranscriptSegment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
         : [];
       if (!segments.length) throw new Error("No spoken narration was detected");
-      setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbles: true, transcriptSegments: segments } : item));
+      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: true, transcriptSegments: segments };
+      setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
+      applyGestureActions(updatedClip);
+      if (owner === "c2") setShowCharacter2(true);
+      else setShowCharacter(true);
       setToast(`Speech bubbles created · ${narrationSentenceCues(segments).length} sentences`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Could not create speech bubbles");
     } finally {
       setTranscribingNarrationId(null);
     }
+  }
+
+  function setNarrationSpeechGestures(clip: Clip, enabled: boolean) {
+    if (clip.type !== "narration") return;
+    const owner = activeCharacterIdRef.current;
+    const updatedClip = { ...clip, speechBubbleGestures: enabled };
+    setClips((current) => current.map((item) => item.id === clip.id ? { ...item, speechBubbleGestures: enabled } : item));
+    setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
+    setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
+    if (!enabled || !updatedClip.speechBubbles || !updatedClip.transcriptSegments?.length) return;
+    const resolvedOwnerActions = owner === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+    updateCharacterActionsFor(owner, (prev) => [
+      ...prev.filter((action) => action.narrationGestureClipId !== clip.id),
+      ...narrationSpeechGestureActions(updatedClip, resolvedOwnerActions, owner),
+    ]);
+    if (owner === "c2") setShowCharacter2(true);
+    else setShowCharacter(true);
+    setToast("Speech hand motions on");
   }
 
   // ─ Media upload ───────────────────────────────────────────────────────────
@@ -11426,13 +11505,24 @@ export default function Board2Page() {
                       </div>
                     )}
                     {selectedClip.type === "narration" && (
-                      <button
-                        onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                        disabled={transcribingNarrationId === selectedClip.id}
-                        style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
-                      >
-                        {transcribingNarrationId === selectedClip.id ? "⟳ Transcribing…" : selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Add speech bubbles"}
-                      </button>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        <button
+                          onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                          disabled={transcribingNarrationId === selectedClip.id}
+                          style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                        >
+                          {transcribingNarrationId === selectedClip.id ? "⟳ Transcribing…" : selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Add speech bubbles"}
+                        </button>
+                        {selectedClip.speechBubbles && (
+                          <button
+                            type="button"
+                            onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                            style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                          >
+                            {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                          </button>
+                        )}
+                      </div>
                     )}
                     {(selectedClip.type === "video" || selectedClip.type === "narration") && (
                       <div>
@@ -13057,6 +13147,7 @@ export default function Board2Page() {
                       pullUps: 4.0,
                       bazooka: 2.4,
                       mirrorCheck: 5.0,
+                      explainGesture: 2.4,
                       flip: 1.2,
                       zipline: 2.0,
                       wallClimb: 2.0,
@@ -13232,10 +13323,10 @@ export default function Board2Page() {
 
             {(selectedCharAction || characterPanelOpen) && (() => {
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: selectedCharAction?.emoji ?? "🤔",
-                flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬", idle: "⏸",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: selectedCharAction?.emoji ?? "🤔",
+                flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", idle: "⏸",
               };
-              const targetableAction = selectedCharAction && !["emote", "idle", "explainGesture"].includes(selectedCharAction.type);
+              const targetableAction = selectedCharAction && !["emote", "idle"].includes(selectedCharAction.type);
               const addButtons: Array<{ mode: CharacterAddMode; label: string; title: string }> = [
                 { mode: "walkTo", label: "Walk", title: "Click board to walk to a position" },
                 { mode: "jumpTo", label: "Jump", title: "Click board to jump to a position" },
@@ -13245,6 +13336,7 @@ export default function Board2Page() {
                 { mode: "wallClimb", label: "Climb", title: "Click board to climb to a position" },
                 { mode: "skateTo", label: "Skate", title: "Click a target image/video to skate there" },
                 { mode: "sitAndWatch", label: "Sit & Watch", title: "Click board to sit and watch" },
+                { mode: "explainGesture", label: "Talk", title: "Click board to place talking hand motions" },
                 { mode: "pointAt", label: "Point", title: "Click board to point at a position" },
                 { mode: "dance", label: "Dance", title: "Click board to place a hip-shake dance loop" },
                 { mode: "emote", label: "Emote", title: "Choose an emoji and place it at the playhead" },
@@ -13746,13 +13838,24 @@ export default function Board2Page() {
                 </div>
 
                 {selectedClip.type === "narration" && (
-                  <button
-                    onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                    disabled={transcribingNarrationId === selectedClip.id}
-                    style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
-                  >
-                    {transcribingNarrationId === selectedClip.id ? "⟳ Whisper transcription…" : selectedClip.speechBubbles ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments ?? []).length}` : "💬 Add comic speech bubbles"}
-                  </button>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <button
+                      onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                      disabled={transcribingNarrationId === selectedClip.id}
+                      style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                    >
+                      {transcribingNarrationId === selectedClip.id ? "⟳ Whisper transcription…" : selectedClip.speechBubbles ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments ?? []).length}` : "💬 Add comic speech bubbles"}
+                    </button>
+                    {selectedClip.speechBubbles && (
+                      <button
+                        type="button"
+                        onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                        style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                      >
+                        {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                      </button>
+                    )}
+                  </div>
                 )}
 
                 {selectedClip.type !== "narration" && (
@@ -14115,8 +14218,8 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
-                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: action.emoji ?? "🤔", idle: "⏸",
+                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
                       <div
@@ -14213,8 +14316,8 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", emote: action.emoji ?? "🤔", idle: "⏸",
-                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", explainGesture: "💬",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: action.emoji ?? "🤔", idle: "⏸",
+                      flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
                       <div
