@@ -191,11 +191,14 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
   const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
-  const centerX = head.x + side * fontSize * (6.2 + (cue.index % 2) * 0.8);
-  const centerY = head.y - fontSize * (5.8 + (cue.index % 3) * 0.35);
+  const centerX = head.x + side * fontSize * (4.9 + (cue.index % 2) * 0.55);
+  const centerY = head.y - fontSize * (4.8 + (cue.index % 3) * 0.28);
   const x = clamp(centerX - boxW / 2, fontSize * 0.5, width - boxW - fontSize * 0.5);
   const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
+  const tailBase = clamp(head.x, x + fontSize * 1.4, x + boxW - fontSize * 1.4);
+  const tailTipX = clamp(head.x + side * fontSize * 1.25, x + fontSize * 0.8, x + boxW - fontSize * 0.8);
+  const tailTipY = clamp(head.y - fontSize * 1.65, y + boxH + fontSize * 0.35, height - fontSize * 0.5);
   const cueDuration = Math.max(0.001, cue.end - cue.start);
   const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
   const cueT = clamp((sourceTime - cue.start) / cueDuration, 0, 1);
@@ -214,6 +217,9 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   ctx.moveTo(x + radius, y);
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
   ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
+  ctx.lineTo(tailBase + fontSize * 0.42, y + boxH);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.85, tailTipX, tailTipY);
+  ctx.quadraticCurveTo(tailBase - fontSize * 0.24, y + boxH + fontSize * 0.48, tailBase - fontSize * 0.45, y + boxH);
   ctx.lineTo(x + radius, y + boxH);
   ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
   ctx.quadraticCurveTo(x, y, x + radius, y);
@@ -247,6 +253,7 @@ type CharacterInstance = {
   faceBlobUrl?: string;
   faceAspect?: number;
   mouthAnchor?: HeadLocalPoint;
+  start?: { x: number; y: number };
 };
 
 type FaceCropCorner = "nw" | "ne" | "sw" | "se";
@@ -3409,6 +3416,9 @@ export default function Board2Page() {
   const [characterSkin2, setCharacterSkin2] = useState<CharacterSkin>("stick");
   const [characterViseme, setCharacterViseme] = useState<Viseme | "auto">("auto");
   const [characterViseme2, setCharacterViseme2] = useState<Viseme | "auto">("auto");
+  const [characterStart, setCharacterStart] = useState<{ x: number; y: number } | null>(null);
+  const [characterStart2, setCharacterStart2] = useState<{ x: number; y: number } | null>(null);
+  const [characterStartPickId, setCharacterStartPickId] = useState<CharacterId | null>(null);
   const [activeCharacterId, setActiveCharacterId] = useState<CharacterId>("c1");
   const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
@@ -3549,8 +3559,8 @@ export default function Board2Page() {
       ? characterActions2.find((a) => a.id === selectedCharActionId) ?? null
       : null;
   const activeCharacter: CharacterInstance = activeCharacterId === "c2"
-    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor }
-    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor };
+    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor, start: characterStart2 ?? undefined }
+    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
   const characterDuration = characterProjectDuration(characterActions);
   const generatedDuration = cameraKeyframeMode === "character" && characterDuration > 0
     ? characterDuration
@@ -3682,6 +3692,8 @@ export default function Board2Page() {
   const authoredAnimationsRef = useRef<Record<string, AuthoredAnimation>>({});
   const charInitXRef = useRef(BOARD_W / 2);
   const charInitYRef = useRef(BOARD_H * 0.75);
+  const charInit2XRef = useRef(BOARD_W / 2 + 60);
+  const charInit2YRef = useRef(BOARD_H * 0.75);
   const characterEntranceTimeRef = useRef(-Infinity);
   const characterEntranceTime2Ref = useRef(-Infinity);
   const characterAddModeRef = useRef<CharacterAddMode | null>(null);
@@ -3778,7 +3790,7 @@ export default function Board2Page() {
 
   const resetLiveRuntimeFor = useCallback((id: CharacterId, startPose?: CharPoseResult) => {
     const now = performance.now();
-    const fallback = id === "c2" ? { x: charInitXRef.current + 60, y: charInitYRef.current } : { x: charInitXRef.current, y: charInitYRef.current };
+    const fallback = id === "c2" ? { x: charInit2XRef.current, y: charInit2YRef.current } : { x: charInitXRef.current, y: charInitYRef.current };
     const center = liveBoardCenter(fallback.x, fallback.y);
     const pose = startPose ?? (id === "c2"
       ? evalCharAtTime(playheadRef.current, resolvedCharActions2Ref.current, fallback.x, fallback.y, clipsRef.current, authoredAnimationsRef.current)
@@ -4430,7 +4442,9 @@ export default function Board2Page() {
   // whenever clips (reorder/add/delete/holdFraction/board-position — all produce a new `clips`
   // array reference), characterActions (manual edits), or characterMode change. There is no way
   // for this to go stale: a clip reorder is automatically reflected on the very next render.
-  const charInit = useMemo(() => getCharInitPos(clips), [clips]);
+  const defaultCharInit = useMemo(() => getCharInitPos(clips), [clips]);
+  const charInit = characterStart ?? defaultCharInit;
+  const charInit2 = useMemo(() => characterStart2 ?? { x: charInit.x + 60, y: charInit.y }, [characterStart2, charInit]);
   const resolvedCharActions = useMemo(() => {
     const merged = characterMode === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions)
@@ -4446,17 +4460,17 @@ export default function Board2Page() {
   }, [characterMode, clips, resolvedCharActions]);
   const resolvedCharActions2 = useMemo(() => {
     const merged = characterMode2 === "auto"
-      ? mergeCharActions(deriveAutoCharActions(clips, charInit.x + 60, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions2)
+      ? mergeCharActions(deriveAutoCharActions(clips, charInit2.x, charInit2.y, cameraKeyframes, canvasW, canvasH), characterActions2)
       : characterActions2;
     return resolveCharActions(
       merged,
-      charInit.x + 60,
-      charInit.y,
+      charInit2.x,
+      charInit2.y,
       clips,
       showCharacter ? [{ resolved: resolvedCharActions, initX: charInit.x, initY: charInit.y, entranceTime: characterEntranceTime }] : [],
       characterMode2 === "auto" ? 60 : 0
     );
-  }, [clips, characterActions2, characterMode2, charInit, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
+  }, [clips, characterActions2, characterMode2, charInit, charInit2, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
 
   // Character-camera mode resolves stored manual + AI choreography only. Clip-schedule auto
   // derivation stays exclusive to clips mode, while Character 2 retains the current collision
@@ -4468,13 +4482,13 @@ export default function Board2Page() {
   const cameraResolvedCharActions2 = useMemo(
     () => resolveCharActions(
       characterActions2,
-      charInit.x + 60,
-      charInit.y,
+      charInit2.x,
+      charInit2.y,
       clips,
       showCharacter ? [{ resolved: cameraResolvedCharActions, initX: charInit.x, initY: charInit.y, entranceTime: -Infinity }] : [],
       60,
     ),
-    [characterActions2, charInit, clips, showCharacter, cameraResolvedCharActions],
+    [characterActions2, charInit, charInit2, clips, showCharacter, cameraResolvedCharActions],
   );
   const occupancyWindows = useMemo(() => {
     if (cameraKeyframeMode !== "character" || characterDuration <= 0) return [];
@@ -4505,11 +4519,13 @@ export default function Board2Page() {
   useEffect(() => {
     charInitXRef.current = charInit.x;
     charInitYRef.current = charInit.y;
+    charInit2XRef.current = charInit2.x;
+    charInit2YRef.current = charInit2.y;
     resolvedCharActionsRef.current = resolvedCharActions;
     resolvedCharActions2Ref.current = resolvedCharActions2;
     characterEntranceTimeRef.current = characterEntranceTime;
     characterEntranceTime2Ref.current = characterEntranceTime2;
-  }, [charInit, resolvedCharActions, resolvedCharActions2, characterEntranceTime, characterEntranceTime2]);
+  }, [charInit, charInit2, resolvedCharActions, resolvedCharActions2, characterEntranceTime, characterEntranceTime2]);
 
   useEffect(() => {
     const check = () => {
@@ -5161,11 +5177,11 @@ export default function Board2Page() {
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
       const resolved = resolvedCharActions2Ref.current;
-      const pose = evalCharAtTime(time, resolved, charInitXRef.current + 60, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
+      const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, showCharacter2Ref.current,
-        cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
+        cam, sf, W, H, charInit2XRef.current, charInit2YRef.current,
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
@@ -5268,6 +5284,7 @@ export default function Board2Page() {
       resolved: ResolvedCharAction[],
       enabled: boolean,
       initX: number,
+      initY: number,
       faceSettings: CharacterFaceSettings | null,
       faceImage: HTMLImageElement | null,
       skin: CharacterSkin,
@@ -5275,12 +5292,12 @@ export default function Board2Page() {
     ) => {
       if (!enabled) return;
       const pose = evalCharAtTime(
-        time, resolved, initX, charInitYRef.current, currentClips, authoredAnimationsRef.current,
+        time, resolved, initX, initY, currentClips, authoredAnimationsRef.current,
         !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
       );
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
-        ctx, time, resolved, true, cam, sf, W, H, initX, charInitYRef.current,
+        ctx, time, resolved, true, cam, sf, W, H, initX, initY,
         currentClips, -Infinity, authoredAnimationsRef.current,
         faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect, mouthAnchor: faceSettings.mouthAnchor } : null,
         skin, { ...pose, viseme },
@@ -5305,12 +5322,12 @@ export default function Board2Page() {
 
     drawEditorCharacter(
       "c1",
-      resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current,
+      resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current, charInitYRef.current,
       characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, characterVisemeRef.current,
     );
     drawEditorCharacter(
       "c2",
-      resolvedCharActions2Ref.current, showCharacter2Ref.current, charInitXRef.current + 60,
+      resolvedCharActions2Ref.current, showCharacter2Ref.current, charInit2XRef.current, charInit2YRef.current,
       characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, characterViseme2Ref.current,
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
@@ -7611,6 +7628,7 @@ export default function Board2Page() {
     setSelectedAnnotationId(null);
     setSelectedCharActionId(null);
     setRetargetCharActionId(null);
+    setCharacterStartPickId(null);
   }
 
   function selectCharAction(id: string) {
@@ -7635,6 +7653,7 @@ export default function Board2Page() {
     setSelectedAnnotationId(null);
     setSelectedCharActionId(null);
     selectedCharActionIdRef.current = null;
+    setCharacterStartPickId(null);
     setCharacterPanelOpen(true);
     setCharacterToolbarOpen(false);
   }
@@ -8571,8 +8590,8 @@ export default function Board2Page() {
             const pose = evalCharAtTime(
               time,
               cameraResolvedCharActions2,
-              charInit.x + 60,
-              charInit.y,
+              charInit2.x,
+              charInit2.y,
               clipsRef.current,
               authoredAnimationsRef.current,
             );
@@ -8661,8 +8680,8 @@ export default function Board2Page() {
       const pose = evalCharAtTime(
         t,
         useC2 ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
-        useC2 ? charInitXRef.current + 60 : charInitXRef.current,
-        charInitYRef.current,
+        useC2 ? charInit2XRef.current : charInitXRef.current,
+        useC2 ? charInit2YRef.current : charInitYRef.current,
         clipsRef.current,
         authoredAnimationsRef.current
       );
@@ -11740,8 +11759,8 @@ export default function Board2Page() {
       const manifestFace = await saveFaceAsset(characterFaceRef.current, "assets/character-face-c1.png");
       const manifestFace2 = await saveFaceAsset(characterFace2Ref.current, "assets/character-face-c2.png");
       const manifestCharacters: ManifestCharacter[] = [
-        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current, face: manifestFace },
-        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current, face: manifestFace2 },
+        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current, start: characterStart ?? undefined, face: manifestFace },
+        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current, start: characterStart2 ?? undefined, face: manifestFace2 },
       ];
 
       const manifest = {
@@ -11762,6 +11781,7 @@ export default function Board2Page() {
         characterMode: characterModeRef.current,
         characterSkin: characterSkinRef.current,
         characterFace: manifestFace,
+        characterStart: characterStart ?? undefined,
         characters: manifestCharacters,
         spawnDoor: spawnDoorRef.current,
       };
@@ -11868,6 +11888,13 @@ export default function Board2Page() {
           mouthAnchor: face.mouthAnchor,
         };
       };
+      const loadStart = (value: unknown): { x: number; y: number } | null => {
+        if (!value || typeof value !== "object") return null;
+        const point = value as { x?: unknown; y?: unknown };
+        return typeof point.x === "number" && Number.isFinite(point.x) && typeof point.y === "number" && Number.isFinite(point.y)
+          ? { x: point.x, y: point.y }
+          : null;
+      };
       if (Array.isArray(manifest.characters)) {
         type LoadedCharacter = Partial<CharacterInstance> & { id?: CharacterId; face?: ManifestFace | null };
         const c1 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c1");
@@ -11877,11 +11904,13 @@ export default function Board2Page() {
         setCharacterMode(c1?.mode ?? "auto");
         setCharacterSkin(c1?.skin === "styled" ? "styled" : "stick");
         setCharacterFace(loadFace(c1?.face));
+        setCharacterStart(loadStart(c1?.start));
         setCharacterActions2(c2?.actions ?? []);
         setShowCharacter2(c2?.enabled ?? false);
         setCharacterMode2(c2?.mode ?? "auto");
         setCharacterSkin2(c2?.skin === "styled" ? "styled" : "stick");
         setCharacterFace2(loadFace(c2?.face));
+        setCharacterStart2(loadStart(c2?.start));
       } else {
         if (manifest.characterActions) setCharacterActions(manifest.characterActions);
         else setCharacterActions([]);
@@ -11891,11 +11920,13 @@ export default function Board2Page() {
         else setCharacterMode("auto");
         setCharacterSkin(manifest.characterSkin === "styled" ? "styled" : "stick");
         setCharacterFace(loadFace(manifest.characterFace));
+        setCharacterStart(loadStart(manifest.characterStart));
         setCharacterActions2([]);
         setShowCharacter2(false);
         setCharacterMode2("auto");
         setCharacterSkin2("stick");
         setCharacterFace2(null);
+        setCharacterStart2(null);
       }
       setToast(`Loaded "${manifest.name ?? "board"}"`);
     } catch (err) {
@@ -12981,8 +13012,8 @@ export default function Board2Page() {
                 </ProGated>
               </div>
 
-              {/* Character placement overlay — captures board click when characterAddMode or retargeting is set */}
-              {activeCharacter.enabled && ((characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
+              {/* Character placement overlay — captures board click when characterAddMode, start picking, or retargeting is set */}
+              {activeCharacter.enabled && (characterStartPickId || (characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
                 <div
                   style={{ position: "absolute", inset: 0, cursor: "crosshair", zIndex: 28 }}
                   onClick={(e) => {
@@ -12999,6 +13030,23 @@ export default function Board2Page() {
                         rawBx >= c.boardX && rawBx <= c.boardX + c.boardW &&
                         rawBy >= c.boardY && rawBy <= c.boardY + c.boardH
                       );
+                    if (characterStartPickId) {
+                      const next = { x: Math.round(snapped.x), y: Math.round(snapped.y) };
+                      if (characterStartPickId === "c2") {
+                        setCharacterStart2(next);
+                        charInit2XRef.current = next.x;
+                        charInit2YRef.current = next.y;
+                      } else {
+                        setCharacterStart(next);
+                        charInitXRef.current = next.x;
+                        charInitYRef.current = next.y;
+                      }
+                      if (liveControlEnabledRef.current) resetLiveRuntimeFor(characterStartPickId);
+                      setCharacterStartPickId(null);
+                      setToast(`Character ${characterStartPickId === "c2" ? "2" : "1"} start position set`);
+                      drawFrameRef.current(playheadRef.current);
+                      return;
+                    }
                     const durationMap: Record<string, number> = {
                       walkTo: 1.5,
                       jumpTo: 1.0,
@@ -13251,6 +13299,7 @@ export default function Board2Page() {
                             setActiveCharacterId(selectedCharActionOwner ?? activeCharacterId);
                             setRetargetCharActionId(selectedCharAction.id);
                             setCharacterAddMode(null);
+                            setCharacterStartPickId(null);
                           }}
                           style={{ ...miniButton, background: retargetCharActionId === selectedCharAction.id ? "#2a2a2a" : "transparent", color: retargetCharActionId === selectedCharAction.id ? CHARACTER_COLOR : "#2a2a2a" }}
                         >
@@ -13318,6 +13367,7 @@ export default function Board2Page() {
                             setShowCharacter2(false);
                             setCharacterActions2([]);
                             setCharacterFace2(null);
+                            setCharacterStart2(null);
                             setSelectedCharActionId(null);
                           }}
                           style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
@@ -13346,6 +13396,48 @@ export default function Board2Page() {
                       >
                         {activeCharacter.enabled ? "● Show Character" : "○ Show Character"}
                       </button>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (activeCharacterId === "c2") setShowCharacter2(true);
+                            else setShowCharacter(true);
+                            setCharacterPanelOpen(true);
+                            setRetargetCharActionId(null);
+                            setCharacterAddMode(null);
+                            setCharacterEmojiPickerOpen(false);
+                            setCharacterStartPickId((prev) => (prev === activeCharacterId ? null : activeCharacterId));
+                          }}
+                          style={{ ...miniButton, flex: 1, background: characterStartPickId === activeCharacterId || !!activeCharacter.start ? "#f4b942" : "transparent" }}
+                        >
+                          {characterStartPickId === activeCharacterId ? "Click board for start..." : activeCharacter.start ? "Move Start Position" : "Set Start Position"}
+                        </button>
+                        {activeCharacter.start && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (activeCharacterId === "c2") {
+                                const fallback = { x: charInit.x + 60, y: charInit.y };
+                                setCharacterStart2(null);
+                                charInit2XRef.current = fallback.x;
+                                charInit2YRef.current = fallback.y;
+                                if (liveControlEnabledRef.current) resetLiveRuntimeFor("c2");
+                              } else {
+                                setCharacterStart(null);
+                                charInitXRef.current = defaultCharInit.x;
+                                charInitYRef.current = defaultCharInit.y;
+                                if (liveControlEnabledRef.current) resetLiveRuntimeFor("c1");
+                              }
+                              setCharacterStartPickId(null);
+                              setToast(`Character ${activeCharacterId === "c2" ? "2" : "1"} start reset`);
+                              drawFrameRef.current(playheadRef.current);
+                            }}
+                            style={{ ...miniButton, padding: "5px 6px", color: "#ff5e3a", borderColor: "#ff5e3a" }}
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
                       <ProGated featureName="Live Character Control">
                         <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: liveControlEnabled ? "#f0ffe0" : "transparent" }}>
                           <button
@@ -13483,6 +13575,7 @@ export default function Board2Page() {
                                 setCharacterMode("manual");
                               }
                               setRetargetCharActionId(null);
+                              setCharacterStartPickId(null);
                               if (mode === "emote") {
                                 setCharacterEmojiPickerOpen((v) => !v);
                                 setCharacterAddMode("emote");
@@ -13499,6 +13592,9 @@ export default function Board2Page() {
                       </div>
                       {characterAddMode && characterAddMode !== "emote" && (
                         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>Click the board to place {characterAddMode}.</div>
+                      )}
+                      {characterStartPickId === activeCharacterId && (
+                        <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>Click the board to set this character start position.</div>
                       )}
                       {characterEmojiPickerOpen && (
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 24px)", gap: 2 }}>
