@@ -29,6 +29,7 @@ import {
   streamChannelName,
   resolveStreamSkin,
 } from "@/lib/stream";
+import type { Viseme, HeadLocalPoint } from "@/lib/stream";
 import {
   PLAY_CHARACTER_HEIGHT,
   PLAY_GRAVITY,
@@ -51,6 +52,7 @@ import {
   projectilePoint,
   streamCharacterConstructionParams,
 } from "@/lib/character/renderer";
+import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
@@ -121,33 +123,40 @@ type Clip = {
 
 type TranscriptSegment = { start: number; end: number; text: string };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
+type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
 
 function narrationSentenceCues(segments: readonly TranscriptSegment[]): SpeechBubbleCue[] {
   const cues: SpeechBubbleCue[] = [];
-  let text = "";
-  let start = 0;
-  let end = 0;
-  const flush = () => {
-    const clean = text.trim();
-    if (clean) cues.push({ start, end, text: clean, index: cues.length });
-    text = "";
+  const pushChunks = (segment: TranscriptSegment, parts: string[]) => {
+    const cleanParts = parts.map((part) => part.trim()).filter(Boolean);
+    const totalChars = Math.max(1, cleanParts.reduce((sum, part) => sum + part.length, 0));
+    let cursor = segment.start;
+    for (const part of cleanParts) {
+      const partEnd = cursor + (segment.end - segment.start) * part.length / totalChars;
+      const words = part.split(/\s+/).filter(Boolean);
+      let text = "";
+      let start = cursor;
+      for (const word of words) {
+        const next = text ? `${text} ${word}` : word;
+        if (text && next.length > 48) {
+          const chunkEnd = cursor + (partEnd - cursor) * Math.max(0.2, text.length / Math.max(1, part.length));
+          cues.push({ start, end: chunkEnd, text, index: cues.length });
+          start = chunkEnd;
+          text = word;
+        } else {
+          text = next;
+        }
+      }
+      if (text.trim()) cues.push({ start, end: partEnd, text: text.trim(), index: cues.length });
+      cursor = partEnd;
+    }
   };
   for (const segment of segments) {
     const clean = segment.text.trim();
     if (!clean) continue;
-    const parts = clean.match(/.*?[.!?](?:[\"')\]]+)?(?=\s|$)|.+$/g)?.map((part) => part.trim()).filter(Boolean) ?? [clean];
-    const totalChars = Math.max(1, parts.reduce((sum, part) => sum + part.length, 0));
-    let cursor = segment.start;
-    for (const part of parts) {
-      const partEnd = cursor + (segment.end - segment.start) * part.length / totalChars;
-      if (!text) start = cursor;
-      text = `${text} ${part}`.trim();
-      end = partEnd;
-      cursor = partEnd;
-      if (/[.!?][\"')\]]?$/.test(part) || text.length >= 105) flush();
-    }
+    const parts = clean.match(/.*?[,;:](?=\s|$)|.*?[.!?](?:[\"')\]]+)?(?=\s|$)|.+$/g) ?? [clean];
+    pushChunks(segment, parts);
   }
-  flush();
   return cues.map((cue, index, all) => ({ ...cue, end: all[index + 1]?.start ?? cue.end, index }));
 }
 
@@ -160,18 +169,14 @@ function activeNarrationBubble(time: number, clips: readonly Clip[]): { cue: Spe
   return cue ? { cue, clip } : null;
 }
 
-function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number) {
+function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number, anchor?: SpeechBubbleAnchor | null) {
   const active = activeNarrationBubble(time, clips);
   if (!active) return;
   const { cue } = active;
-  const placements = [
-    { x: 0.08, y: 0.07, w: 0.56, tailX: 0.3 },
-    { x: 0.36, y: 0.08, w: 0.56, tailX: 0.72 },
-    { x: 0.16, y: 0.05, w: 0.68, tailX: 0.5 },
-    { x: 0.3, y: 0.14, w: 0.6, tailX: 0.66 },
-  ][cue.index % 4];
-  const fontSize = clamp(Math.round(width * 0.038), 22, 46);
-  const maxWidth = width * placements.w;
+  const head = anchor ?? { x: width * 0.5, y: height * 0.42, facing: 1 as const };
+  const side = cue.index % 2 === 0 ? -head.facing : head.facing;
+  const fontSize = clamp(Math.round(width * 0.022), 15, 27);
+  const maxWidth = clamp(width * 0.32, 170, 310);
   ctx.save();
   ctx.font = `${fontSize}px 'Patrick Hand', 'Comic Sans MS', cursive`;
   const words = cue.text.toUpperCase().split(/\s+/);
@@ -186,9 +191,11 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
   const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
-  const x = clamp(width * placements.x, fontSize * 0.5, width - boxW - fontSize * 0.5);
-  const y = clamp(height * placements.y, fontSize * 0.4, height - boxH - fontSize * 2.2);
+  const x = clamp(head.x + side * fontSize * 3.1 - (side < 0 ? boxW : 0), fontSize * 0.5, width - boxW - fontSize * 0.5);
+  const y = clamp(head.y - boxH - fontSize * (1.55 + (cue.index % 3) * 0.32), fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
+  const tailBase = clamp(head.x, x + fontSize * 1.2, x + boxW - fontSize * 1.2);
+  const tailTipY = clamp(head.y + fontSize * 0.3, y + boxH + fontSize * 0.4, height - fontSize * 0.5);
   ctx.shadowColor = "rgba(0,0,0,.12)";
   ctx.shadowBlur = 3;
   ctx.shadowOffsetX = 3;
@@ -200,10 +207,9 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   ctx.moveTo(x + radius, y);
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
   ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
-  const tailBase = x + boxW * placements.tailX;
-  ctx.lineTo(tailBase + fontSize * 0.45, y + boxH);
-  ctx.quadraticCurveTo(tailBase + fontSize * 0.25, y + boxH + fontSize * 1.05, tailBase - fontSize * 0.6, y + boxH + fontSize * 1.45);
-  ctx.quadraticCurveTo(tailBase - fontSize * 0.05, y + boxH + fontSize * 0.55, tailBase - fontSize * 0.5, y + boxH);
+  ctx.lineTo(tailBase + fontSize * 0.38, y + boxH);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.2, y + boxH + fontSize * 0.7, head.x, tailTipY);
+  ctx.quadraticCurveTo(tailBase - fontSize * 0.15, y + boxH + fontSize * 0.45, tailBase - fontSize * 0.45, y + boxH);
   ctx.lineTo(x + radius, y + boxH);
   ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
   ctx.quadraticCurveTo(x, y, x + radius, y);
@@ -221,6 +227,7 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
 type CharacterFaceSettings = {
   faceBlobUrl: string;
   faceAspect: number;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 type CharacterId = "c1" | "c2";
@@ -235,6 +242,7 @@ type CharacterInstance = {
   skin: CharacterSkin;
   faceBlobUrl?: string;
   faceAspect?: number;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 type FaceCropCorner = "nw" | "ne" | "sw" | "se";
@@ -590,6 +598,8 @@ const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
 const CHARACTER_TRACK_H = 36;
 const CHARACTER_COLOR = "#cdeac0";
+const DEV_MOUTH_TEST = process.env.NODE_ENV !== "production";
+const VISEME_OPTIONS = Object.keys(VISEME_MOUTH) as Viseme[];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -3238,6 +3248,56 @@ function evalLiveCharacterAtWallTime(
   return pose;
 }
 
+function boardCharacterDrawEvaluators(): BoardCharacterDrawEvaluators {
+  return {
+    evalCharAtTime: evalCharAtTime as unknown as BoardCharacterDrawEvaluators["evalCharAtTime"],
+    physiqueAt: physiqueAt as unknown as BoardCharacterDrawEvaluators["physiqueAt"],
+  };
+}
+
+function characterHeadSpeechAnchor(
+  pose: CharPoseResult,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  width: number,
+  height: number,
+  hasFace: boolean,
+  faceAspect: number,
+  physique: "slim" | "jacked" = "slim",
+): SpeechBubbleAnchor {
+  const s = sf;
+  const sx = (pose.boardX - cam.cameraX) * sf + width / 2;
+  const sy = (pose.boardY - cam.cameraY) * sf + height / 2;
+  const isJacked = physique === "jacked";
+  const torsoLen = STREAM_CHARACTER_GEOMETRY.torsoRaw * s;
+  const neckLen = STREAM_CHARACTER_GEOMETRY.neckRaw * s * (isJacked ? 0.72 : 1);
+  const headR = STREAM_CHARACTER_GEOMETRY.headRaw * s * (hasFace ? 1.15 : 1);
+  const headRY = hasFace ? headR * Math.sqrt(clamp(faceAspect, 0.75, 1.6)) : headR;
+  const hipY = (-STREAM_CHARACTER_GEOMETRY.hipRaw + (pose.skateboardVisible ? (pose.skateCrouch ?? 6) : 0)) * s + pose.headBob * s * 0.25;
+  const headTilt = pose.headTilt ?? 0;
+  const neckTopX = -Math.sin(headTilt) * neckLen;
+  const neckTopY = -torsoLen - Math.cos(headTilt) * neckLen;
+  const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
+  const headCY = neckTopY - Math.cos(headTilt) * headRY;
+  const leanCos = Math.cos(pose.bodyLean);
+  const leanSin = Math.sin(pose.bodyLean);
+  let localX = headCX * leanCos - headCY * leanSin;
+  let localY = hipY + headCX * leanSin + headCY * leanCos;
+  if (pose.spinAngle) {
+    const spinCenterY = hipY - torsoLen / 2;
+    const dx = localX;
+    const dy = localY - spinCenterY;
+    const cos = Math.cos(pose.spinAngle);
+    const sin = Math.sin(pose.spinAngle);
+    localX = dx * cos - dy * sin;
+    localY = spinCenterY + dx * sin + dy * cos;
+  }
+  return {
+    x: sx + localX * pose.facing * (pose.momentumScaleX ?? 1),
+    y: sy + pose.airY * s + localY * (pose.momentumScaleY ?? 1),
+    facing: pose.facing,
+  };
+}
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -3317,6 +3377,8 @@ export default function Board2Page() {
   const [characterActions2, setCharacterActions2] = useState<CharacterAction[]>([]);
   const [characterMode2, setCharacterMode2] = useState<"auto" | "manual">("auto");
   const [characterSkin2, setCharacterSkin2] = useState<CharacterSkin>("stick");
+  const [characterViseme, setCharacterViseme] = useState<Viseme | "auto">("auto");
+  const [characterViseme2, setCharacterViseme2] = useState<Viseme | "auto">("auto");
   const [activeCharacterId, setActiveCharacterId] = useState<CharacterId>("c1");
   const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
@@ -3328,6 +3390,7 @@ export default function Board2Page() {
   const [facePickerOpen, setFacePickerOpen] = useState(false);
   const [faceCropSource, setFaceCropSource] = useState<{ url: string; name: string } | null>(null);
   const [faceCrop, setFaceCrop] = useState({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
+  const [faceMouthAnchor, setFaceMouthAnchor] = useState<HeadLocalPoint>(DEFAULT_MOUTH_ANCHOR);
   const [faceCropPreview, setFaceCropPreview] = useState<{ url: string; aspect: number } | null>(null);
   const [liveControlEnabled, setLiveControlEnabled] = useState(false);
   const [liveCameraMode, setLiveCameraMode] = useState<LiveCameraMode>("character");
@@ -3456,8 +3519,8 @@ export default function Board2Page() {
       ? characterActions2.find((a) => a.id === selectedCharActionId) ?? null
       : null;
   const activeCharacter: CharacterInstance = activeCharacterId === "c2"
-    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect }
-    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect };
+    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor }
+    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor };
   const characterDuration = characterProjectDuration(characterActions);
   const generatedDuration = cameraKeyframeMode === "character" && characterDuration > 0
     ? characterDuration
@@ -3596,6 +3659,8 @@ export default function Board2Page() {
   const characterMode2Ref = useRef<"auto" | "manual">("auto");
   const characterSkinRef = useRef<CharacterSkin>("stick");
   const characterSkin2Ref = useRef<CharacterSkin>("stick");
+  const characterVisemeRef = useRef<Viseme>("rest");
+  const characterViseme2Ref = useRef<Viseme>("rest");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const liveControlEnabledRef = useRef(false);
   const streamGuestSkinRef = useRef<CharacterSkin>("stick");
@@ -3632,6 +3697,7 @@ export default function Board2Page() {
   });
   const charActionDragRef = useRef<CharTimelineDrag | null>(null);
   const faceCropDragRef = useRef<{ mode: "move" | "resize"; corner?: FaceCropCorner; startX: number; startY: number; orig: typeof faceCrop; rectW: number; rectH: number } | null>(null);
+  const faceMouthAnchorDragRef = useRef<{ startX: number; startY: number; orig: HeadLocalPoint; rectW: number; rectH: number } | null>(null);
   const playModeRef = useRef(false);
   const playOverlayInputActiveRef = useRef(false);
   const playTimeRef = useRef(0);
@@ -3954,8 +4020,8 @@ export default function Board2Page() {
       annotations: annotationsRef.current,
       craters: streamCratersRef.current,
       characters: [
-        { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: "stick", physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect },
-        { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: "stick", physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect },
+        { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: "stick", physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect, mouthAnchor: characterFaceRef.current?.mouthAnchor },
+        { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: "stick", physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect, mouthAnchor: characterFace2Ref.current?.mouthAnchor },
       ],
     });
     let maxLongEdge = 512;
@@ -4075,6 +4141,8 @@ export default function Board2Page() {
             if (playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
             pose = applyPlayForceChokePose(pose);
           }
+          const viseme = id === "c2" ? characterViseme2Ref.current : characterVisemeRef.current;
+          const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = active?.type ?? (!state
             ? "idle"
@@ -4096,9 +4164,11 @@ export default function Board2Page() {
             actionStartTime: sentAt - actionProgress * actionDuration * 1000,
             actionDuration,
             velocity: { x: state?.vx ?? 0, y: state?.vy ?? 0 },
-            boardPose: pose ?? undefined,
+            boardPose: pose ? { ...pose, viseme } : undefined,
             emoji: pose?.emojiText,
             emojiAlpha: pose?.emojiAlpha,
+            viseme,
+            mouthAnchor: face?.mouthAnchor,
           };
         })
       : (["c1", "c2"] as CharacterId[]).map((id): StreamCharacterFrame => {
@@ -4109,6 +4179,8 @@ export default function Board2Page() {
           const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
           const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
           const duration = active?.duration ?? 2;
+          const viseme = id === "c2" ? characterViseme2Ref.current : characterVisemeRef.current;
+          const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           return {
             id,
             enabled: runtime.enabled,
@@ -4122,9 +4194,11 @@ export default function Board2Page() {
             actionStartTime: sentAt - progress * duration * 1000,
             actionDuration: duration,
             velocity: { x: 0, y: 0 },
-            boardPose: pose,
+            boardPose: { ...pose, viseme },
             emoji: pose.emojiText,
             emojiAlpha: pose.emojiAlpha,
+            viseme,
+            mouthAnchor: face?.mouthAnchor,
           };
         });
     streamHostCharacterDebugRef.current = characters.filter((ch) => ch.enabled).map(streamHostDebugRow);
@@ -4300,6 +4374,8 @@ export default function Board2Page() {
   useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
   useEffect(() => { characterSkinRef.current = characterSkin; }, [characterSkin]);
   useEffect(() => { characterSkin2Ref.current = characterSkin2; }, [characterSkin2]);
+  useEffect(() => { characterVisemeRef.current = characterViseme === "auto" ? "rest" : characterViseme; }, [characterViseme]);
+  useEffect(() => { characterViseme2Ref.current = characterViseme2 === "auto" ? "rest" : characterViseme2; }, [characterViseme2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
   useEffect(() => { streamGuestSkinRef.current = streamGuestSkin; }, [streamGuestSkin]);
@@ -4875,6 +4951,7 @@ export default function Board2Page() {
           name: frame.name,
           skin: streamGuestSkinRef.current,
           physique: frame.physique ?? "slim",
+          mouthAnchor: frame.mouthAnchor,
         });
         streamGuestEntitiesRef.current.set(frame.guestId, entity);
       }
@@ -4883,6 +4960,7 @@ export default function Board2Page() {
         name: frame.name,
         skin: streamGuestSkinRef.current,
         physique: smoothed.physique ?? "slim",
+        mouthAnchor: smoothed.mouthAnchor,
       };
       entity.setGuestFrame(smoothed, clockOffset, streamGuestSkinRef.current);
       entity.draw({
@@ -4986,6 +5064,10 @@ export default function Board2Page() {
       }
     }
     ctx.globalAlpha = 1;
+    let speechBubbleAnchor: SpeechBubbleAnchor | null = null;
+    const setSpeechAnchor = (id: CharacterId, anchor: SpeechBubbleAnchor) => {
+      if (!speechBubbleAnchor || activeCharacterIdRef.current === id) speechBubbleAnchor = anchor;
+    };
     if (liveMode) {
       const wallMs = liveWallMs ?? performance.now();
       const live = liveCharactersRef.current;
@@ -4994,16 +5076,17 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c1.currentPose = pose;
+        setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c1.initX, live.c1.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
           characterFaceRef.current && characterFaceImageRef.current
-            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
-          pose,
-          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
+          { ...pose, viseme: characterVisemeRef.current },
+          boardCharacterDrawEvaluators()
         );
       }
       if (live.c2.enabled) {
@@ -5011,32 +5094,34 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c2.currentPose = pose;
+        setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c2.initX, live.c2.initY,
           clipsRef.current, -Infinity, authoredAnimationsRef.current,
           characterFace2Ref.current && characterFace2ImageRef.current
-            ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
+            ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
             : null,
           characterSkin2Ref.current,
-          pose,
-          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
+          { ...pose, viseme: characterViseme2Ref.current },
+          boardCharacterDrawEvaluators()
         );
       }
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
       const resolved = resolvedCharActionsRef.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters);
+      setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
         clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
         characterFaceRef.current && characterFaceImageRef.current
-          ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+          ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
           : null,
         characterSkinRef.current,
-        pose,
-        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
+        { ...pose, viseme: characterVisemeRef.current },
+        boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
@@ -5047,16 +5132,17 @@ export default function Board2Page() {
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
       const resolved = resolvedCharActions2Ref.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current + 60, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
+      setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
         clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
         characterFace2Ref.current && characterFace2ImageRef.current
-          ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect }
+          ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
           : null,
         characterSkin2Ref.current,
-        pose,
-        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
+        { ...pose, viseme: characterViseme2Ref.current },
+        boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX !== undefined && active.targetY !== undefined) {
@@ -5069,7 +5155,7 @@ export default function Board2Page() {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
     ctx.restore();
-    drawNarrationSpeechBubble(ctx, time, currentClips, W, H);
+    drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
   }, [drawStreamGuestsToCtx]);
 
   const drawFrame = useCallback((time: number) => {
@@ -5142,26 +5228,33 @@ export default function Board2Page() {
       currentClips,
       streamCratersRef.current,
     );
+    let speechBubbleAnchor: SpeechBubbleAnchor | null = null;
+    const setSpeechAnchor = (id: CharacterId, anchor: SpeechBubbleAnchor) => {
+      if (!speechBubbleAnchor || activeCharacterIdRef.current === id) speechBubbleAnchor = anchor;
+    };
 
     const drawEditorCharacter = (
+      id: CharacterId,
       resolved: ResolvedCharAction[],
       enabled: boolean,
       initX: number,
       faceSettings: CharacterFaceSettings | null,
       faceImage: HTMLImageElement | null,
       skin: CharacterSkin,
+      viseme: Viseme,
     ) => {
       if (!enabled) return;
       const pose = evalCharAtTime(
         time, resolved, initX, charInitYRef.current, currentClips, authoredAnimationsRef.current,
         !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
       );
+      setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true, cam, sf, W, H, initX, charInitYRef.current,
         currentClips, -Infinity, authoredAnimationsRef.current,
-        faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect } : null,
-        skin, pose,
-        { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any },
+        faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect, mouthAnchor: faceSettings.mouthAnchor } : null,
+        skin, { ...pose, viseme },
+        boardCharacterDrawEvaluators(),
       );
       const active = authoredBazookaDisplayAction(time, resolved);
       if (active?.targetX === undefined || active.targetY === undefined) return;
@@ -5181,15 +5274,17 @@ export default function Board2Page() {
     };
 
     drawEditorCharacter(
+      "c1",
       resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current,
-      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current,
+      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, characterVisemeRef.current,
     );
     drawEditorCharacter(
+      "c2",
       resolvedCharActions2Ref.current, showCharacter2Ref.current, charInitXRef.current + 60,
-      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current,
+      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, characterViseme2Ref.current,
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
-    drawNarrationSpeechBubble(ctx, time, currentClips, W, H);
+    drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
   }, []);
 
   const drawBoardImageOverlays = useCallback((time: number) => {
@@ -5914,6 +6009,7 @@ export default function Board2Page() {
   function openFaceCropFromSource(url: string, name: string) {
     setFaceCropSource({ url, name });
     setFaceCrop({ x: 0.25, y: 0.12, w: 0.5, h: 0.68 });
+    setFaceMouthAnchor(DEFAULT_MOUTH_ANCHOR);
     setFacePickerOpen(false);
   }
 
@@ -5973,6 +6069,27 @@ export default function Board2Page() {
     window.addEventListener("pointerup", onUp, { once: true });
   }
 
+  function handleMouthAnchorPointerDown(e: React.PointerEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = (e.currentTarget.parentElement as HTMLElement | null)?.getBoundingClientRect();
+    if (!rect) return;
+    const anchorFromEvent = (ev: PointerEvent | React.PointerEvent): HeadLocalPoint => ({
+      x: clamp(((ev.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1, -0.8, 0.8),
+      y: clamp(((ev.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1, -0.15, 0.85),
+    });
+    setFaceMouthAnchor(anchorFromEvent(e));
+    faceMouthAnchorDragRef.current = { startX: e.clientX, startY: e.clientY, orig: faceMouthAnchor, rectW: rect.width || 1, rectH: rect.height || 1 };
+    const onMove = (ev: PointerEvent) => setFaceMouthAnchor(anchorFromEvent(ev));
+    const onUp = () => {
+      faceMouthAnchorDragRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+
   async function confirmFaceCrop() {
     if (!faceCropSource) return;
     try {
@@ -5980,8 +6097,8 @@ export default function Board2Page() {
       const faceBlobUrl = URL.createObjectURL(blob);
       const activeFace = activeCharacterIdRef.current === "c2" ? characterFace2Ref.current : characterFaceRef.current;
       if (activeFace?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(activeFace.faceBlobUrl);
-      if (activeCharacterIdRef.current === "c2") setCharacterFace2({ faceBlobUrl, faceAspect: aspect });
-      else setCharacterFace({ faceBlobUrl, faceAspect: aspect });
+      if (activeCharacterIdRef.current === "c2") setCharacterFace2({ faceBlobUrl, faceAspect: aspect, mouthAnchor: faceMouthAnchor });
+      else setCharacterFace({ faceBlobUrl, faceAspect: aspect, mouthAnchor: faceMouthAnchor });
       setFaceCropSource(null);
       setToast("Face added");
     } catch (err) {
@@ -9861,11 +9978,11 @@ export default function Board2Page() {
           -Infinity,
           authoredAnimationsRef.current,
           characterFaceRef.current && characterFaceImageRef.current
-            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect }
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
-          playPose,
-          { evalCharAtTime: evalCharAtTime as any, physiqueAt: physiqueAt as any }
+          { ...playPose, viseme: characterVisemeRef.current },
+          boardCharacterDrawEvaluators()
         );
         for (const shot of playWeaponShotsRef.current) {
           drawWeaponProjectile(ctx, shot, playCameraRef.current, sf, canvas.width, canvas.height, nowMs);
@@ -11545,6 +11662,7 @@ export default function Board2Page() {
       };
       type ManifestFace = {
         faceAspect: number;
+        mouthAnchor?: HeadLocalPoint;
         assetFile: string;
         assetMime: string;
       };
@@ -11584,6 +11702,7 @@ export default function Board2Page() {
         zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
         return {
           faceAspect: face.faceAspect,
+          mouthAnchor: face.mouthAnchor,
           assetFile,
           assetMime: blob.type || "image/png",
         };
@@ -11644,6 +11763,7 @@ export default function Board2Page() {
     try {
       type ManifestFace = {
         faceAspect: number;
+        mouthAnchor?: HeadLocalPoint;
         assetFile: string;
         assetMime: string;
       };
@@ -11715,6 +11835,7 @@ export default function Board2Page() {
         return {
           faceBlobUrl: URL.createObjectURL(faceBlob),
           faceAspect: face.faceAspect ?? 1,
+          mouthAnchor: face.mouthAnchor,
         };
       };
       if (Array.isArray(manifest.characters)) {
@@ -13291,6 +13412,32 @@ export default function Board2Page() {
                           </button>
                         ))}
                       </div>
+                      {DEV_MOUTH_TEST && (
+                        <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 10 }}>
+                          <span>Mouth test</span>
+                          <select
+                            value={activeCharacterId === "c2" ? characterViseme2 : characterViseme}
+                            onChange={(event) => {
+                              const raw = event.target.value as Viseme | "auto";
+                              const next = raw === "auto" ? "rest" : raw;
+                              if (activeCharacterId === "c2") {
+                                characterViseme2Ref.current = next;
+                                setCharacterViseme2(raw);
+                              } else {
+                                characterVisemeRef.current = next;
+                                setCharacterViseme(raw);
+                              }
+                              drawFrameRef.current(playheadRef.current);
+                            }}
+                            style={{ flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 10, border: "1px solid #2a2a2a", background: "#fffdf4", padding: "3px 5px" }}
+                          >
+                            <option value="auto">auto</option>
+                            {VISEME_OPTIONS.map((viseme) => (
+                              <option key={viseme} value={viseme}>{viseme}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
                         {addButtons.map(({ mode, label, title }) => (
                           <button
@@ -13782,7 +13929,11 @@ export default function Board2Page() {
                       userSelect: "none",
                       overflow: "hidden",
                     }}
-                    onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setClipSelection([clip.id]);
+                      if (!clip.speechBubbles && transcribingNarrationId !== clip.id) void setNarrationSpeechBubbles(clip, true);
+                    }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
                     {/* Left resize handle */}
@@ -14204,6 +14355,7 @@ export default function Board2Page() {
                 <div style={{ ...panelLabelStyle, alignSelf: "stretch" }}>Preview</div>
                 <div
                   style={{
+                    position: "relative",
                     width: faceCropPreview && faceCropPreview.aspect > 1 ? Math.round(86 / faceCropPreview.aspect) : 86,
                     height: faceCropPreview && faceCropPreview.aspect < 1 ? Math.round(86 * faceCropPreview.aspect) : 86,
                     display: "flex",
@@ -14222,9 +14374,26 @@ export default function Board2Page() {
                       style={{ display: "block", width: "100%", height: "100%" }}
                     />
                   )}
+                  <div
+                    onPointerDown={handleMouthAnchorPointerDown}
+                    title="Mouth anchor"
+                    style={{
+                      position: "absolute",
+                      left: `${(faceMouthAnchor.x + 1) * 50}%`,
+                      top: `${(faceMouthAnchor.y + 1) * 50}%`,
+                      width: 12,
+                      height: 12,
+                      transform: "translate(-50%, -50%)",
+                      borderRadius: "50%",
+                      border: "2px solid #2a2a2a",
+                      background: "#c8f135",
+                      boxShadow: "0 0 0 2px rgba(255,253,245,0.9)",
+                      cursor: "grab",
+                    }}
+                  />
                 </div>
                 <div style={{ fontSize: 9, color: "#6a6a6a", textAlign: "center", lineHeight: 1.45 }}>
-                  Drag the oval to move it. Drag a corner to resize.
+                  Drag the oval to move it. Drag a corner to resize. Drag the green dot to place the mouth.
                 </div>
                 <button type="button" onClick={confirmFaceCrop} style={{ ...sketchButton, width: "100%", background: "#c8f135", fontWeight: 700 }}>
                   Use Face

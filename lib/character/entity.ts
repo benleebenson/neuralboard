@@ -3,6 +3,7 @@ import { isGrounded } from "./grounding";
 import { STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { FORWARD_TUCK_FLIP_KEYFRAMES, sampleAnimation, type Pose } from "../characterAnimations";
 import {
+  type HeadLocalPoint,
   type CharacterSkin,
   type GuestCharacterFrame,
   type StreamCamera,
@@ -21,6 +22,7 @@ export type CharacterEntityIdentity = {
   physique: "slim" | "jacked";
   faceDataUrl?: string;
   faceAspect?: number;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 export type CharacterWeaponState = {
@@ -139,7 +141,7 @@ export class CharacterEntity {
       [],
       -Infinity,
       {},
-      face ? { image: face, aspect: this.identity.faceAspect ?? 1 } : null,
+      face ? { image: face, aspect: this.identity.faceAspect ?? 1, mouthAnchor: this.identity.mouthAnchor } : null,
       this.identity.skin,
       this.pose,
       {
@@ -172,8 +174,9 @@ function actionProgressFromFrame(
 }
 
 function entityPoseFromHostFrame(frame: StreamCharacterFrame, identity: CharacterEntityIdentity, clockOffsetMs = 0): BoardCharPoseResult {
-  if (frame.boardPose) return { ...frame.boardPose };
-  return streamPoseFallback({
+  if (frame.boardPose) return { ...frame.boardPose, viseme: frame.viseme ?? frame.boardPose.viseme ?? "rest" };
+  return {
+    ...streamPoseFallback({
     x: frame.x,
     y: frame.y,
     vx: frame.velocity?.x ?? 0,
@@ -185,12 +188,15 @@ function entityPoseFromHostFrame(frame: StreamCharacterFrame, identity: Characte
     emoji: frame.emoji,
     physique: frame.physique ?? identity.physique,
     seed: hash01(`${frame.id}:${frame.actionStartTime ?? 0}:${frame.actionType}`),
-  });
+    }),
+    viseme: frame.viseme ?? "rest",
+  };
 }
 
 function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: CharacterEntityIdentity, clockOffsetMs = 0): BoardCharPoseResult {
-  if (frame.boardPose) return { ...frame.boardPose };
-  return streamPoseFallback({
+  if (frame.boardPose) return { ...frame.boardPose, viseme: frame.viseme ?? frame.boardPose.viseme ?? "rest" };
+  return {
+    ...streamPoseFallback({
     x: frame.position.x,
     y: frame.position.y,
     vx: frame.velocity?.x ?? 0,
@@ -203,7 +209,9 @@ function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: Characte
     physique: frame.physique ?? identity.physique,
     signActive: frame.signActive,
     seed: hash01(`${frame.guestId}:${frame.actionStartTime ?? 0}:${frame.actionType}`),
-  });
+    }),
+    viseme: frame.viseme ?? "rest",
+  };
 }
 
 function streamPoseFallback(args: {
@@ -715,6 +723,7 @@ export function packetsFromHostFrame(frame: StreamFrameMessage, seqBase: number)
       name: ch.id === "c1" ? "HOST" : "HOST 2",
       skin: ch.skin ?? "stick",
       physique: ch.physique,
+      mouthAnchor: ch.mouthAnchor,
     },
     character: ch,
     weapon: frame.weapon,

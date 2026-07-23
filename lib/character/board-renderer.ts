@@ -1,4 +1,4 @@
-import type { CharacterSkin } from "../stream";
+import type { CharacterSkin, HeadLocalPoint, Viseme } from "../stream";
 import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
@@ -14,13 +14,100 @@ const MIRROR_W = 90;
 const MIRROR_H = 260;
 const MIRROR_OFFSET = 140;
 const LAUNCHER_ALWAYS_VISIBLE = true;
+export const DEFAULT_MOUTH_ANCHOR: HeadLocalPoint = { x: 0, y: 0.35 };
+export const VISEME_MOUTH: Record<Viseme, {
+  cx: number;
+  cy: number;
+  w: number;
+  h: number;
+  fill?: "dark" | "none";
+  curve?: number;
+  forward?: number;
+  teethH?: number;
+  tongue?: boolean;
+}> = {
+  rest: { cx: 0, cy: 0, w: 0, h: 0 },
+  closed: { cx: 0, cy: 0, w: 0.46, h: 0.06, curve: 0.09 },
+  slightOpen: { cx: 0, cy: 0, w: 0.42, h: 0.12 },
+  open: { cx: 0, cy: 0, w: 0.38, h: 0.30, fill: "dark" },
+  wide: { cx: 0, cy: 0, w: 0.56, h: 0.32, fill: "dark" },
+  round: { cx: 0, cy: 0, w: 0.34, h: 0.34, fill: "dark" },
+  pucker: { cx: 0, cy: 0, w: 0.24, h: 0.24, fill: "dark", forward: 0.12 },
+  teeth: { cx: 0, cy: 0, w: 0.48, h: 0.18, teethH: 0.08 },
+  tongue: { cx: 0, cy: 0, w: 0.42, h: 0.30, fill: "dark", tongue: true },
+};
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
+function drawCharacterMouth(
+  ctx: CanvasRenderingContext2D,
+  viseme: Viseme,
+  anchor: HeadLocalPoint | undefined,
+  headCX: number,
+  headCY: number,
+  headRX: number,
+  headRY: number,
+  headTilt: number,
+) {
+  if (viseme === "rest") return;
+  const spec = VISEME_MOUTH[viseme] ?? VISEME_MOUTH.rest;
+  const base = anchor ?? DEFAULT_MOUTH_ANCHOR;
+  const x = (base.x + spec.cx + (spec.forward ?? 0)) * headRX;
+  const y = (base.y + spec.cy) * headRY;
+  const w = spec.w * headRX;
+  const h = spec.h * headRY;
+  const dark = "#201715";
+  ctx.save();
+  ctx.translate(headCX, headCY);
+  ctx.rotate(headTilt);
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.lineWidth = Math.max(1, headRX * 0.075);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  if (viseme === "closed") {
+    ctx.beginPath();
+    ctx.moveTo(x - w / 2, y);
+    ctx.quadraticCurveTo(x, y + (spec.curve ?? 0) * headRY, x + w / 2, y);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+  if (viseme === "teeth") {
+    ctx.fillStyle = "#fffdf5";
+    ctx.beginPath();
+    ctx.roundRect(x - w / 2, y - h / 2, w, Math.max(1, (spec.teethH ?? 0.08) * headRY), Math.max(1, headRX * 0.03));
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - w / 2, y + h * 0.08);
+    ctx.lineTo(x + w / 2, y + h * 0.08);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+  ctx.beginPath();
+  ctx.ellipse(x, y, w / 2, h / 2, 0, 0, Math.PI * 2);
+  if (spec.fill === "dark") {
+    ctx.fillStyle = dark;
+    ctx.fill();
+  }
+  ctx.stroke();
+  if (spec.tongue) {
+    ctx.strokeStyle = "#e98b80";
+    ctx.lineWidth = Math.max(1, headRX * 0.055);
+    ctx.beginPath();
+    ctx.arc(x, y + h * 0.2, w * 0.24, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
 export type BoardResolvedCharAction = Record<string, any>;
 export type BoardCharSurfaceClip = Record<string, any>;
 export type BoardCharPoseResult = Record<string, any>;
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 export type BoardCharacterDrawEvaluators = {
   evalCharAtTime: (time: number, resolved: BoardResolvedCharAction[], initX: number, initY: number, clips: BoardCharSurfaceClip[], authoredAnimations: Record<string, unknown>, hasFace: boolean, faceAspect: number) => BoardCharPoseResult;
@@ -41,7 +128,7 @@ export function drawBoardCharacterToCanvas(
   clips: BoardCharSurfaceClip[],
   entranceTime: number,
   authoredAnimations: Record<string, unknown> = {},
-  characterFace: { image: HTMLImageElement | null; aspect: number } | null = null,
+  characterFace: { image: HTMLImageElement | null; aspect: number; mouthAnchor?: HeadLocalPoint } | null = null,
   characterSkin: CharacterSkin = "stick",
   poseOverride: BoardCharPoseResult | null = null,
   evaluators: BoardCharacterDrawEvaluators
@@ -797,6 +884,7 @@ export function drawBoardCharacterToCanvas(
   // adopting the crop oval's aspect ratio (headRX/headRY) instead of staying perfectly round.
   const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
   const headCY = neckTopY - Math.cos(headTilt) * headRY;
+  const drawMouth = () => drawCharacterMouth(ctx, p.viseme ?? "rest", characterFace?.mouthAnchor, headCX, headCY, headRX, headRY, headTilt);
   if (hasFace && characterFace?.image) {
     ctx.save();
     ctx.translate(headCX, headCY);
@@ -807,9 +895,11 @@ export function drawBoardCharacterToCanvas(
     if (facing < 0) ctx.scale(-1, 1);
     ctx.drawImage(characterFace.image, -headRX, -headRY, headRX * 2, headRY * 2);
     ctx.restore();
+    drawMouth();
   } else {
     // Blank default head keeps its outline; a custom face's clipped image edge IS the head edge.
     ctx.beginPath(); ctx.ellipse(headCX, headCY, headRX, headRY, 0, 0, Math.PI * 2); ctx.stroke();
+    drawMouth();
   }
 
   // Emoji emote

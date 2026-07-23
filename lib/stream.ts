@@ -33,6 +33,8 @@ export const STREAM_ACTION_TYPES = [
 ] as const;
 
 export type CharacterSkin = "stick" | "styled";
+export type Viseme = "rest" | "closed" | "slightOpen" | "open" | "wide" | "round" | "pucker" | "teeth" | "tongue";
+export type HeadLocalPoint = { x: number; y: number };
 export type StreamActionType = (typeof STREAM_ACTION_TYPES)[number];
 export type StreamSkinSource = "own-setting" | "presence" | "guest-skin-default" | "fallback";
 export type StreamCharacterDebugRow = {
@@ -139,6 +141,7 @@ export type StreamCharacterSnapshot = {
   physique?: "slim" | "jacked";
   faceDataUrl?: string;
   faceAspect?: number;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 export type StreamCharacterFrame = {
@@ -158,6 +161,8 @@ export type StreamCharacterFrame = {
   boardPose?: StreamBoardPose;
   emoji?: string;
   emojiAlpha?: number;
+  viseme?: Viseme;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 export type SpawnDoor = { x: number; y: number };
@@ -201,6 +206,8 @@ export type GuestCharacterFrame = {
   signActive?: boolean;
   receivedAt?: number;
   emote?: string;
+  viseme?: Viseme;
+  mouthAnchor?: HeadLocalPoint;
 };
 
 export type StreamKickMessage = {
