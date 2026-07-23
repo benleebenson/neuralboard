@@ -171,8 +171,8 @@ function activeNarrationBubble(time: number, clips: readonly Clip[]): { cue: Spe
 
 function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number, anchor?: SpeechBubbleAnchor | null) {
   const active = activeNarrationBubble(time, clips);
-  if (!active) return;
-  const { cue } = active;
+  if (!active || !anchor) return;
+  const { cue, clip } = active;
   const head = anchor ?? { x: width * 0.5, y: height * 0.42, facing: 1 as const };
   const side = cue.index % 2 === 0 ? -head.facing : head.facing;
   const fontSize = clamp(Math.round(width * 0.022), 15, 27);
@@ -191,25 +191,29 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
   const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
-  const x = clamp(head.x + side * fontSize * 3.1 - (side < 0 ? boxW : 0), fontSize * 0.5, width - boxW - fontSize * 0.5);
-  const y = clamp(head.y - boxH - fontSize * (1.55 + (cue.index % 3) * 0.32), fontSize * 0.4, height - boxH - fontSize * 1.1);
+  const centerX = head.x + side * fontSize * (6.2 + (cue.index % 2) * 0.8);
+  const centerY = head.y - fontSize * (5.8 + (cue.index % 3) * 0.35);
+  const x = clamp(centerX - boxW / 2, fontSize * 0.5, width - boxW - fontSize * 0.5);
+  const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
-  const tailBase = clamp(head.x, x + fontSize * 1.2, x + boxW - fontSize * 1.2);
-  const tailTipY = clamp(head.y + fontSize * 0.3, y + boxH + fontSize * 0.4, height - fontSize * 0.5);
+  const cueDuration = Math.max(0.001, cue.end - cue.start);
+  const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
+  const cueT = clamp((sourceTime - cue.start) / cueDuration, 0, 1);
+  const pop = cueT < 0.16 ? 0.86 + Math.sin((cueT / 0.16) * Math.PI * 0.5) * 0.14 : cueT < 0.28 ? 1.02 - (cueT - 0.16) / 0.12 * 0.02 : 1;
+  ctx.translate(x + boxW / 2, y + boxH / 2);
+  ctx.scale(pop, pop);
+  ctx.translate(-(x + boxW / 2), -(y + boxH / 2));
   ctx.shadowColor = "rgba(0,0,0,.12)";
-  ctx.shadowBlur = 3;
-  ctx.shadowOffsetX = 3;
-  ctx.shadowOffsetY = 3;
+  ctx.shadowBlur = 2;
+  ctx.shadowOffsetX = 2;
+  ctx.shadowOffsetY = 2;
   ctx.fillStyle = "rgba(255,255,252,.97)";
   ctx.strokeStyle = "#171717";
-  ctx.lineWidth = Math.max(3, width * 0.004);
+  ctx.lineWidth = Math.max(1.1, width * 0.0016);
   ctx.beginPath();
   ctx.moveTo(x + radius, y);
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
   ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
-  ctx.lineTo(tailBase + fontSize * 0.38, y + boxH);
-  ctx.quadraticCurveTo(tailBase + fontSize * 0.2, y + boxH + fontSize * 0.7, head.x, tailTipY);
-  ctx.quadraticCurveTo(tailBase - fontSize * 0.15, y + boxH + fontSize * 0.45, tailBase - fontSize * 0.45, y + boxH);
   ctx.lineTo(x + radius, y + boxH);
   ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
   ctx.quadraticCurveTo(x, y, x + radius, y);
@@ -3299,6 +3303,32 @@ function characterHeadSpeechAnchor(
   };
 }
 
+function poseAllowsSpeechBubble(pose: CharPoseResult): boolean {
+  const action = pose.actionType ?? "idle";
+  if (pose.grappleRopeAlpha || pose.pullUpBarAlpha || pose.skateboardVisible || pose.spinAngle || Math.abs(pose.airY) > 18) return false;
+  return ![
+    "walkTo",
+    "runTo",
+    "walk",
+    "run",
+    "jumpTo",
+    "jump",
+    "flip",
+    "grapple",
+    "zipline",
+    "wallClimb",
+    "skateTo",
+    "pullUps",
+    "pullups",
+    "sitAndWatch",
+    "dance",
+    "mirrorCheck",
+    "bazooka",
+    "forceChoke",
+    "eliminated",
+  ].includes(action);
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function Board2Page() {
@@ -5076,7 +5106,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c1.currentPose = pose;
-        setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current))));
+        if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c1.initX, live.c1.initY,
@@ -5094,7 +5124,7 @@ export default function Board2Page() {
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
         const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
         live.c2.currentPose = pose;
-        setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current))));
+        if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx, liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current), true,
           cam, sf, W, H, live.c2.initX, live.c2.initY,
@@ -5111,7 +5141,7 @@ export default function Board2Page() {
     } else if (showCharacterRef.current && !playModeRef.current) {
       const resolved = resolvedCharActionsRef.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters);
-      setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+      if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
@@ -5132,7 +5162,7 @@ export default function Board2Page() {
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
       const resolved = resolvedCharActions2Ref.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current + 60, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
-      setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+      if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, showCharacter2Ref.current,
         cam, sf, W, H, charInitXRef.current + 60, charInitYRef.current,
@@ -5248,7 +5278,7 @@ export default function Board2Page() {
         time, resolved, initX, charInitYRef.current, currentClips, authoredAnimationsRef.current,
         !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
       );
-      setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
+      if (poseAllowsSpeechBubble(pose)) setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true, cam, sf, W, H, initX, charInitYRef.current,
         currentClips, -Infinity, authoredAnimationsRef.current,
