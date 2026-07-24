@@ -308,6 +308,62 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   ctx.restore();
 }
 
+function drawLiveSpeechBubble(ctx: CanvasRenderingContext2D, text: string, width: number, height: number, anchor?: SpeechBubbleAnchor | null) {
+  const clean = text.trim();
+  if (!clean || !anchor) return;
+  const fontSize = clamp(Math.round(width * 0.021), 15, 26);
+  const maxWidth = clamp(width * 0.3, 170, 300);
+  const side = anchor.facing || 1;
+  ctx.save();
+  ctx.font = `${fontSize}px 'Patrick Hand', 'Comic Sans MS', cursive`;
+  const words = clean.toUpperCase().split(/\s+/).slice(-18);
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(next).width > maxWidth - fontSize * 1.8) { lines.push(line); line = word; }
+    else line = next;
+  }
+  if (line) lines.push(line);
+  const lineHeight = fontSize * 1.08;
+  const boxW = Math.min(maxWidth, Math.max(fontSize * 6.5, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
+  const boxH = Math.max(fontSize * 2.3, lines.length * lineHeight + fontSize * 1.25);
+  const centerX = anchor.x + side * fontSize * 4.7;
+  const centerY = anchor.y - fontSize * 4.9;
+  const x = clamp(centerX - boxW / 2, fontSize * 0.5, width - boxW - fontSize * 0.5);
+  const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
+  const radius = Math.min(boxH * 0.42, fontSize * 1.45);
+  const tailBase = clamp(anchor.x, x + fontSize * 1.4, x + boxW - fontSize * 1.4);
+  const tailTipX = clamp(anchor.x + side * fontSize * 1.15, x + fontSize * 0.8, x + boxW - fontSize * 0.8);
+  const tailTipY = clamp(anchor.y - fontSize * 1.55, y + boxH + fontSize * 0.35, height - fontSize * 0.5);
+  ctx.shadowColor = "rgba(0,0,0,.12)";
+  ctx.shadowBlur = 2;
+  ctx.shadowOffsetX = 2;
+  ctx.shadowOffsetY = 2;
+  ctx.fillStyle = "rgba(255,255,252,.97)";
+  ctx.strokeStyle = "#171717";
+  ctx.lineWidth = Math.max(0.85, width * 0.00105);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
+  ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
+  ctx.lineTo(tailBase + fontSize * 0.42, y + boxH);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.82, tailTipX, tailTipY);
+  ctx.quadraticCurveTo(tailBase - fontSize * 0.24, y + boxH + fontSize * 0.46, tailBase - fontSize * 0.45, y + boxH);
+  ctx.lineTo(x + radius, y + boxH);
+  ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.stroke();
+  ctx.fillStyle = "#171717";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((item, index) => ctx.fillText(item, x + boxW / 2, y + fontSize * 0.68 + lineHeight * (index + 0.5)));
+  ctx.restore();
+}
+
 type CharacterFaceSettings = {
   faceBlobUrl: string;
   faceAspect: number;
@@ -3588,6 +3644,9 @@ export default function Board2Page() {
   const [playMaximize, setPlayMaximize] = useState(false);
   const [playNativeFullscreen, setPlayNativeFullscreen] = useState(false);
   const [playAddMenuOpen, setPlayAddMenuOpen] = useState(false);
+  const [playLiveSpeechEnabled, setPlayLiveSpeechEnabled] = useState(false);
+  const [playLiveSpeechStatus, setPlayLiveSpeechStatus] = useState<"idle" | "listening" | "transcribing" | "error">("idle");
+  const [playLiveSpeechText, setPlayLiveSpeechText] = useState("");
   const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
   const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
@@ -3836,6 +3895,14 @@ export default function Board2Page() {
   const characterVisemeRef = useRef<Viseme>("rest");
   const characterViseme2Ref = useRef<Viseme>("rest");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
+  const playLiveSpeechEnabledRef = useRef(false);
+  const playLiveSpeechRecorderRef = useRef<MediaRecorder | null>(null);
+  const playLiveSpeechStreamRef = useRef<MediaStream | null>(null);
+  const playLiveSpeechBusyRef = useRef(false);
+  const playLiveSpeechActiveUntilRef = useRef(0);
+  const playLiveSpeechTextRef = useRef("");
+  const playLiveSpeechTextUntilRef = useRef(0);
+  const playLiveSpeechSeqRef = useRef(0);
   const liveControlEnabledRef = useRef(false);
   const streamGuestSkinRef = useRef<CharacterSkin>("stick");
   const liveCameraModeRef = useRef<LiveCameraMode>("character");
@@ -4558,6 +4625,8 @@ export default function Board2Page() {
   }, [characterViseme2]);
   useEffect(() => { activeCharacterIdRef.current = activeCharacterId; }, [activeCharacterId]);
   useEffect(() => { liveControlEnabledRef.current = liveControlEnabled; }, [liveControlEnabled]);
+  useEffect(() => { playLiveSpeechEnabledRef.current = playLiveSpeechEnabled; }, [playLiveSpeechEnabled]);
+  useEffect(() => { playLiveSpeechTextRef.current = playLiveSpeechText; }, [playLiveSpeechText]);
   useEffect(() => { streamGuestSkinRef.current = streamGuestSkin; }, [streamGuestSkin]);
   useEffect(() => { spawnDoorRef.current = spawnDoor; }, [spawnDoor]);
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
@@ -9606,6 +9675,94 @@ export default function Board2Page() {
     return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
   }
 
+  function playLiveSpeechViseme(time: number): Viseme | null {
+    if (!playLiveSpeechEnabledRef.current && performance.now() > playLiveSpeechActiveUntilRef.current) return null;
+    return rhythmicViseme(time, "play-live-speech");
+  }
+
+  async function transcribePlayLiveSpeechChunk(blob: Blob, sequence: number) {
+    if (!playLiveSpeechEnabledRef.current || playLiveSpeechBusyRef.current || blob.size < 1200) return;
+    playLiveSpeechBusyRef.current = true;
+    setPlayLiveSpeechStatus("transcribing");
+    try {
+      const form = new FormData();
+      form.append("audio", blob, `play-live-${sequence}.webm`);
+      const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Live transcription failed");
+      const transcript = String(data.transcript ?? "").trim();
+      if (transcript) {
+        setPlayLiveSpeechText(transcript);
+        playLiveSpeechTextRef.current = transcript;
+        playLiveSpeechTextUntilRef.current = performance.now() + 5200;
+      }
+      setPlayLiveSpeechStatus(playLiveSpeechEnabledRef.current ? "listening" : "idle");
+    } catch (error) {
+      setPlayLiveSpeechStatus("error");
+      setToast(error instanceof Error ? error.message : "Live speech transcription failed");
+    } finally {
+      playLiveSpeechBusyRef.current = false;
+    }
+  }
+
+  async function startPlayLiveSpeech() {
+    if (playLiveSpeechRecorderRef.current) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setToast("Microphone capture is not available in this browser");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      playLiveSpeechStreamRef.current = stream;
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm"
+        : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      playLiveSpeechRecorderRef.current = recorder;
+      playLiveSpeechEnabledRef.current = true;
+      setPlayLiveSpeechEnabled(true);
+      setPlayLiveSpeechStatus("listening");
+      setPlayLiveSpeechText("");
+      playLiveSpeechTextRef.current = "";
+      playLiveSpeechTextUntilRef.current = 0;
+      recorder.ondataavailable = (event) => {
+        if (!event.data || event.data.size <= 0) return;
+        playLiveSpeechActiveUntilRef.current = performance.now() + 2400;
+        void transcribePlayLiveSpeechChunk(event.data, ++playLiveSpeechSeqRef.current);
+      };
+      recorder.onstop = () => {
+        playLiveSpeechStreamRef.current?.getTracks().forEach((track) => track.stop());
+        playLiveSpeechStreamRef.current = null;
+        playLiveSpeechRecorderRef.current = null;
+      };
+      recorder.start(1800);
+      setToast("Live speech bubbles on");
+    } catch (error) {
+      playLiveSpeechEnabledRef.current = false;
+      setPlayLiveSpeechEnabled(false);
+      setPlayLiveSpeechStatus("error");
+      setToast(error instanceof Error ? error.message : "Could not start microphone");
+    }
+  }
+
+  function stopPlayLiveSpeech() {
+    playLiveSpeechEnabledRef.current = false;
+    setPlayLiveSpeechEnabled(false);
+    setPlayLiveSpeechStatus("idle");
+    playLiveSpeechActiveUntilRef.current = 0;
+    playLiveSpeechTextUntilRef.current = performance.now() + 1800;
+    try {
+      const recorder = playLiveSpeechRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+    } catch {}
+    playLiveSpeechStreamRef.current?.getTracks().forEach((track) => track.stop());
+    playLiveSpeechStreamRef.current = null;
+  }
+
+  function togglePlayLiveSpeech() {
+    if (playLiveSpeechEnabledRef.current) stopPlayLiveSpeech();
+    else void startPlayLiveSpeech();
+  }
+
   function guestAtPlayPoint(point: { rawX: number; rawY: number }): GuestCharacterFrame | null {
     let best: { frame: GuestCharacterFrame; d: number } | null = null;
     for (const frame of streamGuestFramesRef.current.values()) {
@@ -9887,6 +10044,7 @@ export default function Board2Page() {
     playPhysicsRef.current = null;
     playActionRuntimeRef.current = null;
     playWeaponShotsRef.current = [];
+    stopPlayLiveSpeech();
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
     setPlayBazookaArmed(false); playBazookaArmedRef.current=false; playBazookaEventsRef.current=[];
@@ -10200,6 +10358,9 @@ export default function Board2Page() {
         const shake=bazookaShake(playBazookaEventsRef.current,nowMs);ctx.save();ctx.translate(shake.x,shake.y);
         renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
+        const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
+        const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
+        const playViseme = playLiveSpeechViseme(now) ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved);
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx,
@@ -10215,11 +10376,11 @@ export default function Board2Page() {
           clipsRef.current,
           -Infinity,
           authoredAnimationsRef.current,
-          characterFaceRef.current && characterFaceImageRef.current
-            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
+          hasFace
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current!.faceAspect, mouthAnchor: characterFaceRef.current!.mouthAnchor }
             : null,
           characterSkinRef.current,
-          { ...playPose, viseme: resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved) },
+          { ...playPose, viseme: playViseme },
           boardCharacterDrawEvaluators()
         );
         for (const shot of playWeaponShotsRef.current) {
@@ -10242,6 +10403,10 @@ export default function Board2Page() {
         if(playBazookaArmedRef.current){const recoilAge=nowMs-playBazookaLastFireAtRef.current,recoil=recoilAge<260?Math.sin((1-recoilAge/260)*Math.PI)*9:0;drawBazookaHeld(ctx,{x:state.x,y:state.y,facing:state.facing},playCursorRef.current??{x:state.x+state.facing*400,y:state.y-115},playCameraRef.current,sf,canvas.width,canvas.height,recoil);}
         for(const event of playBazookaEventsRef.current)drawBazookaEffect(ctx,event,playCameraRef.current,sf,canvas.width,canvas.height,nowMs);
         drawStreamGuestsToCtx(ctx, playCameraRef.current, sf, canvas.width, canvas.height);
+        if (performance.now() < playLiveSpeechTextUntilRef.current) {
+          const anchor = characterHeadSpeechAnchor(playPose, playCameraRef.current, sf, canvas.width, canvas.height, hasFace, faceAspect, physiqueAt(playDrawTime, playDrawResolved));
+          drawLiveSpeechBubble(ctx, playLiveSpeechTextRef.current, canvas.width, canvas.height, anchor);
+        }
         ctx.restore();
       }
       broadcastWeaponState();
@@ -11056,6 +11221,31 @@ export default function Board2Page() {
         <div style={{ position: "fixed", top: 14, left: playCleanUi ? 14 : 90, zIndex: 2, padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, color: streamPublishing ? "#228b22" : "#8a6a00" }}>
           {streamPublishing ? "LIVE" : "LOCAL"}
         </div>
+        {!playCleanUi && (
+          <button
+            type="button"
+            onClick={togglePlayLiveSpeech}
+            title="Capture microphone speech as live bubbles"
+            style={{
+              position: "fixed",
+              top: 14,
+              left: playCleanUi ? 84 : 196,
+              zIndex: 2,
+              padding: "8px 10px",
+              border: "1.5px solid #2a2a2a",
+              background: playLiveSpeechEnabled ? "#c8f135" : "rgba(255,253,245,0.92)",
+              boxShadow: "2px 2px 0 #2a2a2a",
+              fontFamily: "monospace",
+              fontSize: 10,
+              fontWeight: 800,
+              color: "#2a2a2a",
+              cursor: "pointer",
+            }}
+          >
+            {playLiveSpeechEnabled ? "🎙 Speech ON" : "🎙 Speech"}
+            {playLiveSpeechStatus === "transcribing" ? " ..." : playLiveSpeechStatus === "error" ? " !" : ""}
+          </button>
+        )}
         {DEBUG_STREAM && playDebugOpen && !playMaximize && (
           <div data-stream-debug-overlay style={{ position: "fixed", bottom: 12, left: 12, zIndex: 10040, width:"min(560px, calc(100vw - 24px))", maxHeight:"40vh", overflowY:"auto", padding: "6px 8px", border: "1px solid rgba(42,42,42,0.35)", background: "rgba(255,253,245,0.96)", fontFamily: "monospace", fontSize: 9, color: "#2a2a2a" }}>
             <button onClick={()=>setPlayDebugOpen(false)} style={{float:"right",border:0,background:"transparent"}}>✕</button>
