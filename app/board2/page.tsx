@@ -2815,37 +2815,54 @@ function evalCharPoseRaw(
   }
 
   if (active.type === "explainGesture") {
-    // Open-palmed talking gestures. Sentence-generated actions restart the beat, so the first
-    // bubble pop gets a clear "here's the point" lift before settling into alternating hands.
+    // Broad presenter gestures keyed by wrist targets: side holds, point-up, point-down, and
+    // two-hand spread. This keeps the action readable as "talking with hands" at timeline scale.
     const localT = Math.max(0, time - active.startTime);
-    const cuePop = Math.max(0, 1 - localT / 0.34);
     const seed = seededRandom(active.id);
-    const leftBeat = 0.5 + 0.5 * Math.sin(localT * (Math.PI * 2 / 1.05) + seed * Math.PI);
-    const rightBeat = 0.5 + 0.5 * Math.sin(localT * (Math.PI * 2 / 1.22) + Math.PI + seed * 4.1);
-    const lRaise = Math.pow(leftBeat, 1.75);
-    const rRaise = Math.pow(rightBeat, 1.75);
-    const spreadCycle = (localT + seed * 1.7) % 3.2;
-    const spread = Math.max(0, 1 - Math.abs(spreadCycle - 1.45) / 0.42);
-    const pointBeat = Math.max(0, 1 - Math.abs(((localT + 0.18) % 2.6) - 0.4) / 0.22);
-
-    const leftArmA = 0.18 + lRaise * 0.64 + spread * 0.34 + cuePop * 0.42;
-    const rightArmA = -0.18 - rRaise * 0.64 - spread * 0.34 - pointBeat * 0.5 - cuePop * 0.18;
-    const leftForeA = 0.1 + lRaise * 0.55 + spread * 0.22 + cuePop * 0.18;
-    const rightForeA = -0.1 - rRaise * 0.55 - spread * 0.22 - pointBeat * 0.18 - cuePop * 0.1;
+    const poseTargets = [
+      { t: 0, left: { x: -52, y: -64 }, right: { x: 48, y: -66 }, lean: 0.02, tilt: -0.02 },
+      { t: 0.14, left: { x: -58, y: -80 }, right: { x: 38, y: -104 }, lean: -0.03, tilt: 0.05 },
+      { t: 0.29, left: { x: -54, y: -58 }, right: { x: 58, y: -42 }, lean: 0.04, tilt: 0.01 },
+      { t: 0.45, left: { x: -36, y: -104 }, right: { x: 58, y: -64 }, lean: 0.035, tilt: -0.05 },
+      { t: 0.62, left: { x: -62, y: -64 }, right: { x: 62, y: -70 }, lean: 0, tilt: 0.02 },
+      { t: 0.8, left: { x: -60, y: -38 }, right: { x: 44, y: -100 }, lean: -0.035, tilt: 0.055 },
+      { t: 1, left: { x: -52, y: -64 }, right: { x: 48, y: -66 }, lean: 0.02, tilt: -0.02 },
+    ];
+    const cycle = 3.2 + seed * 0.45;
+    const cycleT = ((localT + seed * cycle) % cycle) / cycle;
+    let poseIndex = 0;
+    while (poseIndex < poseTargets.length - 2 && cycleT > poseTargets[poseIndex + 1].t) poseIndex++;
+    const a = poseTargets[poseIndex];
+    const b = poseTargets[poseIndex + 1];
+    const blend = easeInOutCubic(clamp((cycleT - a.t) / Math.max(0.001, b.t - a.t), 0, 1));
+    const handDrift = Math.sin(localT * 9.4 + seed * 8) * 2.4;
+    const interpPoint = (pa: { x: number; y: number }, pb: { x: number; y: number }, side: -1 | 1) => ({
+      x: lerp(pa.x, pb.x, blend) + side * handDrift,
+      y: lerp(pa.y, pb.y, blend) + Math.sin(localT * 7.1 + seed * 5 + side) * 1.7,
+    });
+    const leftHand = interpPoint(a.left, b.left, -1);
+    const rightHand = interpPoint(a.right, b.right, 1);
+    const leftArm = solveArmToLocalPoint(leftHand.x, leftHand.y, -1);
+    const rightArm = solveArmToLocalPoint(rightHand.x, rightHand.y, 1);
+    const intro = easeInOutCubic(clamp(localT / 0.22, 0, 1));
+    const exit = easeInOutCubic(clamp((active.startTime + active.duration - time) / 0.22, 0, 1));
+    const gestureAlpha = Math.min(intro, exit);
     const facing: 1 | -1 = active.targetX !== undefined && Math.abs(active.targetX - active.fromX) > 3
       ? active.targetX >= active.fromX ? 1 : -1
       : 1;
 
     return applyAuthoredPose({
       boardX: active.fromX, boardY: active.fromY, facing,
-      headBob: Math.sin(localT * 2.2) * 1.2 + (lRaise + rRaise) * 1.05 - cuePop * 2,
-      bodyLean: Math.sin(localT * 0.9 + seed) * 0.035 + (lRaise - rRaise) * 0.045 + cuePop * 0.04,
-      headTilt: Math.sin(localT * 1.35 + seed * 2) * 0.045 + pointBeat * 0.035,
+      headBob: Math.sin(localT * 4.4 + seed) * 1.1 - (1 - intro) * 2.5,
+      bodyLean: lerp(0, lerp(a.lean, b.lean, blend), gestureAlpha),
+      headTilt: lerp(0, lerp(a.tilt, b.tilt, blend), gestureAlpha),
       leftLegA: 0.1 + Math.sin(localT * 0.75) * 0.045,
       rightLegA: -0.1 - Math.sin(localT * 0.75 + 1.3) * 0.045,
-      leftArmA, rightArmA, leftForeA, rightForeA,
+      leftArmA: lerp(CHAR_RELAX_ARM_A, leftArm.armA, gestureAlpha),
+      rightArmA: lerp(-CHAR_RELAX_ARM_A, rightArm.armA, gestureAlpha),
+      leftForeA: lerp(CHAR_RELAX_FORE_A, leftArm.foreA, gestureAlpha),
+      rightForeA: lerp(-CHAR_RELAX_FORE_A, rightArm.foreA, gestureAlpha),
       airY: 0,
-      forceHandOpen: true,
     }, authoredPose);
   }
 
