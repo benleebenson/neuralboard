@@ -27,14 +27,14 @@ export const VISEME_MOUTH: Record<Viseme, {
   tongue?: boolean;
 }> = {
   rest: { cx: 0, cy: 0, w: 0, h: 0 },
-  closed: { cx: 0, cy: 0, w: 0.46, h: 0.06, curve: 0.09 },
-  slightOpen: { cx: 0, cy: 0, w: 0.42, h: 0.12 },
-  open: { cx: 0, cy: 0, w: 0.38, h: 0.30, fill: "dark" },
-  wide: { cx: 0, cy: 0, w: 0.56, h: 0.32, fill: "dark" },
-  round: { cx: 0, cy: 0, w: 0.34, h: 0.34, fill: "dark" },
-  pucker: { cx: 0, cy: 0, w: 0.24, h: 0.24, fill: "dark", forward: 0.12 },
-  teeth: { cx: 0, cy: 0, w: 0.48, h: 0.18, teethH: 0.08 },
-  tongue: { cx: 0, cy: 0, w: 0.42, h: 0.30, fill: "dark", tongue: true },
+  closed: { cx: 0, cy: 0, w: 0.46, h: 0.045, curve: 0.075 },
+  slightOpen: { cx: 0, cy: 0, w: 0.4, h: 0.095 },
+  open: { cx: 0, cy: 0, w: 0.36, h: 0.24, fill: "dark" },
+  wide: { cx: 0, cy: 0, w: 0.54, h: 0.25, fill: "dark" },
+  round: { cx: 0, cy: 0, w: 0.32, h: 0.27, fill: "dark" },
+  pucker: { cx: 0, cy: 0, w: 0.22, h: 0.19, fill: "dark", forward: 0.1 },
+  teeth: { cx: 0, cy: 0, w: 0.46, h: 0.14, teethH: 0.06 },
+  tongue: { cx: 0, cy: 0, w: 0.4, h: 0.24, fill: "dark", tongue: true },
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));

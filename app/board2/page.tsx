@@ -2887,30 +2887,30 @@ function evalCharPoseRaw(
   }
 
   if (active.type === "explainGesture") {
-    // Broad presenter gestures keyed by wrist targets: side holds, point-up, point-down, and
-    // two-hand spread. This keeps the action readable as "talking with hands" at timeline scale.
+    // Conversational presenter gestures keyed by wrist targets: side holds, small point-up/down,
+    // and modest two-hand spreads. Keep the hands expressive without turning every beat into a pose.
     const localT = Math.max(0, time - active.startTime);
     const seed = seededRandom(active.id);
     const poseTargets = [
-      { t: 0, left: { x: -52, y: -64 }, right: { x: 48, y: -66 }, lean: 0.02, tilt: -0.02 },
-      { t: 0.14, left: { x: -58, y: -80 }, right: { x: 38, y: -104 }, lean: -0.03, tilt: 0.05 },
-      { t: 0.29, left: { x: -54, y: -58 }, right: { x: 58, y: -42 }, lean: 0.04, tilt: 0.01 },
-      { t: 0.45, left: { x: -36, y: -104 }, right: { x: 58, y: -64 }, lean: 0.035, tilt: -0.05 },
-      { t: 0.62, left: { x: -62, y: -64 }, right: { x: 62, y: -70 }, lean: 0, tilt: 0.02 },
-      { t: 0.8, left: { x: -60, y: -38 }, right: { x: 44, y: -100 }, lean: -0.035, tilt: 0.055 },
-      { t: 1, left: { x: -52, y: -64 }, right: { x: 48, y: -66 }, lean: 0.02, tilt: -0.02 },
+      { t: 0, left: { x: -42, y: -54 }, right: { x: 42, y: -56 }, lean: 0.01, tilt: -0.01 },
+      { t: 0.16, left: { x: -48, y: -60 }, right: { x: 34, y: -82 }, lean: -0.018, tilt: 0.03 },
+      { t: 0.32, left: { x: -46, y: -50 }, right: { x: 52, y: -44 }, lean: 0.022, tilt: 0.005 },
+      { t: 0.5, left: { x: -32, y: -80 }, right: { x: 50, y: -58 }, lean: 0.02, tilt: -0.025 },
+      { t: 0.68, left: { x: -54, y: -58 }, right: { x: 54, y: -62 }, lean: 0, tilt: 0.012 },
+      { t: 0.84, left: { x: -50, y: -42 }, right: { x: 38, y: -78 }, lean: -0.018, tilt: 0.03 },
+      { t: 1, left: { x: -42, y: -54 }, right: { x: 42, y: -56 }, lean: 0.01, tilt: -0.01 },
     ];
-    const cycle = 3.2 + seed * 0.45;
+    const cycle = 3.6 + seed * 0.55;
     const cycleT = ((localT + seed * cycle) % cycle) / cycle;
     let poseIndex = 0;
     while (poseIndex < poseTargets.length - 2 && cycleT > poseTargets[poseIndex + 1].t) poseIndex++;
     const a = poseTargets[poseIndex];
     const b = poseTargets[poseIndex + 1];
     const blend = easeInOutCubic(clamp((cycleT - a.t) / Math.max(0.001, b.t - a.t), 0, 1));
-    const handDrift = Math.sin(localT * 9.4 + seed * 8) * 2.4;
+    const handDrift = Math.sin(localT * 8.2 + seed * 8) * 1.35;
     const interpPoint = (pa: { x: number; y: number }, pb: { x: number; y: number }, side: -1 | 1) => ({
       x: lerp(pa.x, pb.x, blend) + side * handDrift,
-      y: lerp(pa.y, pb.y, blend) + Math.sin(localT * 7.1 + seed * 5 + side) * 1.7,
+      y: lerp(pa.y, pb.y, blend) + Math.sin(localT * 6.4 + seed * 5 + side) * 1.05,
     });
     const leftHand = interpPoint(a.left, b.left, -1);
     const rightHand = interpPoint(a.right, b.right, 1);
@@ -2925,7 +2925,7 @@ function evalCharPoseRaw(
 
     return applyAuthoredPose({
       boardX: active.fromX, boardY: active.fromY, facing,
-      headBob: Math.sin(localT * 4.4 + seed) * 1.1 - (1 - intro) * 2.5,
+      headBob: Math.sin(localT * 3.4 + seed) * 0.75 - (1 - intro) * 1.4,
       bodyLean: lerp(0, lerp(a.lean, b.lean, blend), gestureAlpha),
       headTilt: lerp(0, lerp(a.tilt, b.tilt, blend), gestureAlpha),
       leftLegA: 0.1 + Math.sin(localT * 0.75) * 0.045,
