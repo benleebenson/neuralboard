@@ -173,18 +173,20 @@ function activeNarrationBubble(time: number, clips: readonly Clip[]): { cue: Spe
 function narrationVisemeAt(time: number, clips: readonly Clip[]): Viseme {
   const clip = clips.find((candidate) =>
     candidate.type === "narration" &&
-    candidate.transcriptSegments?.length &&
     time >= candidate.startTime &&
     time < candidate.startTime + candidate.duration
   );
-  if (!clip?.transcriptSegments?.length) return "rest";
+  if (!clip) return "rest";
   const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
+  if (!clip.transcriptSegments?.length) {
+    return rhythmicViseme(sourceTime, clip.id);
+  }
   const segment = clip.transcriptSegments.find((candidate) =>
     sourceTime >= candidate.start &&
     sourceTime < candidate.end &&
     candidate.text.trim()
   );
-  if (!segment) return "rest";
+  if (!segment) return rhythmicViseme(sourceTime, clip.id);
   const segmentDur = Math.max(0.001, segment.end - segment.start);
   const segmentT = clamp((sourceTime - segment.start) / segmentDur, 0, 1);
   if (segmentT < 0.035 || segmentT > 0.97) return "closed";
@@ -214,6 +216,30 @@ function narrationVisemeAt(time: number, clips: readonly Clip[]): Viseme {
     cursor = end;
   }
   return "closed";
+}
+
+function rhythmicViseme(time: number, seedKey: string): Viseme {
+  const seed = seededRandom(seedKey);
+  const beat = (time * (7.5 + seed * 2.5) + seed * 5) % 1;
+  if (beat < 0.12) return "closed";
+  if (beat < 0.32) return "open";
+  if (beat < 0.5) return seed < 0.45 ? "wide" : "round";
+  if (beat < 0.68) return "slightOpen";
+  if (beat < 0.82) return seed > 0.7 ? "pucker" : "teeth";
+  return "slightOpen";
+}
+
+function actionSpeechVisemeAt(time: number, actions: readonly ResolvedCharAction[], seedKey: string): Viseme {
+  const active = actions.find((action) =>
+    (action.type === "explainGesture" || action.type === "emote") &&
+    time >= action.startTime &&
+    time < action.startTime + action.duration
+  );
+  if (!active) return "rest";
+  const localT = Math.max(0, time - active.startTime);
+  const edge = Math.min(localT, active.duration - localT);
+  if (edge < 0.08) return "closed";
+  return rhythmicViseme(localT, `${seedKey}:${active.id}:${active.type}`);
 }
 
 function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number, anchor?: SpeechBubbleAnchor | null) {
@@ -4289,7 +4315,7 @@ export default function Board2Page() {
             if (playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
             pose = applyPlayForceChokePose(pose);
           }
-          const viseme = resolvedCharacterViseme(id, playTimeRef.current, clipsRef.current);
+          const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved);
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = active?.type ?? (!state
@@ -4327,7 +4353,7 @@ export default function Board2Page() {
           const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
           const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
           const duration = active?.duration ?? 2;
-          const viseme = resolvedCharacterViseme(id, playheadRef.current, clipsRef.current);
+          const viseme = resolvedCharacterViseme(id, t, clipsRef.current, resolved);
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           return {
             id,
@@ -4538,10 +4564,17 @@ export default function Board2Page() {
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
 
-  function resolvedCharacterViseme(id: CharacterId, time: number, sourceClips: readonly Clip[] = clipsRef.current): Viseme {
+  function resolvedCharacterViseme(
+    id: CharacterId,
+    time: number,
+    sourceClips: readonly Clip[] = clipsRef.current,
+    actions: readonly ResolvedCharAction[] = id === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
+  ): Viseme {
     const mode = id === "c2" ? characterVisemeMode2Ref.current : characterVisemeModeRef.current;
     if (mode !== "auto") return mode;
-    return narrationVisemeAt(time, sourceClips);
+    const narration = narrationVisemeAt(time, sourceClips);
+    if (narration !== "rest") return narration;
+    return actionSpeechVisemeAt(time, actions, id);
   }
   useEffect(() => { playModeRef.current = playMode; }, [playMode]);
   useEffect(() => { playWeaponArmedRef.current = playWeaponArmed; }, [playWeaponArmed]);
@@ -5249,7 +5282,7 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
-          { ...pose, viseme: resolvedCharacterViseme("c1", time, currentClips) },
+          { ...pose, viseme: resolvedCharacterViseme("c1", liveRuntimeSeconds(live.c1, wallMs), currentClips, liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current)) },
           boardCharacterDrawEvaluators()
         );
       }
@@ -5267,7 +5300,7 @@ export default function Board2Page() {
             ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
             : null,
           characterSkin2Ref.current,
-          { ...pose, viseme: resolvedCharacterViseme("c2", time, currentClips) },
+          { ...pose, viseme: resolvedCharacterViseme("c2", liveRuntimeSeconds(live.c2, wallMs), currentClips, liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current)) },
           boardCharacterDrawEvaluators()
         );
       }
@@ -5284,7 +5317,7 @@ export default function Board2Page() {
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
           : null,
         characterSkinRef.current,
-        { ...pose, viseme: resolvedCharacterViseme("c1", time, currentClips) },
+        { ...pose, viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -5305,7 +5338,7 @@ export default function Board2Page() {
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
           : null,
         characterSkin2Ref.current,
-        { ...pose, viseme: resolvedCharacterViseme("c2", time, currentClips) },
+        { ...pose, viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -5441,12 +5474,12 @@ export default function Board2Page() {
     drawEditorCharacter(
       "c1",
       resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current, charInitYRef.current,
-      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, resolvedCharacterViseme("c1", time, currentClips),
+      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, resolvedCharacterViseme("c1", time, currentClips, resolvedCharActionsRef.current),
     );
     drawEditorCharacter(
       "c2",
       resolvedCharActions2Ref.current, showCharacter2Ref.current, charInit2XRef.current, charInit2YRef.current,
-      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, resolvedCharacterViseme("c2", time, currentClips),
+      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, resolvedCharacterViseme("c2", time, currentClips, resolvedCharActions2Ref.current),
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
@@ -10186,7 +10219,7 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
-          { ...playPose, viseme: resolvedCharacterViseme("c1", now, clipsRef.current) },
+          { ...playPose, viseme: resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved) },
           boardCharacterDrawEvaluators()
         );
         for (const shot of playWeaponShotsRef.current) {
