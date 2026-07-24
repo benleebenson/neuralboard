@@ -286,7 +286,7 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   ctx.shadowOffsetY = 2;
   ctx.fillStyle = "rgba(255,255,252,.97)";
   ctx.strokeStyle = "#171717";
-  ctx.lineWidth = Math.max(1.1, width * 0.0016);
+  ctx.lineWidth = Math.max(0.85, width * 0.00105);
   ctx.beginPath();
   ctx.moveTo(x + radius, y);
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
