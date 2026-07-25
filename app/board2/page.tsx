@@ -10978,7 +10978,6 @@ export default function Board2Page() {
       }
     }
 
-    if(state.grounded&&!ragdolling&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
     const previousY = state.y;
     const horizontalMotion = state.grounded && !ragdolling
       ? resolveGroundedCharacterMotion(

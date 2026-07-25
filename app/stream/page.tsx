@@ -828,7 +828,6 @@ export default function StreamPage() {
               }
             }
             if(p.grounded&&p.action==="ragdoll")p.vx*=Math.exp(-dt*BAZOOKA_RAGDOLL_GROUND_DRAG);
-            if(p.grounded&&p.action!=="ragdoll"&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
             const terrain=surfaces as TerrainClip[];
             const horizontalMotion=p.grounded&&p.action!=="ragdoll"
               ?resolveGroundedCharacterMotion(
