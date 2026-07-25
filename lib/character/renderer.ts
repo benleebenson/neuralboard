@@ -132,70 +132,121 @@ export function drawTommyGunHeld(
   H: number,
   recoilPx = 0,
 ) {
-  const sx = (shooter.x - cam.cameraX) * sf + W / 2;
-  const sy = (shooter.y - cam.cameraY) * sf + H / 2;
-  const ax = (aimBoard.x - cam.cameraX) * sf + W / 2;
-  const ay = (aimBoard.y - cam.cameraY) * sf + H / 2;
-  const rawDx = ax - sx;
-  const dir = Math.abs(rawDx) < Math.tan((8 * Math.PI) / 180) * Math.abs(ay - (sy - 104 * sf))
-    ? shooter.facing
-    : rawDx >= 0 ? 1 : -1;
-  const localAim = Math.atan2(ay - (sy - 104 * sf), Math.abs(rawDx));
-  const aimUxLocal = Math.cos(localAim);
-  const aimUy = Math.sin(localAim);
-  const aimUx = aimUxLocal * dir;
-  const perpX = -aimUy;
-  const perpY = aimUx;
-  const chest = { x: sx, y: sy - 108 * sf };
+  const geometry = tommyGunAimGeometry(shooter, aimBoard);
+  const pivotX = (geometry.pivot.x - cam.cameraX) * sf + W / 2;
+  const pivotY = (geometry.pivot.y - cam.cameraY) * sf + H / 2;
+  const aimAngle = Math.atan2(geometry.dir.y, geometry.dir.x);
+  const keepGripsDown = geometry.dir.x < 0 ? -1 : 1;
   const recoil = recoilPx * sf;
-  const rearGrip = {
-    x: chest.x + aimUx * 34 * sf - aimUx * recoil,
-    y: chest.y + aimUy * 34 * sf - aimUy * recoil,
-  };
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.strokeStyle = "#27221f";
-  ctx.lineWidth = Math.max(1.5, 3 * sf);
-  ctx.translate(rearGrip.x - aimUx * 18 * sf - perpX * 1.5 * sf, rearGrip.y - aimUy * 18 * sf - perpY * 1.5 * sf);
-  ctx.rotate(localAim);
-  ctx.scale(dir, 1);
-  ctx.fillStyle = "#595f66";
+  ctx.strokeStyle = "#171717";
+  ctx.lineWidth = Math.max(1.5, 3.2 * sf);
+  ctx.translate(pivotX - geometry.dir.x * recoil, pivotY - geometry.dir.y * recoil);
+  ctx.rotate(aimAngle);
+  ctx.scale(1, keepGripsDown);
+
+  // Rear wooden stock
+  ctx.fillStyle = "#a86f50";
   ctx.beginPath();
-  ctx.roundRect(0, -9 * sf, 58 * sf, 18 * sf, 4 * sf);
+  ctx.moveTo(-31 * sf, -7 * sf);
+  ctx.bezierCurveTo(-48 * sf, -10 * sf, -69 * sf, -20 * sf, -91 * sf, -29 * sf);
+  ctx.lineTo(-98 * sf, -26 * sf);
+  ctx.lineTo(-97 * sf, 3 * sf);
+  ctx.bezierCurveTo(-72 * sf, 16 * sf, -51 * sf, 22 * sf, -29 * sf, 11 * sf);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Receiver and long barrel
+  ctx.fillStyle = "#55595c";
+  ctx.beginPath();
+  ctx.roundRect(-33 * sf, -13 * sf, 76 * sf, 25 * sf, 4 * sf);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#34383b";
+  ctx.beginPath();
+  ctx.roundRect(39 * sf, -6 * sf, 93 * sf, 8 * sf, 2 * sf);
   ctx.fill();
   ctx.stroke();
   ctx.beginPath();
-  ctx.rect(56 * sf, -3 * sf, 30 * sf, 6 * sf);
+  ctx.roundRect(126 * sf, -8 * sf, 13 * sf, 12 * sf, 2 * sf);
   ctx.fill();
   ctx.stroke();
   ctx.beginPath();
-  ctx.moveTo(82 * sf, -9 * sf);
-  ctx.lineTo(89 * sf, -9 * sf);
+  ctx.moveTo(112 * sf, -7 * sf);
+  ctx.lineTo(112 * sf, -14 * sf);
+  ctx.lineTo(117 * sf, -14 * sf);
   ctx.stroke();
-  ctx.fillStyle = "#8B5A2B";
   ctx.beginPath();
-  ctx.moveTo(-1 * sf, 1 * sf);
-  ctx.lineTo(-38 * sf, 18 * sf);
-  ctx.lineTo(-43 * sf, 9 * sf);
-  ctx.lineTo(-8 * sf, -6 * sf);
+  ctx.moveTo(21 * sf, -14 * sf);
+  ctx.lineTo(24 * sf, -22 * sf);
+  ctx.lineTo(30 * sf, -22 * sf);
+  ctx.lineTo(33 * sf, -14 * sf);
+  ctx.stroke();
+
+  // Trigger grip and forward wooden grip
+  ctx.fillStyle = "#a86f50";
+  ctx.beginPath();
+  ctx.moveTo(-8 * sf, 9 * sf);
+  ctx.lineTo(5 * sf, 10 * sf);
+  ctx.lineTo(12 * sf, 42 * sf);
+  ctx.quadraticCurveTo(3 * sf, 50 * sf, -7 * sf, 44 * sf);
+  ctx.lineTo(-14 * sf, 17 * sf);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
   ctx.beginPath();
-  ctx.roundRect(17 * sf, 9 * sf, 10 * sf, 26 * sf, 3 * sf);
+  ctx.moveTo(55 * sf, 3 * sf);
+  ctx.lineTo(75 * sf, 3 * sf);
+  ctx.lineTo(71 * sf, 25 * sf);
+  ctx.quadraticCurveTo(63 * sf, 36 * sf, 53 * sf, 27 * sf);
+  ctx.lineTo(47 * sf, 10 * sf);
+  ctx.closePath();
   ctx.fill();
   ctx.stroke();
+
+  // Curved magazine
+  ctx.fillStyle = "#4a4e51";
   ctx.beginPath();
-  ctx.roundRect(36 * sf, 7 * sf, 9 * sf, 24 * sf, 3 * sf);
+  ctx.moveTo(18 * sf, 10 * sf);
+  ctx.lineTo(34 * sf, 10 * sf);
+  ctx.bezierCurveTo(36 * sf, 31 * sf, 30 * sf, 52 * sf, 17 * sf, 68 * sf);
+  ctx.lineTo(5 * sf, 58 * sf);
+  ctx.bezierCurveTo(16 * sf, 43 * sf, 21 * sf, 27 * sf, 18 * sf, 10 * sf);
+  ctx.closePath();
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = "#6d7379";
+
+  // Trigger guard and trigger
+  ctx.fillStyle = "transparent";
   ctx.beginPath();
-  ctx.arc(31 * sf, 20 * sf, 16 * sf, 0, Math.PI * 2);
-  ctx.fill();
+  ctx.ellipse(-2 * sf, 17 * sf, 12 * sf, 9 * sf, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-1 * sf, 10 * sf);
+  ctx.lineTo(4 * sf, 20 * sf);
   ctx.stroke();
   ctx.restore();
+}
+
+export function tommyGunAimGeometry(
+  shooter: { x: number; y: number; facing: 1 | -1 },
+  aimBoard: { x: number; y: number },
+) {
+  const pivot = { x: shooter.x, y: shooter.y - 108 };
+  const dx = aimBoard.x - pivot.x;
+  const dy = aimBoard.y - pivot.y;
+  const length = Math.hypot(dx, dy);
+  const dir = length > 0.001
+    ? { x: dx / length, y: dy / length }
+    : { x: shooter.facing, y: 0 };
+  return {
+    pivot,
+    dir,
+    muzzle: { x: pivot.x + dir.x * 139, y: pivot.y + dir.y * 139 },
+  };
 }
 
 export function drawBazookaHeld(ctx:CanvasRenderingContext2D,shooter:{x:number;y:number;facing:1|-1},aimBoard:{x:number;y:number},cam:StreamCamera,sf:number,W:number,H:number,recoilPx=0,pickupProgress=1,bodyPose?:{bodyLean?:number;headBob?:number}){

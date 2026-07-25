@@ -51,6 +51,7 @@ import {
   eliminationFrameForGuest,
   projectilePoint,
   streamCharacterConstructionParams,
+  tommyGunAimGeometry,
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
@@ -510,7 +511,7 @@ function authoredBazookaTimeline(
   clips: readonly Clip[],
   initialCraters: readonly StreamCrater[] = [],
 ): { craters: StreamCrater[]; events: BazookaVisualEvent[] } {
-  const terrain = clips.filter((clip) => clip.type === "image" && clip.boardX !== undefined) as Array<Clip & Required<Pick<Clip, "boardX" | "boardY" | "boardW" | "boardH">>>;
+  const terrain = clips.filter((clip) => (clip.type === "image" || clip.type === "video") && clip.boardX !== undefined) as Array<Clip & Required<Pick<Clip, "boardX" | "boardY" | "boardW" | "boardH">>>;
   const actions = actionGroups.flatMap((group) => group.filter((action) => action.type === "bazooka" && action.targetX !== undefined && action.targetY !== undefined)
     .map((action) => ({ action, fireFraction: authoredBazookaFireFraction(action, group) })))
     .sort((a, b) => a.action.startTime - b.action.startTime || a.action.id.localeCompare(b.action.id));
@@ -712,7 +713,7 @@ function rocketRayEnd(from: TerrainPoint, cursor: TerrainPoint, boardW = BOARD_W
 }
 
 function rocketTerrainClips(clips: readonly Clip[]): TerrainClip[] {
-  return clips.flatMap((clip) => clip.type === "image" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
+  return clips.flatMap((clip) => (clip.type === "image" || clip.type === "video") && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
     ? [{ id: clip.id, type: clip.type, boardX: clip.boardX, boardY: clip.boardY, boardW: clip.boardW, boardH: clip.boardH }]
     : []);
 }
@@ -3633,6 +3634,7 @@ export default function Board2Page() {
   const [playMode, setPlayMode] = useState(false);
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
+  const [playTalkingGestures, setPlayTalkingGestures] = useState(false);
   const [playMediaFocusId, setPlayMediaFocusId] = useState<string | null>(null);
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playBazookaArmed, setPlayBazookaArmed] = useState(false);
@@ -3957,6 +3959,7 @@ export default function Board2Page() {
   const playWallStartRef = useRef(0);
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
   const playMediaFocusIdRef = useRef<string | null>(null);
+  const playTalkingGesturesRef = useRef(false);
   const playHeldKeysRef = useRef(new Set<string>());
   const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
   const playCursorRef = useRef<{ x: number; y: number } | null>(null);
@@ -5315,7 +5318,10 @@ export default function Board2Page() {
         // primarily on decoded future data + actually playing. The currentTime guard only applies
         // immediately after an active-range restart to avoid the first-play thumbnail/audio race.
         if (vid && vid.readyState >= 3 && !vid.paused && !vid.ended && (!justRestartedActive || vid.currentTime > 0.05)) {
-          try { ctx.drawImage(vid, sx - sw / 2, sy - sh / 2, sw, sh); drewLive = true; } catch { drewLive = false; }
+          try {
+            drawCrateredImage(ctx, vid, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
+            drewLive = true;
+          } catch { drewLive = false; }
         }
         if (drewLive) {
           videoStuckFrameCountRef.current.set(clip.id, 0);
@@ -5336,7 +5342,7 @@ export default function Board2Page() {
         }
         if (!drewLive) {
           if (thumbEl) {
-            ctx.drawImage(thumbEl, sx - sw / 2, sy - sh / 2, sw, sh);
+            drawCrateredImage(ctx, thumbEl, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
           } else {
             // Thumbnail not yet captured or failed — draw black box with play icon
             ctx.fillStyle = "#111";
@@ -9715,12 +9721,43 @@ export default function Board2Page() {
     setToast(surface.type === "video" ? "Camera focused · video playing" : "Camera focused on image");
   }
 
+  function applyPlayTalkingGestures(pose: CharPoseResult, wallMs: number): CharPoseResult {
+    if (!playTalkingGesturesRef.current) return pose;
+    const time = wallMs / 1000;
+    const action: ResolvedCharAction = {
+      id: "play-talking-gestures",
+      type: "explainGesture",
+      startTime: 0,
+      duration: 24 * 60 * 60,
+      targetX: pose.boardX,
+      targetY: pose.boardY,
+      fromX: pose.boardX,
+      fromY: pose.boardY,
+    };
+    const talking = evalCharAtTime(time, [action], pose.boardX, pose.boardY, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
+    return {
+      ...pose,
+      leftArmA: talking.leftArmA,
+      rightArmA: talking.rightArmA,
+      leftForeA: talking.leftForeA,
+      rightForeA: talking.rightForeA,
+      headTilt: talking.headTilt,
+      bodyLean: pose.bodyLean + talking.bodyLean,
+      forceHandOpen: talking.forceHandOpen,
+      actionType: "explainGesture",
+    };
+  }
+
+  function togglePlayTalkingGestures() {
+    const next = !playTalkingGesturesRef.current;
+    playTalkingGesturesRef.current = next;
+    setPlayTalkingGestures(next);
+    setToast(next ? "Talking gestures on" : "Talking gestures off");
+  }
+
   function playWeaponOrigin(state: PlayCharacterState): { x: number; y: number } {
     const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
-    const dx = aim.x - state.x;
-    const dy = aim.y - (state.y - 110);
-    const len = Math.max(1, Math.hypot(dx, dy));
-    return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
+    return tommyGunAimGeometry(state, aim).muzzle;
   }
 
   function playLiveSpeechViseme(): Viseme | null {
@@ -9954,9 +9991,16 @@ export default function Board2Page() {
   function applyPlayWeaponPose(pose: CharPoseResult, state: PlayCharacterState): CharPoseResult {
     const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
     const facing = playAimFacing(state.facing, state.x, state.y - 110, aim);
-    const aimA = aimAngleFromPoint(pose.boardX, pose.boardY, facing, aim.x, aim.y);
-    const firingArmA = clamp(aimA, -1.15, 1.15);
-    const supportArmA = clamp(aimA * 0.78 + 0.08, -0.95, 0.95);
+    const gun = tommyGunAimGeometry({ x: state.x, y: state.y, facing }, aim);
+    const toLocal = (along: number, down: number) => {
+      const worldX = gun.dir.x * along - gun.dir.y * down;
+      const worldY = gun.dir.y * along + gun.dir.x * down;
+      return { x: worldX * facing, y: -108 + worldY };
+    };
+    const triggerPoint = toLocal(-1, 22);
+    const supportPoint = toLocal(60, 18);
+    const triggerArm = solveArmToLocalPoint(triggerPoint.x, triggerPoint.y, facing >= 0 ? 1 : -1);
+    const supportArm = solveArmToLocalPoint(supportPoint.x, supportPoint.y, facing >= 0 ? -1 : 1);
     const armedPose: CharPoseResult = {
       ...pose,
       facing,
@@ -9968,15 +10012,15 @@ export default function Board2Page() {
       rightShinA: (pose.rightShinA ?? pose.rightLegA) - 0.18,
     };
     if (facing >= 0) {
-      armedPose.rightArmA = firingArmA;
-      armedPose.rightForeA = firingArmA;
-      armedPose.leftArmA = supportArmA;
-      armedPose.leftForeA = supportArmA * 0.75;
+      armedPose.rightArmA = triggerArm.armA;
+      armedPose.rightForeA = triggerArm.foreA;
+      armedPose.leftArmA = supportArm.armA;
+      armedPose.leftForeA = supportArm.foreA;
     } else {
-      armedPose.leftArmA = firingArmA;
-      armedPose.leftForeA = firingArmA;
-      armedPose.rightArmA = -supportArmA;
-      armedPose.rightForeA = -supportArmA * 0.75;
+      armedPose.leftArmA = triggerArm.armA;
+      armedPose.leftForeA = triggerArm.foreA;
+      armedPose.rightArmA = supportArm.armA;
+      armedPose.rightForeA = supportArm.foreA;
     }
     return armedPose;
   }
@@ -10168,6 +10212,8 @@ export default function Board2Page() {
     playWeaponArmedRef.current = false;
     setPlayBazookaArmed(false); playBazookaArmedRef.current=false; playBazookaEventsRef.current=[];
     setPlaySceneShot(false);
+    playTalkingGesturesRef.current = false;
+    setPlayTalkingGestures(false);
     playMediaFocusIdRef.current = null;
     setPlayMediaFocusId(null);
     setPlayMode(true);
@@ -10181,6 +10227,8 @@ export default function Board2Page() {
       playForceChokeRef.current = null;
     }
     setPlayMode(false);
+    playTalkingGesturesRef.current = false;
+    setPlayTalkingGestures(false);
     playMediaFocusIdRef.current = null;
     setPlayMediaFocusId(null);
     playHeldKeysRef.current.clear();
@@ -10486,6 +10534,7 @@ export default function Board2Page() {
         updatePlayPhysics(state, dt, canvas);
         playPose = sharedPlayPoseFromPhysics(state, now);
       }
+      playPose = applyPlayTalkingGestures(playPose, wall);
       updatePlayWeaponShots(nowMs, previousNowMs);
       if (playWeaponArmedRef.current || playBazookaArmedRef.current) {
         const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
@@ -10611,7 +10660,17 @@ export default function Board2Page() {
           });
           return;
         }
-        if (e.code === "KeyV") { e.preventDefault(); setPlaySceneShot((v) => !v); return; }
+        if (e.code === "KeyB") {
+          e.preventDefault();
+          const next = !playBazookaArmedRef.current;
+          playWeaponArmedRef.current = false;
+          setPlayWeaponArmed(false);
+          playBazookaArmedRef.current = next;
+          setPlayBazookaArmed(next);
+          broadcastWeaponState(true);
+          return;
+        }
+        if (e.code === "KeyV") { e.preventDefault(); togglePlayTalkingGestures(); return; }
         if (e.code === "KeyC") { e.preventDefault(); togglePlayMediaFocus(); return; }
         if (playWeaponArmedRef.current && ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.code)) {
           e.preventDefault();
@@ -11324,8 +11383,23 @@ export default function Board2Page() {
       {label:"Exit Play Mode",icon:"←",onSelect:()=>choosePlayWheel(exitPlayMode)},
     ];
     return (
-	      <div ref={playContainerRef} data-play-maximize={playMaximize||undefined} style={{ position: "fixed", inset: 0, zIndex: playMaximize?2147483000:10000, overflow: "hidden", background: "#111" }}>
-	        <style>{`[data-play-maximize] > :not(canvas):not(style):not([data-max-exit]){display:none!important}`}</style>
+	      <div ref={playContainerRef} data-play-ui data-play-maximize={playMaximize||undefined} style={{ position: "fixed", inset: 0, zIndex: playMaximize?2147483000:10000, overflow: "hidden", background: "#111", color: "#111", colorScheme: "light" }}>
+	        <style>{`
+            [data-play-maximize] > :not(canvas):not(style):not([data-max-exit]){display:none!important}
+            [data-play-ui] button,
+            [data-play-ui] input,
+            [data-play-ui] select,
+            [data-play-ui] textarea,
+            [data-play-ui] label,
+            [data-play-ui] [data-action-wheel],
+            [data-play-ui] [data-action-wheel-menu],
+            [data-play-ui] aside {
+              color:#111!important;
+            }
+            [data-play-ui] [data-play-toast] {
+              color:#fffdf5!important;
+            }
+          `}</style>
 	        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
 	        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
 	        <canvas
@@ -11447,7 +11521,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · B {playBazookaArmed ? "stow bazooka" : "bazooka"} · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · V {playTalkingGestures ? "stop talking gestures" : "talking gestures"}<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror · wheel zoom · Esc exit
 	            </div>
 	          )}
 	        </div>}
@@ -11456,8 +11530,8 @@ export default function Board2Page() {
 	        {playParticipantsOpen&&!playMaximize&&<aside style={{position:"fixed",top:64,right:14,zIndex:10025,minWidth:190,padding:10,border:"2px solid #2a2a2a",background:"#fffdf5",fontFamily:"'Patrick Hand', cursive"}}><button onClick={()=>setPlayParticipantsOpen(false)} style={{float:"right",border:0,background:"transparent"}}>✕</button><strong>Participants ({streamGuests.length})</strong>{streamGuests.map(g=><div key={g.guestId}>{g.name}</div>)}</aside>}
 	        {renderPlayYoutubeModal()}
 	        {renderDownloadToasts()}
-	        {toast && (
-	          <div style={{ position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 10001, background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace", fontSize: 11, padding: "8px 14px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135" }}>
+	        {toast && !playCleanUi && (
+	          <div data-play-toast style={{ position: "fixed", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 10001, background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace", fontSize: 11, padding: "8px 14px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135" }}>
 	            {toast}
 	          </div>
 	        )}
