@@ -17,8 +17,9 @@ export type PlayCharacterState = {
   airborneAt?: number;
   spawnX: number;
   spawnY: number;
-  action: "none" | "dance" | "emote" | "pullups" | "mirror" | "forceChoke";
+  action: "none" | "dance" | "emote" | "pullups" | "mirror" | "forceChoke" | "ragdoll";
   actionUntil: number;
+  ragdollSpin?: number;
   landedAt: number;
   grappleX: number | null;
   grappleY: number | null;

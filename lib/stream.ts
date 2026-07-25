@@ -167,7 +167,37 @@ export type StreamCharacterFrame = {
 
 export type SpawnDoor = { x: number; y: number };
 export type StreamCrater = { clipId: string; cx: number; cy: number; r: number; seed: number };
-export type StreamBazookaFireMessage = { kind:"bazooka_fire";sequenceType:"bazookaFire";streamId:string;sessionId:string;sentAt:number;startTime:number;from:{x:number;y:number};target:{x:number;y:number};seed:number };
+export type StreamBazookaFireMessage = {
+  kind: "bazooka_fire";
+  sequenceType: "bazookaFire";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  startTime: number;
+  shotId?: string;
+  shooter?: { role: "host" | "guest"; guestId?: string };
+  from: { x: number; y: number };
+  target: { x: number; y: number };
+  seed: number;
+};
+export type StreamBazookaImpactMessage = {
+  kind: "bazooka_impact";
+  sequenceType: "bazookaImpact";
+  streamId: string;
+  sessionId: string;
+  sentAt: number;
+  startTime: number;
+  impactAt: number;
+  shotId: string;
+  from: { x: number; y: number };
+  point: { x: number; y: number };
+  direction: { x: number; y: number };
+  impulse: { x: number; y: number };
+  spin: number;
+  seed: number;
+  duration: number;
+  target: { role: "host" } | { role: "guest"; guestId: string };
+};
 export type StreamRepairBoardMessage = { kind:"repair_board";streamId:string;sessionId:string;sentAt:number };
 
 export type StreamParticipantPresence = {
@@ -194,7 +224,7 @@ export type GuestCharacterFrame = {
   position: { x: number; y: number };
   velocity?: { x: number; y: number };
   facing: 1 | -1;
-  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "grapple" | "skateTo" | "wallClimb" | "zipline" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "forceChoke" | "eliminated";
+  actionType: "idle" | "walk" | "run" | "jump" | "flip" | "ragdoll" | "grapple" | "skateTo" | "wallClimb" | "zipline" | "dance" | "pullUps" | "mirrorCheck" | "sitAndWatch" | "emote" | "forceChoke" | "eliminated";
   actionProgress: number;
   actionStartTime?: number;
   actionDuration?: number;
@@ -306,7 +336,7 @@ export type StreamEndMessage = {
   sentAt: number;
 };
 
-export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage | StreamBazookaFireMessage | StreamRepairBoardMessage;
+export type StreamMessage = StreamSnapshotMessage | StreamFrameMessage | StreamEndMessage | StreamKickMessage | StreamEliminationMessage | StreamShotFiredMessage | StreamWeaponHitMessage | StreamChokeMessage | StreamBazookaFireMessage | StreamBazookaImpactMessage | StreamRepairBoardMessage;
 
 export function streamChannelName(streamId: string): string {
   return `${STREAM_CHANNEL_PREFIX}:${streamId}`;

@@ -264,9 +264,18 @@ function streamPoseFallback(args: {
       pose.grappleTaut = true;
     }
   }
-  if (args.actionType === "flip" || args.actionType === "eliminated") {
+  if (args.actionType === "flip" || args.actionType === "ragdoll" || args.actionType === "eliminated") {
     const flipPose = sampleAnimation({ id: "entity-fallback-flip", name: "flip", keyframes: FORWARD_TUCK_FLIP_KEYFRAMES, loop: false, createdAt: "fallback" }, Math.min(1, p));
     applyPose(pose, flipPose, true);
+    if (args.actionType === "ragdoll") {
+      const spin = param("ragdollSpin", args.facing * 8);
+      pose.spinAngle = p * spin;
+      pose.leftArmA += Math.sin(p * Math.PI * 5) * 0.45;
+      pose.rightArmA -= Math.cos(p * Math.PI * 4) * 0.45;
+      pose.leftLegA += Math.cos(p * Math.PI * 3) * 0.35;
+      pose.rightLegA -= Math.sin(p * Math.PI * 4) * 0.35;
+      pose.terrainGrounded = false;
+    }
     if (args.actionType === "eliminated") pose.spinAngle = p * Math.PI * 7.5;
   }
   if (args.actionType === "dance") {

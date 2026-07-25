@@ -9,7 +9,8 @@ import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, ty
 import { groundProfileY, raycastSolid, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
-import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
+import { bazookaShotKey } from "@/lib/character/impacts";
+import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamBazookaImpactMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 
 type Mode = "landing" | "watch" | "join" | "guest";
@@ -253,6 +254,7 @@ function guestActionDuration(action: GuestCharacterFrame["actionType"], distance
   if (action === "mirrorCheck") return 1.6;
   if (action === "sitAndWatch") return 3.0;
   if (action === "forceChoke") return 1.4;
+  if (action === "ragdoll") return 1.25;
   if (action === "emote") return 1.5;
   if (action === "eliminated") return 3.2;
   return action === "run" ? 0.75 : action === "walk" ? 0.9 : 2;
@@ -277,7 +279,7 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
     actionProgress: progress,
     actionStartTime: sentAt - progress * duration * 1000,
     actionDuration: duration,
-    actionParams: p.actionTargetX !== undefined || p.terrainSlope !== undefined ? {
+    actionParams: p.actionParams || p.actionTargetX !== undefined || p.terrainSlope !== undefined ? {
       ...(p.actionParams ?? {}),
       fromX: p.actionFromX,
       fromY: p.actionFromY,
@@ -517,7 +519,7 @@ export default function StreamPage() {
   const characterEntities=useRef(new Map<string,CharacterEntity>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteGuestSeq=useRef(new Map<string,number>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<StreamFrameMessage["weapon"]|null>(null), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), guestSeq=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const signDataUrlRef=useRef<string|undefined>(undefined), signActiveRef=useRef(false), signDrawingRef=useRef(false);
-  const bazookaEventsRef=useRef<BazookaVisualEvent[]>([]),cratersRef=useRef<StreamCrater[]>([]),guestBazookaArmedRef=useRef(false),guestBazookaAimRef=useRef<{x:number;y:number}|null>(null),guestBazookaLastFireAtRef=useRef(0);
+  const bazookaEventsRef=useRef<BazookaVisualEvent[]>([]),bazookaCharacterImpactsRef=useRef(new Map<string,StreamBazookaImpactMessage>()),cratersRef=useRef<StreamCrater[]>([]),guestBazookaArmedRef=useRef(false),guestBazookaAimRef=useRef<{x:number;y:number}|null>(null),guestBazookaLastFireAtRef=useRef(0);
   const repairAtRef=useRef(0);
   const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[wheelOpen,setWheelOpen]=useState(false),[wheelMenuOpen,setWheelMenuOpen]=useState(false),[debugOpen,setDebugOpen]=useState(false),[maximize,setMaximize]=useState(false),[nativeFullscreen,setNativeFullscreen]=useState(false),[guestBazookaArmed,setGuestBazookaArmed]=useState(false);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
@@ -529,8 +531,72 @@ export default function StreamPage() {
   const refreshGuestPresence=async(_active=signActiveRef.current,dataUrl=signDataUrlRef.current)=>{if(mode!=="guest")return;const presence={role:"guest",isHost:false,guestId,name:nameRef.current,faceDataUrl:face,skin:hostGuestSkin.current,physique:physics.current?.physique??"slim",signDataUrl:validSignDataUrl(dataUrl)?dataUrl:undefined,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channelRef.current?.track(presence);};
   const clearSignCanvas=()=>{const c=signCanvasRef.current,ctx=c?.getContext("2d");if(!c||!ctx)return;ctx.clearRect(0,0,c.width,c.height);ctx.fillStyle="#fffdf4";ctx.fillRect(0,0,c.width,c.height);};
   const bakeSign=async()=>{const source=signCanvasRef.current;if(!source)return;const out=document.createElement("canvas");out.width=256;out.height=171;const ctx=out.getContext("2d")!;ctx.fillStyle="#fffdf4";ctx.fillRect(0,0,out.width,out.height);ctx.drawImage(source,0,0,out.width,out.height);const text=signText.trim().slice(0,40);if(text){ctx.fillStyle=signColor;ctx.font="700 27px Caveat, cursive, monospace";ctx.textAlign="center";ctx.textBaseline="middle";const words=text.split(/\s+/),lines:string[]=[];let line="";for(const word of words){const test=line?`${line} ${word}`:word;if(ctx.measureText(test).width>218&&line){lines.push(line);line=word;}else line=test;}if(line)lines.push(line);const start=out.height/2-(lines.length-1)*17;lines.slice(0,4).forEach((ln,i)=>ctx.fillText(ln,out.width/2,start+i*34));}const dataUrl=out.toDataURL("image/png");if(dataUrl.length>MAX_GUEST_SIGN_DATA_URL_BYTES){setJoinError("That sign is too large. Try fewer strokes.");return;}signDataUrlRef.current=dataUrl;signActiveRef.current=true;setSignActive(true);cacheSignImage(guestId,dataUrl);setSignOpen(false);await refreshGuestPresence(true,dataUrl);};
-  const receiveBazookaFire=(event:StreamBazookaFireMessage)=>{const clips=(snapshotRef.current?.clips.filter(c=>c.type==="image"||c.type==="video")??[]) as TerrainClip[],impact=raycastSolid(clips,cratersRef.current,event.from,event.target),impactPoint=impact?.point??event.target,visualEvent:BazookaVisualEvent={...event,target:impactPoint,fizzle:!impact};bazookaEventsRef.current=[...bazookaEventsRef.current,visualEvent].slice(-12);const clip=impact?clips.find(candidate=>candidate.id===impact.imageId):undefined,impactDelay=Math.max(0,event.startTime+Math.hypot(impactPoint.x-event.from.x,impactPoint.y-event.from.y)/1100*1000-Date.now());window.setTimeout(()=>{if(event.startTime<repairAtRef.current)return;if(clip&&impact){const crater=craterForImpact(clip,impact.point,event.seed);cratersRef.current=[...cratersRef.current.filter(c=>c.clipId!==clip.id),...cratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];const p=physics.current;if(p&&Math.hypot(p.x-impact.point.x,p.y-90-impact.point.y)<140){p.vx+=(p.x<impact.point.x?-1:1)*320;p.vy=-280;p.grounded=false;p.action="jump";}}},impactDelay);};
-  const fireGuestBazooka=(aim:{x:number;y:number})=>{const p=physics.current,host=latestHost.current;if(!p||!host||!guestBazookaArmedRef.current)return;const now=Date.now();if(now-guestBazookaLastFireAtRef.current<1200)return;guestBazookaLastFireAtRef.current=now;const shoulder={x:p.x,y:p.y-110},dx=aim.x-shoulder.x,dy=aim.y-shoulder.y,length=Math.max(1,Math.hypot(dx,dy)),dir={x:dx/length,y:dy/length},from={x:shoulder.x+dir.x*92,y:shoulder.y+dir.y*92},target={x:from.x+dir.x*3200,y:from.y+dir.y*3200},event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:host.sessionId,sentAt:now,startTime:now,from,target,seed:Math.floor(Math.random()*1_000_000)};p.facing=dir.x>=0?1:-1;p.x-=p.facing*12;p.vx-=p.facing*90;receiveBazookaFire(event);void channelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});};
+  const receiveBazookaFire=useCallback((event:StreamBazookaFireMessage)=>{
+    const key=bazookaShotKey(event),characterImpact=bazookaCharacterImpactsRef.current.get(key);
+    const clips=(snapshotRef.current?.clips.filter(c=>c.type==="image"||c.type==="video")??[]) as TerrainClip[];
+    const terrainImpact=characterImpact?null:raycastSolid(clips,cratersRef.current,event.from,event.target);
+    const impactPoint=characterImpact?.point??terrainImpact?.point??event.target;
+    const visualEvent:BazookaVisualEvent={...event,target:impactPoint,fizzle:!characterImpact&&!terrainImpact};
+    bazookaEventsRef.current=[...bazookaEventsRef.current.filter(candidate=>bazookaShotKey(candidate)!==key),visualEvent].slice(-12);
+    const clip=terrainImpact?clips.find(candidate=>candidate.id===terrainImpact.imageId):undefined;
+    const impactDelay=Math.max(0,event.startTime+Math.hypot(impactPoint.x-event.from.x,impactPoint.y-event.from.y)/1100*1000-Date.now());
+    window.setTimeout(()=>{
+      if(event.startTime<repairAtRef.current||bazookaCharacterImpactsRef.current.has(key))return;
+      if(clip&&terrainImpact){
+        const crater=craterForImpact(clip,terrainImpact.point,event.seed);
+        cratersRef.current=[...cratersRef.current.filter(c=>c.clipId!==clip.id),...cratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];
+      }
+    },impactDelay);
+  },[]);
+  const receiveBazookaImpact=useCallback((event:StreamBazookaImpactMessage)=>{
+    const host=latestHost.current;
+    if(host&&event.sessionId!==host.sessionId)return;
+    bazookaCharacterImpactsRef.current.set(event.shotId,event);
+    window.setTimeout(()=>bazookaCharacterImpactsRef.current.delete(event.shotId),3000);
+    const existing=bazookaEventsRef.current.find(candidate=>bazookaShotKey(candidate)===event.shotId);
+    const visual:BazookaVisualEvent=existing
+      ?{...existing,target:event.point,fizzle:false}
+      :{kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:event.streamId,sessionId:event.sessionId,sentAt:event.sentAt,startTime:event.startTime,shotId:event.shotId,from:event.from,target:event.point,seed:event.seed,fizzle:false};
+    bazookaEventsRef.current=[...bazookaEventsRef.current.filter(candidate=>bazookaShotKey(candidate)!==event.shotId),visual].slice(-12);
+    if(event.target.role!=="guest"||event.target.guestId!==guestId)return;
+    const delay=Math.max(0,event.impactAt-Date.now());
+    window.setTimeout(()=>{
+      const currentHost=latestHost.current,p=physics.current;
+      if(!p||(currentHost&&event.sessionId!==currentHost.sessionId))return;
+      if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);}
+      guestBazookaArmedRef.current=false;
+      setGuestBazookaArmed(false);
+      clearGuestActionPlan(p);
+      p.targetX=null;
+      p.targetY=null;
+      p.vx=event.impulse.x;
+      p.vy=event.impulse.y;
+      p.facing=event.impulse.x>=0?1:-1;
+      p.grounded=false;
+      p.surfaceId=null;
+      p.action="ragdoll";
+      p.actionStarted=performance.now();
+      p.actionDurationMs=event.duration*1000;
+      p.actionParams={ragdollSpin:event.spin};
+      p.frozenUntil=event.impactAt+event.duration*1000;
+      streamDebugLog("bazooka ragdoll guest",{shotId:event.shotId,impulse:event.impulse});
+    },delay);
+  },[guestId]);
+  const fireGuestBazooka=(aim:{x:number;y:number})=>{
+    const p=physics.current,host=latestHost.current;
+    if(!p||!host||!guestBazookaArmedRef.current)return;
+    const now=Date.now();
+    if(now-guestBazookaLastFireAtRef.current<1200)return;
+    guestBazookaLastFireAtRef.current=now;
+    const shoulder={x:p.x,y:p.y-110},dx=aim.x-shoulder.x,dy=aim.y-shoulder.y,length=Math.max(1,Math.hypot(dx,dy)),dir={x:dx/length,y:dy/length};
+    const from={x:shoulder.x+dir.x*92,y:shoulder.y+dir.y*92},target={x:from.x+dir.x*3200,y:from.y+dir.y*3200};
+    const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:host.sessionId,sentAt:now,startTime:now,shotId:`${guestId}:${now}:${guestBazookaLastFireAtRef.current}`,shooter:{role:"guest",guestId},from,target,seed:Math.floor(Math.random()*1_000_000)};
+    p.facing=dir.x>=0?1:-1;
+    p.x-=p.facing*12;
+    p.vx-=p.facing*90;
+    receiveBazookaFire(event);
+    void channelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});
+  };
 
   useEffect(()=>{const initial=window.setTimeout(()=>void loadSnapshot(),0);const supabase=getBrowserSupabase();const channelName=streamChannelName(STREAM_OWNER_USER_ID);if(!supabase){streamDebugLog("realtime not configured",{channel:channelName});window.setTimeout(()=>setStatus("realtime-not-configured"),0);return()=>window.clearTimeout(initial);}const key=`client-${guestId}`;streamDebugLog("join channel",{channel:channelName,key});const channel=supabase.channel(channelName,{config:{broadcast:{self:false},presence:{key}}});channelRef.current=channel;
     const requestSnapshot=()=>{const now=Date.now();if(now-snapshotRequestedAt.current<1000)return;snapshotRequestedAt.current=now;streamDebugLog("snapshot request",{channel:channelName,requestedAt:now});void channel.send({type:"broadcast",event:"snapshot-request",payload:{streamId:STREAM_OWNER_USER_ID,sentAt:now}});};
@@ -541,6 +607,7 @@ export default function StreamPage() {
       .on("broadcast",{event:"weapon_state"},({payload})=>{streamDebugLog("ignore legacy weapon_state; frame.weapon is authoritative",payload);})
       .on("broadcast",{event:"shot_fired"},({payload})=>{streamDebugLog("shot_fired received",(payload as StreamShotFiredMessage).shotId);weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
       .on("broadcast",{event:"bazooka_fire"},({payload})=>receiveBazookaFire(payload as StreamBazookaFireMessage))
+      .on("broadcast",{event:"bazooka_impact"},({payload})=>receiveBazookaImpact(payload as StreamBazookaImpactMessage))
       .on("broadcast",{event:"repair_board"},({payload})=>{repairAtRef.current=(payload as {sentAt:number}).sentAt;cratersRef.current=[];streamDebugLog("repair board guest");})
       .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
       .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
@@ -548,7 +615,7 @@ export default function StreamPage() {
       .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);remoteGuestSeq.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);const hostRow=rows.find(p=>p.role==="host");if(hostRow?.guestSkin){hostGuestSkin.current=hostRow.guestSkin;setGuestSkinLabel(hostRow.guestSkin);}hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows){if(p.guestId){const stale=eliminations.current.get(p.guestId);if(stale&&p.joinedAt>stale.sentAt){streamDebugLog("clear stale elimination on rejoin",{guestId:p.guestId,joinedAt:p.joinedAt,eliminationSentAt:stale.sentAt});eliminations.current.delete(p.guestId);remoteGuests.current.delete(p.guestId);renderedGuests.current.delete(p.guestId);}if(p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}if(validSignDataUrl(p.signDataUrl))cacheSignImage(p.guestId,p.signDataUrl);}}})
-      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;const presence={role:"viewer",isHost:false,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channel.track(presence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot]);
+      .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;const presence={role:"viewer",isHost:false,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channel.track(presence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot,receiveBazookaFire,receiveBazookaImpact]);
 
   useEffect(()=>{if(!snapshot)return;cratersRef.current=snapshot.craters??[];streamDebugLog("snapshot craters late join",cratersRef.current);const load=(cache:Map<string,HTMLImageElement>,url:string)=>{if(!url||cache.has(url))return;const img=new Image();img.crossOrigin="anonymous";img.onerror=()=>streamDebugLog("image load failed",{url:url.slice(0,48)});img.src=url;cache.set(url,img);};for(const clip of snapshot.clips){const url=clip.type==="video"?(clip.thumbnailUrl||clip.sourceUrl):clip.sourceUrl;load(imageCache.current,url);}for(const ch of snapshot.characters)if(ch.faceDataUrl&&!faceCache.current.has(ch.id)){const img=new Image();img.src=ch.faceDataUrl;faceCache.current.set(ch.id,img);}},[snapshot]);
 
@@ -609,6 +676,11 @@ export default function StreamPage() {
             p.action = "forceChoke";
             clearGuestActionPlan(p);
           }
+          if (p.action === "ragdoll" && now - p.actionStarted >= (p.actionDurationMs ?? 1250)) {
+            p.action = p.grounded ? "idle" : "jump";
+            p.frozenUntil = undefined;
+            clearGuestActionPlan(p);
+          }
           const frozen = (p.frozenUntil !== undefined && Date.now() < p.frozenUntil) || held?.phase === "hold";
           if (p.action === "emote" && now - p.actionStarted > 1500) {
             p.action = "idle";
@@ -633,7 +705,7 @@ export default function StreamPage() {
               p.vx = p.facing * speed;
               if (p.grounded) p.action = Math.abs(dx) > 280 ? "run" : "walk";
             }
-          } else if (!planned && frozen) {
+          } else if (!planned && frozen && p.action !== "ragdoll") {
             p.vx = 0;
             p.targetX = null;
           }
