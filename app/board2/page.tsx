@@ -3633,6 +3633,7 @@ export default function Board2Page() {
   const [playMode, setPlayMode] = useState(false);
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
+  const [playMediaFocusId, setPlayMediaFocusId] = useState<string | null>(null);
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playBazookaArmed, setPlayBazookaArmed] = useState(false);
   const [playCleanUi, setPlayCleanUi] = useState(false);
@@ -3942,7 +3943,7 @@ export default function Board2Page() {
   const streamChokeStatesRef = useRef<Map<string, StreamChokeMessage>>(new Map());
   const streamGuestKickTombstonesRef = useRef<Map<string, number>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
-  const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null }) => void) | null>(null);
+  const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
     c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
     c2: { enabled: false, startWallMs: 0, initX: BOARD_W / 2 + 60, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
@@ -3955,6 +3956,7 @@ export default function Board2Page() {
   const playTimeRef = useRef(0);
   const playWallStartRef = useRef(0);
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
+  const playMediaFocusIdRef = useRef<string | null>(null);
   const playHeldKeysRef = useRef(new Set<string>());
   const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
   const playCursorRef = useRef<{ x: number; y: number } | null>(null);
@@ -4219,7 +4221,7 @@ export default function Board2Page() {
     if (!ctx) return "";
     try {
       ctx.drawImage(image, 0, 0, w, h);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.84);
       streamMediaDataUrlCacheRef.current.set(clipId, { signature, maxLongEdge, dataUrl });
       return dataUrl;
     } catch (error) {
@@ -4276,11 +4278,16 @@ export default function Board2Page() {
         { id: "c2", enabled: showCharacter2Ref.current, name: "HOST 2", skin: "stick", physique: "slim", faceDataUrl: face2, faceAspect: characterFace2Ref.current?.faceAspect, mouthAnchor: characterFace2Ref.current?.mouthAnchor },
       ],
     });
-    let maxLongEdge = 512;
+    let maxLongEdge = 1024;
     let snapshot = await build(maxLongEdge);
     let snapshotBytes = new Blob([JSON.stringify(snapshot)]).size;
     if (snapshotBytes > 2 * 1024 * 1024) {
-      maxLongEdge = 384;
+      maxLongEdge = 768;
+      snapshot = await build(maxLongEdge);
+      snapshotBytes = new Blob([JSON.stringify(snapshot)]).size;
+    }
+    if (snapshotBytes > 2 * 1024 * 1024) {
+      maxLongEdge = 512;
       snapshot = await build(maxLongEdge);
       snapshotBytes = new Blob([JSON.stringify(snapshot)]).size;
     }
@@ -4986,6 +4993,9 @@ export default function Board2Page() {
           if (event.sessionId !== streamSessionIdRef.current) return;
           if (event.phase === "end") streamChokeStatesRef.current.delete(event.targetGuestId);
           else streamChokeStatesRef.current.set(event.targetGuestId, event);
+        })
+        .on("broadcast", { event: "bazooka_fire" }, ({ payload }) => {
+          receiveGuestBazookaFire(payload as StreamBazookaFireMessage);
         })
         .on("broadcast", { event: "snapshot-request" }, ({ payload }) => {
           streamDebugLog("snapshot request", payload);
@@ -5760,7 +5770,7 @@ export default function Board2Page() {
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number,
-    options: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null } = {}
+    options: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null } = {}
   ) {
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
@@ -5809,9 +5819,12 @@ export default function Board2Page() {
       ensureVideoAudioNodes(clip.id, vid);
       const runtime = videoRuntimeFor(clip.id);
       const isActive = activeIds.has(clip.id);
+      const isFocused = options.focusedVideoId === clip.id;
       const isAmbient = !isActive && ambientVideoEnabledRef.current && ambientCandidateIdsRef.current.has(clip.id);
-      const desired: VideoPlaybackMode = isActive ? "active" : isAmbient ? "ambient" : "dormant";
-      const reason = isActive
+      const desired: VideoPlaybackMode = isActive || isFocused ? "active" : isAmbient ? "ambient" : "dormant";
+      const reason = isFocused
+        ? "play-media-focus"
+        : isActive
         ? cameraKeyframeModeRef.current === "character" ? "character-occupancy-active" : "timeline-active"
         : !ambientVideoEnabledRef.current
           ? "ambient-disabled"
@@ -5825,12 +5838,12 @@ export default function Board2Page() {
       if (desired === "active") {
         activeCount++;
         vid.loop = false;
-        const expected = Math.max(0, time - activeWindows.get(clip.id)!.start);
+        const expected = isActive ? Math.max(0, time - activeWindows.get(clip.id)!.start) : 0;
         if (previousState !== "active" || vid.paused || vid.ended) {
           restartAndPlay(vid, expected);
           runtime.lastRestartAt = now;
           console.log("[video] clip", clip.id, "entered — restart + play");
-        } else if (Math.abs(vid.currentTime - expected) > 0.3) {
+        } else if (isActive && Math.abs(vid.currentTime - expected) > 0.3) {
           vid.currentTime = expected;
         }
         if (options.audioMode === "silent") setClipAudioOff(clip.id, vid); else updateVideoVolume(clip, vid);
@@ -9673,9 +9686,33 @@ export default function Board2Page() {
   function heldPlayTargetCommand(): LiveCommandKey | null {
     if (playHeldKeysRef.current.has("KeyG")) return "grapple";
     if (playHeldKeysRef.current.has("KeyS")) return "skateTo";
-    if (playHeldKeysRef.current.has("KeyC")) return "wallClimb";
     if (playHeldKeysRef.current.has("KeyZ")) return "zipline";
     return null;
+  }
+
+  function togglePlayMediaFocus() {
+    if (playMediaFocusIdRef.current) {
+      playMediaFocusIdRef.current = null;
+      setPlayMediaFocusId(null);
+      setToast("Camera following character");
+      return;
+    }
+    const state = playPhysicsRef.current;
+    if (!state) return;
+    const surface = clipsRef.current.find((clip) => clip.id === state.surfaceId && isBoardSurface(clip))
+      ?? findSurfaceAtFeet(state.x, state.y, clipsRef.current);
+    if (!surface) {
+      setToast("Stand on an image or video, then press C");
+      return;
+    }
+    if (!surface.id) {
+      setToast("Could not focus this board item");
+      return;
+    }
+    playMediaFocusIdRef.current = surface.id;
+    setPlayMediaFocusId(surface.id);
+    setPlaySceneShot(false);
+    setToast(surface.type === "video" ? "Camera focused · video playing" : "Camera focused on image");
   }
 
   function playWeaponOrigin(state: PlayCharacterState): { x: number; y: number } {
@@ -10049,6 +10086,31 @@ export default function Board2Page() {
     state.x-=state.facing*12;state.vx-=state.facing*90;streamChannelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});streamDebugLog("bazooka fire host",event);
   }
 
+  function receiveGuestBazookaFire(event: StreamBazookaFireMessage) {
+    if (event.sessionId !== streamSessionIdRef.current) return;
+    const clips = rocketTerrainClips(clipsRef.current);
+    const impact = raycastSolid(clips, streamCratersRef.current, event.from, event.target);
+    const impactPoint = impact?.point ?? event.target;
+    playBazookaEventsRef.current = [
+      ...playBazookaEventsRef.current,
+      { ...event, target: impactPoint, fizzle: !impact } satisfies BazookaVisualEvent,
+    ].slice(-12);
+    if (!impact) return;
+    const clip = clips.find((candidate) => candidate.id === impact.imageId);
+    if (!clip) return;
+    const crater = craterForImpact(clip, impact.point, event.seed);
+    const impactDelay = Math.max(0, event.startTime + Math.hypot(impactPoint.x - event.from.x, impactPoint.y - event.from.y) / 1100 * 1000 - Date.now());
+    window.setTimeout(() => {
+      if (event.startTime < streamRepairAtRef.current) return;
+      streamCratersRef.current = [
+        ...streamCratersRef.current.filter((candidate) => candidate.clipId !== clip.id),
+        ...streamCratersRef.current.filter((candidate) => candidate.clipId === clip.id).slice(-23),
+        crater,
+      ];
+      void publishStreamSnapshot();
+    }, impactDelay);
+  }
+
   function repairBoard(){streamCratersRef.current=[];streamRepairAtRef.current=Date.now();const payload:StreamRepairBoardMessage={kind:"repair_board",streamId:STREAM_OWNER_USER_ID,sessionId:streamSessionIdRef.current,sentAt:streamRepairAtRef.current};streamChannelRef.current?.send({type:"broadcast",event:"repair_board",payload});void publishStreamSnapshot();}
 
   function updatePlayWeaponShots(nowMs: number, previousNowMs: number) {
@@ -10106,6 +10168,8 @@ export default function Board2Page() {
     playWeaponArmedRef.current = false;
     setPlayBazookaArmed(false); playBazookaArmedRef.current=false; playBazookaEventsRef.current=[];
     setPlaySceneShot(false);
+    playMediaFocusIdRef.current = null;
+    setPlayMediaFocusId(null);
     setPlayMode(true);
     setIsPlaying(false);
   }
@@ -10117,6 +10181,8 @@ export default function Board2Page() {
       playForceChokeRef.current = null;
     }
     setPlayMode(false);
+    playMediaFocusIdRef.current = null;
+    setPlayMediaFocusId(null);
     playHeldKeysRef.current.clear();
     playPointerRef.current = null;
     playCursorRef.current = null;
@@ -10428,10 +10494,29 @@ export default function Board2Page() {
       }
       playPose = applyPlayForceChokePose(playPose);
       const shot = interpolateCameraKeyframes(cameraKeyframesRef.current, editorPlayheadBeforePlayRef.current);
-      const target = playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom };
+      const focusedMedia = playMediaFocusIdRef.current
+        ? clipsRef.current.find((clip): clip is Clip & RequiredSurfaceClip => clip.id === playMediaFocusIdRef.current && isBoardSurface(clip))
+        : undefined;
+      if (playMediaFocusIdRef.current && !focusedMedia) {
+        playMediaFocusIdRef.current = null;
+        setPlayMediaFocusId(null);
+      }
+      const mediaTarget = focusedMedia ? {
+        cameraX: focusedMedia.boardX + focusedMedia.boardW / 2,
+        cameraY: focusedMedia.boardY + focusedMedia.boardH / 2,
+        boardZoom: clamp(Math.min(
+          BOARD_W * 0.82 / focusedMedia.boardW,
+          BOARD_W * canvas.height * 0.76 / (focusedMedia.boardH * canvas.width),
+        ), 0.35, 3),
+      } : null;
+      const target = mediaTarget ?? (playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom });
       const follow = 1 - Math.exp(-dt * 5.5);
-      playCameraRef.current = { cameraX: lerp(playCameraRef.current.cameraX, target.cameraX, follow), cameraY: lerp(playCameraRef.current.cameraY, target.cameraY, follow), boardZoom: lerp(playCameraRef.current.boardZoom, target.boardZoom, playSceneShot ? follow : follow * 0.08) };
-      evaluateVideoPlaybackStates(editorPlayheadBeforePlayRef.current, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, { audioMode: "preview" });
+      playCameraRef.current = { cameraX: lerp(playCameraRef.current.cameraX, target.cameraX, follow), cameraY: lerp(playCameraRef.current.cameraY, target.cameraY, follow), boardZoom: lerp(playCameraRef.current.boardZoom, target.boardZoom, mediaTarget || playSceneShot ? follow : follow * 0.08) };
+      evaluateVideoPlaybackStates(editorPlayheadBeforePlayRef.current, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, {
+        audioMode: "preview",
+        overrideCamera: playCameraRef.current,
+        focusedVideoId: focusedMedia?.type === "video" ? focusedMedia.id : null,
+      });
       const ctx = canvas.getContext("2d");
       if (ctx) {
         const shake=bazookaShake(playBazookaEventsRef.current,nowMs);ctx.save();ctx.translate(shake.x,shake.y);
@@ -10527,12 +10612,13 @@ export default function Board2Page() {
           return;
         }
         if (e.code === "KeyV") { e.preventDefault(); setPlaySceneShot((v) => !v); return; }
+        if (e.code === "KeyC") { e.preventDefault(); togglePlayMediaFocus(); return; }
         if (playWeaponArmedRef.current && ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.code)) {
           e.preventDefault();
           return;
         }
         if(playBazookaArmedRef.current&&["KeyW","KeyA","KeyS","KeyD"].includes(e.code)){e.preventDefault();return;}
-        if (["KeyG", "KeyS", "KeyC", "KeyZ"].includes(e.code)) { e.preventDefault(); return; }
+        if (["KeyG", "KeyS", "KeyZ"].includes(e.code)) { e.preventDefault(); return; }
         if (e.code === "KeyD") { e.preventDefault(); issuePlayCharacterAction("dance"); return; }
         if (e.code === "KeyF") {
           e.preventDefault();
@@ -11361,7 +11447,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · click/hold fires while armed<br />Hold G/S/C/Z + click for grapple/skate/climb/zipline<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
+              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · D dance · E emote · F flip · J jump · P pull-ups · M mirror<br />V {playSceneShot ? "follow camera" : "scene shot"} · wheel zoom · Esc exit
 	            </div>
 	          )}
 	        </div>}
