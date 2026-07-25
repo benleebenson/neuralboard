@@ -26,6 +26,7 @@ import {
   StreamBazookaFireMessage,
   StreamBazookaImpactMessage,
   StreamCrater,
+  StreamHealthState,
   StreamRepairBoardMessage,
   streamChannelName,
   resolveStreamSkin,
@@ -59,7 +60,16 @@ import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, ty
 import { groundProfileY, raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
-import { bazookaRagdollImpulse, bazookaShotKey, firstBazookaCharacterHit } from "@/lib/character/impacts";
+import {
+  BAZOOKA_RAGDOLL_GROUND_DRAG,
+  BAZOOKA_RAGDOLL_RECOVERY_MS,
+  GUEST_BAZOOKA_MAX_HEALTH,
+  HOST_BAZOOKA_MAX_HEALTH,
+  bazookaRagdollImpulse,
+  bazookaShotKey,
+  firstBazookaCharacterHit,
+  nextBazookaHealth,
+} from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
   CameraMode,
@@ -3975,6 +3985,9 @@ export default function Board2Page() {
   const playBazookaArmedRef = useRef(false);
   const playBazookaLastFireAtRef = useRef(0);
   const playBazookaEventsRef = useRef<BazookaVisualEvent[]>([]);
+  const playHostHealthRef = useRef<StreamHealthState>({ current: HOST_BAZOOKA_MAX_HEALTH, max: HOST_BAZOOKA_MAX_HEALTH, hitAt: 0 });
+  const playGuestHealthRef = useRef<Map<string, StreamHealthState>>(new Map());
+  const resolvedBazookaShotsRef = useRef<Set<string>>(new Set());
   const streamCratersRef = useRef<StreamCrater[]>([]);
   const streamRepairAtRef = useRef(0);
   const playWeaponShotsRef = useRef<PlayWeaponShot[]>([]);
@@ -4412,13 +4425,22 @@ export default function Board2Page() {
           const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved);
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           const moving = state ? Math.abs(state.vx) > 40 : false;
-          const actionType = active?.type ?? (!state
+          const actionType = state?.action === "ragdoll" ? "ragdoll" : active?.type ?? (!state
             ? "idle"
             : !state.grounded ? "jumpTo"
               : moving ? (Math.abs(state.vx) >= PLAY_RUN_SPEED * 0.72 ? "runTo" : "walkTo")
               : "idle");
-          const actionDuration = active?.duration ?? (!state?.grounded ? 1.1 : moving ? 0.8 : 2);
-          const actionProgress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : state ? (actionType === "idle" ? 0 : moving ? ((state.stride / (Math.PI * 2)) % 1 + 1) % 1 : clamp((state.vy + PLAY_JUMP_SPEED) / (PLAY_JUMP_SPEED + PLAY_MAX_FALL_SPEED), 0, 1)) : 0;
+          const ragdollRecoverySeconds = BAZOOKA_RAGDOLL_RECOVERY_MS / 1000;
+          const actionDuration = state?.action === "ragdoll"
+            ? (state.ragdollLandedAt === undefined ? 1.25 : ragdollRecoverySeconds)
+            : active?.duration ?? (!state?.grounded ? 1.1 : moving ? 0.8 : 2);
+          const actionProgress = state?.action === "ragdoll"
+            ? state.ragdollLandedAt === undefined
+              ? clamp((playTimeRef.current - (state.airborneAt ?? playTimeRef.current)) / 1.25, 0, 0.98)
+              : clamp((playTimeRef.current - state.ragdollLandedAt) / ragdollRecoverySeconds, 0, 1)
+            : active
+              ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1)
+              : state ? (actionType === "idle" ? 0 : moving ? ((state.stride / (Math.PI * 2)) % 1 + 1) % 1 : clamp((state.vy + PLAY_JUMP_SPEED) / (PLAY_JUMP_SPEED + PLAY_MAX_FALL_SPEED), 0, 1)) : 0;
           return {
             id,
             enabled: !!state,
@@ -4429,8 +4451,18 @@ export default function Board2Page() {
             skin: HOST_STREAM_SKIN,
             actionType,
             progress: actionProgress,
-            actionStartTime: sentAt - actionProgress * actionDuration * 1000,
+            actionStartTime: state?.action === "ragdoll" && state.ragdollLandedAt !== undefined
+              ? sentAt - (playTimeRef.current - state.ragdollLandedAt) * 1000
+              : sentAt - actionProgress * actionDuration * 1000,
             actionDuration,
+            actionParams: state?.action === "ragdoll"
+              ? {
+                  ragdollSpin: state.ragdollSpin,
+                  ragdollPhase: state.ragdollLandedAt === undefined ? "airborne" : "recovery",
+                  ragdollSide: state.ragdollSpin && state.ragdollSpin < 0 ? -1 : 1,
+                  terrainGrounded: state.ragdollLandedAt !== undefined,
+                }
+              : undefined,
             velocity: { x: state?.vx ?? 0, y: state?.vy ?? 0 },
             boardPose: pose ? { ...pose, viseme } : undefined,
             emoji: pose?.emojiText,
@@ -4493,6 +4525,10 @@ export default function Board2Page() {
         sentAt,
         camera: cam,
         guestSkin: streamGuestSkinRef.current,
+        combat: {
+          host: playHostHealthRef.current,
+          guests: Object.fromEntries(playGuestHealthRef.current),
+        },
         weapon: playModeRef.current && playPhysicsRef.current
           ? {
               armed: playWeaponArmedRef.current || playBazookaArmedRef.current,
@@ -4526,6 +4562,7 @@ export default function Board2Page() {
     streamEliminationsRef.current.delete(guestId);
     streamChokeStatesRef.current.delete(guestId);
     streamGuestSignsRef.current.delete(guestId);
+    playGuestHealthRef.current.delete(guestId);
     playWeaponHitCountsRef.current.delete(guestId);
     playEliminationKickSentRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
@@ -4942,6 +4979,8 @@ export default function Board2Page() {
       streamEliminationsRef.current.clear();
       streamChokeStatesRef.current.clear();
       streamGuestKickTombstonesRef.current.clear();
+      playGuestHealthRef.current.clear();
+      resolvedBazookaShotsRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
     }
@@ -5026,6 +5065,7 @@ export default function Board2Page() {
               streamEliminationsRef.current.delete(guestId);
               streamChokeStatesRef.current.delete(guestId);
               streamGuestSignsRef.current.delete(guestId);
+              playGuestHealthRef.current.delete(guestId);
               playWeaponHitCountsRef.current.delete(guestId);
               playEliminationKickSentRef.current.delete(guestId);
             }
@@ -5042,7 +5082,15 @@ export default function Board2Page() {
               streamGuestEntitiesRef.current.delete(guest.guestId);
               streamGuestSeqRef.current.delete(guest.guestId);
               playWeaponHitCountsRef.current.delete(guest.guestId);
+              playGuestHealthRef.current.delete(guest.guestId);
               playEliminationKickSentRef.current.delete(guest.guestId);
+            }
+            if (!playGuestHealthRef.current.has(guest.guestId)) {
+              playGuestHealthRef.current.set(guest.guestId, {
+                current: GUEST_BAZOOKA_MAX_HEALTH,
+                max: GUEST_BAZOOKA_MAX_HEALTH,
+                hitAt: 0,
+              });
             }
             const kickedAt = streamGuestKickTombstonesRef.current.get(guest.guestId);
             if (kickedAt && guest.joinedAt > kickedAt) {
@@ -5268,7 +5316,29 @@ export default function Board2Page() {
         face: streamGuestFacesRef.current.get(frame.guestId) ?? null,
         sign: streamGuestSignsRef.current.get(frame.guestId) ?? null,
         renderTimeMs: now,
+        health: playGuestHealthRef.current.get(frame.guestId),
       });
+      if (smoothed.weapon?.armed && smoothed.weapon.aim && smoothed.weapon.shooter) {
+        drawBazookaHeld(
+          ctx,
+          {
+            x: smoothed.position.x,
+            y: smoothed.position.y,
+            facing: smoothed.facing,
+          },
+          smoothed.weapon.aim,
+          cam,
+          sf,
+          W,
+          H,
+          0,
+          1,
+          {
+            bodyLean: entity.pose?.bodyLean,
+            headBob: entity.pose?.headBob,
+          },
+        );
+      }
     }
   }, [kickStreamGuest, session?.user?.name]);
 
@@ -9545,13 +9615,14 @@ export default function Board2Page() {
     const speed = Math.abs(state.vx);
     const moving = state.grounded && speed > 25;
     const ragdolling = state.action === "ragdoll";
+    const recovering = ragdolling && state.ragdollLandedAt !== undefined;
     const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
     const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
     let sampleTime = 0;
     let resolved: ResolvedCharAction[] = [];
 
-    if (ragdolling) {
-      const duration = Math.max(0.1, state.actionUntil - (state.airborneAt ?? time));
+    if (ragdolling && !recovering) {
+      const duration = 1.25;
       const progress = clamp((time - (state.airborneAt ?? time)) / duration, 0, 1);
       sampleTime = progress;
       resolved = [{
@@ -9601,13 +9672,32 @@ export default function Board2Page() {
     }
 
     const pose = evalCharAtTime(sampleTime, resolved, 0, state.y, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
-    if (ragdolling) {
+    if (ragdolling && !recovering) {
       const flail = time * 13;
       pose.leftArmA += Math.sin(flail) * 0.45;
       pose.rightArmA -= Math.cos(flail * 0.82) * 0.45;
       pose.leftLegA += Math.cos(flail * 0.67) * 0.35;
       pose.rightLegA -= Math.sin(flail * 0.74) * 0.35;
       pose.surpriseAlpha = 0.8;
+    } else if (recovering) {
+      const recoveryProgress = clamp(
+        (time - (state.ragdollLandedAt ?? time)) / (BAZOOKA_RAGDOLL_RECOVERY_MS / 1000),
+        0,
+        1,
+      );
+      const getUp = clamp((recoveryProgress - 0.28) / 0.72, 0, 1);
+      const eased = getUp * getUp * (3 - 2 * getUp);
+      pose.headBob = lerp(18, 0, eased);
+      pose.bodyLean = lerp(state.facing * 0.08, 0, eased);
+      pose.leftArmA = lerp(1.15, 0.25, eased);
+      pose.rightArmA = lerp(-0.95, -0.25, eased);
+      pose.leftForeA = lerp(0.7, 0.1, eased);
+      pose.rightForeA = lerp(-0.6, -0.1, eased);
+      pose.leftLegA = lerp(0.75, 0.12, eased);
+      pose.rightLegA = lerp(-0.55, -0.12, eased);
+      pose.leftShinA = lerp(-0.5, 0, eased);
+      pose.rightShinA = lerp(0.42, 0, eased);
+      pose.surpriseAlpha = 0.8 * (1 - recoveryProgress);
     }
     const terrain=clipsRef.current.filter(isBoardSurface).map(({id,type,boardX,boardY,boardW,boardH})=>({id:id??"surface",type,boardX,boardY,boardW,boardH})) as TerrainClip[];
     const directGround=groundProfileY(terrain,streamCratersRef.current,state.x),slope=directGround?.slope??0;
@@ -9619,7 +9709,7 @@ export default function Board2Page() {
       bodyLean: pose.bodyLean+clamp(slope*.4,-.12,.12),
       spinAngle: ragdolling ? state.spin : pose.spinAngle,
       actionType:ragdolling?"ragdoll":state.grounded?(moving?"walk":"idle"):"punchThroughFall",
-      terrainGrounded:state.grounded&&!moving&&!ragdolling,
+      terrainGrounded:state.grounded&&!moving&&(!ragdolling||recovering),
       terrainLeftFootY:(groundProfileY(terrain,streamCratersRef.current,state.x-14)?.y??state.y)-state.y,
       terrainRightFootY:(groundProfileY(terrain,streamCratersRef.current,state.x+14)?.y??state.y)-state.y,
       airY: 0,
@@ -10248,9 +10338,10 @@ export default function Board2Page() {
       state.grappleX = null;
       state.grappleY = null;
       state.action = "ragdoll";
-      state.actionUntil = playTimeRef.current + event.duration;
+      state.actionUntil = Number.POSITIVE_INFINITY;
       state.airborneAt = playTimeRef.current;
       state.ragdollSpin = event.spin;
+      state.ragdollLandedAt = undefined;
       state.spin = 0;
       streamDebugLog("bazooka ragdoll host", { shotId: event.shotId, impulse: event.impulse });
     }, delay);
@@ -10258,17 +10349,21 @@ export default function Board2Page() {
 
   function resolveLiveBazookaFire(event: StreamBazookaFireMessage) {
     if (event.sessionId !== streamSessionIdRef.current) return;
+    const shotKey = bazookaShotKey(event);
+    if (resolvedBazookaShotsRef.current.has(shotKey)) return;
+    resolvedBazookaShotsRef.current.add(shotKey);
+    window.setTimeout(() => resolvedBazookaShotsRef.current.delete(shotKey), 5000);
     const clips = rocketTerrainClips(clipsRef.current);
     const terrainImpact = raycastSolid(clips, streamCratersRef.current, event.from, event.target);
     const terrainDistance = terrainImpact ? Math.hypot(terrainImpact.point.x - event.from.x, terrainImpact.point.y - event.from.y) : Infinity;
     const targets = [];
     const host = playPhysicsRef.current;
     if (host && event.shooter?.role !== "host") {
-      targets.push({ role: "host" as const, center: { x: host.x, y: host.y - 86 }, radius: 62 });
+      targets.push({ role: "host" as const, center: { x: host.x, y: host.y - 86 }, radius: 74 });
     }
     for (const frame of streamGuestFramesRef.current.values()) {
       if (frame.guestId === event.shooter?.guestId || streamEliminationsRef.current.has(frame.guestId)) continue;
-      targets.push({ role: "guest" as const, guestId: frame.guestId, center: { x: frame.position.x, y: frame.position.y - 86 }, radius: 58 });
+      targets.push({ role: "guest" as const, guestId: frame.guestId, center: { x: frame.position.x, y: frame.position.y - 86 }, radius: 68 });
     }
     const characterImpact = firstBazookaCharacterHit(event.from, event.target, targets);
     const hitCharacter = characterImpact && characterImpact.distance < terrainDistance ? characterImpact : null;
@@ -10283,6 +10378,20 @@ export default function Board2Page() {
       const length = Math.max(1, Math.hypot(dx, dy));
       const direction = { x: dx / length, y: dy / length };
       const impulse = bazookaRagdollImpulse(direction, event.seed);
+      const impactAt = event.startTime + hitCharacter.distance / 1100 * 1000;
+      const health = hitCharacter.role === "host"
+        ? nextBazookaHealth(
+            playHostHealthRef.current.current,
+            playHostHealthRef.current.max,
+            impactAt,
+          )
+        : nextBazookaHealth(
+            playGuestHealthRef.current.get(hitCharacter.guestId!)?.current ?? GUEST_BAZOOKA_MAX_HEALTH,
+            playGuestHealthRef.current.get(hitCharacter.guestId!)?.max ?? GUEST_BAZOOKA_MAX_HEALTH,
+            impactAt,
+          );
+      if (hitCharacter.role === "host") playHostHealthRef.current = health;
+      else playGuestHealthRef.current.set(hitCharacter.guestId!, health);
       const impact: StreamBazookaImpactMessage = {
         kind: "bazooka_impact",
         sequenceType: "bazookaImpact",
@@ -10290,8 +10399,8 @@ export default function Board2Page() {
         sessionId: event.sessionId,
         sentAt: Date.now(),
         startTime: event.startTime,
-        impactAt: event.startTime + hitCharacter.distance / 1100 * 1000,
-        shotId: bazookaShotKey(event),
+        impactAt,
+        shotId: shotKey,
         from: event.from,
         point: hitCharacter.point,
         direction,
@@ -10299,6 +10408,7 @@ export default function Board2Page() {
         spin: impulse.spin,
         seed: event.seed,
         duration: 1.25,
+        health,
         target: hitCharacter.role === "host"
           ? { role: "host" }
           : { role: "guest", guestId: hitCharacter.guestId! },
@@ -10381,6 +10491,20 @@ export default function Board2Page() {
     playActionRuntimeRef.current = null;
     playWeaponShotsRef.current = [];
     playWeaponHitCountsRef.current.clear();
+    playHostHealthRef.current = {
+      current: HOST_BAZOOKA_MAX_HEALTH,
+      max: HOST_BAZOOKA_MAX_HEALTH,
+      hitAt: 0,
+    };
+    playGuestHealthRef.current = new Map(
+      streamGuests
+        .filter((guest): guest is StreamParticipantPresence & { guestId: string } => !!guest.guestId)
+        .map((guest) => [
+          guest.guestId,
+          { current: GUEST_BAZOOKA_MAX_HEALTH, max: GUEST_BAZOOKA_MAX_HEALTH, hitAt: 0 },
+        ]),
+    );
+    resolvedBazookaShotsRef.current.clear();
     playEliminationKickSentRef.current.clear();
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
@@ -10559,10 +10683,29 @@ export default function Board2Page() {
   function updatePlayPhysics(state: PlayCharacterState, dt: number, canvas: HTMLCanvasElement) {
     const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
     const terrain = surfaces.map(({id,type,boardX,boardY,boardW,boardH})=>({id,type,boardX,boardY,boardW,boardH})) as TerrainClip[];
-    if (state.action !== "none" && playTimeRef.current >= state.actionUntil) {
+    if (state.action !== "none" && state.action !== "ragdoll" && playTimeRef.current >= state.actionUntil) {
       state.action = "none";
       state.ragdollSpin = undefined;
       if (state.grounded) state.spin = 0;
+    }
+    if (state.action === "ragdoll" && state.ragdollLandedAt !== undefined) {
+      const recoveryProgress = clamp(
+        (playTimeRef.current - state.ragdollLandedAt) / (BAZOOKA_RAGDOLL_RECOVERY_MS / 1000),
+        0,
+        1,
+      );
+      const getUp = clamp((recoveryProgress - 0.28) / 0.72, 0, 1);
+      const eased = getUp * getUp * (3 - 2 * getUp);
+      const side = state.ragdollSpin && state.ragdollSpin < 0 ? -1 : 1;
+      state.spin = side * Math.PI * 0.5 * (1 - eased);
+      if (recoveryProgress >= 1) {
+        state.action = "none";
+        state.actionUntil = playTimeRef.current;
+        state.ragdollSpin = undefined;
+        state.ragdollLandedAt = undefined;
+        state.spin = 0;
+        state.vx = 0;
+      }
     }
     const ragdolling = state.action === "ragdoll";
     if(playBazookaArmedRef.current&&!ragdolling){const keys=playHeldKeysRef.current;if(keys.has("KeyA")){state.vx=-PLAY_WALK_SPEED;state.facing=-1;}else if(keys.has("KeyD")){state.vx=PLAY_WALK_SPEED;state.facing=1;}if(keys.has("KeyW")&&state.grounded){state.vy=-PLAY_JUMP_SPEED;state.grounded=false;state.surfaceId=null;}if(keys.has("KeyS"))state.vx*=.6;}
@@ -10575,7 +10718,7 @@ export default function Board2Page() {
       state.vx *= Math.exp(-dt * 11);
       if (Math.abs(state.vx) < 5) state.vx = 0;
     } else if (state.grounded && ragdolling) {
-      state.vx *= Math.exp(-dt * 4);
+      state.vx *= Math.exp(-dt * BAZOOKA_RAGDOLL_GROUND_DRAG);
     }
 
     if (state.action === "pullups") {
@@ -10591,6 +10734,7 @@ export default function Board2Page() {
         state.surfaceId = null;
         state.vy = 35;
         state.airborneAt = playTimeRef.current;
+        if (ragdolling) state.ragdollLandedAt = undefined;
         streamDebugLog("terrain fall host",{x:state.x,fromY:state.y});
       } else {
         state.y=lerp(state.y,ground.y,1-Math.exp(-dt*14));
@@ -10598,7 +10742,7 @@ export default function Board2Page() {
       }
     }
 
-    if(state.grounded&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
+    if(state.grounded&&!ragdolling&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
     const previousY = state.y;
     state.x += state.vx * dt;
     if (!state.grounded) {
@@ -10630,7 +10774,15 @@ export default function Board2Page() {
           state.grounded = true;
           state.surfaceId = landing.imageId;
           streamDebugLog("terrain landing host",{x:state.x,groundY:landing.y,slope:landing.slope});
-          if (!ragdolling) state.spin = 0;
+          if (ragdolling) {
+            const side = state.ragdollSpin && state.ragdollSpin < 0 ? -1 : 1;
+            state.ragdollLandedAt = playTimeRef.current;
+            state.actionUntil = playTimeRef.current + BAZOOKA_RAGDOLL_RECOVERY_MS / 1000;
+            state.spin = side * Math.PI * 0.5;
+            state.vx *= 0.35;
+          } else {
+            state.spin = 0;
+          }
           state.airborneAt = undefined;
           state.landedAt = playTimeRef.current;
         } else {
@@ -10657,6 +10809,8 @@ export default function Board2Page() {
       state.spin = 0;
       state.airborneAt = undefined;
       state.action = "none";
+      state.ragdollSpin = undefined;
+      state.ragdollLandedAt = undefined;
       state.landedAt = playTimeRef.current;
       state.grappleX = null;
       state.grappleY = null;

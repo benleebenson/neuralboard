@@ -20,6 +20,7 @@ export type PlayCharacterState = {
   action: "none" | "dance" | "emote" | "pullups" | "mirror" | "forceChoke" | "ragdoll";
   actionUntil: number;
   ragdollSpin?: number;
+  ragdollLandedAt?: number;
   landedAt: number;
   grappleX: number | null;
   grappleY: number | null;

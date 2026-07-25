@@ -9,8 +9,13 @@ import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, ty
 import { groundProfileY, raycastSolid, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
-import { bazookaShotKey } from "@/lib/character/impacts";
-import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamBazookaImpactMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
+import {
+  BAZOOKA_RAGDOLL_GROUND_DRAG,
+  BAZOOKA_RAGDOLL_RECOVERY_MS,
+  combatHealthColor,
+  bazookaShotKey,
+} from "@/lib/character/impacts";
+import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamBazookaImpactMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCombatState, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamGuestWeaponState, StreamHealthState, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 
 type Mode = "landing" | "watch" | "join" | "guest";
@@ -40,6 +45,7 @@ type GuestPhysics = {
   terrainSlope?: number;
   terrainLeftFootY?: number;
   terrainRightFootY?: number;
+  ragdollLandedAt?: number;
 };
 const BOARD_W = 4000;
 const GUEST_RESPAWN_BELOW_LOWEST_SURFACE = 650;
@@ -260,7 +266,7 @@ function guestActionDuration(action: GuestCharacterFrame["actionType"], distance
   return action === "run" ? 0.75 : action === "walk" ? 0.9 : 2;
 }
 
-function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, sessionId: string, now: number, seq: number, skin: "stick" | "styled", signDataUrl?: string, signActive = false): GuestCharacterFrame {
+function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, sessionId: string, now: number, seq: number, skin: "stick" | "styled", signDataUrl?: string, signActive = false, weapon?: StreamGuestWeaponState): GuestCharacterFrame {
   const sentAt = Date.now();
   const duration = (p.actionDurationMs ?? guestActionDuration(p.action) * 1000) / 1000;
   const progress = clamp((now - p.actionStarted) / Math.max(1, duration * 1000), 0, 1.4);
@@ -294,7 +300,17 @@ function guestFrameFromPhysics(p: GuestPhysics, guestId: string, name: string, s
     physique: p.physique,
     signDataUrl,
     signActive: !!signDataUrl && signActive,
+    weapon,
     emote: p.emote,
+  };
+}
+
+function guestBazookaWeapon(p: GuestPhysics, armed: boolean, aim: { x: number; y: number } | null): StreamGuestWeaponState {
+  return {
+    armed,
+    kind: "bazooka",
+    shooter: { x: p.x, y: p.y, facing: p.facing },
+    aim: aim ?? { x: p.x + p.facing * 500, y: p.y - 110 },
   };
 }
 
@@ -517,11 +533,11 @@ function guestDebugRow(frame: GuestCharacterFrame, guestSkinOverride?: "stick" |
 export default function StreamPage() {
   const containerRef=useRef<HTMLElement>(null), canvasRef=useRef<HTMLCanvasElement>(null), signCanvasRef=useRef<HTMLCanvasElement>(null), channelRef=useRef<RealtimeChannel|null>(null), imageCache=useRef(new Map<string,HTMLImageElement>()), faceCache=useRef(new Map<string,HTMLImageElement>()), signCache=useRef(new Map<string,HTMLImageElement>());
   const characterEntities=useRef(new Map<string,CharacterEntity>());
-  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteGuestSeq=useRef(new Map<string,number>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<StreamFrameMessage["weapon"]|null>(null), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), guestSeq=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
+  const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteGuestSeq=useRef(new Map<string,number>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<StreamFrameMessage["weapon"]|null>(null), combatHealthRef=useRef<StreamCombatState|null>(null), hostHealthSignatureRef=useRef(""), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), guestSeq=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const signDataUrlRef=useRef<string|undefined>(undefined), signActiveRef=useRef(false), signDrawingRef=useRef(false);
   const bazookaEventsRef=useRef<BazookaVisualEvent[]>([]),bazookaCharacterImpactsRef=useRef(new Map<string,StreamBazookaImpactMessage>()),cratersRef=useRef<StreamCrater[]>([]),guestBazookaArmedRef=useRef(false),guestBazookaAimRef=useRef<{x:number;y:number}|null>(null),guestBazookaLastFireAtRef=useRef(0);
   const repairAtRef=useRef(0);
-  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[wheelOpen,setWheelOpen]=useState(false),[wheelMenuOpen,setWheelMenuOpen]=useState(false),[debugOpen,setDebugOpen]=useState(false),[maximize,setMaximize]=useState(false),[nativeFullscreen,setNativeFullscreen]=useState(false),[guestBazookaArmed,setGuestBazookaArmed]=useState(false);
+  const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[wheelOpen,setWheelOpen]=useState(false),[wheelMenuOpen,setWheelMenuOpen]=useState(false),[debugOpen,setDebugOpen]=useState(false),[maximize,setMaximize]=useState(false),[nativeFullscreen,setNativeFullscreen]=useState(false),[guestBazookaArmed,setGuestBazookaArmed]=useState(false),[hostHealth,setHostHealth]=useState<StreamHealthState|null>(null);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const renderDebugRowsRef=useRef<StreamCharacterDebugRow[]>([]), renderDebugOverlayAt=useRef(0);
   const [renderDebugRows,setRenderDebugRows]=useState<StreamCharacterDebugRow[]>([]);
@@ -558,6 +574,18 @@ export default function StreamPage() {
       ?{...existing,target:event.point,fizzle:false}
       :{kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:event.streamId,sessionId:event.sessionId,sentAt:event.sentAt,startTime:event.startTime,shotId:event.shotId,from:event.from,target:event.point,seed:event.seed,fizzle:false};
     bazookaEventsRef.current=[...bazookaEventsRef.current.filter(candidate=>bazookaShotKey(candidate)!==event.shotId),visual].slice(-12);
+    if(event.target.role==="host"){
+      const guests=combatHealthRef.current?.guests??{};
+      combatHealthRef.current={host:event.health,guests};
+      const signature=`${event.health.current}:${event.health.max}:${event.health.hitAt}`;
+      hostHealthSignatureRef.current=signature;
+      setHostHealth(event.health);
+    }else if(combatHealthRef.current){
+      combatHealthRef.current={
+        ...combatHealthRef.current,
+        guests:{...combatHealthRef.current.guests,[event.target.guestId]:event.health},
+      };
+    }
     if(event.target.role!=="guest"||event.target.guestId!==guestId)return;
     const delay=Math.max(0,event.impactAt-Date.now());
     window.setTimeout(()=>{
@@ -577,8 +605,9 @@ export default function StreamPage() {
       p.action="ragdoll";
       p.actionStarted=performance.now();
       p.actionDurationMs=event.duration*1000;
-      p.actionParams={ragdollSpin:event.spin};
-      p.frozenUntil=event.impactAt+event.duration*1000;
+      p.actionParams={ragdollSpin:event.spin,ragdollPhase:"airborne",terrainGrounded:false};
+      p.ragdollLandedAt=undefined;
+      p.frozenUntil=Number.POSITIVE_INFINITY;
       streamDebugLog("bazooka ragdoll guest",{shotId:event.shotId,impulse:event.impulse});
     },delay);
   },[guestId]);
@@ -601,7 +630,7 @@ export default function StreamPage() {
   useEffect(()=>{const initial=window.setTimeout(()=>void loadSnapshot(),0);const supabase=getBrowserSupabase();const channelName=streamChannelName(STREAM_OWNER_USER_ID);if(!supabase){streamDebugLog("realtime not configured",{channel:channelName});window.setTimeout(()=>setStatus("realtime-not-configured"),0);return()=>window.clearTimeout(initial);}const key=`client-${guestId}`;streamDebugLog("join channel",{channel:channelName,key});const channel=supabase.channel(channelName,{config:{broadcast:{self:false},presence:{key}}});channelRef.current=channel;
     const requestSnapshot=()=>{const now=Date.now();if(now-snapshotRequestedAt.current<1000)return;snapshotRequestedAt.current=now;streamDebugLog("snapshot request",{channel:channelName,requestedAt:now});void channel.send({type:"broadcast",event:"snapshot-request",payload:{streamId:STREAM_OWNER_USER_ID,sentAt:now}});};
     channel.on("broadcast",{event:"snapshot"},({payload})=>{streamDebugLog("snapshot broadcast",{sessionId:(payload as StreamSnapshotMessage).sessionId,clips:(payload as StreamSnapshotMessage).clips?.length});snapshotRef.current=payload as StreamSnapshotMessage;setSnapshot(snapshotRef.current);setLive(true);setStatus("live");})
-      .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const previousSeq=latestHost.current?.seq??-1;if(frame.seq!==undefined&&frame.seq<=previousSeq){streamDebugLog("drop stale host frame",{seq:frame.seq,previousSeq});return;}if(frame.guestSkin){hostGuestSkin.current=frame.guestSkin;setGuestSkinLabel(frame.guestSkin);}const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(frame.weapon)weaponState.current=frame.weapon;if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{seq:frame.seq,sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),renderer:RENDERER_VERSION,guestSkin:hostGuestSkin.current,weapon:frame.weapon,characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
+      .on("broadcast",{event:"frame"},({payload})=>{const frame=payload as StreamFrameMessage;const previousSeq=latestHost.current?.seq??-1;if(frame.seq!==undefined&&frame.seq<=previousSeq){streamDebugLog("drop stale host frame",{seq:frame.seq,previousSeq});return;}if(frame.guestSkin){hostGuestSkin.current=frame.guestSkin;setGuestSkinLabel(frame.guestSkin);}const measured=Date.now()-frame.sentAt;hostClockOffset.current=hostClockOffset.current?hostClockOffset.current*.88+measured*.12:measured;if(frame.weapon)weaponState.current=frame.weapon;if(frame.combat){combatHealthRef.current=frame.combat;const signature=`${frame.combat.host.current}:${frame.combat.host.max}:${frame.combat.host.hitAt}`;if(signature!==hostHealthSignatureRef.current){hostHealthSignatureRef.current=signature;setHostHealth(frame.combat.host);}}if(DEBUG_STREAM&&Date.now()-lastDebugFrameAt.current>2000){lastDebugFrameAt.current=Date.now();streamDebugLog("frame broadcast",{seq:frame.seq,sentAt:frame.sentAt,clockOffset:Math.round(hostClockOffset.current),renderer:RENDERER_VERSION,guestSkin:hostGuestSkin.current,weapon:frame.weapon,characters:frame.characters?.filter(ch=>ch.enabled).map(ch=>ch.id)});}latestHost.current=frame;setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();})
       .on("broadcast",{event:"guest-state"},({payload})=>{const f=payload as GuestCharacterFrame;if(f.sessionId===latestHost.current?.sessionId||!latestHost.current){const prevSeq=remoteGuestSeq.current.get(f.guestId)??-1;if(f.seq!==undefined&&f.seq<=prevSeq){streamDebugLog("drop stale guest-state",{guestId:f.guestId,seq:f.seq,prevSeq});return;}if(f.seq!==undefined)remoteGuestSeq.current.set(f.guestId,f.seq);if(validSignDataUrl(f.signDataUrl))cacheSignImage(f.guestId,f.signDataUrl);const measured=Date.now()-f.sentAt;const prev=remoteClockOffsets.current.get(f.guestId)??measured;remoteClockOffsets.current.set(f.guestId,prev*.85+measured*.15);remoteGuests.current.set(f.guestId,{...f,receivedAt:Date.now()});}})
       .on("broadcast",{event:"elimination"},({payload})=>{const event=payload as StreamEliminationMessage;eliminations.current.set(event.targetGuestId,event);streamDebugLog("elimination received",{target:event.targetGuestId,start:event.startTime,duration:event.duration});const p=physics.current;if(event.targetGuestId===guestId&&p){signActiveRef.current=false;setSignActive(false);p.action="eliminated";p.actionStarted=performance.now();p.frozenUntil=event.startTime+event.duration*1000+250;p.eliminatedBy=event.hostName;p.targetX=null;p.targetY=null;p.vx=0;p.vy=0;clearGuestActionPlan(p);void refreshGuestPresence(false);}})
       .on("broadcast",{event:"weapon_state"},({payload})=>{streamDebugLog("ignore legacy weapon_state; frame.weapon is authoritative",payload);})
@@ -676,9 +705,12 @@ export default function StreamPage() {
             p.action = "forceChoke";
             clearGuestActionPlan(p);
           }
-          if (p.action === "ragdoll" && now - p.actionStarted >= (p.actionDurationMs ?? 1250)) {
-            p.action = p.grounded ? "idle" : "jump";
+          if (p.action === "ragdoll" && p.ragdollLandedAt !== undefined && now - p.ragdollLandedAt >= BAZOOKA_RAGDOLL_RECOVERY_MS) {
+            p.action = "idle";
+            p.actionStarted = now;
+            p.vx = 0;
             p.frozenUntil = undefined;
+            p.ragdollLandedAt = undefined;
             clearGuestActionPlan(p);
           }
           const frozen = (p.frozenUntil !== undefined && Date.now() < p.frozenUntil) || held?.phase === "hold";
@@ -716,6 +748,12 @@ export default function StreamPage() {
                 p.grounded = false;
                 p.surfaceId = null;
                 p.vy = 30;
+                if(p.action==="ragdoll"){
+                  p.ragdollLandedAt=undefined;
+                  p.actionStarted=now;
+                  p.actionDurationMs=1250;
+                  p.actionParams={ragdollSpin:typeof p.actionParams?.ragdollSpin==="number"?p.actionParams.ragdollSpin:p.facing*8,ragdollPhase:"airborne",terrainGrounded:false};
+                }
                 streamDebugLog("terrain fall guest", { x: p.x, fromY: p.y });
               } else {
                 p.y = lerp(p.y, ground.y, 1 - Math.exp(-dt * 14));
@@ -725,11 +763,12 @@ export default function StreamPage() {
                 p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x+14)?.y??ground.y)-ground.y;
               }
             }
-            if(p.grounded&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
+            if(p.grounded&&p.action==="ragdoll")p.vx*=Math.exp(-dt*BAZOOKA_RAGDOLL_GROUND_DRAG);
+            if(p.grounded&&p.action!=="ragdoll"&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
             p.x += p.vx * dt;
             if (!p.grounded) {
               const previousY = p.y;
-              p.vy = Math.min(1200, p.vy + 1850 * dt);
+              p.vy = Math.min(1350, p.vy + 1850 * dt);
               const nextY = p.y + p.vy * dt;
               const landing = groundProfileY(surfaces as TerrainClip[], cratersRef.current, p.x);
               if (landing && previousY <= landing.y && nextY >= landing.y) {
@@ -740,7 +779,17 @@ export default function StreamPage() {
                 p.terrainSlope = landing.slope;
                 p.terrainLeftFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x-14)?.y??landing.y)-landing.y;
                 p.terrainRightFootY=(groundProfileY(surfaces as TerrainClip[],cratersRef.current,p.x+14)?.y??landing.y)-landing.y;
-                p.action = p.targetX === null ? "idle" : p.action;
+                if(p.action==="ragdoll"){
+                  const spin=typeof p.actionParams?.ragdollSpin==="number"?p.actionParams.ragdollSpin:p.facing*8;
+                  const side=spin<0?-1:1;
+                  p.vx*=0.35;
+                  p.ragdollLandedAt=now;
+                  p.actionStarted=now;
+                  p.actionDurationMs=BAZOOKA_RAGDOLL_RECOVERY_MS;
+                  p.actionParams={ragdollSpin:spin,ragdollSide:side,ragdollPhase:"recovery",terrainGrounded:true};
+                }else{
+                  p.action = p.targetX === null ? "idle" : p.action;
+                }
                 streamDebugLog("terrain landing guest", { x: p.x, groundY: landing.y, slope: landing.slope });
               } else {
                 p.y = nextY;
@@ -758,6 +807,8 @@ export default function StreamPage() {
             p.grounded = spawn.grounded;
             p.surfaceId = spawn.surfaceId;
             p.action = "idle";
+            p.ragdollLandedAt = undefined;
+            p.frozenUntil = undefined;
             p.emote = undefined;
             p.actionStarted = now;
             p.spawnAt = now;
@@ -780,7 +831,7 @@ export default function StreamPage() {
         }
         if (p && now - publishAt.current > 1000 / STREAM_FPS && host) {
           publishAt.current = now;
-          const packet = guestFrameFromPhysics(p, guestId, nameRef.current, host.sessionId, now, ++guestSeq.current, hostGuestSkin.current, validSignDataUrl(signDataUrlRef.current) ? signDataUrlRef.current : undefined, signActiveRef.current);
+          const packet = guestFrameFromPhysics(p, guestId, nameRef.current, host.sessionId, now, ++guestSeq.current, hostGuestSkin.current, validSignDataUrl(signDataUrlRef.current) ? signDataUrlRef.current : undefined, signActiveRef.current, guestBazookaWeapon(p, guestBazookaArmedRef.current, guestBazookaAimRef.current));
           channelRef.current?.send({ type: "broadcast", event: "guest-state", payload: packet });
         }
         const baseCam = camera.current;
@@ -857,11 +908,14 @@ export default function StreamPage() {
             renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== id), guestDebugRow(smooth, hostGuestSkin.current, !!faceCache.current.get(id))];
             const entity = entityFor({ id, isHost: false, name: smooth.name, skin: hostGuestSkin.current, physique: smooth.physique ?? "slim" });
             entity.setGuestFrame(smooth, remoteClockOffsets.current.get(id) ?? 0, hostGuestSkin.current);
-            entity.draw({ ctx, cam, sf, width: w, height: h, face: faceCache.current.get(id) ?? null, sign: signCache.current.get(id) ?? null, alpha: id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, renderTimeMs: Date.now(), guestSkinOverride: hostGuestSkin.current });
+            entity.draw({ ctx, cam, sf, width: w, height: h, face: faceCache.current.get(id) ?? null, sign: signCache.current.get(id) ?? null, alpha: id === guestId ? clamp((now - (p?.spawnAt ?? 0)) / 650, 0, 1) : 1, renderTimeMs: Date.now(), guestSkinOverride: hostGuestSkin.current, health: combatHealthRef.current?.guests[id] });
+            if(smooth.weapon?.armed&&smooth.weapon.aim){
+              drawBazookaHeld(ctx,{x:smooth.position.x,y:smooth.position.y,facing:smooth.facing},smooth.weapon.aim,cam,sf,w,h,0,1,{bodyLean:entity.pose?.bodyLean,headBob:entity.pose?.headBob});
+            }
           }
           if (p && mode === "guest") {
             const sessionId = host?.sessionId ?? latestHost.current?.sessionId ?? "local";
-            const localFrame = guestFrameFromPhysics(p, guestId, nameRef.current, sessionId, now, guestSeq.current, hostGuestSkin.current, validSignDataUrl(signDataUrlRef.current) ? signDataUrlRef.current : undefined, signActiveRef.current);
+            const localFrame = guestFrameFromPhysics(p, guestId, nameRef.current, sessionId, now, guestSeq.current, hostGuestSkin.current, validSignDataUrl(signDataUrlRef.current) ? signDataUrlRef.current : undefined, signActiveRef.current, guestBazookaWeapon(p, guestBazookaArmedRef.current, guestBazookaAimRef.current));
             const event = eliminations.current.get(guestId);
             const choke = chokeStates.current.get(guestId);
             const renderFrame = choke?.phase === "hold"
@@ -873,8 +927,10 @@ export default function StreamPage() {
               renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== guestId), guestDebugRow(renderFrame, hostGuestSkin.current, !!faceCache.current.get(guestId))];
               const entity = entityFor({ id: guestId, isHost: false, name: renderFrame.name, skin: hostGuestSkin.current, physique: renderFrame.physique ?? "slim", faceDataUrl: face });
               entity.setGuestFrame(renderFrame, 0, hostGuestSkin.current);
-              entity.draw({ ctx, cam, sf, width: w, height: h, face: faceCache.current.get(guestId) ?? null, sign: signCache.current.get(guestId) ?? null, alpha: clamp((now - p.spawnAt) / 650, 0, 1), renderTimeMs: Date.now(), guestSkinOverride: hostGuestSkin.current });
-              if(guestBazookaArmedRef.current){const aim=guestBazookaAimRef.current??{x:p.x+p.facing*500,y:p.y-110};drawBazookaHeld(ctx,{x:p.x,y:p.y,facing:p.facing},aim,cam,sf,w,h,0);}
+              entity.draw({ ctx, cam, sf, width: w, height: h, face: faceCache.current.get(guestId) ?? null, sign: signCache.current.get(guestId) ?? null, alpha: clamp((now - p.spawnAt) / 650, 0, 1), renderTimeMs: Date.now(), guestSkinOverride: hostGuestSkin.current, health: combatHealthRef.current?.guests[guestId] });
+              if(renderFrame.weapon?.armed&&renderFrame.weapon.aim){
+                drawBazookaHeld(ctx,{x:renderFrame.position.x,y:renderFrame.position.y,facing:renderFrame.facing},renderFrame.weapon.aim,cam,sf,w,h,0,1,{bodyLean:entity.pose?.bodyLean,headBob:entity.pose?.headBob});
+              }
             } else {
               if (process.env.NODE_ENV !== "production") console.debug("[stream:despawn]", { where: "spectator-local", guestId, event: event?.sequenceType });
               void channelRef.current?.untrack();
@@ -901,7 +957,7 @@ export default function StreamPage() {
     return () => cancelAnimationFrame(raf);
   }, [guestId, mode, hostCam, snapshot]);
 
-  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;guestBazookaAimRef.current={x:rawX,y:rawY};if(guestBazookaArmedRef.current){fireGuestBazooka({x:rawX,y:rawY});return;}const allSurfaces=streamSurfaces(snapshot);const surfaces=allSurfaces.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){if(GUEST_AUTO_STOW_ACTIONS.has(verb)&&signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}issueGuestTargetVerb(verb,targetX,targetY,allSurfaces,destination);return;}const dx=targetX-p.x;const wantsArc=p.grounded&&(rawY<p.y-90||Math.abs(dx)>520|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
+  const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;guestBazookaAimRef.current={x:rawX,y:rawY};if(guestBazookaArmedRef.current){fireGuestBazooka({x:rawX,y:rawY});return;}const allSurfaces=streamSurfaces(snapshot);const surfaces=allSurfaces.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){if(GUEST_AUTO_STOW_ACTIONS.has(verb)&&signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}issueGuestTargetVerb(verb,targetX,targetY,allSurfaces,destination);return;}const wantsArc=p.grounded&&(rawY<p.y-90|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
   useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="b"){const next=!guestBazookaArmedRef.current;guestBazookaArmedRef.current=next;setGuestBazookaArmed(next);}if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance"))startGuestStationaryAction(p,"dance");if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps"))startGuestStationaryAction(p,"pullUps");if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){startGuestStationaryAction(p,"mirrorCheck");p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch"))startGuestStationaryAction(p,"sitAndWatch");};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
   useEffect(()=>{if(signOpen)requestAnimationFrame(clearSignCanvas);},[signOpen]);
   const signPoint=(e:React.PointerEvent<HTMLCanvasElement>)=>{const rect=e.currentTarget.getBoundingClientRect();return{x:(e.clientX-rect.left)*(e.currentTarget.width/rect.width),y:(e.clientY-rect.top)*(e.currentTarget.height/rect.height)};};
@@ -927,6 +983,12 @@ export default function StreamPage() {
   return (
     <main ref={containerRef} style={{ position: "fixed", inset: 0, zIndex:maximize?2147483000:undefined, overflow: "hidden", background: "#f5ecd8" }}>
       <canvas ref={canvasRef} onClick={clickCanvas} onPointerMove={e=>{if(mode!=="guest"||hostCam)return;const rect=e.currentTarget.getBoundingClientRect(),sf=camera.current.boardZoom*rect.width/BOARD_W;guestBazookaAimRef.current={x:(e.clientX-rect.left-rect.width/2)/sf+camera.current.cameraX,y:(e.clientY-rect.top-rect.height/2)/sf+camera.current.cameraY};}} style={{ width: "100vw", height: "100vh", display: "block", cursor: mode === "guest" && !hostCam ? "crosshair" : "default" }} />
+      {mode==="guest"&&hostHealth&&hostHealth.current<hostHealth.max&&<div aria-label={`Host health ${hostHealth.current} of ${hostHealth.max}`} style={{position:"fixed",top:"max(12px, env(safe-area-inset-top))",left:"50%",transform:"translateX(-50%)",zIndex:20,width:"min(240px, 48vw)",padding:"7px 9px",border:"1.5px solid #2a2a2a",background:"rgba(255,253,245,.92)",boxShadow:"2px 2px 0 #2a2a2a",fontFamily:"monospace",fontSize:10,fontWeight:800,textAlign:"center",pointerEvents:"none"}}>
+        <div style={{marginBottom:5}}>HOST HEALTH</div>
+        <div style={{height:7,background:"#2a2a2a",padding:2}}>
+          <div style={{height:"100%",width:`${clamp(hostHealth.current/Math.max(1,hostHealth.max),0,1)*100}%`,background:combatHealthColor(hostHealth.current,hostHealth.max),transition:"width 180ms ease, background 180ms ease"}}/>
+        </div>
+      </div>}
       {!maximize&&<div style={{position:"fixed",top:"max(12px, env(safe-area-inset-top))",left:"max(12px, env(safe-area-inset-left))",display:"flex",gap:8,fontFamily:"monospace"}}><span style={pill}>{mode==="guest"?name:`LIVE · ${STREAM_OWNER_NAME}`}</span><button type="button" aria-label="Fullscreen" style={{...pill,cursor:"pointer"}} onClick={()=>void toggleFullscreen()}>⛶</button></div>}
       {maximize?<button type="button" onClick={()=>void exitFullscreen()} style={{...pill,position:"fixed",top:10,right:10}}>✕</button>:<button type="button" aria-label="Open action wheel" onClick={()=>setWheelOpen(true)} style={wheelTriggerStyle}>✦</button>}
       <ActionWheel open={wheelOpen&&!maximize} items={wheelItems} onDismiss={dismissWheel} menuOpen={wheelMenuOpen} menuItems={menuItems}/>

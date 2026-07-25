@@ -2,6 +2,7 @@ import { drawBoardCharacterToCanvas, type BoardCharPoseResult } from "./board-re
 import { isGrounded } from "./grounding";
 import { STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { FORWARD_TUCK_FLIP_KEYFRAMES, sampleAnimation, type Pose } from "../characterAnimations";
+import { combatHealthColor } from "./impacts";
 import {
   type HeadLocalPoint,
   type CharacterSkin,
@@ -9,6 +10,7 @@ import {
   type StreamCamera,
   type StreamCharacterFrame,
   type StreamFrameMessage,
+  type StreamHealthState,
   type StreamParticipantPresence,
 } from "../stream";
 
@@ -56,6 +58,7 @@ export type CharacterEntityDrawContext = {
   alpha?: number;
   clockOffsetMs?: number;
   guestSkinOverride?: CharacterSkin;
+  health?: StreamHealthState;
 };
 
 export interface CharacterInputAdapter {
@@ -150,7 +153,7 @@ export class CharacterEntity {
       },
     );
     drawEntitySign(args.ctx, this, args.sign ?? null, args.cam, args.sf, args.width, args.height, args.renderTimeMs ?? Date.now());
-    drawEntityLabel(args.ctx, this, args.cam, args.sf, args.width, args.height);
+    drawEntityLabel(args.ctx, this, args.cam, args.sf, args.width, args.height, args.health);
     args.ctx.restore();
   }
 }
@@ -194,8 +197,14 @@ function entityPoseFromHostFrame(frame: StreamCharacterFrame, identity: Characte
 }
 
 function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: CharacterEntityIdentity, clockOffsetMs = 0): BoardCharPoseResult {
-  if (frame.boardPose) return { ...frame.boardPose, viseme: frame.viseme ?? frame.boardPose.viseme ?? "rest" };
-  return {
+  if (frame.boardPose) {
+    return {
+      ...frame.boardPose,
+      hideArms: frame.weapon?.armed || frame.boardPose.hideArms,
+      viseme: frame.viseme ?? frame.boardPose.viseme ?? "rest",
+    };
+  }
+  const pose: BoardCharPoseResult = {
     ...streamPoseFallback({
     x: frame.position.x,
     y: frame.position.y,
@@ -212,6 +221,8 @@ function entityPoseFromGuestFrame(frame: GuestCharacterFrame, identity: Characte
     }),
     viseme: frame.viseme ?? "rest",
   };
+  if (frame.weapon?.armed) pose.hideArms = true;
+  return pose;
 }
 
 function streamPoseFallback(args: {
@@ -265,9 +276,28 @@ function streamPoseFallback(args: {
     }
   }
   if (args.actionType === "flip" || args.actionType === "ragdoll" || args.actionType === "eliminated") {
-    const flipPose = sampleAnimation({ id: "entity-fallback-flip", name: "flip", keyframes: FORWARD_TUCK_FLIP_KEYFRAMES, loop: false, createdAt: "fallback" }, Math.min(1, p));
-    applyPose(pose, flipPose, true);
-    if (args.actionType === "ragdoll") {
+    const recovering = args.actionType === "ragdoll" && args.actionParams?.ragdollPhase === "recovery";
+    if (recovering) {
+      const getUp = clamp((p - 0.28) / 0.72, 0, 1);
+      const eased = getUp * getUp * (3 - 2 * getUp);
+      const side = param("ragdollSide", args.facing);
+      pose.spinAngle = side * Math.PI * 0.5 * (1 - eased);
+      pose.headBob = lerp(18, 0, eased);
+      pose.bodyLean = lerp(side * 0.08, 0, eased);
+      pose.leftArmA = lerp(1.15, 0.25, eased);
+      pose.rightArmA = lerp(-0.95, -0.25, eased);
+      pose.leftForeA = lerp(0.7, 0.1, eased);
+      pose.rightForeA = lerp(-0.6, -0.1, eased);
+      pose.leftLegA = lerp(0.75, 0.12, eased);
+      pose.rightLegA = lerp(-0.55, -0.12, eased);
+      pose.leftShinA = lerp(-0.5, 0, eased);
+      pose.rightShinA = lerp(0.42, 0, eased);
+      pose.terrainGrounded = true;
+    } else {
+      const flipPose = sampleAnimation({ id: "entity-fallback-flip", name: "flip", keyframes: FORWARD_TUCK_FLIP_KEYFRAMES, loop: false, createdAt: "fallback" }, Math.min(1, p));
+      applyPose(pose, flipPose, true);
+    }
+    if (args.actionType === "ragdoll" && !recovering) {
       const spin = param("ragdollSpin", args.facing * 8);
       pose.spinAngle = p * spin;
       pose.leftArmA += Math.sin(p * Math.PI * 5) * 0.45;
@@ -623,11 +653,28 @@ function entityHandPoint(
   };
 }
 
-function drawEntityLabel(ctx: CanvasRenderingContext2D, entity: CharacterEntity, cam: StreamCamera, sf: number, W: number, H: number) {
-  if (!entity.identity.name || !entity.pose) return;
+function drawEntityLabel(ctx: CanvasRenderingContext2D, entity: CharacterEntity, cam: StreamCamera, sf: number, W: number, H: number, health?: StreamHealthState) {
+  if (!entity.pose) return;
   const sx = (entity.pose.boardX - cam.cameraX) * sf + W / 2;
   const sy = (entity.pose.boardY - cam.cameraY) * sf + H / 2;
   ctx.save();
+  if (health && health.current < health.max) {
+    const barWidth = Math.max(34, 62 * sf);
+    const barHeight = Math.max(4, 6 * sf);
+    const x = sx - barWidth / 2;
+    const y = sy - 232 * sf;
+    const ratio = clamp(health.current / Math.max(1, health.max), 0, 1);
+    ctx.fillStyle = "rgba(25, 22, 20, 0.78)";
+    ctx.fillRect(x - 2, y - 2, barWidth + 4, barHeight + 4);
+    ctx.fillStyle = combatHealthColor(health.current, health.max);
+    ctx.fillRect(x, y, barWidth * ratio, barHeight);
+    ctx.restore();
+    return;
+  }
+  if (!entity.identity.name) {
+    ctx.restore();
+    return;
+  }
   ctx.font = `700 ${Math.max(9, 13 * sf)}px 'Caveat', monospace`;
   ctx.textAlign = "center";
   ctx.fillStyle = entity.identity.isHost ? "#8b2bd1" : "#27221f";

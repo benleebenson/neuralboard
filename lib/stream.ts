@@ -167,6 +167,17 @@ export type StreamCharacterFrame = {
 
 export type SpawnDoor = { x: number; y: number };
 export type StreamCrater = { clipId: string; cx: number; cy: number; r: number; seed: number };
+export type StreamHealthState = { current: number; max: number; hitAt: number };
+export type StreamCombatState = {
+  host: StreamHealthState;
+  guests: Record<string, StreamHealthState>;
+};
+export type StreamGuestWeaponState = {
+  armed: boolean;
+  kind: "bazooka";
+  aim?: { x: number; y: number };
+  shooter?: { x: number; y: number; facing: 1 | -1 };
+};
 export type StreamBazookaFireMessage = {
   kind: "bazooka_fire";
   sequenceType: "bazookaFire";
@@ -196,6 +207,7 @@ export type StreamBazookaImpactMessage = {
   spin: number;
   seed: number;
   duration: number;
+  health: StreamHealthState;
   target: { role: "host" } | { role: "guest"; guestId: string };
 };
 export type StreamRepairBoardMessage = { kind:"repair_board";streamId:string;sessionId:string;sentAt:number };
@@ -234,6 +246,7 @@ export type GuestCharacterFrame = {
   physique?: "slim" | "jacked";
   signDataUrl?: string;
   signActive?: boolean;
+  weapon?: StreamGuestWeaponState;
   receivedAt?: number;
   emote?: string;
   viseme?: Viseme;
@@ -320,6 +333,7 @@ export type StreamFrameMessage = {
   sentAt: number;
   camera: StreamCamera;
   guestSkin?: CharacterSkin;
+  combat?: StreamCombatState;
   weapon?: {
     armed: boolean;
     kind?: "tommy" | "bazooka";
