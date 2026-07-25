@@ -3648,6 +3648,7 @@ export default function Board2Page() {
   const [playNativeFullscreen, setPlayNativeFullscreen] = useState(false);
   const [playAddMenuOpen, setPlayAddMenuOpen] = useState(false);
   const [playLiveSpeechEnabled, setPlayLiveSpeechEnabled] = useState(false);
+  const [playLiveSpeechBubbles, setPlayLiveSpeechBubbles] = useState(false);
   const [playLiveSpeechStatus, setPlayLiveSpeechStatus] = useState<"idle" | "listening" | "transcribing" | "error">("idle");
   const [playLiveSpeechText, setPlayLiveSpeechText] = useState("");
   const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
@@ -3899,6 +3900,7 @@ export default function Board2Page() {
   const characterViseme2Ref = useRef<Viseme>("rest");
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const playLiveSpeechEnabledRef = useRef(false);
+  const playLiveSpeechBubblesRef = useRef(false);
   const playLiveSpeechRecorderRef = useRef<MediaRecorder | null>(null);
   const playLiveSpeechStreamRef = useRef<MediaStream | null>(null);
   const playLiveSpeechAudioContextRef = useRef<AudioContext | null>(null);
@@ -9775,8 +9777,9 @@ export default function Board2Page() {
     const rms = Math.sqrt(sumSquares / samples.length);
     const mouth = playLiveSpeechMouthRef.current;
 
-    // Follow speech quickly but let the jaw settle instead of flickering between samples.
-    const envelopeRate = rms > mouth.envelope ? 0.34 : 0.13;
+    // A quick attack keeps the mouth live; the gentler release prevents chattering
+    // between neighboring shapes at the end of every syllable.
+    const envelopeRate = rms > mouth.envelope ? 0.24 : 0.09;
     mouth.envelope += (rms - mouth.envelope) * envelopeRate;
 
     // Learn the room tone only while we are probably not speaking. The two thresholds add
@@ -9797,22 +9800,19 @@ export default function Board2Page() {
       return mouth.viseme;
     }
 
-    // Hold each pose long enough to read as a syllable. Loudness drives jaw openness while
-    // a restrained shape cycle keeps speech expressive without pretending to know phonemes.
+    // Choose adjacent jaw openings from the live envelope instead of cycling through
+    // unrelated phoneme shapes. This reads as one continuous jaw motion.
     if (now >= mouth.nextChangeAt) {
       const strength = clamp((mouth.envelope - closeThreshold) / Math.max(0.018, openThreshold * 2.8), 0, 1);
-      const softShapes: Viseme[] = ["slightOpen", "closed", "slightOpen", "round"];
-      const mediumShapes: Viseme[] = ["slightOpen", "open", "wide", "slightOpen", "round"];
-      const strongShapes: Viseme[] = ["open", "wide", "open", "round", "slightOpen"];
-      const shapes = strength < 0.28 ? softShapes : strength < 0.68 ? mediumShapes : strongShapes;
-      mouth.viseme = shapes[mouth.shapeIndex++ % shapes.length];
-      mouth.nextChangeAt = now + lerp(190, 125, strength);
+      const nextViseme: Viseme = strength < 0.2 ? "slightOpen" : strength < 0.58 ? "open" : "wide";
+      mouth.viseme = nextViseme;
+      mouth.nextChangeAt = now + 72;
     }
     return mouth.viseme;
   }
 
   async function transcribePlayLiveSpeechChunk(blob: Blob, sequence: number) {
-    if (!playLiveSpeechEnabledRef.current || playLiveSpeechBusyRef.current || blob.size < 1200) return;
+    if (!playLiveSpeechEnabledRef.current || !playLiveSpeechBubblesRef.current || playLiveSpeechBusyRef.current || blob.size < 700) return;
     playLiveSpeechBusyRef.current = true;
     setPlayLiveSpeechStatus("transcribing");
     try {
@@ -9873,16 +9873,18 @@ export default function Board2Page() {
       playLiveSpeechTextUntilRef.current = 0;
       recorder.ondataavailable = (event) => {
         if (!event.data || event.data.size <= 0) return;
-        playLiveSpeechActiveUntilRef.current = performance.now() + 2400;
-        void transcribePlayLiveSpeechChunk(event.data, ++playLiveSpeechSeqRef.current);
+        playLiveSpeechActiveUntilRef.current = performance.now() + 1400;
+        if (playLiveSpeechBubblesRef.current) {
+          void transcribePlayLiveSpeechChunk(event.data, ++playLiveSpeechSeqRef.current);
+        }
       };
       recorder.onstop = () => {
         playLiveSpeechStreamRef.current?.getTracks().forEach((track) => track.stop());
         playLiveSpeechStreamRef.current = null;
         playLiveSpeechRecorderRef.current = null;
       };
-      recorder.start(1800);
-      setToast("Live speech bubbles on");
+      recorder.start(1000);
+      setToast("Live mouth on");
     } catch (error) {
       playLiveSpeechEnabledRef.current = false;
       setPlayLiveSpeechEnabled(false);
@@ -9894,6 +9896,8 @@ export default function Board2Page() {
   function stopPlayLiveSpeech() {
     playLiveSpeechEnabledRef.current = false;
     setPlayLiveSpeechEnabled(false);
+    playLiveSpeechBubblesRef.current = false;
+    setPlayLiveSpeechBubbles(false);
     setPlayLiveSpeechStatus("idle");
     playLiveSpeechActiveUntilRef.current = 0;
     playLiveSpeechTextUntilRef.current = performance.now() + 1800;
@@ -9914,6 +9918,19 @@ export default function Board2Page() {
   function togglePlayLiveSpeech() {
     if (playLiveSpeechEnabledRef.current) stopPlayLiveSpeech();
     else void startPlayLiveSpeech();
+  }
+
+  function togglePlayLiveSpeechBubbles() {
+    const next = !playLiveSpeechBubblesRef.current;
+    playLiveSpeechBubblesRef.current = next;
+    setPlayLiveSpeechBubbles(next);
+    if (!next) {
+      playLiveSpeechTextUntilRef.current = 0;
+      setToast("Speech bubbles off");
+      return;
+    }
+    setToast("Speech bubbles on");
+    if (!playLiveSpeechEnabledRef.current) void startPlayLiveSpeech();
   }
 
   function guestAtPlayPoint(point: { rawX: number; rawY: number }): GuestCharacterFrame | null {
@@ -9997,8 +10014,8 @@ export default function Board2Page() {
       const worldY = gun.dir.y * along + gun.dir.x * down;
       return { x: worldX * facing, y: -108 + worldY };
     };
-    const triggerPoint = toLocal(-1, 22);
-    const supportPoint = toLocal(60, 18);
+    const triggerPoint = toLocal(-1 * gun.scale, 22 * gun.scale);
+    const supportPoint = toLocal(60 * gun.scale, 18 * gun.scale);
     const triggerArm = solveArmToLocalPoint(triggerPoint.x, triggerPoint.y, facing >= 0 ? 1 : -1);
     const supportArm = solveArmToLocalPoint(supportPoint.x, supportPoint.y, facing >= 0 ? -1 : 1);
     const armedPose: CharPoseResult = {
@@ -10616,7 +10633,7 @@ export default function Board2Page() {
         if(playBazookaArmedRef.current){const recoilAge=nowMs-playBazookaLastFireAtRef.current,recoil=recoilAge<260?Math.sin((1-recoilAge/260)*Math.PI)*9:0;drawBazookaHeld(ctx,{x:state.x,y:state.y,facing:state.facing},playCursorRef.current??{x:state.x+state.facing*400,y:state.y-115},playCameraRef.current,sf,canvas.width,canvas.height,recoil);}
         for(const event of playBazookaEventsRef.current)drawBazookaEffect(ctx,event,playCameraRef.current,sf,canvas.width,canvas.height,nowMs);
         drawStreamGuestsToCtx(ctx, playCameraRef.current, sf, canvas.width, canvas.height);
-        if (performance.now() < playLiveSpeechTextUntilRef.current) {
+        if (playLiveSpeechBubblesRef.current && performance.now() < playLiveSpeechTextUntilRef.current) {
           const anchor = characterHeadSpeechAnchor(playPose, playCameraRef.current, sf, canvas.width, canvas.height, hasFace, faceAspect, physiqueAt(playDrawTime, playDrawResolved));
           drawLiveSpeechBubble(ctx, playLiveSpeechTextRef.current, canvas.width, canvas.height, anchor);
         }
@@ -11464,7 +11481,7 @@ export default function Board2Page() {
           <button
             type="button"
             onClick={togglePlayLiveSpeech}
-            title="Capture microphone speech as live bubbles"
+            title="Animate the character's mouth from your microphone"
             style={{
               position: "fixed",
               top: 14,
@@ -11481,8 +11498,31 @@ export default function Board2Page() {
               cursor: "pointer",
             }}
           >
-            {playLiveSpeechEnabled ? "🎙 Speech ON" : "🎙 Speech"}
+            {playLiveSpeechEnabled ? "🎙 Mouth ON" : "🎙 Live mouth"}
             {playLiveSpeechStatus === "transcribing" ? " ..." : playLiveSpeechStatus === "error" ? " !" : ""}
+          </button>
+        )}
+        {!playCleanUi && (
+          <button
+            type="button"
+            onClick={togglePlayLiveSpeechBubbles}
+            title="Toggle live speech-bubble transcription"
+            style={{
+              position: "fixed",
+              top: 14,
+              left: playCleanUi ? 184 : 306,
+              zIndex: 2,
+              padding: "8px 10px",
+              border: "1.5px solid #2a2a2a",
+              background: playLiveSpeechBubbles ? "#a8d8ff" : "rgba(255,253,245,0.92)",
+              boxShadow: "2px 2px 0 #2a2a2a",
+              fontFamily: "monospace",
+              fontSize: 10,
+              fontWeight: 800,
+              cursor: "pointer",
+            }}
+          >
+            {playLiveSpeechBubbles ? "💬 Bubbles ON" : "💬 Bubbles"}
           </button>
         )}
         {DEBUG_STREAM && playDebugOpen && !playMaximize && (

@@ -145,16 +145,16 @@ export function drawTommyGunHeld(
   ctx.lineWidth = Math.max(1.5, 3.2 * sf);
   ctx.translate(pivotX - geometry.dir.x * recoil, pivotY - geometry.dir.y * recoil);
   ctx.rotate(aimAngle);
-  ctx.scale(1, keepGripsDown);
+  ctx.scale(geometry.scale, keepGripsDown * geometry.scale);
 
   // Rear wooden stock
   ctx.fillStyle = "#a86f50";
   ctx.beginPath();
   ctx.moveTo(-31 * sf, -7 * sf);
-  ctx.bezierCurveTo(-48 * sf, -10 * sf, -69 * sf, -20 * sf, -91 * sf, -29 * sf);
-  ctx.lineTo(-98 * sf, -26 * sf);
-  ctx.lineTo(-97 * sf, 3 * sf);
-  ctx.bezierCurveTo(-72 * sf, 16 * sf, -51 * sf, 22 * sf, -29 * sf, 11 * sf);
+  ctx.bezierCurveTo(-45 * sf, -9 * sf, -61 * sf, -17 * sf, -78 * sf, -24 * sf);
+  ctx.lineTo(-84 * sf, -21 * sf);
+  ctx.lineTo(-82 * sf, 1 * sf);
+  ctx.bezierCurveTo(-63 * sf, 12 * sf, -47 * sf, 17 * sf, -29 * sf, 11 * sf);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
@@ -235,6 +235,7 @@ export function tommyGunAimGeometry(
   shooter: { x: number; y: number; facing: 1 | -1 },
   aimBoard: { x: number; y: number },
 ) {
+  const scale = 0.65;
   const pivot = { x: shooter.x, y: shooter.y - 108 };
   const dx = aimBoard.x - pivot.x;
   const dy = aimBoard.y - pivot.y;
@@ -243,9 +244,10 @@ export function tommyGunAimGeometry(
     ? { x: dx / length, y: dy / length }
     : { x: shooter.facing, y: 0 };
   return {
+    scale,
     pivot,
     dir,
-    muzzle: { x: pivot.x + dir.x * 139, y: pivot.y + dir.y * 139 },
+    muzzle: { x: pivot.x + dir.x * 139 * scale, y: pivot.y + dir.y * 139 * scale },
   };
 }
 
