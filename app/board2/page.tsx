@@ -55,7 +55,7 @@ import {
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
+import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
 import {
@@ -608,6 +608,11 @@ type PendingBazookaShot = {
   maxDistance: number;
   terrainImpact: ReturnType<typeof raycastSolid>;
   terrainDistance: number;
+};
+
+type GuestBazookaVisualImpact = {
+  event: StreamBazookaImpactMessage;
+  startPosition: { x: number; y: number };
 };
 
 type CharTimelineDrag = {
@@ -4001,6 +4006,7 @@ export default function Board2Page() {
   const playBazookaLastFireAtRef = useRef(0);
   const playBazookaEventsRef = useRef<BazookaVisualEvent[]>([]);
   const pendingBazookaShotsRef = useRef<PendingBazookaShot[]>([]);
+  const playGuestBazookaVisualImpactsRef = useRef<Map<string, GuestBazookaVisualImpact>>(new Map());
   const playHostHealthRef = useRef<StreamHealthState>({ current: HOST_BAZOOKA_MAX_HEALTH, max: HOST_BAZOOKA_MAX_HEALTH, hitAt: 0 });
   const playGuestHealthRef = useRef<Map<string, StreamHealthState>>(new Map());
   const resolvedBazookaShotsRef = useRef<Set<string>>(new Set());
@@ -4584,6 +4590,7 @@ export default function Board2Page() {
     playWeaponHitCountsRef.current.delete(guestId);
     playEliminationKickSentRef.current.delete(guestId);
     playBazookaKnockoutPendingRef.current.delete(guestId);
+    playGuestBazookaVisualImpactsRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
@@ -5002,6 +5009,7 @@ export default function Board2Page() {
       resolvedBazookaShotsRef.current.clear();
       pendingBazookaShotsRef.current = [];
       playBazookaKnockoutPendingRef.current.clear();
+      playGuestBazookaVisualImpactsRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
     }
@@ -5278,11 +5286,40 @@ export default function Board2Page() {
       const elimination = streamEliminationsRef.current.get(frame.guestId);
       const choke = streamChokeStatesRef.current.get(frame.guestId);
       const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
+      const bazookaVisual = playGuestBazookaVisualImpactsRef.current.get(frame.guestId);
+      if (bazookaVisual && (frame.actionType === "ragdoll" || now - bazookaVisual.event.impactAt > 500)) {
+        playGuestBazookaVisualImpactsRef.current.delete(frame.guestId);
+      }
+      const activeBazookaVisual = playGuestBazookaVisualImpactsRef.current.get(frame.guestId);
+      const bazookaAge = activeBazookaVisual ? Math.max(0, (now - activeBazookaVisual.event.impactAt) / 1000) : 0;
+      const bazookaFrame = activeBazookaVisual
+        ? {
+            ...frame,
+            position: {
+              x: activeBazookaVisual.startPosition.x + activeBazookaVisual.event.impulse.x * bazookaAge,
+              y: activeBazookaVisual.startPosition.y + activeBazookaVisual.event.impulse.y * bazookaAge + 925 * bazookaAge * bazookaAge,
+            },
+            velocity: {
+              x: activeBazookaVisual.event.impulse.x,
+              y: activeBazookaVisual.event.impulse.y + 1850 * bazookaAge,
+            },
+            actionType: "ragdoll" as const,
+            actionProgress: clamp(bazookaAge / activeBazookaVisual.event.duration, 0, 1),
+            actionStartTime: activeBazookaVisual.event.impactAt,
+            actionDuration: activeBazookaVisual.event.duration,
+            actionParams: {
+              ragdollSpin: activeBazookaVisual.event.spin,
+              ragdollPhase: "airborne",
+              terrainGrounded: false,
+            },
+            weapon: frame.weapon ? { ...frame.weapon, armed: false } : undefined,
+          }
+        : null;
       const activeFrame = choke && choke.phase === "hold"
         ? { ...frame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4, weapon: frame.weapon ? { ...frame.weapon, armed: false } : undefined }
         : choke && choke.phase === "drop"
           ? { ...frame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1, weapon: frame.weapon ? { ...frame.weapon, armed: false } : undefined }
-          : elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
+          : bazookaFrame ?? (elimination ? eliminationFrameForGuest(frame, elimination, now) : frame);
       if (!activeFrame) {
         streamRenderedGuestFramesRef.current.delete(frame.guestId);
         streamGuestFramesRef.current.delete(frame.guestId);
@@ -10518,6 +10555,15 @@ export default function Board2Page() {
         ? { role: "host" }
         : { role: "guest", guestId: hitCharacter.guestId! },
     };
+    if (hitCharacter.role === "guest") {
+      const frame = streamGuestFramesRef.current.get(hitCharacter.guestId!);
+      if (frame) {
+        playGuestBazookaVisualImpactsRef.current.set(hitCharacter.guestId!, {
+          event: impact,
+          startPosition: { ...frame.position },
+        });
+      }
+    }
     playBazookaEventsRef.current = [
       ...playBazookaEventsRef.current.filter((candidate) => bazookaShotKey(candidate) !== impact.shotId),
       { ...event, target: hitCharacter.point, fizzle: false } satisfies BazookaVisualEvent,
@@ -10690,6 +10736,7 @@ export default function Board2Page() {
     resolvedBazookaShotsRef.current.clear();
     pendingBazookaShotsRef.current = [];
     playBazookaKnockoutPendingRef.current.clear();
+    playGuestBazookaVisualImpactsRef.current.clear();
     playEliminationKickSentRef.current.clear();
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
@@ -10933,13 +10980,22 @@ export default function Board2Page() {
 
     if(state.grounded&&!ragdolling&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
     const previousY = state.y;
-    const horizontalMotion = resolveCharacterSolidMotion(
-      terrain,
-      streamCratersRef.current,
-      { x: state.x, y: state.y },
-      { x: state.x + state.vx * dt, y: state.y },
-    );
+    const horizontalMotion = state.grounded && !ragdolling
+      ? resolveGroundedCharacterMotion(
+          terrain,
+          streamCratersRef.current,
+          { x: state.x, y: state.y },
+          state.x + state.vx * dt,
+          state.surfaceId,
+        )
+      : resolveCharacterSolidMotion(
+          terrain,
+          streamCratersRef.current,
+          { x: state.x, y: state.y },
+          { x: state.x + state.vx * dt, y: state.y },
+        );
     state.x = horizontalMotion.x;
+    if (state.grounded && !ragdolling && !horizontalMotion.hitX) state.y = horizontalMotion.y;
     if (horizontalMotion.hitX) state.vx = 0;
     if (!state.grounded) {
       state.vy = Math.min(PLAY_MAX_FALL_SPEED, state.vy + PLAY_GRAVITY * dt);

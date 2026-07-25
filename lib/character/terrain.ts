@@ -10,6 +10,7 @@ export type TerrainClip = {
 };
 export type TerrainHit = { point: TerrainPoint; imageId: string; normalHint: TerrainPoint };
 export type GroundProfile = { y: number; imageId: string; slope: number };
+export type CharacterSolidMotion = { x: number; y: number; hitX: boolean; hitCeiling: boolean };
 
 const RAY_STEP_PX = 1;
 const RAY_REFINE_PX = 0.5;
@@ -136,7 +137,7 @@ export function resolveCharacterSolidMotion(
   from: TerrainPoint,
   to: TerrainPoint,
   options: { halfWidth?: number; height?: number } = {},
-): { x: number; y: number; hitX: boolean; hitCeiling: boolean } {
+): CharacterSolidMotion {
   const halfWidth = options.halfWidth ?? 22;
   const height = options.height ?? 205;
   let x = to.x;
@@ -169,4 +170,45 @@ export function resolveCharacterSolidMotion(
   }
 
   return { x, y, hitX, hitCeiling };
+}
+
+/**
+ * Lets a grounded character follow the crater profile of its current image without
+ * treating that same curved floor as a side wall. Other image/video boxes remain
+ * solid, so this cannot walk through an adjacent prop or stacked image.
+ */
+export function resolveGroundedCharacterMotion(
+  clips: readonly TerrainClip[],
+  craters: readonly TerrainCrater[],
+  from: TerrainPoint,
+  targetX: number,
+  supportImageId: string | null,
+  options: { halfWidth?: number; height?: number; maxStepUp?: number; maxStepDown?: number } = {},
+): CharacterSolidMotion {
+  if (!supportImageId) {
+    return resolveCharacterSolidMotion(clips, craters, from, { x: targetX, y: from.y }, options);
+  }
+  const supportClip = solidClips(clips).find((clip) => clip.id === supportImageId);
+  const support = supportClip ? groundProfileY([supportClip], craters, targetX) : null;
+  const rise = support ? from.y - support.y : Infinity;
+  const drop = support ? support.y - from.y : Infinity;
+  if (
+    !support ||
+    rise > (options.maxStepUp ?? 96) ||
+    drop > (options.maxStepDown ?? 96)
+  ) {
+    return resolveCharacterSolidMotion(clips, craters, from, { x: targetX, y: from.y }, options);
+  }
+
+  const blockers = clips.filter((clip) => clip.id !== supportImageId);
+  const motion = resolveCharacterSolidMotion(
+    blockers,
+    craters,
+    from,
+    { x: targetX, y: support.y },
+    options,
+  );
+  return motion.hitX || motion.hitCeiling
+    ? motion
+    : { ...motion, y: support.y };
 }

@@ -5,15 +5,17 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { RENDERER_VERSION, drawBazookaHeld, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
-import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, type TerrainClip } from "@/lib/character/terrain";
+import { bazookaShake, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
+import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
 import {
   BAZOOKA_RAGDOLL_GROUND_DRAG,
   BAZOOKA_RAGDOLL_RECOVERY_MS,
+  bazookaCharacterHitZones,
   combatHealthColor,
   bazookaShotKey,
+  firstBazookaCharacterHit,
 } from "@/lib/character/impacts";
 import { GUEST_EMOTES, GUEST_NAME_MAX_LENGTH, GUEST_VERBS, GuestCharacterFrame, MAX_GUESTS, MAX_GUEST_SIGN_DATA_URL_BYTES, STREAM_FPS, StreamAnnotation, StreamBazookaFireMessage, StreamBazookaImpactMessage, StreamCamera, StreamCharacterDebugRow, StreamChokeMessage, StreamCombatState, StreamCrater, StreamEliminationMessage, StreamFrameMessage, StreamGuestWeaponState, StreamHealthState, StreamKickMessage, StreamParticipantPresence, StreamShotFiredMessage, StreamSnapshotMessage, StreamWeaponHitMessage, resolveStreamSkin, streamChannelName } from "@/lib/stream";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
@@ -68,8 +70,19 @@ const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 type FullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type FullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
 type StreamSurface = StreamSnapshotMessage["clips"][number];
+type PendingBazookaVisualShot = {
+  event: StreamBazookaFireMessage;
+  previousDistance: number;
+  maxDistance: number;
+  terrainDistance: number;
+};
+type GuestBazookaVisualImpact = {
+  event: StreamBazookaImpactMessage;
+  startPosition: { x: number; y: number };
+};
 const GUEST_PLANNED_TRAVEL = new Set<GuestCharacterFrame["actionType"]>(["jump", "flip", "grapple", "skateTo", "wallClimb", "zipline"]);
 const GUEST_AUTO_STOW_ACTIONS = new Set<GuestCharacterFrame["actionType"]>(["grapple", "skateTo", "wallClimb", "zipline", "forceChoke", "eliminated"]);
+const BAZOOKA_PROJECTILE_SPEED = 1100;
 
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:guest]", ...args);
@@ -538,8 +551,7 @@ export default function StreamPage() {
   const characterEntities=useRef(new Map<string,CharacterEntity>());
   const latestHost=useRef<StreamFrameMessage|null>(null), hostPresent=useRef(false), snapshotRef=useRef<StreamSnapshotMessage|null>(null), snapshotRequestedAt=useRef(0), lastDebugFrameAt=useRef(0), imageRetried=useRef(new Set<string>()), reconnectAttempt=useRef(0), remoteGuests=useRef(new Map<string,GuestCharacterFrame>()), renderedGuests=useRef(new Map<string,GuestCharacterFrame>()), remoteGuestSeq=useRef(new Map<string,number>()), remoteClockOffsets=useRef(new Map<string,number>()), hostClockOffset=useRef(0), hostGuestSkin=useRef<"stick"|"styled">(GUEST_DEFAULT_SKIN), eliminations=useRef(new Map<string,StreamEliminationMessage>()), chokeStates=useRef(new Map<string,StreamChokeMessage>()), weaponState=useRef<StreamFrameMessage["weapon"]|null>(null), combatHealthRef=useRef<StreamCombatState|null>(null), hostHealthSignatureRef=useRef(""), weaponShots=useRef<StreamShotFiredMessage[]>([]), weaponHits=useRef(new Map<string,StreamWeaponHitMessage>()), physics=useRef<GuestPhysics|null>(null), camera=useRef<StreamCamera>({cameraX:2000,cameraY:1500,boardZoom:1}), publishAt=useRef(0), guestSeq=useRef(0), emoteIndex=useRef(0), guestHeldKeys=useRef(new Set<string>());
   const signDataUrlRef=useRef<string|undefined>(undefined), signActiveRef=useRef(false), signDrawingRef=useRef(false);
-  const bazookaEventsRef=useRef<BazookaVisualEvent[]>([]),bazookaCharacterImpactsRef=useRef(new Map<string,StreamBazookaImpactMessage>()),cratersRef=useRef<StreamCrater[]>([]),guestBazookaArmedRef=useRef(false),guestBazookaAimRef=useRef<{x:number;y:number}|null>(null),guestBazookaLastFireAtRef=useRef(0);
-  const repairAtRef=useRef(0);
+  const bazookaEventsRef=useRef<BazookaVisualEvent[]>([]),bazookaCharacterImpactsRef=useRef(new Map<string,StreamBazookaImpactMessage>()),pendingBazookaVisualShotsRef=useRef(new Map<string,PendingBazookaVisualShot>()),guestBazookaVisualImpactsRef=useRef(new Map<string,GuestBazookaVisualImpact>()),cratersRef=useRef<StreamCrater[]>([]),guestBazookaArmedRef=useRef(false),guestBazookaAimRef=useRef<{x:number;y:number}|null>(null),guestBazookaLastFireAtRef=useRef(0);
   const [snapshot,setSnapshot]=useState<StreamSnapshotMessage|null>(null),[live,setLive]=useState(false),[mode,setMode]=useState<Mode>("landing"),[status,setStatus]=useState("connecting"),[subscribeStatus,setSubscribeStatus]=useState("PENDING"),[participants,setParticipants]=useState<StreamParticipantPresence[]>([]),[name,setName]=useState(""),[face,setFace]=useState<string>(),[joinError,setJoinError]=useState(""),[hostCam,setHostCam]=useState(false),[signOpen,setSignOpen]=useState(false),[signText,setSignText]=useState(""),[signColor,setSignColor]=useState("#27221f"),[signErase,setSignErase]=useState(false),[signActive,setSignActive]=useState(false),[guestSkinLabel,setGuestSkinLabel]=useState<"stick"|"styled">(GUEST_DEFAULT_SKIN),[wheelOpen,setWheelOpen]=useState(false),[wheelMenuOpen,setWheelMenuOpen]=useState(false),[debugOpen,setDebugOpen]=useState(false),[maximize,setMaximize]=useState(false),[nativeFullscreen,setNativeFullscreen]=useState(false),[guestBazookaArmed,setGuestBazookaArmed]=useState(false),[hostHealth,setHostHealth]=useState<StreamHealthState|null>(null);
   const guestId=`guest-${useId().replace(/:/g,"-")}`, nameRef=useRef("");
   const renderDebugRowsRef=useRef<StreamCharacterDebugRow[]>([]), renderDebugOverlayAt=useRef(0);
@@ -557,21 +569,20 @@ export default function StreamPage() {
     const impactPoint=characterImpact?.point??terrainImpact?.point??event.target;
     const visualEvent:BazookaVisualEvent={...event,target:impactPoint,fizzle:!characterImpact&&!terrainImpact};
     bazookaEventsRef.current=[...bazookaEventsRef.current.filter(candidate=>bazookaShotKey(candidate)!==key),visualEvent].slice(-12);
-    const clip=terrainImpact?clips.find(candidate=>candidate.id===terrainImpact.imageId):undefined;
-    const impactDelay=Math.max(0,event.startTime+Math.hypot(impactPoint.x-event.from.x,impactPoint.y-event.from.y)/1100*1000-Date.now());
-    window.setTimeout(()=>{
-      if(event.startTime<repairAtRef.current||bazookaCharacterImpactsRef.current.has(key))return;
-      if(clip&&terrainImpact){
-        const crater=craterForImpact(clip,terrainImpact.point,event.seed);
-        cratersRef.current=[...cratersRef.current.filter(c=>c.clipId!==clip.id),...cratersRef.current.filter(c=>c.clipId===clip.id).slice(-23),crater];
-      }
-    },impactDelay);
+    if(characterImpact)return;
+    pendingBazookaVisualShotsRef.current.set(key,{
+      event,
+      previousDistance:0,
+      maxDistance:Math.hypot(event.target.x-event.from.x,event.target.y-event.from.y),
+      terrainDistance:terrainImpact?Math.hypot(terrainImpact.point.x-event.from.x,terrainImpact.point.y-event.from.y):Infinity,
+    });
   },[]);
   const receiveBazookaImpact=useCallback((event:StreamBazookaImpactMessage)=>{
     const host=latestHost.current;
     if(host&&event.sessionId!==host.sessionId)return;
+    pendingBazookaVisualShotsRef.current.delete(event.shotId);
     bazookaCharacterImpactsRef.current.set(event.shotId,event);
-    window.setTimeout(()=>bazookaCharacterImpactsRef.current.delete(event.shotId),3000);
+    window.setTimeout(()=>bazookaCharacterImpactsRef.current.delete(event.shotId),15000);
     const existing=bazookaEventsRef.current.find(candidate=>bazookaShotKey(candidate)===event.shotId);
     const visual:BazookaVisualEvent=existing
       ?{...existing,target:event.point,fizzle:false}
@@ -588,6 +599,10 @@ export default function StreamPage() {
         ...combatHealthRef.current,
         guests:{...combatHealthRef.current.guests,[event.target.guestId]:event.health},
       };
+    }
+    if(event.target.role==="guest"&&event.target.guestId!==guestId){
+      const frame=remoteGuests.current.get(event.target.guestId);
+      if(frame)guestBazookaVisualImpactsRef.current.set(event.target.guestId,{event,startPosition:{...frame.position}});
     }
     if(event.target.role!=="guest"||event.target.guestId!==guestId)return;
     const delay=Math.max(0,event.impactAt-Date.now());
@@ -614,6 +629,49 @@ export default function StreamPage() {
       streamDebugLog("bazooka ragdoll guest",{shotId:event.shotId,impulse:event.impulse});
     },delay);
   },[guestId]);
+  const updateBazookaVisualCollisions=(nowMs:number)=>{
+    if(pendingBazookaVisualShotsRef.current.size===0)return;
+    for(const [key,shot] of pendingBazookaVisualShotsRef.current){
+      if(bazookaCharacterImpactsRef.current.has(key)){
+        pendingBazookaVisualShotsRef.current.delete(key);
+        continue;
+      }
+      const traveled=clamp((nowMs-shot.event.startTime)/1000*BAZOOKA_PROJECTILE_SPEED,0,shot.maxDistance);
+      if(traveled<=shot.previousDistance)continue;
+      const dx=shot.event.target.x-shot.event.from.x,dy=shot.event.target.y-shot.event.from.y,length=Math.max(1,Math.hypot(dx,dy)),direction={x:dx/length,y:dy/length};
+      const segmentFrom={x:shot.event.from.x+direction.x*shot.previousDistance,y:shot.event.from.y+direction.y*shot.previousDistance};
+      const segmentTo={x:shot.event.from.x+direction.x*traveled,y:shot.event.from.y+direction.y*traveled};
+      const targets=[];
+      const hostFrame=latestHost.current?.characters.find(character=>character.id==="c1"&&character.enabled);
+      if(hostFrame&&shot.event.shooter?.role!=="host")targets.push(...bazookaCharacterHitZones({role:"host",x:hostFrame.x,y:hostFrame.y}));
+      for(const [id,frame] of remoteGuests.current){
+        if(id===shot.event.shooter?.guestId||eliminations.current.has(id))continue;
+        targets.push(...bazookaCharacterHitZones({role:"guest",guestId:id,x:frame.position.x,y:frame.position.y}));
+      }
+      const local=physics.current;
+      if(local&&mode==="guest"&&guestId!==shot.event.shooter?.guestId&&!eliminations.current.has(guestId)){
+        targets.push(...bazookaCharacterHitZones({role:"guest",guestId,x:local.x,y:local.y}));
+      }
+      const hit=firstBazookaCharacterHit(segmentFrom,segmentTo,targets);
+      const hitDistance=hit?shot.previousDistance+hit.distance:Infinity;
+      if(hit&&hitDistance<shot.terrainDistance){
+        const existing=bazookaEventsRef.current.find(candidate=>bazookaShotKey(candidate)===key);
+        if(existing){
+          bazookaEventsRef.current=[
+            ...bazookaEventsRef.current.filter(candidate=>bazookaShotKey(candidate)!==key),
+            {...existing,target:hit.point,fizzle:false},
+          ].slice(-12);
+        }
+        pendingBazookaVisualShotsRef.current.delete(key);
+        continue;
+      }
+      if(shot.terrainDistance<=traveled||traveled>=shot.maxDistance){
+        pendingBazookaVisualShotsRef.current.delete(key);
+        continue;
+      }
+      pendingBazookaVisualShotsRef.current.set(key,{...shot,previousDistance:traveled});
+    }
+  };
   const fireGuestBazooka=(aim:{x:number;y:number})=>{
     const p=physics.current,host=latestHost.current;
     if(!p||!host||!guestBazookaArmedRef.current)return;
@@ -643,7 +701,7 @@ export default function StreamPage() {
       .on("broadcast",{event:"shot_fired"},({payload})=>{streamDebugLog("shot_fired received",(payload as StreamShotFiredMessage).shotId);weaponShots.current=[...weaponShots.current,payload as StreamShotFiredMessage].slice(-80);})
       .on("broadcast",{event:"bazooka_fire"},({payload})=>receiveBazookaFire(payload as StreamBazookaFireMessage))
       .on("broadcast",{event:"bazooka_impact"},({payload})=>receiveBazookaImpact(payload as StreamBazookaImpactMessage))
-      .on("broadcast",{event:"repair_board"},({payload})=>{repairAtRef.current=(payload as {sentAt:number}).sentAt;cratersRef.current=[];streamDebugLog("repair board guest");})
+      .on("broadcast",{event:"repair_board"},()=>{cratersRef.current=[];streamDebugLog("repair board guest");})
       .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
       .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}guestBazookaArmedRef.current=false;setGuestBazookaArmed(false);p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
       .on("broadcast",{event:"remove-sign"},({payload})=>{const msg=payload as {guestId?:string};if(msg.guestId===guestId){signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);void refreshGuestPresence(false,undefined);}})
@@ -772,13 +830,22 @@ export default function StreamPage() {
             if(p.grounded&&p.action==="ragdoll")p.vx*=Math.exp(-dt*BAZOOKA_RAGDOLL_GROUND_DRAG);
             if(p.grounded&&p.action!=="ragdoll"&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
             const terrain=surfaces as TerrainClip[];
-            const horizontalMotion=resolveCharacterSolidMotion(
-              terrain,
-              cratersRef.current,
-              {x:p.x,y:p.y},
-              {x:p.x+p.vx*dt,y:p.y},
-            );
+            const horizontalMotion=p.grounded&&p.action!=="ragdoll"
+              ?resolveGroundedCharacterMotion(
+                terrain,
+                cratersRef.current,
+                {x:p.x,y:p.y},
+                p.x+p.vx*dt,
+                p.surfaceId,
+              )
+              :resolveCharacterSolidMotion(
+                terrain,
+                cratersRef.current,
+                {x:p.x,y:p.y},
+                {x:p.x+p.vx*dt,y:p.y},
+              );
             p.x=horizontalMotion.x;
+            if(p.grounded&&p.action!=="ragdoll"&&!horizontalMotion.hitX)p.y=horizontalMotion.y;
             if(horizontalMotion.hitX)p.vx=0;
             if (!p.grounded) {
               const previousY = p.y;
@@ -858,6 +925,7 @@ export default function StreamPage() {
           const packet = guestFrameFromPhysics(p, guestId, nameRef.current, host.sessionId, now, ++guestSeq.current, hostGuestSkin.current, validSignDataUrl(signDataUrlRef.current) ? signDataUrlRef.current : undefined, signActiveRef.current, guestBazookaWeapon(p, guestBazookaArmedRef.current, guestBazookaAimRef.current));
           channelRef.current?.send({ type: "broadcast", event: "guest-state", payload: packet });
         }
+        updateBazookaVisualCollisions(Date.now());
         const baseCam = camera.current;
         const sf = baseCam.boardZoom * w / BOARD_W;
         const shake=bazookaShake(bazookaEventsRef.current);
@@ -913,11 +981,32 @@ export default function StreamPage() {
             if (id === guestId && p) continue;
             const event = eliminations.current.get(id);
             const choke = chokeStates.current.get(id);
+            const bazookaVisual=guestBazookaVisualImpactsRef.current.get(id);
+            if(bazookaVisual&&(g.actionType==="ragdoll"||Date.now()-bazookaVisual.event.impactAt>500))guestBazookaVisualImpactsRef.current.delete(id);
+            const activeBazookaVisual=guestBazookaVisualImpactsRef.current.get(id);
+            const bazookaAge=activeBazookaVisual?Math.max(0,(Date.now()-activeBazookaVisual.event.impactAt)/1000):0;
+            const bazookaFrame=activeBazookaVisual?{
+              ...g,
+              position:{
+                x:activeBazookaVisual.startPosition.x+activeBazookaVisual.event.impulse.x*bazookaAge,
+                y:activeBazookaVisual.startPosition.y+activeBazookaVisual.event.impulse.y*bazookaAge+925*bazookaAge*bazookaAge,
+              },
+              velocity:{
+                x:activeBazookaVisual.event.impulse.x,
+                y:activeBazookaVisual.event.impulse.y+1850*bazookaAge,
+              },
+              actionType:"ragdoll" as const,
+              actionProgress:clamp(bazookaAge/activeBazookaVisual.event.duration,0,1),
+              actionStartTime:activeBazookaVisual.event.impactAt,
+              actionDuration:activeBazookaVisual.event.duration,
+              actionParams:{ragdollSpin:activeBazookaVisual.event.spin,ragdollPhase:"airborne",terrainGrounded:false},
+              weapon:g.weapon?{...g.weapon,armed:false}:undefined,
+            }:null;
             const renderFrame = choke?.phase === "hold"
               ? { ...g, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4, weapon: g.weapon ? { ...g.weapon, armed: false } : undefined }
               : choke?.phase === "drop"
                 ? { ...g, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1, weapon: g.weapon ? { ...g.weapon, armed: false } : undefined }
-                : event ? eliminationFrameForGuest(g, event, Date.now(), hostClockOffset.current) : g;
+                : bazookaFrame ?? (event ? eliminationFrameForGuest(g, event, Date.now(), hostClockOffset.current) : g);
             if (!renderFrame) {
               renderedGuests.current.delete(id);
               remoteGuests.current.delete(id);
