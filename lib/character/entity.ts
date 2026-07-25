@@ -488,7 +488,7 @@ function streamPoseFallback(args: {
   pose.terrainLeftFootY=param("terrainLeftFootY",0);
   pose.terrainRightFootY=param("terrainRightFootY",0);
   pose.actionType=args.actionType;
-  pose.terrainGrounded=isGrounded({actionType:args.actionType,explicitGrounded:typeof args.actionParams?.terrainGrounded==="boolean"?args.actionParams.terrainGrounded:undefined,airY:pose.airY,skateAirborne:pose.skateFootMode==="air",grappleAirborne:args.actionType==="grapple"&&p>=.32&&p<.93});
+  pose.terrainGrounded=!moving&&isGrounded({actionType:args.actionType,explicitGrounded:typeof args.actionParams?.terrainGrounded==="boolean"?args.actionParams.terrainGrounded:undefined,airY:pose.airY,skateAirborne:pose.skateFootMode==="air",grappleAirborne:args.actionType==="grapple"&&p>=.32&&p<.93});
   if(args.actionType==="skateTo"&&pose.skateFootMode!=="air")pose.skateboardTilt=Math.atan(terrainSlope);
   return pose;
 }

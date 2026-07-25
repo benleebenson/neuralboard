@@ -755,7 +755,7 @@ export default function StreamPage() {
             }
             renderDebugRowsRef.current = rows;
           }
-          if (weaponState.current?.armed && weaponState.current.shooter && weaponState.current.aim) {if(weaponState.current.kind==="bazooka")drawBazookaHeld(ctx,weaponState.current.shooter,weaponState.current.aim,cam,sf,w,h,0);else drawTommyGunHeld(ctx, weaponState.current.shooter, weaponState.current.aim, cam, sf, w, h, 0);}
+          if (weaponState.current?.armed && weaponState.current.shooter && weaponState.current.aim) {if(weaponState.current.kind==="bazooka")drawBazookaHeld(ctx,weaponState.current.shooter,weaponState.current.aim,cam,sf,w,h,0);else drawTommyGunHeld(ctx, weaponState.current.shooter, weaponState.current.aim, cam, sf, w, h, 0, host?.characters.find((character)=>character.id==="c1")?.boardPose);}
           weaponShots.current = weaponShots.current.filter((shot) => Date.now() - shot.sentAt < 1700);
           for (const shot of weaponShots.current) drawWeaponProjectile(ctx, shot, cam, sf, w, h, Date.now());
           for (const [guestIdForEvent, event] of eliminations.current) {

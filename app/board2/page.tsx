@@ -3356,7 +3356,7 @@ function evalCharAtTime(
   const active = resolved.find((a) => time >= a.startTime && time < a.startTime + a.duration);
   const actionAge = active ? time - active.startTime : Infinity;
   const actionTail = active ? active.startTime + active.duration - time : Infinity;
-  const terrainGrounded=isGrounded({actionType:active?.type??"idle",airY:base.airY,skateAirborne:base.skateFootMode==="air",grappleAirborne:active?.type==="grapple"&&actionAge>=active.duration*.32&&actionAge<active.duration*.93});
+  const terrainGrounded=active?.type!=="walkTo"&&isGrounded({actionType:active?.type??"idle",airY:base.airY,skateAirborne:base.skateFootMode==="air",grappleAirborne:active?.type==="grapple"&&actionAge>=active.duration*.32&&actionAge<active.duration*.93});
   const leanEase = Math.min(1, actionAge * LEAN_RESPONSE_HZ, actionTail * LEAN_RESPONSE_HZ);
   const leanExtra = clamp(velocity.x * LEAN_K, -LEAN_MAX, LEAN_MAX) * easeInOutCubic(clamp(leanEase, 0, 1)) * intensity;
 
@@ -3914,6 +3914,8 @@ export default function Board2Page() {
     nextChangeAt: 0,
     shapeIndex: 0,
   });
+  const playLiveSpeechChunkTimerRef = useRef<number | null>(null);
+  const playLiveSpeechQueueRef = useRef<Array<{ blob: Blob; sequence: number }>>([]);
   const playLiveSpeechBusyRef = useRef(false);
   const playLiveSpeechActiveUntilRef = useRef(0);
   const playLiveSpeechTextRef = useRef("");
@@ -4402,7 +4404,7 @@ export default function Board2Page() {
             ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
           if (pose && id === "c1") {
-            if (playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
+            if (playWeaponArmedRef.current || playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
             pose = applyPlayForceChokePose(pose);
           }
           const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved);
@@ -9591,7 +9593,7 @@ export default function Board2Page() {
       facing: state.facing,
       bodyLean: pose.bodyLean+clamp(slope*.4,-.12,.12),
       actionType:state.grounded?(moving?"walk":"idle"):"punchThroughFall",
-      terrainGrounded:isGrounded({actionType:state.grounded?(moving?"walk":"idle"):"punchThroughFall",explicitGrounded:state.grounded,airY:pose.airY}),
+      terrainGrounded:state.grounded&&!moving,
       terrainLeftFootY:(groundProfileY(terrain,streamCratersRef.current,state.x-14)?.y??state.y)-state.y,
       terrainRightFootY:(groundProfileY(terrain,streamCratersRef.current,state.x+14)?.y??state.y)-state.y,
       airY: 0,
@@ -9812,12 +9814,17 @@ export default function Board2Page() {
   }
 
   async function transcribePlayLiveSpeechChunk(blob: Blob, sequence: number) {
-    if (!playLiveSpeechEnabledRef.current || !playLiveSpeechBubblesRef.current || playLiveSpeechBusyRef.current || blob.size < 700) return;
+    if (!playLiveSpeechEnabledRef.current || !playLiveSpeechBubblesRef.current || blob.size < 700) return;
+    if (playLiveSpeechBusyRef.current) {
+      playLiveSpeechQueueRef.current = [...playLiveSpeechQueueRef.current.slice(-1), { blob, sequence }];
+      return;
+    }
     playLiveSpeechBusyRef.current = true;
     setPlayLiveSpeechStatus("transcribing");
     try {
       const form = new FormData();
-      form.append("audio", blob, `play-live-${sequence}.webm`);
+      const extension = blob.type.includes("mp4") ? "m4a" : "webm";
+      form.append("audio", blob, `play-live-${sequence}.${extension}`);
       const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Live transcription failed");
@@ -9833,7 +9840,37 @@ export default function Board2Page() {
       setToast(error instanceof Error ? error.message : "Live speech transcription failed");
     } finally {
       playLiveSpeechBusyRef.current = false;
+      const next = playLiveSpeechQueueRef.current.shift();
+      if (next && playLiveSpeechEnabledRef.current && playLiveSpeechBubblesRef.current) {
+        void transcribePlayLiveSpeechChunk(next.blob, next.sequence);
+      }
     }
+  }
+
+  function recordPlayLiveSpeechChunk(stream: MediaStream, mimeType: string) {
+    if (!playLiveSpeechEnabledRef.current || !stream.active) return;
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const chunks: Blob[] = [];
+    playLiveSpeechRecorderRef.current = recorder;
+    recorder.ondataavailable = (event) => {
+      if (event.data?.size) chunks.push(event.data);
+    };
+    recorder.onstop = () => {
+      if (playLiveSpeechRecorderRef.current === recorder) playLiveSpeechRecorderRef.current = null;
+      if (chunks.length) {
+        const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "audio/webm" });
+        playLiveSpeechActiveUntilRef.current = performance.now() + 2400;
+        void transcribePlayLiveSpeechChunk(blob, ++playLiveSpeechSeqRef.current);
+      }
+      if (playLiveSpeechEnabledRef.current && stream.active) {
+        recordPlayLiveSpeechChunk(stream, mimeType);
+      }
+    };
+    recorder.start();
+    playLiveSpeechChunkTimerRef.current = window.setTimeout(() => {
+      playLiveSpeechChunkTimerRef.current = null;
+      if (recorder.state === "recording") recorder.stop();
+    }, 2400);
   }
 
   async function startPlayLiveSpeech() {
@@ -9863,27 +9900,14 @@ export default function Board2Page() {
       };
       const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm"
         : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
-      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      playLiveSpeechRecorderRef.current = recorder;
       playLiveSpeechEnabledRef.current = true;
       setPlayLiveSpeechEnabled(true);
       setPlayLiveSpeechStatus("listening");
       setPlayLiveSpeechText("");
       playLiveSpeechTextRef.current = "";
       playLiveSpeechTextUntilRef.current = 0;
-      recorder.ondataavailable = (event) => {
-        if (!event.data || event.data.size <= 0) return;
-        playLiveSpeechActiveUntilRef.current = performance.now() + 1400;
-        if (playLiveSpeechBubblesRef.current) {
-          void transcribePlayLiveSpeechChunk(event.data, ++playLiveSpeechSeqRef.current);
-        }
-      };
-      recorder.onstop = () => {
-        playLiveSpeechStreamRef.current?.getTracks().forEach((track) => track.stop());
-        playLiveSpeechStreamRef.current = null;
-        playLiveSpeechRecorderRef.current = null;
-      };
-      recorder.start(1000);
+      playLiveSpeechQueueRef.current = [];
+      recordPlayLiveSpeechChunk(stream, mimeType);
       setToast("Live mouth on");
     } catch (error) {
       playLiveSpeechEnabledRef.current = false;
@@ -9901,6 +9925,11 @@ export default function Board2Page() {
     setPlayLiveSpeechStatus("idle");
     playLiveSpeechActiveUntilRef.current = 0;
     playLiveSpeechTextUntilRef.current = performance.now() + 1800;
+    playLiveSpeechQueueRef.current = [];
+    if (playLiveSpeechChunkTimerRef.current !== null) {
+      window.clearTimeout(playLiveSpeechChunkTimerRef.current);
+      playLiveSpeechChunkTimerRef.current = null;
+    }
     try {
       const recorder = playLiveSpeechRecorderRef.current;
       if (recorder && recorder.state !== "inactive") recorder.stop();
@@ -10021,7 +10050,7 @@ export default function Board2Page() {
     const armedPose: CharPoseResult = {
       ...pose,
       facing,
-      hideArms: playBazookaArmedRef.current,
+      hideArms: true,
       bodyLean: pose.bodyLean + 0.06 * facing,
       leftLegA: pose.leftLegA + 0.16,
       rightLegA: pose.rightLegA - 0.16,
@@ -10628,6 +10657,7 @@ export default function Board2Page() {
             canvas.width,
             canvas.height,
             recoil,
+            playPose,
           );
         }
         if(playBazookaArmedRef.current){const recoilAge=nowMs-playBazookaLastFireAtRef.current,recoil=recoilAge<260?Math.sin((1-recoilAge/260)*Math.PI)*9:0;drawBazookaHeld(ctx,{x:state.x,y:state.y,facing:state.facing},playCursorRef.current??{x:state.x+state.facing*400,y:state.y-115},playCameraRef.current,sf,canvas.width,canvas.height,recoil);}

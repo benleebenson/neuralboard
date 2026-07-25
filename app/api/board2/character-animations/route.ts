@@ -6,6 +6,13 @@ import { AuthoredAnimation, PoseKeyframe, normalizeAnimation, starterAnimations 
 
 type AnimationRow = { id: string; name: string; data: unknown; created_at: string };
 
+const LEGACY_WALK_KEYFRAMES = normalizeLegacyKeyframes("walk", true, [
+  { t: 0, pose: { leftLegA: 0.46, rightLegA: -0.46, leftArmA: -0.32, rightArmA: 0.32, leftForeA: -0.08, rightForeA: 0.08, bodyLean: 0.04 } },
+  { t: 0.33, pose: { leftLegA: 0.05, rightLegA: -0.08, leftArmA: 0.02, rightArmA: -0.02, leftForeA: 0.08, rightForeA: -0.08, headBob: -2 } },
+  { t: 0.66, pose: { leftLegA: -0.46, rightLegA: 0.46, leftArmA: 0.32, rightArmA: -0.32, leftForeA: 0.08, rightForeA: -0.08, bodyLean: -0.04 } },
+  { t: 1, pose: { leftLegA: 0.46, rightLegA: -0.46, leftArmA: -0.32, rightArmA: 0.32, leftForeA: -0.08, rightForeA: 0.08, bodyLean: 0.04 } },
+]);
+
 const LEGACY_SKATE_PEDAL_KEYFRAMES = normalizeLegacyKeyframes("skate-pedal", true, [
   { t: 0, pose: { leftLegA: -0.2, rightLegA: 0.65, leftArmA: -0.15, rightArmA: 0.35, leftForeA: 0.15, rightForeA: 0.2, bodyLean: -0.15 } },
   { t: 0.18, pose: { leftLegA: -0.18, rightLegA: 1.15, leftArmA: 0.1, rightArmA: 0.25, leftForeA: 0.12, rightForeA: 0.3, bodyLean: -0.18 } },
@@ -117,7 +124,7 @@ function keyframesEqual(a: PoseKeyframe[], b: PoseKeyframe[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-const REFRESHABLE_STARTER_NAMES = new Set(["skate-pedal", "skate-olly", "emote-thinking", "pullups-rep", "mirror-flex"]);
+const REFRESHABLE_STARTER_NAMES = new Set(["walk", "skate-pedal", "skate-olly", "emote-thinking", "pullups-rep", "mirror-flex"]);
 
 function starterFor(name: string, createdAt: string): AuthoredAnimation | undefined {
   return starterAnimations(createdAt).find((anim) => anim.name === name);
@@ -127,10 +134,11 @@ function isPristineRefreshableSeed(row: AnimationRow): boolean {
   if (!REFRESHABLE_STARTER_NAMES.has(row.name)) return false;
   const data = (row.data ?? {}) as Record<string, unknown>;
   const updatedAt = typeof data.updatedAt === "string" ? data.updatedAt : undefined;
-  if (updatedAt) return updatedAt === row.created_at;
-
   const anim = normalizeAnimation({ ...data, id: row.id, name: row.name, createdAt: row.created_at });
   if (!anim) return false;
+  if (updatedAt === row.created_at) return true;
+  if (row.name === "walk") return keyframesEqual(anim.keyframes, LEGACY_WALK_KEYFRAMES);
+  if (updatedAt) return false;
   if (row.name === "emote-thinking" || row.name === "pullups-rep" || row.name === "mirror-flex") return false;
   const legacy = row.name === "skate-pedal" ? LEGACY_SKATE_PEDAL_KEYFRAMES : LEGACY_SKATE_OLLY_KEYFRAMES;
   return keyframesEqual(anim.keyframes, legacy);

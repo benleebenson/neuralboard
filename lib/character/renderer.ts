@@ -79,7 +79,7 @@ export function drawPlacedSpawnDoor(ctx: CanvasRenderingContext2D, door: SpawnDo
 }
 
 // Stream/render adapter exports live in this shared renderer module so /board2 and /stream cannot drift.
-export const RENDERER_VERSION = "board2-authoritative-character-entity-2026-07-18-f";
+export const RENDERER_VERSION = "board2-authoritative-character-entity-2026-07-25-g";
 
 const ELIMINATION_LAUNCH_AT = 0.58;
 const ELIMINATION_DESPAWN_AT = 1.04;
@@ -131,19 +131,80 @@ export function drawTommyGunHeld(
   W: number,
   H: number,
   recoilPx = 0,
+  bodyPose?: { bodyLean?: number; headBob?: number; airY?: number },
 ) {
   const geometry = tommyGunAimGeometry(shooter, aimBoard);
   const pivotX = (geometry.pivot.x - cam.cameraX) * sf + W / 2;
   const pivotY = (geometry.pivot.y - cam.cameraY) * sf + H / 2;
   const aimAngle = Math.atan2(geometry.dir.y, geometry.dir.x);
-  const keepGripsDown = geometry.dir.x < 0 ? -1 : 1;
+  const keepGripsDown: 1 | -1 = geometry.dir.x < 0 ? -1 : 1;
   const recoil = recoilPx * sf;
+  const gunOrigin = {
+    x: pivotX - geometry.dir.x * recoil,
+    y: pivotY - geometry.dir.y * recoil,
+  };
+  const gunPoint = (along: number, down: number) => {
+    const localX = along * sf * geometry.scale;
+    const localY = down * sf * keepGripsDown * geometry.scale;
+    return {
+      x: gunOrigin.x + Math.cos(aimAngle) * localX - Math.sin(aimAngle) * localY,
+      y: gunOrigin.y + Math.sin(aimAngle) * localX + Math.cos(aimAngle) * localY,
+    };
+  };
+  const sx = (shooter.x - cam.cameraX) * sf + W / 2;
+  const sy = (shooter.y - cam.cameraY) * sf + H / 2;
+  const facing: 1 | -1 = geometry.dir.x < 0 ? -1 : 1;
+  const bodyLean = bodyPose?.bodyLean ?? 0;
+  const bodyY = ((bodyPose?.airY ?? 0) + (bodyPose?.headBob ?? 0) * 0.25) * sf;
+  const shoulderLocalY = -STREAM_CHARACTER_GEOMETRY.torsoRaw * STREAM_CHARACTER_GEOMETRY.shoulderFactor * sf;
+  const shoulderCenter = {
+    x: sx - Math.sin(bodyLean) * shoulderLocalY * facing,
+    y: sy + bodyY - STREAM_CHARACTER_GEOMETRY.hipRaw * sf + Math.cos(bodyLean) * shoulderLocalY,
+  };
+  const shoulderTrigger = { x: shoulderCenter.x + facing * 4 * sf, y: shoulderCenter.y };
+  const shoulderSupport = { x: shoulderCenter.x - facing * 4 * sf, y: shoulderCenter.y + 2 * sf };
+  const solveArm = (shoulder: { x: number; y: number }, target: { x: number; y: number }, bend: 1 | -1) => {
+    const segment = STREAM_CHARACTER_GEOMETRY.armRaw * sf;
+    const dx = target.x - shoulder.x;
+    const dy = target.y - shoulder.y;
+    const rawDistance = Math.max(0.001, Math.hypot(dx, dy));
+    const distance = clamp(rawDistance, 5 * sf, segment * 2 * 0.98);
+    const ux = dx / rawDistance;
+    const uy = dy / rawDistance;
+    const hand = { x: shoulder.x + ux * distance, y: shoulder.y + uy * distance };
+    const mid = { x: (shoulder.x + hand.x) / 2, y: (shoulder.y + hand.y) / 2 };
+    const bendHeight = Math.sqrt(Math.max(0, segment * segment - (distance / 2) ** 2));
+    return {
+      hand,
+      elbow: {
+        x: mid.x + (-uy) * bendHeight * bend,
+        y: mid.y + ux * bendHeight * bend,
+      },
+    };
+  };
+  const supportArm = solveArm(shoulderSupport, gunPoint(61, 17), facing > 0 ? 1 : -1);
+  const triggerArm = solveArm(shoulderTrigger, gunPoint(0, 27), facing > 0 ? -1 : 1);
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#27221f";
+  ctx.lineWidth = Math.max(1.5, 3 * sf);
+  for (const [shoulder, arm] of [[shoulderSupport, supportArm], [shoulderTrigger, triggerArm]] as const) {
+    ctx.beginPath();
+    ctx.moveTo(shoulder.x, shoulder.y);
+    ctx.lineTo(arm.elbow.x, arm.elbow.y);
+    ctx.lineTo(arm.hand.x, arm.hand.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.strokeStyle = "#171717";
   ctx.lineWidth = Math.max(1.5, 3.2 * sf);
-  ctx.translate(pivotX - geometry.dir.x * recoil, pivotY - geometry.dir.y * recoil);
+  ctx.translate(gunOrigin.x, gunOrigin.y);
   ctx.rotate(aimAngle);
   ctx.scale(geometry.scale, keepGripsDown * geometry.scale);
 
@@ -228,6 +289,15 @@ export function drawTommyGunHeld(
   ctx.moveTo(-1 * sf, 10 * sf);
   ctx.lineTo(4 * sf, 20 * sf);
   ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.fillStyle = "#27221f";
+  for (const arm of [supportArm, triggerArm]) {
+    ctx.beginPath();
+    ctx.arc(arm.hand.x, arm.hand.y, 4.5 * sf, 0, Math.PI * 2);
+    ctx.fill();
+  }
   ctx.restore();
 }
 
