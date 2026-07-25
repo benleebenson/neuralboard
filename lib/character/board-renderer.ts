@@ -163,12 +163,15 @@ export function drawBoardCharacterToCanvas(
   const bobS = p.headBob * S;
   const headTilt = p.headTilt ?? 0;
   const hipY = (-CHAR_HIP_RAW + (p.skateboardVisible ? (p.skateCrouch ?? 6) : 0)) * S + bobS * 0.25;
-  const getForearmMount = (preferFiring: boolean): { x: number; y: number; angle: number; localX: number; localY: number; w: number; h: number } => {
+  const getForearmMount = (
+    preferFiring: boolean,
+    armAngles?: { leftArm: number; leftFore: number; rightArm: number; rightFore: number },
+  ): { x: number; y: number; angle: number; localX: number; localY: number; w: number; h: number } => {
     const shoulderY = -torsoLen * 0.85;
     const useRight = preferFiring ? facing >= 0 : facing < 0;
     const sOff = 0;
-    const armA = useRight ? p.rightArmA : p.leftArmA;
-    const foreA = useRight ? p.rightForeA : p.leftForeA;
+    const armA = useRight ? (armAngles?.rightArm ?? p.rightArmA) : (armAngles?.leftArm ?? p.leftArmA);
+    const foreA = useRight ? (armAngles?.rightFore ?? p.rightForeA) : (armAngles?.leftFore ?? p.leftForeA);
     const shoulderLocalX = sOff;
     const shoulderLocalY = hipY + shoulderY;
     const elbowLocalX = shoulderLocalX - Math.sin(armA) * armLen;
@@ -861,14 +864,22 @@ export function drawBoardCharacterToCanvas(
 
   // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
   if (!p.hideArms && (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0))) {
+    // Pointing and force-choke poses resolve their final arm angles inside the renderer. Mount
+    // against those resolved angles so the launcher remains strapped to the moving forearm.
+    const resolvedLauncherMount = getForearmMount(true, {
+      leftArm: lArmA,
+      leftFore: lForeA,
+      rightArm: rArmA,
+      rightFore: rForeA,
+    });
     ctx.save();
-    ctx.translate(launcherMount.localX, launcherMount.localY - hipY);
-    ctx.rotate(launcherMount.angle);
+    ctx.translate(resolvedLauncherMount.localX, resolvedLauncherMount.localY - hipY);
+    ctx.rotate(resolvedLauncherMount.angle);
     ctx.fillStyle = "#8B5A2B";
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = Math.max(1, 1.3 * S);
     ctx.beginPath();
-    ctx.roundRect(-launcherMount.w * 0.78, -launcherMount.h / 2, launcherMount.w, launcherMount.h, 2 * S);
+    ctx.roundRect(-resolvedLauncherMount.w * 0.78, -resolvedLauncherMount.h / 2, resolvedLauncherMount.w, resolvedLauncherMount.h, 2 * S);
     ctx.fill();
     ctx.stroke();
     ctx.restore();

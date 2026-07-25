@@ -3898,6 +3898,17 @@ export default function Board2Page() {
   const playLiveSpeechEnabledRef = useRef(false);
   const playLiveSpeechRecorderRef = useRef<MediaRecorder | null>(null);
   const playLiveSpeechStreamRef = useRef<MediaStream | null>(null);
+  const playLiveSpeechAudioContextRef = useRef<AudioContext | null>(null);
+  const playLiveSpeechAnalyserRef = useRef<AnalyserNode | null>(null);
+  const playLiveSpeechSamplesRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const playLiveSpeechMouthRef = useRef({
+    envelope: 0,
+    noiseFloor: 0.012,
+    speaking: false,
+    viseme: "closed" as Viseme,
+    nextChangeAt: 0,
+    shapeIndex: 0,
+  });
   const playLiveSpeechBusyRef = useRef(false);
   const playLiveSpeechActiveUntilRef = useRef(0);
   const playLiveSpeechTextRef = useRef("");
@@ -9675,9 +9686,55 @@ export default function Board2Page() {
     return { x: state.x + (dx / len) * 92, y: state.y - 110 + (dy / len) * 92 };
   }
 
-  function playLiveSpeechViseme(time: number): Viseme | null {
+  function playLiveSpeechViseme(): Viseme | null {
     if (!playLiveSpeechEnabledRef.current && performance.now() > playLiveSpeechActiveUntilRef.current) return null;
-    return rhythmicViseme(time, "play-live-speech");
+    const analyser = playLiveSpeechAnalyserRef.current;
+    const samples = playLiveSpeechSamplesRef.current;
+    if (!analyser || !samples) return "closed";
+
+    analyser.getByteTimeDomainData(samples);
+    let sumSquares = 0;
+    for (let index = 0; index < samples.length; index++) {
+      const sample = (samples[index] - 128) / 128;
+      sumSquares += sample * sample;
+    }
+    const rms = Math.sqrt(sumSquares / samples.length);
+    const mouth = playLiveSpeechMouthRef.current;
+
+    // Follow speech quickly but let the jaw settle instead of flickering between samples.
+    const envelopeRate = rms > mouth.envelope ? 0.34 : 0.13;
+    mouth.envelope += (rms - mouth.envelope) * envelopeRate;
+
+    // Learn the room tone only while we are probably not speaking. The two thresholds add
+    // hysteresis, preventing breaths and background noise from rapidly toggling the mouth.
+    if (!mouth.speaking || mouth.envelope < mouth.noiseFloor * 1.7) {
+      mouth.noiseFloor += (Math.min(rms, 0.045) - mouth.noiseFloor) * 0.012;
+    }
+    const openThreshold = Math.max(0.022, mouth.noiseFloor * 2.25);
+    const closeThreshold = Math.max(0.015, mouth.noiseFloor * 1.5);
+    mouth.speaking = mouth.speaking
+      ? mouth.envelope > closeThreshold
+      : mouth.envelope > openThreshold;
+
+    const now = performance.now();
+    if (!mouth.speaking) {
+      mouth.viseme = "closed";
+      mouth.nextChangeAt = now + 90;
+      return mouth.viseme;
+    }
+
+    // Hold each pose long enough to read as a syllable. Loudness drives jaw openness while
+    // a restrained shape cycle keeps speech expressive without pretending to know phonemes.
+    if (now >= mouth.nextChangeAt) {
+      const strength = clamp((mouth.envelope - closeThreshold) / Math.max(0.018, openThreshold * 2.8), 0, 1);
+      const softShapes: Viseme[] = ["slightOpen", "closed", "slightOpen", "round"];
+      const mediumShapes: Viseme[] = ["slightOpen", "open", "wide", "slightOpen", "round"];
+      const strongShapes: Viseme[] = ["open", "wide", "open", "round", "slightOpen"];
+      const shapes = strength < 0.28 ? softShapes : strength < 0.68 ? mediumShapes : strongShapes;
+      mouth.viseme = shapes[mouth.shapeIndex++ % shapes.length];
+      mouth.nextChangeAt = now + lerp(190, 125, strength);
+    }
+    return mouth.viseme;
   }
 
   async function transcribePlayLiveSpeechChunk(blob: Blob, sequence: number) {
@@ -9714,6 +9771,22 @@ export default function Board2Page() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       playLiveSpeechStreamRef.current = stream;
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.45;
+      audioContext.createMediaStreamSource(stream).connect(analyser);
+      playLiveSpeechAudioContextRef.current = audioContext;
+      playLiveSpeechAnalyserRef.current = analyser;
+      playLiveSpeechSamplesRef.current = new Uint8Array(analyser.fftSize);
+      playLiveSpeechMouthRef.current = {
+        envelope: 0,
+        noiseFloor: 0.012,
+        speaking: false,
+        viseme: "closed",
+        nextChangeAt: 0,
+        shapeIndex: 0,
+      };
       const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm"
         : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
@@ -9756,6 +9829,12 @@ export default function Board2Page() {
     } catch {}
     playLiveSpeechStreamRef.current?.getTracks().forEach((track) => track.stop());
     playLiveSpeechStreamRef.current = null;
+    void playLiveSpeechAudioContextRef.current?.close().catch(() => {});
+    playLiveSpeechAudioContextRef.current = null;
+    playLiveSpeechAnalyserRef.current = null;
+    playLiveSpeechSamplesRef.current = null;
+    playLiveSpeechMouthRef.current.speaking = false;
+    playLiveSpeechMouthRef.current.viseme = "closed";
   }
 
   function togglePlayLiveSpeech() {
@@ -9818,7 +9897,7 @@ export default function Board2Page() {
       bodyLean: pose.bodyLean + 0.08 * facing,
       pointTargetBX: choke.position.x,
       pointTargetBY: choke.position.y - 78,
-      forceHandOpen: true,
+      forceHandOpen: false,
       leftArmA: facing >= 0 ? 0.42 : pose.leftArmA,
       leftForeA: facing >= 0 ? 0.14 : pose.leftForeA,
       rightArmA: facing < 0 ? -0.42 : pose.rightArmA,
@@ -10360,7 +10439,7 @@ export default function Board2Page() {
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        const playViseme = playLiveSpeechViseme(now) ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved);
+        const playViseme = playLiveSpeechViseme() ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved);
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx,
