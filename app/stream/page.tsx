@@ -6,7 +6,7 @@ import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/boa
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { RENDERER_VERSION, drawBazookaHeld, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { groundProfileY, raycastSolid, type TerrainClip } from "@/lib/character/terrain";
+import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, type TerrainClip } from "@/lib/character/terrain";
 import { CharacterEntity, type CharacterEntityIdentity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
 import {
@@ -222,10 +222,13 @@ function resolveGuestSpawn(snapshot: StreamSnapshotMessage) {
     const support = surfaces
       .filter((surface) => x >= surface.boardX && x <= surface.boardX + surface.boardW)
       .sort((a, b) => Math.abs(a.boardY - y) - Math.abs(b.boardY - y))[0];
+    const supportY = support
+      ? groundProfileY([support] as TerrainClip[], snapshot.craters ?? [], x)?.y ?? support.boardY
+      : y;
     return {
       x,
-      y,
-      grounded: true,
+      y: supportY,
+      grounded: !!support,
       surfaceId: support?.id ?? null as string | null,
     };
   }
@@ -621,8 +624,11 @@ export default function StreamPage() {
     const from={x:shoulder.x+dir.x*92,y:shoulder.y+dir.y*92},target={x:from.x+dir.x*3200,y:from.y+dir.y*3200};
     const event:StreamBazookaFireMessage={kind:"bazooka_fire",sequenceType:"bazookaFire",streamId:STREAM_OWNER_USER_ID,sessionId:host.sessionId,sentAt:now,startTime:now,shotId:`${guestId}:${now}:${guestBazookaLastFireAtRef.current}`,shooter:{role:"guest",guestId},from,target,seed:Math.floor(Math.random()*1_000_000)};
     p.facing=dir.x>=0?1:-1;
-    p.x-=p.facing*12;
-    p.vx-=p.facing*90;
+    p.x-=p.facing*8;
+    p.vx*=0.25;
+    p.targetX=null;
+    p.targetY=null;
+    if(p.grounded)p.action="idle";
     receiveBazookaFire(event);
     void channelRef.current?.send({type:"broadcast",event:"bazooka_fire",payload:event});
   };
@@ -639,9 +645,9 @@ export default function StreamPage() {
       .on("broadcast",{event:"bazooka_impact"},({payload})=>receiveBazookaImpact(payload as StreamBazookaImpactMessage))
       .on("broadcast",{event:"repair_board"},({payload})=>{repairAtRef.current=(payload as {sentAt:number}).sentAt;cratersRef.current=[];streamDebugLog("repair board guest");})
       .on("broadcast",{event:"hit"},({payload})=>{const hit=payload as StreamWeaponHitMessage;weaponHits.current.set(hit.guestId,hit);if(hit.guestId===guestId&&physics.current){clearGuestActionPlan(physics.current);physics.current.vx+=hit.dir.x*140;physics.current.vy-=120;physics.current.action="jump";physics.current.actionStarted=performance.now();}})
-      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
+      .on("broadcast",{event:"choke_state"},({payload})=>{const msg=payload as StreamChokeMessage;if(msg.phase==="end")chokeStates.current.delete(msg.targetGuestId);else chokeStates.current.set(msg.targetGuestId,msg);const p=physics.current;if(msg.targetGuestId===guestId&&p){if(msg.phase==="hold"){if(signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}guestBazookaArmedRef.current=false;setGuestBazookaArmed(false);p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=0;p.targetX=null;p.targetY=null;p.grounded=false;p.action="forceChoke";p.actionStarted=performance.now();clearGuestActionPlan(p);}else if(msg.phase==="drop"){p.x=msg.position.x;p.y=msg.position.y;p.vx=0;p.vy=420;p.grounded=false;p.action="jump";p.actionStarted=performance.now();clearGuestActionPlan(p);}}})
       .on("broadcast",{event:"remove-sign"},({payload})=>{const msg=payload as {guestId?:string};if(msg.guestId===guestId){signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);void refreshGuestPresence(false,undefined);}})
-      .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);remoteGuestSeq.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
+      .on("broadcast",{event:"kick"},({payload})=>{const kick=payload as StreamKickMessage;if(kick.guestId===guestId){eliminations.current.delete(guestId);chokeStates.current.delete(guestId);remoteGuests.current.delete(guestId);renderedGuests.current.delete(guestId);remoteGuestSeq.current.delete(guestId);signDataUrlRef.current=undefined;signActiveRef.current=false;setSignActive(false);signCache.current.delete(guestId);channel.untrack();physics.current=null;setMode("landing");setJoinError(kick.reason==="elimination_bazooka"?`💥 KNOCKED OUT by ${kick.hostName||"Host"} — rejoin when ready.`:kick.reason==="elimination_tommygun"?`💥 KICKED by ${kick.hostName||"Host"}`:"You were removed by the host.");}})
       .on("broadcast",{event:"session-end"},()=>{streamDebugLog("session end");hostPresent.current=false;latestHost.current=null;snapshotRef.current=null;setSnapshot(null);setLive(false);setStatus("ended");physics.current=null;setMode("landing");})
       .on("presence",{event:"sync"},()=>{const rows=Object.values(channel.presenceState()).flat() as unknown as StreamParticipantPresence[];streamDebugLog("presence sync",rows);const hostRow=rows.find(p=>p.role==="host");if(hostRow?.guestSkin){hostGuestSkin.current=hostRow.guestSkin;setGuestSkinLabel(hostRow.guestSkin);}hostPresent.current=rows.some(p=>p.role==="host");setParticipants(rows);if(hostPresent.current){setLive(true);setStatus("live");if(!snapshotRef.current)void requestSnapshot();}for(const p of rows){if(p.guestId){const stale=eliminations.current.get(p.guestId);if(stale&&p.joinedAt>stale.sentAt){streamDebugLog("clear stale elimination on rejoin",{guestId:p.guestId,joinedAt:p.joinedAt,eliminationSentAt:stale.sentAt});eliminations.current.delete(p.guestId);remoteGuests.current.delete(p.guestId);renderedGuests.current.delete(p.guestId);}if(p.faceDataUrl&&!faceCache.current.has(p.guestId)){const img=new Image();img.src=p.faceDataUrl;faceCache.current.set(p.guestId,img);}if(validSignDataUrl(p.signDataUrl))cacheSignImage(p.guestId,p.signDataUrl);}}})
       .subscribe(async s=>{setSubscribeStatus(s);streamDebugLog("subscribe status",s);if(s==="SUBSCRIBED"){reconnectAttempt.current=0;const presence={role:"viewer",isHost:false,joinedAt:Date.now()} satisfies StreamParticipantPresence;streamDebugLog("presence track send",presence);await channel.track(presence);requestSnapshot();window.setTimeout(()=>{if(!snapshotRef.current)requestSnapshot();},1200);void loadSnapshot();}else if(s==="CHANNEL_ERROR"||s==="TIMED_OUT"||s==="CLOSED"){setStatus("reconnecting");const delay=Math.min(8000,1000*2**reconnectAttempt.current++);window.setTimeout(()=>{streamDebugLog("reconnect retry",{delay});void loadSnapshot();requestSnapshot();},delay);}});return()=>{window.clearTimeout(initial);hostPresent.current=false;supabase.removeChannel(channel);channelRef.current=null;};},[guestId,loadSnapshot,receiveBazookaFire,receiveBazookaImpact]);
@@ -765,12 +771,30 @@ export default function StreamPage() {
             }
             if(p.grounded&&p.action==="ragdoll")p.vx*=Math.exp(-dt*BAZOOKA_RAGDOLL_GROUND_DRAG);
             if(p.grounded&&p.action!=="ragdoll"&&Math.abs(p.vx)>1){const direction=p.vx>0?1:-1,nextX=p.x+p.vx*dt,terrain=surfaces as TerrainClip[];if(!groundProfileY(terrain,cratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,cratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){p.grounded=false;p.surfaceId=null;p.vy=-520;streamDebugLog("terrain auto-jump guest",{gapWidth:Math.abs(landingX-nextX),popPoint:p.x});}else{p.vx=0;streamDebugLog("terrain stop at lip guest",{x:p.x});}}}
-            p.x += p.vx * dt;
+            const terrain=surfaces as TerrainClip[];
+            const horizontalMotion=resolveCharacterSolidMotion(
+              terrain,
+              cratersRef.current,
+              {x:p.x,y:p.y},
+              {x:p.x+p.vx*dt,y:p.y},
+            );
+            p.x=horizontalMotion.x;
+            if(horizontalMotion.hitX)p.vx=0;
             if (!p.grounded) {
               const previousY = p.y;
               p.vy = Math.min(1350, p.vy + 1850 * dt);
-              const nextY = p.y + p.vy * dt;
-              const landing = groundProfileY(surfaces as TerrainClip[], cratersRef.current, p.x);
+              let nextY = p.y + p.vy * dt;
+              if(p.vy<0){
+                const verticalMotion=resolveCharacterSolidMotion(
+                  terrain,
+                  cratersRef.current,
+                  {x:p.x,y:p.y},
+                  {x:p.x,y:nextY},
+                );
+                nextY=verticalMotion.y;
+                if(verticalMotion.hitCeiling)p.vy=0;
+              }
+              const landing = groundProfileY(terrain, cratersRef.current, p.x);
               if (landing && previousY <= landing.y && nextY >= landing.y) {
                 p.y = landing.y;
                 p.vy = 0;
@@ -890,9 +914,9 @@ export default function StreamPage() {
             const event = eliminations.current.get(id);
             const choke = chokeStates.current.get(id);
             const renderFrame = choke?.phase === "hold"
-              ? { ...g, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4 }
+              ? { ...g, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4, weapon: g.weapon ? { ...g.weapon, armed: false } : undefined }
               : choke?.phase === "drop"
-                ? { ...g, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
+                ? { ...g, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1, weapon: g.weapon ? { ...g.weapon, armed: false } : undefined }
                 : event ? eliminationFrameForGuest(g, event, Date.now(), hostClockOffset.current) : g;
             if (!renderFrame) {
               renderedGuests.current.delete(id);
@@ -919,9 +943,9 @@ export default function StreamPage() {
             const event = eliminations.current.get(guestId);
             const choke = chokeStates.current.get(guestId);
             const renderFrame = choke?.phase === "hold"
-              ? { ...localFrame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4 }
+              ? { ...localFrame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4, weapon: localFrame.weapon ? { ...localFrame.weapon, armed: false } : undefined }
               : choke?.phase === "drop"
-                ? { ...localFrame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
+                ? { ...localFrame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1, weapon: localFrame.weapon ? { ...localFrame.weapon, armed: false } : undefined }
                 : event ? eliminationFrameForGuest(localFrame, event, Date.now(), hostClockOffset.current) : localFrame;
             if (renderFrame) {
               renderDebugRowsRef.current = [...renderDebugRowsRef.current.filter((row) => row.id !== guestId), guestDebugRow(renderFrame, hostGuestSkin.current, !!faceCache.current.get(guestId))];
@@ -958,7 +982,7 @@ export default function StreamPage() {
   }, [guestId, mode, hostCam, snapshot]);
 
   const clickCanvas=(e:React.MouseEvent<HTMLCanvasElement>)=>{const p=physics.current;if(!p||!snapshot||hostCam||(p.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const rect=e.currentTarget.getBoundingClientRect(),cam=camera.current,sf=cam.boardZoom*rect.width/BOARD_W,rawX=(e.clientX-rect.left-rect.width/2)/sf+cam.cameraX,rawY=(e.clientY-rect.top-rect.height/2)/sf+cam.cameraY;guestBazookaAimRef.current={x:rawX,y:rawY};if(guestBazookaArmedRef.current){fireGuestBazooka({x:rawX,y:rawY});return;}const allSurfaces=streamSurfaces(snapshot);const surfaces=allSurfaces.filter(s=>rawX>=s.boardX&&rawX<=s.boardX+s.boardW);const destination=surfaces.sort((a,b)=>Math.abs(a.boardY-rawY)-Math.abs(b.boardY-rawY))[0];const targetX=destination?clamp(rawX,destination.boardX+18,destination.boardX+destination.boardW-18):clamp(rawX,0,snapshot.board.width);const targetY=destination?.boardY??p.y;const verb=guestTargetVerb();if(verb){if(GUEST_AUTO_STOW_ACTIONS.has(verb)&&signActiveRef.current){signActiveRef.current=false;setSignActive(false);void refreshGuestPresence(false);}issueGuestTargetVerb(verb,targetX,targetY,allSurfaces,destination);return;}const wantsArc=p.grounded&&(rawY<p.y-90|| (!!destination&&p.y-destination.boardY>=60&&p.y-destination.boardY<=280));if(wantsArc){flipGuestTo(targetX,targetY);return;}clearGuestActionPlan(p);p.targetX=targetX;p.targetY=targetY;};
-  useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="b"){const next=!guestBazookaArmedRef.current;guestBazookaArmedRef.current=next;setGuestBazookaArmed(next);}if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance"))startGuestStationaryAction(p,"dance");if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps"))startGuestStationaryAction(p,"pullUps");if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){startGuestStationaryAction(p,"mirrorCheck");p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch"))startGuestStationaryAction(p,"sitAndWatch");};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
+  useEffect(()=>{const isTyping=(target:EventTarget|null)=>target instanceof HTMLInputElement||target instanceof HTMLTextAreaElement||target instanceof HTMLSelectElement;const down=(e:KeyboardEvent)=>{if(mode!=="guest"||isTyping(e.target))return;const p=physics.current;if((p?.frozenUntil&&Date.now()<p.frozenUntil)||chokeStates.current.get(guestId)?.phase==="hold")return;const key=e.key.toLowerCase();guestHeldKeys.current.add(key);if(key==="e")emote();if(key==="v")setHostCam(v=>!v);if(key==="b"){const next=!guestBazookaArmedRef.current;guestBazookaArmedRef.current=next;setGuestBazookaArmed(next);if(next&&p){p.targetX=null;p.targetY=null;p.vx=0;if(p.grounded)p.action="idle";}}if(key==="h"){const next=!signActiveRef.current;signActiveRef.current=next;setSignActive(next);void refreshGuestPresence(next);}if(key==="d"&&p&&GUEST_VERB_SET.has("dance"))startGuestStationaryAction(p,"dance");if(key==="p"&&p&&GUEST_VERB_SET.has("pullUps"))startGuestStationaryAction(p,"pullUps");if(key==="m"&&p&&GUEST_VERB_SET.has("mirrorCheck")){startGuestStationaryAction(p,"mirrorCheck");p.physique=p.physique==="jacked"?"slim":"jacked";void refreshGuestPresence();}if(key==="t"&&p&&GUEST_VERB_SET.has("sitAndWatch"))startGuestStationaryAction(p,"sitAndWatch");};const up=(e:KeyboardEvent)=>{guestHeldKeys.current.delete(e.key.toLowerCase());};addEventListener("keydown",down);addEventListener("keyup",up);return()=>{removeEventListener("keydown",down);removeEventListener("keyup",up);guestHeldKeys.current.clear();};},[mode]);
   useEffect(()=>{if(signOpen)requestAnimationFrame(clearSignCanvas);},[signOpen]);
   const signPoint=(e:React.PointerEvent<HTMLCanvasElement>)=>{const rect=e.currentTarget.getBoundingClientRect();return{x:(e.clientX-rect.left)*(e.currentTarget.width/rect.width),y:(e.clientY-rect.top)*(e.currentTarget.height/rect.height)};};
   const drawSignStroke=(e:React.PointerEvent<HTMLCanvasElement>,start=false)=>{const c=e.currentTarget,ctx=c.getContext("2d"),p=signPoint(e);if(!ctx)return;if(start){signDrawingRef.current=true;c.setPointerCapture(e.pointerId);ctx.beginPath();ctx.moveTo(p.x,p.y);return;}if(!signDrawingRef.current)return;ctx.lineCap="round";ctx.lineJoin="round";ctx.lineWidth=signErase?18:5;ctx.strokeStyle=signErase?"#fffdf4":signColor;ctx.lineTo(p.x,p.y);ctx.stroke();};
@@ -972,7 +996,7 @@ export default function StreamPage() {
     {label:"Emote",icon:"☺",onSelect:()=>choose(emote)},
     {label:signActive?"Lower sign":"Sign",icon:"▱",onSelect:()=>choose(toggleSign)},
     {label:"Camera",icon:"◉",onSelect:()=>choose(()=>setHostCam(v=>!v))},
-    {label:guestBazookaArmed?"Stow bazooka":"Bazooka",icon:"◁",onSelect:()=>choose(()=>{const next=!guestBazookaArmedRef.current;guestBazookaArmedRef.current=next;setGuestBazookaArmed(next);})},
+    {label:guestBazookaArmed?"Stow bazooka":"Bazooka",icon:"◁",onSelect:()=>choose(()=>{const next=!guestBazookaArmedRef.current;guestBazookaArmedRef.current=next;setGuestBazookaArmed(next);const p=physics.current;if(next&&p){p.targetX=null;p.targetY=null;p.vx=0;if(p.grounded)p.action="idle";}})},
     {label:"Menu",icon:"☰",onSelect:()=>setWheelMenuOpen(true)},
   ]:[{label:"Menu",icon:"☰",onSelect:()=>setWheelMenuOpen(true)}];
   const menuItems=[

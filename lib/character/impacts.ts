@@ -10,6 +10,19 @@ export type BazookaCharacterHit = BazookaCharacterTarget & {
   distance: number;
 };
 
+export function bazookaCharacterHitZones(
+  target: { role: "host" | "guest"; x: number; y: number; guestId?: string },
+): BazookaCharacterTarget[] {
+  const identity = target.role === "host"
+    ? { role: "host" as const }
+    : { role: "guest" as const, guestId: target.guestId };
+  return [
+    { ...identity, center: { x: target.x, y: target.y - 178 }, radius: 28 },
+    { ...identity, center: { x: target.x, y: target.y - 108 }, radius: 35 },
+    { ...identity, center: { x: target.x, y: target.y - 46 }, radius: 31 },
+  ];
+}
+
 const DEFAULT_CHARACTER_HIT_RADIUS = 58;
 export const HOST_BAZOOKA_MAX_HEALTH = 10;
 export const GUEST_BAZOOKA_MAX_HEALTH = 3;

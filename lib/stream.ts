@@ -259,7 +259,7 @@ export type StreamKickMessage = {
   sessionId: string;
   guestId: string;
   sentAt: number;
-  reason?: "instant" | "elimination_tommygun";
+  reason?: "instant" | "elimination_tommygun" | "elimination_bazooka";
   hostName?: string;
 };
 

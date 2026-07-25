@@ -42,8 +42,6 @@ import {
   STREAM_PROJECTILE_SPEED,
   STREAM_CHARACTER_GEOMETRY,
   PlayCharacterState,
-  PlayHairStyle,
-  PlayOutfitStyle,
   drawEliminationSequence,
   drawPlacedSpawnDoor,
   drawPlaySpawnDoor,
@@ -57,7 +55,7 @@ import {
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
-import { groundProfileY, raycastSolid, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
+import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
 import {
@@ -65,8 +63,10 @@ import {
   BAZOOKA_RAGDOLL_RECOVERY_MS,
   GUEST_BAZOOKA_MAX_HEALTH,
   HOST_BAZOOKA_MAX_HEALTH,
+  bazookaCharacterHitZones,
   bazookaRagdollImpulse,
   bazookaShotKey,
+  combatHealthColor,
   firstBazookaCharacterHit,
   nextBazookaHealth,
 } from "@/lib/character/impacts";
@@ -602,6 +602,14 @@ type PlayWeaponShot = {
   hitGuestIds: Set<string>;
 };
 
+type PendingBazookaShot = {
+  event: StreamBazookaFireMessage;
+  previousDistance: number;
+  maxDistance: number;
+  terrainImpact: ReturnType<typeof raycastSolid>;
+  terrainDistance: number;
+};
+
 type CharTimelineDrag = {
   kind: "move" | "resize-left" | "resize-right";
   actionId: string;
@@ -617,6 +625,12 @@ type MediaItem = {
   url: string;
   duration?: number;
   blob?: Blob; // video only — source for cloning a fresh blob when placed on the board
+};
+
+type PendingMediaPlacement = {
+  item: MediaItem;
+  width: number;
+  height: number;
 };
 
 type TimelineDrag = {
@@ -3650,6 +3664,8 @@ export default function Board2Page() {
   const [playMediaFocusId, setPlayMediaFocusId] = useState<string | null>(null);
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playBazookaArmed, setPlayBazookaArmed] = useState(false);
+  const [playHostHealth, setPlayHostHealth] = useState<StreamHealthState>({ current: HOST_BAZOOKA_MAX_HEALTH, max: HOST_BAZOOKA_MAX_HEALTH, hitAt: 0 });
+  const [playHostHealthVisible, setPlayHostHealthVisible] = useState(false);
   const [playCleanUi, setPlayCleanUi] = useState(false);
   const [playCleanMenuOpen, setPlayCleanMenuOpen] = useState(false);
   const [playWheelOpen, setPlayWheelOpen] = useState(false);
@@ -3663,9 +3679,8 @@ export default function Board2Page() {
   const [playLiveSpeechBubbles, setPlayLiveSpeechBubbles] = useState(false);
   const [playLiveSpeechStatus, setPlayLiveSpeechStatus] = useState<"idle" | "listening" | "transcribing" | "error">("idle");
   const [playLiveSpeechText, setPlayLiveSpeechText] = useState("");
-  const [playHairStyle, setPlayHairStyle] = useState<PlayHairStyle>("spikes");
-  const [playOutfitStyle, setPlayOutfitStyle] = useState<PlayOutfitStyle>("tee");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
+  const [pendingMediaPlacement, setPendingMediaPlacement] = useState<PendingMediaPlacement | null>(null);
 
   // ── AI character choreography ──
   const [directCharacterOpen, setDirectCharacterOpen] = useState(false);
@@ -3985,9 +4000,11 @@ export default function Board2Page() {
   const playBazookaArmedRef = useRef(false);
   const playBazookaLastFireAtRef = useRef(0);
   const playBazookaEventsRef = useRef<BazookaVisualEvent[]>([]);
+  const pendingBazookaShotsRef = useRef<PendingBazookaShot[]>([]);
   const playHostHealthRef = useRef<StreamHealthState>({ current: HOST_BAZOOKA_MAX_HEALTH, max: HOST_BAZOOKA_MAX_HEALTH, hitAt: 0 });
   const playGuestHealthRef = useRef<Map<string, StreamHealthState>>(new Map());
   const resolvedBazookaShotsRef = useRef<Set<string>>(new Set());
+  const playBazookaKnockoutPendingRef = useRef<Set<string>>(new Set());
   const streamCratersRef = useRef<StreamCrater[]>([]);
   const streamRepairAtRef = useRef(0);
   const playWeaponShotsRef = useRef<PlayWeaponShot[]>([]);
@@ -4002,6 +4019,7 @@ export default function Board2Page() {
   const streamLastDebugOverlayAtRef = useRef(0);
   const [streamCharacterDebugRows, setStreamCharacterDebugRows] = useState<StreamCharacterDebugRow[]>([]);
   const editorPlayheadBeforePlayRef = useRef(0);
+  const pendingMediaPlacementsRef = useRef<PendingMediaPlacement[]>([]);
 
   const liveBoardCenter = useCallback((fallbackX: number, fallbackY: number): { x: number; y: number } => {
     const placed = clipsRef.current.filter((c) => c.boardX !== undefined && c.boardY !== undefined && c.boardW !== undefined && c.boardH !== undefined);
@@ -4549,7 +4567,7 @@ export default function Board2Page() {
     });
   }, []);
 
-  const kickStreamGuest = useCallback((guestId?: string, options?: { reason?: "instant" | "elimination_tommygun"; hostName?: string }) => {
+  const kickStreamGuest = useCallback((guestId?: string, options?: { reason?: "instant" | "elimination_tommygun" | "elimination_bazooka"; hostName?: string }) => {
     if (!guestId) return;
     const sentAt = Date.now();
     streamGuestKickTombstonesRef.current.set(guestId, sentAt);
@@ -4565,6 +4583,7 @@ export default function Board2Page() {
     playGuestHealthRef.current.delete(guestId);
     playWeaponHitCountsRef.current.delete(guestId);
     playEliminationKickSentRef.current.delete(guestId);
+    playBazookaKnockoutPendingRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
@@ -4981,6 +5000,8 @@ export default function Board2Page() {
       streamGuestKickTombstonesRef.current.clear();
       playGuestHealthRef.current.clear();
       resolvedBazookaShotsRef.current.clear();
+      pendingBazookaShotsRef.current = [];
+      playBazookaKnockoutPendingRef.current.clear();
       window.setTimeout(() => setStreamGuests([]), 0);
       return;
     }
@@ -5068,6 +5089,7 @@ export default function Board2Page() {
               playGuestHealthRef.current.delete(guestId);
               playWeaponHitCountsRef.current.delete(guestId);
               playEliminationKickSentRef.current.delete(guestId);
+              playBazookaKnockoutPendingRef.current.delete(guestId);
             }
           }
           for (const guest of guests) {
@@ -5084,6 +5106,7 @@ export default function Board2Page() {
               playWeaponHitCountsRef.current.delete(guest.guestId);
               playGuestHealthRef.current.delete(guest.guestId);
               playEliminationKickSentRef.current.delete(guest.guestId);
+              playBazookaKnockoutPendingRef.current.delete(guest.guestId);
             }
             if (!playGuestHealthRef.current.has(guest.guestId)) {
               playGuestHealthRef.current.set(guest.guestId, {
@@ -5098,6 +5121,7 @@ export default function Board2Page() {
               streamGuestKickTombstonesRef.current.delete(guest.guestId);
               playWeaponHitCountsRef.current.delete(guest.guestId);
               playEliminationKickSentRef.current.delete(guest.guestId);
+              playBazookaKnockoutPendingRef.current.delete(guest.guestId);
             }
             if (guest.faceDataUrl && !streamGuestFacesRef.current.has(guest.guestId)) {
               const image = new Image(); image.src = guest.faceDataUrl;
@@ -5255,9 +5279,9 @@ export default function Board2Page() {
       const choke = streamChokeStatesRef.current.get(frame.guestId);
       const clockOffset = streamGuestClockOffsetsRef.current.get(frame.guestId) ?? 0;
       const activeFrame = choke && choke.phase === "hold"
-        ? { ...frame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4 }
+        ? { ...frame, position: choke.position, velocity: { x: 0, y: -20 }, actionType: "forceChoke" as const, actionProgress: choke.progress, actionStartTime: choke.sentAt - choke.progress * 1400, actionDuration: 1.4, weapon: frame.weapon ? { ...frame.weapon, armed: false } : undefined }
         : choke && choke.phase === "drop"
-          ? { ...frame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1 }
+          ? { ...frame, position: choke.position, velocity: { x: 0, y: 540 }, actionType: "jump" as const, actionProgress: 0.85, actionStartTime: choke.sentAt - 900, actionDuration: 1.1, weapon: frame.weapon ? { ...frame.weapon, armed: false } : undefined }
           : elimination ? eliminationFrameForGuest(frame, elimination, now) : frame;
       if (!activeFrame) {
         streamRenderedGuestFramesRef.current.delete(frame.guestId);
@@ -6270,7 +6294,7 @@ export default function Board2Page() {
     return findFreeBoardPos(existing, clipW, clipH, camX, camY);
   }
 
-  async function addClipAndPlaceOnBoard(item: MediaItem) {
+  async function addClipAndPlaceOnBoard(item: MediaItem, center?: { x: number; y: number }) {
     // Wait for image to load so we get natural dimensions
     if (item.type === "image") {
       const img = imgCacheRef.current.get(item.url);
@@ -6288,7 +6312,12 @@ export default function Board2Page() {
     setClips((prev) => {
       const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
       const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
-      const pos = findBoardPosForNewMedia(prev, w, h);
+      const pos = center
+        ? {
+            boardX: clamp(center.x - w / 2, 0, BOARD_W - w),
+            boardY: clamp(center.y - h / 2, 0, BOARD_H - h),
+          }
+        : findBoardPosForNewMedia(prev, w, h);
       return [
         ...prev,
         {
@@ -6300,7 +6329,35 @@ export default function Board2Page() {
         },
       ];
     });
-    setSelectedClipId(clipId);
+    setClipSelection([clipId]);
+  }
+
+  function queueMediaPlacement(item: MediaItem) {
+    const { w, h } = getMediaDimensions(item.url, item.type);
+    const placement = { item, width: w, height: h };
+    pendingMediaPlacementsRef.current = [...pendingMediaPlacementsRef.current, placement];
+    if (pendingMediaPlacementsRef.current.length === 1) setPendingMediaPlacement(placement);
+    setToast("Zoom or pan, then click where this media should go");
+  }
+
+  function placePendingMediaAt(point: { x: number; y: number }) {
+    const current = pendingMediaPlacementsRef.current[0];
+    if (!current) return false;
+    pendingMediaPlacementsRef.current = pendingMediaPlacementsRef.current.slice(1);
+    setPendingMediaPlacement(pendingMediaPlacementsRef.current[0] ?? null);
+    void addClipAndPlaceOnBoard(current.item, point);
+    setToast(pendingMediaPlacementsRef.current.length > 0
+      ? "Placed. Click again to place the next item"
+      : "Media placed — drag it or use the corner handles to resize");
+    return true;
+  }
+
+  function cancelPendingMediaPlacement() {
+    if (pendingMediaPlacementsRef.current.length === 0) return false;
+    pendingMediaPlacementsRef.current = pendingMediaPlacementsRef.current.slice(1);
+    setPendingMediaPlacement(pendingMediaPlacementsRef.current[0] ?? null);
+    setToast(pendingMediaPlacementsRef.current.length > 0 ? "Placement cancelled. Next item ready." : "Media placement cancelled");
+    return true;
   }
 
   function deleteClip(clipId: string) {
@@ -6789,7 +6846,17 @@ export default function Board2Page() {
     }
     const item: MediaItem = { id: generateId(), name, type, url, duration, blob: type === "video" ? file : undefined };
     setMediaLibrary((prev) => [...prev, item]);
-    await addClipAndPlaceOnBoard(item);
+    if (type === "image") {
+      const image = imgCacheRef.current.get(url);
+      if (image && !image.complete) {
+        await new Promise<void>((resolve) => {
+          image.addEventListener("load", () => resolve(), { once: true });
+          image.addEventListener("error", () => resolve(), { once: true });
+        });
+      }
+    }
+    if (isMobile) await addClipAndPlaceOnBoard(item);
+    else queueMediaPlacement(item);
   }
 
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -8226,6 +8293,15 @@ export default function Board2Page() {
   }
 
   // ─ Board pan (spacebar + drag) ────────────────────────────────────────────
+
+  function handleBoardPlacementPointerDownCapture(e: React.PointerEvent<HTMLDivElement>) {
+    if (!pendingMediaPlacementsRef.current[0]) return;
+    if (isSpaceDownRef.current) return;
+    if ((e.target as HTMLElement).closest("[data-media-placement-ui]")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    placePendingMediaAt(clientToBoardPoint(e.clientX, e.clientY));
+  }
 
   function handleBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (!isSpaceDownRef.current) return;
@@ -10308,8 +10384,8 @@ export default function Board2Page() {
       target,
       seed: Math.floor(Math.random() * 1_000_000),
     };
-    state.x -= state.facing * 12;
-    state.vx -= state.facing * 90;
+    state.x -= state.facing * 8;
+    state.vx *= 0.25;
     streamChannelRef.current?.send({ type: "broadcast", event: "bazooka_fire", payload: event });
     resolveLiveBazookaFire(event);
     streamDebugLog("bazooka fire host", event);
@@ -10356,82 +10432,177 @@ export default function Board2Page() {
     const clips = rocketTerrainClips(clipsRef.current);
     const terrainImpact = raycastSolid(clips, streamCratersRef.current, event.from, event.target);
     const terrainDistance = terrainImpact ? Math.hypot(terrainImpact.point.x - event.from.x, terrainImpact.point.y - event.from.y) : Infinity;
+    const maxDistance = Math.hypot(event.target.x - event.from.x, event.target.y - event.from.y);
+    pendingBazookaShotsRef.current = [
+      ...pendingBazookaShotsRef.current,
+      { event, previousDistance: 0, maxDistance, terrainImpact, terrainDistance },
+    ];
+    playBazookaEventsRef.current = [
+      ...playBazookaEventsRef.current,
+      {
+        ...event,
+        target: terrainImpact?.point ?? event.target,
+        fizzle: !terrainImpact,
+      } satisfies BazookaVisualEvent,
+    ].slice(-12);
+  }
+
+  function liveBazookaCharacterTargets(event: StreamBazookaFireMessage) {
     const targets = [];
     const host = playPhysicsRef.current;
     if (host && event.shooter?.role !== "host") {
-      targets.push({ role: "host" as const, center: { x: host.x, y: host.y - 86 }, radius: 74 });
+      targets.push(...bazookaCharacterHitZones({ role: "host", x: host.x, y: host.y }));
     }
     for (const frame of streamGuestFramesRef.current.values()) {
-      if (frame.guestId === event.shooter?.guestId || streamEliminationsRef.current.has(frame.guestId)) continue;
-      targets.push({ role: "guest" as const, guestId: frame.guestId, center: { x: frame.position.x, y: frame.position.y - 86 }, radius: 68 });
+      if (
+        frame.guestId === event.shooter?.guestId ||
+        streamEliminationsRef.current.has(frame.guestId) ||
+        playBazookaKnockoutPendingRef.current.has(frame.guestId)
+      ) continue;
+      targets.push(...bazookaCharacterHitZones({
+        role: "guest",
+        guestId: frame.guestId,
+        x: frame.position.x,
+        y: frame.position.y,
+      }));
     }
-    const characterImpact = firstBazookaCharacterHit(event.from, event.target, targets);
-    const hitCharacter = characterImpact && characterImpact.distance < terrainDistance ? characterImpact : null;
-    const impactPoint = hitCharacter?.point ?? terrainImpact?.point ?? event.target;
+    return targets;
+  }
+
+  function finishLiveBazookaCharacterImpact(
+    event: StreamBazookaFireMessage,
+    hitCharacter: NonNullable<ReturnType<typeof firstBazookaCharacterHit>>,
+    totalDistance: number,
+  ) {
+    const dx = event.target.x - event.from.x;
+    const dy = event.target.y - event.from.y;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const direction = { x: dx / length, y: dy / length };
+    const impulse = bazookaRagdollImpulse(direction, event.seed);
+    const impactAt = event.startTime + totalDistance / 1100 * 1000;
+    const health = hitCharacter.role === "host"
+      ? nextBazookaHealth(
+          playHostHealthRef.current.current,
+          playHostHealthRef.current.max,
+          impactAt,
+        )
+      : nextBazookaHealth(
+          playGuestHealthRef.current.get(hitCharacter.guestId!)?.current ?? GUEST_BAZOOKA_MAX_HEALTH,
+          playGuestHealthRef.current.get(hitCharacter.guestId!)?.max ?? GUEST_BAZOOKA_MAX_HEALTH,
+          impactAt,
+        );
+    if (hitCharacter.role === "host") {
+      playHostHealthRef.current = health;
+      setPlayHostHealth(health);
+    } else {
+      playGuestHealthRef.current.set(hitCharacter.guestId!, health);
+    }
+    const impact: StreamBazookaImpactMessage = {
+      kind: "bazooka_impact",
+      sequenceType: "bazookaImpact",
+      streamId: event.streamId,
+      sessionId: event.sessionId,
+      sentAt: Date.now(),
+      startTime: event.startTime,
+      impactAt,
+      shotId: bazookaShotKey(event),
+      from: event.from,
+      point: hitCharacter.point,
+      direction,
+      impulse: { x: impulse.x, y: impulse.y },
+      spin: impulse.spin,
+      seed: event.seed,
+      duration: 1.25,
+      health,
+      target: hitCharacter.role === "host"
+        ? { role: "host" }
+        : { role: "guest", guestId: hitCharacter.guestId! },
+    };
     playBazookaEventsRef.current = [
-      ...playBazookaEventsRef.current,
-      { ...event, target: impactPoint, fizzle: !hitCharacter && !terrainImpact } satisfies BazookaVisualEvent,
+      ...playBazookaEventsRef.current.filter((candidate) => bazookaShotKey(candidate) !== impact.shotId),
+      { ...event, target: hitCharacter.point, fizzle: false } satisfies BazookaVisualEvent,
     ].slice(-12);
-    if (hitCharacter) {
-      const dx = event.target.x - event.from.x;
-      const dy = event.target.y - event.from.y;
-      const length = Math.max(1, Math.hypot(dx, dy));
-      const direction = { x: dx / length, y: dy / length };
-      const impulse = bazookaRagdollImpulse(direction, event.seed);
-      const impactAt = event.startTime + hitCharacter.distance / 1100 * 1000;
-      const health = hitCharacter.role === "host"
-        ? nextBazookaHealth(
-            playHostHealthRef.current.current,
-            playHostHealthRef.current.max,
-            impactAt,
-          )
-        : nextBazookaHealth(
-            playGuestHealthRef.current.get(hitCharacter.guestId!)?.current ?? GUEST_BAZOOKA_MAX_HEALTH,
-            playGuestHealthRef.current.get(hitCharacter.guestId!)?.max ?? GUEST_BAZOOKA_MAX_HEALTH,
-            impactAt,
-          );
-      if (hitCharacter.role === "host") playHostHealthRef.current = health;
-      else playGuestHealthRef.current.set(hitCharacter.guestId!, health);
-      const impact: StreamBazookaImpactMessage = {
-        kind: "bazooka_impact",
-        sequenceType: "bazookaImpact",
-        streamId: event.streamId,
-        sessionId: event.sessionId,
-        sentAt: Date.now(),
-        startTime: event.startTime,
-        impactAt,
-        shotId: shotKey,
-        from: event.from,
-        point: hitCharacter.point,
-        direction,
-        impulse: { x: impulse.x, y: impulse.y },
-        spin: impulse.spin,
-        seed: event.seed,
-        duration: 1.25,
-        health,
-        target: hitCharacter.role === "host"
-          ? { role: "host" }
-          : { role: "guest", guestId: hitCharacter.guestId! },
-      };
-      streamChannelRef.current?.send({ type: "broadcast", event: "bazooka_impact", payload: impact });
-      applyHostBazookaImpact(impact);
-      streamDebugLog("bazooka character impact", impact);
-      return;
+    streamChannelRef.current?.send({ type: "broadcast", event: "bazooka_impact", payload: impact });
+    applyHostBazookaImpact(impact);
+    if (
+      hitCharacter.role === "guest" &&
+      health.current === 0 &&
+      !playBazookaKnockoutPendingRef.current.has(hitCharacter.guestId!)
+    ) {
+      const guestId = hitCharacter.guestId!;
+      playBazookaKnockoutPendingRef.current.add(guestId);
+      window.setTimeout(() => {
+        if (
+          streamSessionIdRef.current === event.sessionId &&
+          playGuestHealthRef.current.get(guestId)?.current === 0
+        ) {
+          kickStreamGuest(guestId, {
+            reason: "elimination_bazooka",
+            hostName: session?.user?.name || "Host",
+          });
+        }
+      }, BAZOOKA_RAGDOLL_RECOVERY_MS);
     }
-    if (!terrainImpact) return;
+    streamDebugLog("bazooka character impact", impact);
+  }
+
+  function finishLiveBazookaTerrainImpact(shot: PendingBazookaShot) {
+    const { event, terrainImpact } = shot;
+    if (!terrainImpact || event.startTime < streamRepairAtRef.current) return;
+    const clips = rocketTerrainClips(clipsRef.current);
     const clip = clips.find((candidate) => candidate.id === terrainImpact.imageId);
     if (!clip) return;
     const crater = craterForImpact(clip, terrainImpact.point, event.seed);
-    const impactDelay = Math.max(0, event.startTime + Math.hypot(impactPoint.x - event.from.x, impactPoint.y - event.from.y) / 1100 * 1000 - Date.now());
-    window.setTimeout(() => {
-      if (event.startTime < streamRepairAtRef.current) return;
-      streamCratersRef.current = [
-        ...streamCratersRef.current.filter((candidate) => candidate.clipId !== clip.id),
-        ...streamCratersRef.current.filter((candidate) => candidate.clipId === clip.id).slice(-23),
-        crater,
-      ];
-      void publishStreamSnapshot();
-    }, impactDelay);
+    streamCratersRef.current = [
+      ...streamCratersRef.current.filter((candidate) => candidate.clipId !== clip.id),
+      ...streamCratersRef.current.filter((candidate) => candidate.clipId === clip.id).slice(-23),
+      crater,
+    ];
+    void publishStreamSnapshot();
+  }
+
+  function updateLiveBazookaShots(nowMs: number) {
+    if (pendingBazookaShotsRef.current.length === 0) return;
+    const survivors: PendingBazookaShot[] = [];
+    for (const shot of pendingBazookaShotsRef.current) {
+      const traveled = clamp((nowMs - shot.event.startTime) / 1000 * 1100, 0, shot.maxDistance);
+      if (traveled <= shot.previousDistance) {
+        survivors.push(shot);
+        continue;
+      }
+      const dx = shot.event.target.x - shot.event.from.x;
+      const dy = shot.event.target.y - shot.event.from.y;
+      const length = Math.max(1, Math.hypot(dx, dy));
+      const direction = { x: dx / length, y: dy / length };
+      const segmentFrom = {
+        x: shot.event.from.x + direction.x * shot.previousDistance,
+        y: shot.event.from.y + direction.y * shot.previousDistance,
+      };
+      const segmentTo = {
+        x: shot.event.from.x + direction.x * traveled,
+        y: shot.event.from.y + direction.y * traveled,
+      };
+      const characterHit = firstBazookaCharacterHit(
+        segmentFrom,
+        segmentTo,
+        liveBazookaCharacterTargets(shot.event),
+      );
+      const characterDistance = characterHit
+        ? shot.previousDistance + characterHit.distance
+        : Infinity;
+      if (characterHit && characterDistance < shot.terrainDistance) {
+        finishLiveBazookaCharacterImpact(shot.event, characterHit, characterDistance);
+        continue;
+      }
+      if (shot.terrainImpact && shot.terrainDistance <= traveled) {
+        finishLiveBazookaTerrainImpact(shot);
+        continue;
+      }
+      if (traveled >= shot.maxDistance) continue;
+      shot.previousDistance = traveled;
+      survivors.push(shot);
+    }
+    pendingBazookaShotsRef.current = survivors;
   }
 
   function receiveGuestBazookaFire(event: StreamBazookaFireMessage) {
@@ -10467,18 +10638,29 @@ export default function Board2Page() {
   function enterPlayMode() {
     editorPlayheadBeforePlayRef.current = playheadRef.current;
     const sourcePose = evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current);
-    const startSurface = findSurfaceAtFeet(sourcePose.boardX, sourcePose.boardY, clipsRef.current)
-      ?? clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip)).sort((a, b) => {
-        const ax = clampInsideClipX(a, sourcePose.boardX);
-        const bx = clampInsideClipX(b, sourcePose.boardX);
-        return Math.hypot(ax - sourcePose.boardX, a.boardY - sourcePose.boardY) - Math.hypot(bx - sourcePose.boardX, b.boardY - sourcePose.boardY);
+    const configuredSpawn = spawnDoorRef.current;
+    const desiredSpawn = configuredSpawn ?? { x: sourcePose.boardX, y: sourcePose.boardY };
+    const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
+    const startSurface = (configuredSpawn
+      ? surfaces
+          .filter((surface) => desiredSpawn.x >= surface.boardX && desiredSpawn.x <= surface.boardX + surface.boardW)
+          .sort((a, b) => Math.abs(a.boardY - desiredSpawn.y) - Math.abs(b.boardY - desiredSpawn.y))[0]
+      : findSurfaceAtFeet(desiredSpawn.x, desiredSpawn.y, clipsRef.current))
+      ?? surfaces.sort((a, b) => {
+        const ax = clampInsideClipX(a, desiredSpawn.x);
+        const bx = clampInsideClipX(b, desiredSpawn.x);
+        return Math.hypot(ax - desiredSpawn.x, a.boardY - desiredSpawn.y) - Math.hypot(bx - desiredSpawn.x, b.boardY - desiredSpawn.y);
       })[0];
     if (!startSurface) {
       setToast("Add an image or video to the board before entering Play Mode");
       return;
     }
-    const startX = clampInsideClipX(startSurface, sourcePose.boardX);
-    const startY = startSurface.boardY;
+    const startX = clampInsideClipX(startSurface, desiredSpawn.x);
+    const startY = groundProfileY(
+      [{ id: startSurface.id ?? "spawn-surface", type: startSurface.type, boardX: startSurface.boardX, boardY: startSurface.boardY, boardW: startSurface.boardW, boardH: startSurface.boardH }],
+      streamCratersRef.current,
+      startX,
+    )?.y ?? startSurface.boardY;
     playPhysicsRef.current = {
       x: startX, y: startY, vx: 0, vy: 0, facing: sourcePose.facing ?? 1,
       grounded: true, surfaceId: startSurface.id ?? null, stride: 0, spin: 0,
@@ -10487,7 +10669,7 @@ export default function Board2Page() {
     };
     playTimeRef.current = 0;
     playWallStartRef.current = 0;
-    playCameraRef.current = { cameraX: sourcePose.boardX, cameraY: sourcePose.boardY - 120, boardZoom: 1.35 };
+    playCameraRef.current = { cameraX: startX, cameraY: startY - 120, boardZoom: 1.35 };
     playActionRuntimeRef.current = null;
     playWeaponShotsRef.current = [];
     playWeaponHitCountsRef.current.clear();
@@ -10496,6 +10678,7 @@ export default function Board2Page() {
       max: HOST_BAZOOKA_MAX_HEALTH,
       hitAt: 0,
     };
+    setPlayHostHealth(playHostHealthRef.current);
     playGuestHealthRef.current = new Map(
       streamGuests
         .filter((guest): guest is StreamParticipantPresence & { guestId: string } => !!guest.guestId)
@@ -10505,6 +10688,8 @@ export default function Board2Page() {
         ]),
     );
     resolvedBazookaShotsRef.current.clear();
+    pendingBazookaShotsRef.current = [];
+    playBazookaKnockoutPendingRef.current.clear();
     playEliminationKickSentRef.current.clear();
     setPlayWeaponArmed(false);
     playWeaponArmedRef.current = false;
@@ -10581,6 +10766,10 @@ export default function Board2Page() {
     if (e.button === 2) return;
     const point = playBoardPointFromClient(e.clientX, e.clientY, e.currentTarget);
     if (point) playCursorRef.current = { x: point.rawX, y: point.rawY };
+    if (point && placePendingMediaAt({ x: point.rawX, y: point.rawY })) {
+      e.preventDefault();
+      return;
+    }
     if (playBazookaArmedRef.current) { e.preventDefault(); firePlayBazooka(); return; }
     const guest = point ? guestAtPlayPoint(point) : null;
     if (guest) {
@@ -10744,7 +10933,14 @@ export default function Board2Page() {
 
     if(state.grounded&&!ragdolling&&Math.abs(state.vx)>1){const direction=state.vx>0?1:-1,nextX=state.x+state.vx*dt;if(!groundProfileY(terrain,streamCratersRef.current,nextX)){let landingX:number|undefined;for(let d=6;d<=120;d+=6){if(groundProfileY(terrain,streamCratersRef.current,nextX+direction*d)){landingX=nextX+direction*d;break;}}if(landingX!==undefined){state.grounded=false;state.surfaceId=null;state.vy=-PLAY_JUMP_SPEED*.62;state.airborneAt=playTimeRef.current;streamDebugLog("terrain auto-jump host",{gapWidth:Math.abs(landingX-nextX),popPoint:state.x});}else{state.vx=0;streamDebugLog("terrain stop at lip host",{x:state.x});}}}
     const previousY = state.y;
-    state.x += state.vx * dt;
+    const horizontalMotion = resolveCharacterSolidMotion(
+      terrain,
+      streamCratersRef.current,
+      { x: state.x, y: state.y },
+      { x: state.x + state.vx * dt, y: state.y },
+    );
+    state.x = horizontalMotion.x;
+    if (horizontalMotion.hitX) state.vx = 0;
     if (!state.grounded) {
       state.vy = Math.min(PLAY_MAX_FALL_SPEED, state.vy + PLAY_GRAVITY * dt);
       if (state.grappleX !== null && state.grappleY !== null) {
@@ -10765,7 +10961,17 @@ export default function Board2Page() {
         }
         state.facing = dx >= 0 ? 1 : -1;
       }
-      const nextY = state.y + state.vy * dt;
+      let nextY = state.y + state.vy * dt;
+      if (state.vy < 0) {
+        const verticalMotion = resolveCharacterSolidMotion(
+          terrain,
+          streamCratersRef.current,
+          { x: state.x, y: state.y },
+          { x: state.x, y: nextY },
+        );
+        nextY = verticalMotion.y;
+        if (verticalMotion.hitCeiling) state.vy = 0;
+      }
       if (state.vy >= 0) {
         const landing=groundProfileY(terrain,streamCratersRef.current,state.x);
         if (landing&&previousY<=landing.y&&nextY>=landing.y) {
@@ -10871,6 +11077,7 @@ export default function Board2Page() {
         playPose = sharedPlayPoseFromPhysics(state, now);
       }
       playPose = applyPlayTalkingGestures(playPose, wall);
+      updateLiveBazookaShots(nowMs);
       updatePlayWeaponShots(nowMs, previousNowMs);
       if (playWeaponArmedRef.current || playBazookaArmedRef.current) {
         const aim = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
@@ -10974,6 +11181,11 @@ export default function Board2Page() {
 	      const tag = (e.target as HTMLElement).tagName;
 	      const inInput = tag === "INPUT" || tag === "TEXTAREA";
 	      if (playModeRef.current && !inInput) {
+          if (e.code === "Escape" && pendingMediaPlacementsRef.current.length > 0) {
+            e.preventDefault();
+            cancelPendingMediaPlacement();
+            return;
+          }
 	        if (playOverlayInputActiveRef.current) {
 	          if (e.code === "Escape") {
 	            e.preventDefault();
@@ -11007,6 +11219,11 @@ export default function Board2Page() {
           broadcastWeaponState(true);
           return;
         }
+        if (e.code === "KeyH") {
+          e.preventDefault();
+          setPlayHostHealthVisible((visible) => !visible);
+          return;
+        }
         if (e.code === "KeyV") { e.preventDefault(); togglePlayTalkingGestures(); return; }
         if (e.code === "KeyC") { e.preventDefault(); togglePlayMediaFocus(); return; }
         if (playWeaponArmedRef.current && ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.code)) {
@@ -11033,6 +11250,11 @@ export default function Board2Page() {
         if (e.code === "KeyE") { e.preventDefault(); issuePlayCharacterAction("emote"); return; }
         if (e.code === "KeyT") { e.preventDefault(); issuePlayCharacterAction("sitAndWatch"); return; }
         if (e.code === "KeyX") { e.preventDefault(); issuePlayCharacterAction("stop"); return; }
+        return;
+      }
+      if (!inInput && e.code === "Escape" && pendingMediaPlacementsRef.current.length > 0) {
+        e.preventDefault();
+        cancelPendingMediaPlacement();
         return;
       }
       if (e.code === "Space") {
@@ -11722,7 +11944,7 @@ export default function Board2Page() {
     return (
 	      <div ref={playContainerRef} data-play-ui data-play-maximize={playMaximize||undefined} style={{ position: "fixed", inset: 0, zIndex: playMaximize?2147483000:10000, overflow: "hidden", background: "#111", color: "#111", colorScheme: "light" }}>
 	        <style>{`
-            [data-play-maximize] > :not(canvas):not(style):not([data-max-exit]){display:none!important}
+            [data-play-maximize] > :not(canvas):not(style):not([data-max-exit]):not([data-host-health]):not([data-media-placement-ui]){display:none!important}
             [data-play-ui] button,
             [data-play-ui] input,
             [data-play-ui] select,
@@ -11755,6 +11977,24 @@ export default function Board2Page() {
           }}
           style={{ display: "block", width: "100vw", height: "100dvh", cursor: "crosshair", touchAction: "none" }}
         />
+        {playHostHealthVisible && (
+          <div
+            data-host-health
+            aria-label={`Host health ${playHostHealth.current} of ${playHostHealth.max}`}
+            style={{ position: "fixed", top: "max(14px, env(safe-area-inset-top))", left: "50%", transform: "translateX(-50%)", zIndex: 10045, width: "min(260px, 52vw)", padding: "7px 9px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.92)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, fontWeight: 800, textAlign: "center", pointerEvents: "none" }}
+          >
+            <div style={{ marginBottom: 5 }}>HOST HEALTH · {playHostHealth.current}/{playHostHealth.max}</div>
+            <div style={{ height: 7, background: "#2a2a2a", padding: 2 }}>
+              <div style={{ height: "100%", width: `${clamp(playHostHealth.current / Math.max(1, playHostHealth.max), 0, 1) * 100}%`, background: combatHealthColor(playHostHealth.current, playHostHealth.max), transition: "width 180ms ease, background 180ms ease" }} />
+            </div>
+          </div>
+        )}
+        {pendingMediaPlacement && (
+          <div data-media-placement-ui style={{ position: "fixed", top: playHostHealthVisible ? 72 : 14, left: "50%", transform: "translateX(-50%)", zIndex: 10046, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100vw - 28px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+            <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom, then click</span>
+            <button type="button" onClick={cancelPendingMediaPlacement} style={{ padding: "3px 6px", border: "1px solid #2a2a2a", background: "#fffdf5", fontFamily: "inherit", cursor: "pointer" }}>Cancel</button>
+          </div>
+        )}
         {!playMaximize&&<button
           type="button"
           onClick={() => setPlayCleanMenuOpen((v) => !v)}
@@ -11856,21 +12096,6 @@ export default function Board2Page() {
             ))}
           </div>
         )}
-        {!playCleanUi && <div style={{ position: "fixed", top: 58, left: 14, zIndex: 2, width: 190, padding: "10px 11px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.94)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", color: "#2a2a2a" }}>
-          <div style={{ fontSize: 10, fontWeight: 800, marginBottom: 6 }}>PLAY LOOK</div>
-          <div style={{ fontSize: 9, marginBottom: 4 }}>Hair</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
-            {(["crop", "spikes", "curls", "none"] as PlayHairStyle[]).map((style) => (
-              <button key={style} type="button" onClick={() => setPlayHairStyle(style)} style={{ padding: "4px 6px", border: "1px solid #2a2a2a", background: playHairStyle === style ? "#f4b942" : "#fffdf5", font: "inherit", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}>{style}</button>
-            ))}
-          </div>
-          <div style={{ fontSize: 9, marginBottom: 4 }}>Outfit</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-            {(["tee", "varsity", "adventure"] as PlayOutfitStyle[]).map((style) => (
-              <button key={style} type="button" onClick={() => setPlayOutfitStyle(style)} style={{ padding: "4px 6px", border: "1px solid #2a2a2a", background: playOutfitStyle === style ? "#8cb8cf" : "#fffdf5", font: "inherit", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}>{style}</button>
-            ))}
-          </div>
-        </div>}
 	        {!playCleanUi && <div style={{ position: "fixed", right: 58, top: 14, zIndex: 2, fontFamily: "monospace", fontSize: 10, color: "#2a2a2a" }}>
           <button
             type="button"
@@ -11881,7 +12106,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · B {playBazookaArmed ? "stow bazooka" : "bazooka"} · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · V {playTalkingGestures ? "stop talking gestures" : "talking gestures"}<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror · wheel zoom · Esc exit
+              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · B {playBazookaArmed ? "stow bazooka" : "bazooka"} · H health · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · V {playTalkingGestures ? "stop talking gestures" : "talking gestures"}<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror · wheel zoom · Esc exit
 	            </div>
 	          )}
 	        </div>}
@@ -13200,7 +13425,7 @@ export default function Board2Page() {
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }}
             />
             <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
-              Upload images or videos — they auto-place on the board and timeline.
+              Upload images or videos, then zoom/pan and click where each one should be placed.
             </p>
           </div>
 
@@ -13210,9 +13435,16 @@ export default function Board2Page() {
             {/* Board container — fills the whole center */}
             <div
               ref={boardContainerRef}
-              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: "default" }}
+              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default" }}
+              onPointerDownCapture={handleBoardPlacementPointerDownCapture}
               onPointerDown={handleBoardPointerDown}
             >
+              {pendingMediaPlacement && (
+                <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+                  <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
+                  <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
+                </div>
+              )}
               {/* Board surface */}
               <div
                 style={{
@@ -14370,9 +14602,9 @@ export default function Board2Page() {
                       <button
                         type="button"
                         onClick={() => {
-                          const centerX = boardPanRef.current.x + BOARD_W / (2 * boardZoomRef.current);
+                          const { camX: centerX, camY: centerY } = getVisibleBoardCenter();
                           const surfaces = clipsRef.current.filter((clip): clip is Clip & RequiredSurfaceClip => isBoardSurface(clip));
-                          const surface = surfaces.filter((clip) => centerX >= clip.boardX && centerX <= clip.boardX + clip.boardW).sort((a, b) => Math.abs(a.boardY - boardPanRef.current.y) - Math.abs(b.boardY - boardPanRef.current.y))[0] ?? surfaces[0];
+                          const surface = surfaces.filter((clip) => centerX >= clip.boardX && centerX <= clip.boardX + clip.boardW).sort((a, b) => Math.abs(a.boardY - centerY) - Math.abs(b.boardY - centerY))[0] ?? surfaces[0];
                           const next = surface ? { x: clamp(centerX, surface.boardX + 45, surface.boardX + surface.boardW - 45), y: surface.boardY } : { x: BOARD_W / 2, y: BOARD_H / 2 };
                           setSpawnDoor(next); spawnDoorRef.current = next; setToast("Spawn Door placed at the current view");
                         }}

@@ -13,7 +13,7 @@ export type GroundProfile = { y: number; imageId: string; slope: number };
 
 const RAY_STEP_PX = 1;
 const RAY_REFINE_PX = 0.5;
-const STANDABLE_MARGIN_PX = 40;
+const CHARACTER_COLLISION_SAMPLES = 7;
 
 function solidClips(clips: readonly TerrainClip[]) {
   return clips.filter((clip) => clip.type === undefined || clip.type === "image" || clip.type === "video");
@@ -74,7 +74,7 @@ export function raycastSolid(clips: readonly TerrainClip[], craters: readonly Te
 
 function surfaceYForClip(clip: TerrainClip, craters: readonly TerrainCrater[], x: number): number | null {
   const localX = x - clip.boardX;
-  if (localX < STANDABLE_MARGIN_PX || localX > clip.boardW - STANDABLE_MARGIN_PX) return null;
+  if (localX < 0 || localX > clip.boardW) return null;
   const removed = cratersFor(craters, clip.id)
     .flatMap((crater) => {
       const dx = localX - crater.cx;
@@ -105,4 +105,68 @@ export function groundProfileY(clips: readonly TerrainClip[], craters: readonly 
     best = { y, imageId: clip.id, slope };
   }
   return best;
+}
+
+function characterBodyIntersectsSolid(
+  clips: readonly TerrainClip[],
+  craters: readonly TerrainCrater[],
+  x: number,
+  feetY: number,
+  halfWidth: number,
+  height: number,
+): boolean {
+  for (let xi = 0; xi < 3; xi += 1) {
+    const sampleX = x + (xi - 1) * halfWidth;
+    for (let yi = 0; yi < CHARACTER_COLLISION_SAMPLES; yi += 1) {
+      const sampleY = feetY - 6 - (height - 12) * (yi / (CHARACTER_COLLISION_SAMPLES - 1));
+      if (solidAt(clips, craters, { x: sampleX, y: sampleY })) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Sweeps a standing character body against the solid interior of image/video boxes.
+ * Ground landing is still handled by groundProfileY; this catches side walls, crater
+ * walls, and image undersides without allowing a fast frame to tunnel through them.
+ */
+export function resolveCharacterSolidMotion(
+  clips: readonly TerrainClip[],
+  craters: readonly TerrainCrater[],
+  from: TerrainPoint,
+  to: TerrainPoint,
+  options: { halfWidth?: number; height?: number } = {},
+): { x: number; y: number; hitX: boolean; hitCeiling: boolean } {
+  const halfWidth = options.halfWidth ?? 22;
+  const height = options.height ?? 205;
+  let x = to.x;
+  let y = to.y;
+  let hitX = false;
+  let hitCeiling = false;
+
+  if (to.x !== from.x && characterBodyIntersectsSolid(clips, craters, to.x, from.y, halfWidth, height)) {
+    let safe = from.x;
+    let blocked = to.x;
+    for (let step = 0; step < 10; step += 1) {
+      const mid = (safe + blocked) / 2;
+      if (characterBodyIntersectsSolid(clips, craters, mid, from.y, halfWidth, height)) blocked = mid;
+      else safe = mid;
+    }
+    x = safe;
+    hitX = true;
+  }
+
+  if (to.y < from.y && characterBodyIntersectsSolid(clips, craters, x, to.y, halfWidth, height)) {
+    let safe = from.y;
+    let blocked = to.y;
+    for (let step = 0; step < 10; step += 1) {
+      const mid = (safe + blocked) / 2;
+      if (characterBodyIntersectsSolid(clips, craters, x, mid, halfWidth, height)) blocked = mid;
+      else safe = mid;
+    }
+    y = safe;
+    hitCeiling = true;
+  }
+
+  return { x, y, hitX, hitCeiling };
 }
