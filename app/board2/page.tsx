@@ -630,6 +630,9 @@ type MediaItem = {
   url: string;
   duration?: number;
   blob?: Blob; // video only — source for cloning a fresh blob when placed on the board
+  youtubeId?: string;
+  ytStart?: number;
+  ytEnd?: number;
 };
 
 type PendingMediaPlacement = {
@@ -2103,6 +2106,29 @@ type CharPoseResult = {
   momentumScaleX?: number;
   momentumScaleY?: number;
 };
+
+function playPointingPoseToward(
+  pose: CharPoseResult,
+  state: PlayCharacterState,
+  target: { x: number; y: number },
+): CharPoseResult {
+  const dx = target.x - state.x;
+  const dy = target.y - (state.y - 110);
+  const dead = Math.tan((8 * Math.PI) / 180) * Math.max(120, Math.abs(dy));
+  const facing: 1 | -1 = Math.abs(dx) <= dead ? state.facing : dx >= 0 ? 1 : -1;
+  return {
+    ...pose,
+    boardX: state.x,
+    boardY: state.y,
+    facing,
+    bodyLean: facing * 0.04,
+    pointTargetBX: target.x,
+    pointTargetBY: target.y,
+    forceHandOpen: false,
+    actionType: "pointAt",
+    terrainGrounded: true,
+  };
+}
 
 const ACTION_ANIMATION_SLOT: Partial<Record<CharacterAction["type"], string>> = {
   walkTo: "walk",
@@ -3666,6 +3692,7 @@ export default function Board2Page() {
   const [playLegendOpen, setPlayLegendOpen] = useState(true);
   const [playSceneShot, setPlaySceneShot] = useState(false);
   const [playTalkingGestures, setPlayTalkingGestures] = useState(false);
+  const [playPointing, setPlayPointing] = useState(false);
   const [playMediaFocusId, setPlayMediaFocusId] = useState<string | null>(null);
   const [playWeaponArmed, setPlayWeaponArmed] = useState(false);
   const [playBazookaArmed, setPlayBazookaArmed] = useState(false);
@@ -3823,7 +3850,6 @@ export default function Board2Page() {
   const isSpaceDownRef = useRef(false);
   const lastRafTimeRef = useRef<number | null>(null);
   const rafIdRef = useRef<number | null>(null);
-  const mediaUploadRef = useRef<HTMLInputElement>(null);
   const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -3981,7 +4007,7 @@ export default function Board2Page() {
   const streamChokeStatesRef = useRef<Map<string, StreamChokeMessage>>(new Map());
   const streamGuestKickTombstonesRef = useRef<Map<string, number>>(new Map());
   const streamMediaDataUrlCacheRef = useRef<Map<string, { signature: string; maxLongEdge: number; dataUrl: string }>>(new Map());
-  const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null }) => void) | null>(null);
+  const evaluateVideoPlaybackStatesRef = useRef<((time: number, currentClips: Clip[], currentCameraKeyframes: CameraKeyframe[], W: number, H: number, options?: { force?: boolean; audioMode?: "preview" | "silent" | "focused"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null }) => void) | null>(null);
   const liveCharactersRef = useRef<Record<CharacterId, LiveCharacterRuntime>>({
     c1: { enabled: false, startWallMs: 0, initX: BOARD_W / 2, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
     c2: { enabled: false, startWallMs: 0, initX: BOARD_W / 2 + 60, initY: BOARD_H * 0.75, actions: [], currentPose: null, blendFromPose: null, blendStartWallMs: 0, blendDuration: LIVE_BLEND_SEC, lastStationaryAction: null, emoteIndex: 0 },
@@ -3996,6 +4022,7 @@ export default function Board2Page() {
   const playCameraRef = useRef({ cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 });
   const playMediaFocusIdRef = useRef<string | null>(null);
   const playTalkingGesturesRef = useRef(false);
+  const playPointingRef = useRef(false);
   const playHeldKeysRef = useRef(new Set<string>());
   const playPointerRef = useRef<{ id: number; clientX: number; clientY: number; down: boolean; lastSteerAt: number } | null>(null);
   const playCursorRef = useRef<{ x: number; y: number } | null>(null);
@@ -4443,13 +4470,18 @@ export default function Board2Page() {
             ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
           if (pose && id === "c1") {
+            if (state && playPointingRef.current) {
+              const target = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
+              pose = playPointingPoseToward(pose, state, target);
+              state.facing = pose.facing;
+            }
             if (playWeaponArmedRef.current || playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
             pose = applyPlayForceChokePose(pose);
           }
           const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved);
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           const moving = state ? Math.abs(state.vx) > 40 : false;
-          const actionType = state?.action === "ragdoll" ? "ragdoll" : active?.type ?? (!state
+          const actionType = playPointingRef.current && id === "c1" ? "pointAt" : state?.action === "ragdoll" ? "ragdoll" : active?.type ?? (!state
             ? "idle"
             : !state.grounded ? "jumpTo"
               : moving ? (Math.abs(state.vx) >= PLAY_RUN_SPEED * 0.72 ? "runTo" : "walkTo")
@@ -5465,15 +5497,18 @@ export default function Board2Page() {
         } else if (playbackMode === "active" || playbackMode === "ambient") {
           drawableFailureCountRef.current++;
         }
-        if (!drewLive && playbackMode === "active" && vid && !vid.paused) {
+        if (!drewLive && playbackMode === "active" && vid && !vid.paused && !justRestartedActive && vid.readyState >= 2) {
           // Clip should be actively playing but produced no drawable frame this render — track
-          // consecutive misses and nudge playback if it's stuck for a few frames in a row.
+          // consecutive misses and gently nudge forward if it stays stuck. Never jump back to
+          // the beginning: repeated backward seeks produce a loud, stuttering audio loop.
           const misses = (videoStuckFrameCountRef.current.get(clip.id) ?? 0) + 1;
           videoStuckFrameCountRef.current.set(clip.id, misses);
-          if (misses >= 3) {
-            vid.currentTime = 0.1;
+          if (misses >= 18) {
+            const latestSeek = Number.isFinite(vid.duration) ? Math.max(0.1, vid.duration - 0.05) : vid.currentTime + 0.05;
+            vid.currentTime = Math.min(Math.max(0.1, vid.currentTime + 0.05), latestSeek);
             vid.play().catch(() => {});
             videoStuckFrameCountRef.current.set(clip.id, 0);
+            if (playbackRuntime) playbackRuntime.lastRestartAt = performance.now();
             console.warn("[video] clip", clip.id, "stuck — nudging playback");
           }
         }
@@ -5855,6 +5890,23 @@ export default function Board2Page() {
     pauseAndReset(vid);
   }
 
+  function stopAllVideoPlayback(reason: string) {
+    for (const nodes of videoAudioNodesRef.current.values()) {
+      try { nodes.gainNode.gain.value = 0; } catch {}
+    }
+    for (const clip of clipsRef.current) {
+      if (clip.type !== "video") continue;
+      const vid = videoElsRef.current.get(clip.id);
+      if (!vid) continue;
+      switchVideoOff(clip, vid);
+      videoRangeStateRef.current.set(clip.id, false);
+      const runtime = videoRuntimeFor(clip.id);
+      runtime.state = "dormant";
+      runtime.reason = reason;
+    }
+    ambientCandidateIdsRef.current = new Set();
+  }
+
   function videoRuntimeFor(clipId: string): VideoPlaybackRuntime {
     let runtime = videoPlaybackStateRef.current.get(clipId);
     if (!runtime) {
@@ -5913,17 +5965,21 @@ export default function Board2Page() {
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number,
-    options: { force?: boolean; audioMode?: "preview" | "silent"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null } = {}
+    options: { force?: boolean; audioMode?: "preview" | "silent" | "focused"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null } = {}
   ) {
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
     const videoClips = currentClips.filter((clip) => clip.type === "video");
-    const activeWindows = new Map(
-      videoClips
-        .map((clip) => [clip.id, activeVideoWindow(clip, time)] as const)
-        .filter((entry): entry is readonly [string, { start: number; end: number }] => !!entry[1])
+    const activeWindows = new Map<string, { start: number; end: number }>(
+      options.audioMode === "focused"
+        ? []
+        : videoClips
+            .map((clip) => [clip.id, activeVideoWindow(clip, time)] as const)
+            .filter((entry): entry is readonly [string, { start: number; end: number }] => !!entry[1])
     );
     const activeIds = new Set(activeWindows.keys());
+    const foregroundIds = new Set(activeIds);
+    if (options.focusedVideoId) foregroundIds.add(options.focusedVideoId);
 
     if (options.force || now - lastAmbientEvalAtRef.current >= AMBIENT_STATE_EVAL_INTERVAL_MS) {
       lastAmbientEvalAtRef.current = now;
@@ -5931,9 +5987,9 @@ export default function Board2Page() {
         ambientCandidateIdsRef.current = new Set();
       } else {
         const cam = options.overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
-        const ambientSlots = Math.max(0, AMBIENT_BUDGET - activeIds.size);
+        const ambientSlots = Math.max(0, AMBIENT_BUDGET - foregroundIds.size);
         const candidates = videoClips
-          .filter((clip) => !activeIds.has(clip.id))
+          .filter((clip) => !foregroundIds.has(clip.id))
           .map((clip) => ({ clip, ...videoViewportInfo(clip, cam, W, H, now) }))
           .filter((item) => item.candidate)
           .sort((a, b) => {
@@ -5989,7 +6045,11 @@ export default function Board2Page() {
         } else if (isActive && Math.abs(vid.currentTime - expected) > 0.3) {
           vid.currentTime = expected;
         }
-        if (options.audioMode === "silent") setClipAudioOff(clip.id, vid); else updateVideoVolume(clip, vid);
+        if (options.audioMode === "silent" || (options.audioMode === "focused" && !isFocused)) {
+          setClipAudioOff(clip.id, vid);
+        } else {
+          updateVideoVolume(clip, vid);
+        }
         videoRangeStateRef.current.set(clip.id, true);
       } else if (desired === "ambient") {
         ambientCount++;
@@ -6363,6 +6423,9 @@ export default function Board2Page() {
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
           sourceBlob: item.type === "video" ? item.blob : undefined,
+          youtubeId: item.youtubeId,
+          ytStart: item.ytStart,
+          ytEnd: item.ytEnd,
         },
       ];
     });
@@ -6395,6 +6458,19 @@ export default function Board2Page() {
     setPendingMediaPlacement(pendingMediaPlacementsRef.current[0] ?? null);
     setToast(pendingMediaPlacementsRef.current.length > 0 ? "Placement cancelled. Next item ready." : "Media placement cancelled");
     return true;
+  }
+
+  function placePendingMediaAutomatically() {
+    const queued = pendingMediaPlacementsRef.current;
+    if (queued.length === 0) return;
+    pendingMediaPlacementsRef.current = [];
+    setPendingMediaPlacement(null);
+    void (async () => {
+      for (const placement of queued) {
+        await addClipAndPlaceOnBoard(placement.item);
+      }
+    })();
+    setToast(queued.length === 1 ? "Media added to the board" : `${queued.length} media items added to the board`);
   }
 
   function deleteClip(clipId: string) {
@@ -6892,8 +6968,8 @@ export default function Board2Page() {
         });
       }
     }
-    if (isMobile) await addClipAndPlaceOnBoard(item);
-    else queueMediaPlacement(item);
+    if (playModeRef.current) queueMediaPlacement(item);
+    else await addClipAndPlaceOnBoard(item);
   }
 
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -6907,13 +6983,6 @@ export default function Board2Page() {
   function openPlayAddMenu() {
     setPlayCleanMenuOpen(false);
     setPlayAddMenuOpen((v) => !v);
-  }
-
-  function triggerPlayMediaUpload() {
-    setPlayAddMenuOpen(false);
-    playHeldKeysRef.current.clear();
-    playPointerRef.current = null;
-    mediaUploadRef.current?.click();
   }
 
   function openPlayYoutubeModal() {
@@ -6991,47 +7060,52 @@ export default function Board2Page() {
         const blob = await dlRes.blob();
         const blobUrl = URL.createObjectURL(blob);
         const clipDuration = end - start;
-        const clipId = generateId();
-
-        const vid = createVideoElement(clipId, blobUrl);
-
-        // Wait for metadata to get natural dimensions + source duration
-        const meta = await new Promise<{ w: number; h: number; sourceDurationSec: number }>((resolve) => {
-          const timer = setTimeout(() => resolve({ w: 800, h: 450, sourceDurationSec: clipDuration }), 3000);
-          vid.addEventListener("loadedmetadata", () => {
-            clearTimeout(timer);
-            const sourceDurationSec = isFinite(vid.duration) ? vid.duration : clipDuration;
-            if (vid.videoWidth > 0 && vid.videoHeight > 0) {
-              const scale = Math.min(1, 800 / vid.videoWidth, 600 / vid.videoHeight);
-              resolve({ w: Math.round(vid.videoWidth * scale), h: Math.round(vid.videoHeight * scale), sourceDurationSec });
-            } else {
-              resolve({ w: 800, h: 450, sourceDurationSec });
-            }
-          }, { once: true });
-        });
+        const rawMeta = await getVideoMeta(blobUrl);
+        const scale = rawMeta.w > 0 && rawMeta.h > 0 ? Math.min(1, 800 / rawMeta.w, 600 / rawMeta.h) : 1;
+        const meta = {
+          w: rawMeta.w > 0 ? Math.round(rawMeta.w * scale) : 800,
+          h: rawMeta.h > 0 ? Math.round(rawMeta.h * scale) : 450,
+          sourceDurationSec: rawMeta.duration > 0 ? rawMeta.duration : clipDuration,
+        };
 
         // Register dimensions so getMediaDimensions can use them for future duplicates
         if (meta.w > 0 && !videoDimsRef.current.has(blobUrl)) {
           videoDimsRef.current.set(blobUrl, { w: meta.w, h: meta.h });
         }
-        setClips((prev) => {
-          const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-          const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
-          const pos = (placeholderBoardX !== undefined && placeholderBoardY !== undefined)
-            ? { boardX: placeholderBoardX, boardY: placeholderBoardY }
-            : findBoardPosForNewMedia(prev, meta.w, meta.h);
-          return [...prev, {
-            id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
-            startTime: endTime, duration: clipDuration, layer,
-            boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
-            sourceDurationSec: meta.sourceDurationSec,
-            sourceBlob: blob,
-            youtubeId: ytSel.id, ytStart: start, ytEnd: end,
-          }];
-        });
-        setSelectedClipId(clipId);
-        if (sourcePlaceholderId) {
-          setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== sourcePlaceholderId));
+        if (playModeRef.current) {
+          queueMediaPlacement({
+            id: generateId(),
+            name: title,
+            type: "video",
+            url: blobUrl,
+            duration: clipDuration,
+            blob,
+            youtubeId: ytSel.id,
+            ytStart: start,
+            ytEnd: end,
+          });
+        } else {
+          const clipId = generateId();
+          createVideoElement(clipId, blobUrl);
+          setClips((prev) => {
+            const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
+            const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
+            const pos = (placeholderBoardX !== undefined && placeholderBoardY !== undefined)
+              ? { boardX: placeholderBoardX, boardY: placeholderBoardY }
+              : findBoardPosForNewMedia(prev, meta.w, meta.h);
+            return [...prev, {
+              id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
+              startTime: endTime, duration: clipDuration, layer,
+              boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
+              sourceDurationSec: meta.sourceDurationSec,
+              sourceBlob: blob,
+              youtubeId: ytSel.id, ytStart: start, ytEnd: end,
+            }];
+          });
+          setSelectedClipId(clipId);
+          if (sourcePlaceholderId) {
+            setNeuralPlaceholders((prev) => prev.filter((p) => p.id !== sourcePlaceholderId));
+          }
         }
 
         setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
@@ -9834,6 +9908,7 @@ export default function Board2Page() {
   function issuePlayCharacterAction(command: LiveCommandKey, target?: { x: number; y: number; rawX?: number; rawY?: number; surface?: RequiredSurfaceClip }) {
     const state = playPhysicsRef.current;
     if (!state) return;
+    if (playPointingRef.current) setPlayPointingMode(false);
     const now = performance.now();
     const currentPose = currentPlayPose(now) ?? sharedPlayPoseFromPhysics(state, playTimeRef.current);
     const startX = currentPose.boardX;
@@ -9931,6 +10006,11 @@ export default function Board2Page() {
 
   function togglePlayMediaFocus() {
     if (playMediaFocusIdRef.current) {
+      const focusedClip = clipsRef.current.find((clip) => clip.id === playMediaFocusIdRef.current);
+      if (focusedClip?.type === "video") {
+        const focusedVideo = videoElsRef.current.get(focusedClip.id);
+        if (focusedVideo) setClipAudioOff(focusedClip.id, focusedVideo);
+      }
       playMediaFocusIdRef.current = null;
       setPlayMediaFocusId(null);
       setToast("Camera following character");
@@ -9986,6 +10066,44 @@ export default function Board2Page() {
     playTalkingGesturesRef.current = next;
     setPlayTalkingGestures(next);
     setToast(next ? "Talking gestures on" : "Talking gestures off");
+  }
+
+  function setPlayPointingMode(enabled: boolean) {
+    if (playPointingRef.current === enabled) return;
+    const state = playPhysicsRef.current;
+    if (enabled && state) {
+      const pose = currentPlayPose() ?? sharedPlayPoseFromPhysics(state, playTimeRef.current);
+      playActionRuntimeRef.current = null;
+      state.x = pose.boardX;
+      state.y = resolveGroundY(pose.boardX, pose.boardY, clipsRef.current, streamCratersRef.current);
+      state.vx = 0;
+      state.vy = 0;
+      state.grounded = true;
+      state.surfaceId = findSurfaceAtFeet(state.x, state.y, clipsRef.current)?.id ?? null;
+      state.action = "none";
+      state.airborneAt = undefined;
+      state.grappleX = null;
+      state.grappleY = null;
+      playPointerRef.current = null;
+      const choke = playForceChokeRef.current;
+      if (choke) {
+        sendForceChokeState(choke.targetGuestId, "end", choke.position);
+        playForceChokeRef.current = null;
+      }
+      playWeaponArmedRef.current = false;
+      setPlayWeaponArmed(false);
+      playBazookaArmedRef.current = false;
+      setPlayBazookaArmed(false);
+      playWeaponShotsRef.current = [];
+      broadcastWeaponState(true);
+    }
+    playPointingRef.current = enabled;
+    setPlayPointing(enabled);
+    setToast(enabled ? "Pointing mode on — move the mouse to aim" : "Pointing mode off");
+  }
+
+  function togglePlayPointing() {
+    setPlayPointingMode(!playPointingRef.current);
   }
 
   function playWeaponOrigin(state: PlayCharacterState): { x: number; y: number } {
@@ -10744,9 +10862,13 @@ export default function Board2Page() {
     setPlaySceneShot(false);
     playTalkingGesturesRef.current = false;
     setPlayTalkingGestures(false);
+    playPointingRef.current = false;
+    setPlayPointing(false);
     playMediaFocusIdRef.current = null;
     setPlayMediaFocusId(null);
+    playModeRef.current = true;
     setPlayMode(true);
+    isPlayingRef.current = false;
     setIsPlaying(false);
   }
 
@@ -10756,9 +10878,14 @@ export default function Board2Page() {
       sendForceChokeState(choke.targetGuestId, "end", choke.position);
       playForceChokeRef.current = null;
     }
+    playModeRef.current = false;
     setPlayMode(false);
+    stopAllVideoPlayback("play-mode-exited");
+    placePendingMediaAutomatically();
     playTalkingGesturesRef.current = false;
     setPlayTalkingGestures(false);
+    playPointingRef.current = false;
+    setPlayPointing(false);
     playMediaFocusIdRef.current = null;
     setPlayMediaFocusId(null);
     playHeldKeysRef.current.clear();
@@ -10817,6 +10944,10 @@ export default function Board2Page() {
       e.preventDefault();
       return;
     }
+    if (playPointingRef.current) {
+      e.preventDefault();
+      return;
+    }
     if (playBazookaArmedRef.current) { e.preventDefault(); firePlayBazooka(); return; }
     const guest = point ? guestAtPlayPoint(point) : null;
     if (guest) {
@@ -10868,6 +10999,7 @@ export default function Board2Page() {
       x: (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX,
       y: (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY,
     };
+    if (playPointingRef.current) return;
     if (playWeaponArmedRef.current && (e.buttons & 1) === 1) {
       firePlayWeaponBurst();
       return;
@@ -11088,6 +11220,7 @@ export default function Board2Page() {
     let raf = 0;
     let last = 0;
     const frame = (wall: number) => {
+      if (!playModeRef.current) return;
       const canvas = playCanvasRef.current;
       if (!canvas) return;
       if (playWallStartRef.current === 0) playWallStartRef.current = wall;
@@ -11132,6 +11265,11 @@ export default function Board2Page() {
         playPose = sharedPlayPoseFromPhysics(state, now);
       }
       playPose = applyPlayTalkingGestures(playPose, wall);
+      if (playPointingRef.current) {
+        const target = playCursorRef.current ?? { x: state.x + state.facing * 400, y: state.y - 115 };
+        playPose = playPointingPoseToward(playPose, state, target);
+        state.facing = playPose.facing;
+      }
       updateLiveBazookaShots(nowMs);
       updatePlayWeaponShots(nowMs, previousNowMs);
       if (playWeaponArmedRef.current || playBazookaArmedRef.current) {
@@ -11160,7 +11298,7 @@ export default function Board2Page() {
       const follow = 1 - Math.exp(-dt * 5.5);
       playCameraRef.current = { cameraX: lerp(playCameraRef.current.cameraX, target.cameraX, follow), cameraY: lerp(playCameraRef.current.cameraY, target.cameraY, follow), boardZoom: lerp(playCameraRef.current.boardZoom, target.boardZoom, mediaTarget || playSceneShot ? follow : follow * 0.08) };
       evaluateVideoPlaybackStates(editorPlayheadBeforePlayRef.current, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, {
-        audioMode: "preview",
+        audioMode: "focused",
         overrideCamera: playCameraRef.current,
         focusedVideoId: focusedMedia?.type === "video" ? focusedMedia.id : null,
       });
@@ -11254,6 +11392,7 @@ export default function Board2Page() {
         if (e.repeat) return;
         if (e.code === "KeyQ") {
           e.preventDefault();
+          if (playPointingRef.current) setPlayPointingMode(false);
           if(playBazookaArmedRef.current){playBazookaArmedRef.current=false;setPlayBazookaArmed(false);return;}
           setPlayWeaponArmed((armed) => {
             const next = !armed;
@@ -11266,6 +11405,7 @@ export default function Board2Page() {
         }
         if (e.code === "KeyB") {
           e.preventDefault();
+          if (playPointingRef.current) setPlayPointingMode(false);
           const next = !playBazookaArmedRef.current;
           playWeaponArmedRef.current = false;
           setPlayWeaponArmed(false);
@@ -11279,6 +11419,7 @@ export default function Board2Page() {
           setPlayHostHealthVisible((visible) => !visible);
           return;
         }
+        if (e.code === "KeyL") { e.preventDefault(); togglePlayLiveSpeech(); return; }
         if (e.code === "KeyV") { e.preventDefault(); togglePlayTalkingGestures(); return; }
         if (e.code === "KeyC") { e.preventDefault(); togglePlayMediaFocus(); return; }
         if (playWeaponArmedRef.current && ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.code)) {
@@ -11301,7 +11442,7 @@ export default function Board2Page() {
           return;
         }
         if (e.code === "KeyM") { e.preventDefault(); issuePlayCharacterAction("mirrorCheck"); return; }
-        if (e.code === "KeyP") { e.preventDefault(); issuePlayCharacterAction("pullUps"); return; }
+        if (e.code === "KeyP") { e.preventDefault(); togglePlayPointing(); return; }
         if (e.code === "KeyE") { e.preventDefault(); issuePlayCharacterAction("emote"); return; }
         if (e.code === "KeyT") { e.preventDefault(); issuePlayCharacterAction("sitAndWatch"); return; }
         if (e.code === "KeyX") { e.preventDefault(); issuePlayCharacterAction("stop"); return; }
@@ -12015,7 +12156,6 @@ export default function Board2Page() {
             }
           `}</style>
 	        <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-	        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
 	        <canvas
 	          ref={playCanvasRef}
           width={playViewport.width}
@@ -12067,7 +12207,23 @@ export default function Board2Page() {
 	        </button>}
 	        {playAddMenuOpen && (
 	          <div style={{ position: "fixed", top: 52, left: playCleanUi ? 78 : 154, zIndex: 7, minWidth: 190, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.96)", boxShadow: "3px 3px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10, color: "#2a2a2a", overflow: "hidden" }}>
-	            <button type="button" onClick={triggerPlayMediaUpload} style={{ width: "100%", padding: "9px 10px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer" }}>📷 Add image</button>
+	            <label style={{ position: "relative", display: "block", width: "100%", padding: "9px 10px", border: "none", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer", boxSizing: "border-box" }}>
+                📷 Add image
+                <input
+                  type="file"
+                  accept="image/*,video/*"
+                  multiple
+                  aria-label="Add image or video"
+                  onClick={(e) => { e.currentTarget.value = ""; }}
+                  onChange={(e) => {
+                    setPlayAddMenuOpen(false);
+                    playHeldKeysRef.current.clear();
+                    playPointerRef.current = null;
+                    void handleMediaUpload(e);
+                  }}
+                  style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
+                />
+              </label>
 	            <button type="button" onClick={openPlayYoutubeModal} style={{ width: "100%", padding: "9px 10px", border: "none", borderTop: "1px solid rgba(42,42,42,0.2)", background: "transparent", textAlign: "left", fontFamily: "inherit", fontWeight: 900, cursor: "pointer" }}>▶️ Add YouTube</button>
 	            <div style={{ padding: "8px 10px", borderTop: "1px solid rgba(42,42,42,0.2)", color: "#6a6a6a", lineHeight: 1.45 }}>📋 Paste with Cmd/Ctrl+V</div>
 	          </div>
@@ -12096,7 +12252,7 @@ export default function Board2Page() {
           <button
             type="button"
             onClick={togglePlayLiveSpeech}
-            title="Animate the character's mouth from your microphone"
+            title="Animate the character's mouth from your microphone (L)"
             style={{
               position: "fixed",
               top: 14,
@@ -12161,7 +12317,7 @@ export default function Board2Page() {
           </button>
           {playLegendOpen && (
             <div style={{ clear: "both", marginTop: 5, padding: "10px 12px", lineHeight: 1.75, border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,0.92)", boxShadow: "2px 2px 0 #2a2a2a" }}>
-              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · B {playBazookaArmed ? "stow bazooka" : "bazooka"} · H health · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · V {playTalkingGestures ? "stop talking gestures" : "talking gestures"}<br />D dance · E emote · F flip · J jump · P pull-ups · M mirror · wheel zoom · Esc exit
+              Click near/far to walk/run · aim above to jump<br />Q {playWeaponArmed ? "holster weapon" : "weapon mode"} · B {playBazookaArmed ? "stow bazooka" : "bazooka"} · H health · click/hold fires while armed<br />Hold G/S/Z + click for grapple/skate/zipline<br />C {playMediaFocusId ? "follow character" : "focus current image/video"} · L {playLiveSpeechEnabled ? "live mouth off" : "live mouth on"} · P {playPointing ? "stop pointing" : "point at mouse"} · V {playTalkingGestures ? "stop talking gestures" : "talking gestures"}<br />D dance · E emote · F flip · J jump · M mirror · wheel zoom · Esc exit
 	            </div>
 	          )}
 	        </div>}
@@ -12214,7 +12370,6 @@ export default function Board2Page() {
     return (
       <div style={{ ...pageStyle, overflow: "hidden", display: "flex", flexDirection: "column", height: "100dvh" }}>
         <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-        <input ref={mediaUploadRef} type="file" accept="image/*,video/*" multiple style={{ display: "none" }} onChange={handleMediaUpload} />
         <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
         <input ref={projectFileInputRef} type="file" accept=".nbp,.zip" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }} />
         <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
@@ -12596,9 +12751,21 @@ export default function Board2Page() {
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    <button onClick={() => { mediaUploadRef.current?.click(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}>
+                    <label style={{ ...sketchButton, position: "relative", display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box", overflow: "hidden" }}>
                       ↑  Upload photo / video
-                    </button>
+                      <input
+                        type="file"
+                        accept="image/*,video/*"
+                        multiple
+                        aria-label="Upload photo or video"
+                        onClick={(e) => { e.currentTarget.value = ""; }}
+                        onChange={(e) => {
+                          void handleMediaUpload(e);
+                          setMobileDrawer(null);
+                        }}
+                        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
+                      />
+                    </label>
                     <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}>
                       ▶  Add YouTube clip
                     </button>
@@ -13326,7 +13493,18 @@ export default function Board2Page() {
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
-            <button onClick={() => mediaUploadRef.current?.click()} style={sketchButton}>↑ Upload media</button>
+            <label style={{ ...sketchButton, position: "relative", display: "block", textAlign: "center", boxSizing: "border-box", overflow: "hidden" }}>
+              ↑ Upload media
+              <input
+                type="file"
+                accept="image/*,video/*"
+                multiple
+                aria-label="Upload media"
+                onClick={(e) => { e.currentTarget.value = ""; }}
+                onChange={handleMediaUpload}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
+              />
+            </label>
             <button
               onClick={() => addPanClip()}
               style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
@@ -13465,14 +13643,6 @@ export default function Board2Page() {
             </ProGated>}
 
             <input
-              ref={mediaUploadRef}
-              type="file"
-              accept="image/*,video/*"
-              multiple
-              style={{ display: "none" }}
-              onChange={handleMediaUpload}
-            />
-            <input
               ref={projectFileInputRef}
               type="file"
               accept=".nbp,.zip"
@@ -13480,7 +13650,7 @@ export default function Board2Page() {
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }}
             />
             <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
-              Upload images or videos, then zoom/pan and click where each one should be placed.
+              Upload images or videos — they automatically appear on the board and timeline.
             </p>
           </div>
 
