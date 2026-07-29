@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { UpgradePrompt } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
+import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import {
   AuthoredAnimation,
   DEFAULT_POSE,
@@ -18,7 +19,7 @@ import {
 
 const PANEL = "#fffdf5";
 const INK = "#2a2a2a";
-const PARCHMENT = "#f5ecd8";
+const PARCHMENT = BOARD_SURFACE_COLOR;
 const ACCENT = "#cdeac0";
 const SVG_W = 620;
 const SVG_H = 640;

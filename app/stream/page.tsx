@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { DEBUG_STREAM, STREAM_OWNER_NAME, STREAM_OWNER_USER_ID } from "@/app/board2/config";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
+import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { RENDERER_VERSION, drawBazookaHeld, drawEliminationSequence, drawTommyGunHeld, drawWeaponProjectile, eliminationFrameForGuest, streamCharacterConstructionParams } from "@/lib/character/renderer";
 import { bazookaShake, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip } from "@/lib/character/terrain";
@@ -957,7 +958,7 @@ export default function StreamPage() {
         const sf = baseCam.boardZoom * w / BOARD_W;
         const shake=bazookaShake(bazookaEventsRef.current);
         const cam={...baseCam,cameraX:baseCam.cameraX-shake.x/sf,cameraY:baseCam.cameraY-shake.y/sf};
-        ctx.fillStyle = snapshot?.board.backgroundColor ?? "#f5ecd8";
+        ctx.fillStyle = snapshot?.board.backgroundColor ?? BOARD_SURFACE_COLOR;
         ctx.fillRect(0, 0, w, h);
         if (snapshot) {
           for (const clip of [...snapshot.clips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1))) {
@@ -1120,7 +1121,7 @@ export default function StreamPage() {
     {label:"Leave",icon:"←",onSelect:()=>choose(()=>void leave())},
   ];
   return (
-    <main ref={containerRef} style={{ position: "fixed", inset: 0, zIndex:maximize?2147483000:undefined, overflow: "hidden", background: "#f5ecd8" }}>
+    <main ref={containerRef} style={{ position: "fixed", inset: 0, zIndex:maximize?2147483000:undefined, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <canvas ref={canvasRef} onClick={clickCanvas} onPointerMove={e=>{if(mode!=="guest"||hostCam)return;const rect=e.currentTarget.getBoundingClientRect(),sf=camera.current.boardZoom*rect.width/BOARD_W;guestBazookaAimRef.current={x:(e.clientX-rect.left-rect.width/2)/sf+camera.current.cameraX,y:(e.clientY-rect.top-rect.height/2)/sf+camera.current.cameraY};}} style={{ width: "100vw", height: "100vh", display: "block", cursor: mode === "guest" && !hostCam ? "crosshair" : "default" }} />
       {mode==="guest"&&hostHealth&&hostHealth.current<hostHealth.max&&<div aria-label={`Host health ${hostHealth.current} of ${hostHealth.max}`} style={{position:"fixed",top:"max(12px, env(safe-area-inset-top))",left:"50%",transform:"translateX(-50%)",zIndex:20,width:"min(240px, 48vw)",padding:"7px 9px",border:"1.5px solid #2a2a2a",background:"rgba(255,253,245,.92)",boxShadow:"2px 2px 0 #2a2a2a",fontFamily:"monospace",fontSize:10,fontWeight:800,textAlign:"center",pointerEvents:"none"}}>
         <div style={{marginBottom:5}}>HOST HEALTH</div>
@@ -1137,7 +1138,7 @@ export default function StreamPage() {
   );
 }
 
-const landing:React.CSSProperties={minHeight:"100vh",background:"#f5ecd8",color:"#2a2a2a",fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"center",padding:24};
+const landing:React.CSSProperties={minHeight:"100vh",background:BOARD_SURFACE_COLOR,color:"#2a2a2a",fontFamily:"monospace",display:"flex",alignItems:"center",justifyContent:"center",padding:24};
 const card:React.CSSProperties={width:390,maxWidth:"100%",border:"2px solid #2a2a2a",background:"#fffdf5",boxShadow:"4px 4px 0 #2a2a2a",padding:18};
 const button:React.CSSProperties={width:"100%",padding:"10px 12px",marginTop:8,border:"2px solid #2a2a2a",background:"#fffdf5",fontFamily:"monospace",fontWeight:700,cursor:"pointer"};
 const input:React.CSSProperties={...button,boxSizing:"border-box"};

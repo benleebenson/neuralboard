@@ -1,4 +1,5 @@
 import type { CharacterSkin, HeadLocalPoint, Viseme } from "../stream";
+import { BOARD_SURFACE_COLOR } from "../board-theme";
 import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
@@ -258,7 +259,7 @@ export function drawBoardCharacterToCanvas(
     ctx.save();
     ctx.globalAlpha = p.pullUpBarAlpha;
     ctx.strokeStyle = "#2a2a2a";
-    ctx.fillStyle = "#f5ecd8";
+    ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.lineWidth = Math.max(1, 2.2 * S);
     ctx.lineCap = "round";
     for (const x of [baseX - postHalf, baseX + postHalf]) {
@@ -466,7 +467,7 @@ export function drawBoardCharacterToCanvas(
     ctx.save();
     ctx.translate(deckCX, deckCY);
     ctx.rotate(p.skateboardTilt ?? 0);
-    ctx.fillStyle = "#f5ecd8";
+    ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = Math.max(1, 2 * S);
     ctx.beginPath();

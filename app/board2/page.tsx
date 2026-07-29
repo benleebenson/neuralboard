@@ -8,6 +8,7 @@ import { ProGated } from "@/app/components/ProGated";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
+import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import {
   STREAM_FPS,
   HOST_STREAM_SKIN,
@@ -4341,7 +4342,7 @@ export default function Board2Page() {
       streamId: STREAM_OWNER_USER_ID,
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
-      board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f7e5c1" },
+      board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
       spawnDoor: spawnDoorRef.current,
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
@@ -5448,7 +5449,7 @@ export default function Board2Page() {
     overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null,
     liveWallMs?: number
   ) => {
-    ctx.fillStyle = "#f7e5c1";
+    ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
     const sf = cam.boardZoom * W / BOARD_W;
@@ -9378,7 +9379,7 @@ export default function Board2Page() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         transcript,
-        board: { width: BOARD_W, height: BOARD_H, backgroundColor: "#f7e5c1" },
+        board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
         clips: sendClips,
       }),
     }).catch(() => null);
@@ -12339,7 +12340,7 @@ export default function Board2Page() {
   // mobileDesktopOverride lets the user escape to the desktop UI.
   if (isMobile && !mobileDesktopOverride && !AI_FEATURES_ENABLED) {
     return (
-      <div style={{ position: "fixed", inset: 0, background: "#f5ecd8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace", padding: 28, textAlign: "center" }}>
+      <div style={{ position: "fixed", inset: 0, background: BOARD_SURFACE_COLOR, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace", padding: 28, textAlign: "center" }}>
         <div style={{ fontSize: 17, fontWeight: 700, color: "#2a2a2a" }}>Open Neural Board on desktop</div>
         <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 10, lineHeight: 1.6 }}>The mobile AI flow is currently hidden while AI features are disabled.</div>
       </div>
@@ -12353,7 +12354,7 @@ export default function Board2Page() {
   // Below: existing mobile board (landscape) — only shown when mobileDesktopOverride is true
   if (isMobile && isPortrait) {
     return (
-      <div style={{ position: "fixed", inset: 0, background: "#f5ecd8", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace" }}>
+      <div style={{ position: "fixed", inset: 0, background: BOARD_SURFACE_COLOR, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace" }}>
         <div style={{ fontSize: 52, lineHeight: 1 }}>↻</div>
         <div style={{ fontSize: 15, fontWeight: 700, marginTop: 18, color: "#2a2a2a" }}>Rotate to landscape</div>
         <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 8, textAlign: "center", padding: "0 32px", lineHeight: 1.6 }}>Neural Board requires landscape mode</div>
@@ -12428,7 +12429,7 @@ export default function Board2Page() {
           onPointerCancel={handleMobileBoardPointerUp}
         >
           {/* Board surface */}
-          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: "#f7e5c1", border: "1.5px dashed rgba(42,42,42,0.2)" }}>
+          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: BOARD_SURFACE_COLOR, border: "1.5px dashed rgba(42,42,42,0.2)" }}>
             {clips.filter((c) => c.boardX !== undefined).map((clip) => {
               const isSel = clip.id === selectedClipId;
               return (
@@ -13678,7 +13679,7 @@ export default function Board2Page() {
                   top: boardPan.y,
                   width: BOARD_W * boardZoom,
                   height: BOARD_H * boardZoom,
-                  background: "#f7e5c1",
+                  background: BOARD_SURFACE_COLOR,
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
