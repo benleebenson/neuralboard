@@ -1822,8 +1822,9 @@ function resolveCharActions(
     // Explicit targetX/Y (manual placement) always wins; otherwise resolve targetClipId against
     // the clip's current position (AI-choreographed actions).
     const resolvedTarget = resolveClipTarget(a, clips);
-    let targetX = a.type === "bazooka" ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
-    let targetY = a.type === "bazooka" ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
+    const clipTargetWins = a.type === "bazooka" || a.type === "grapple";
+    let targetX = clipTargetWins ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
+    let targetY = clipTargetWins ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
       const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters);
       targetX = slot.x;
@@ -1982,6 +1983,7 @@ function deriveAutoCharActions(
           startTime: travelStart,
           duration: travelEnd - travelStart,
           targetX: arriveX, targetY: arriveY,
+          ...(moveType === "grapple" ? { targetClipId: clip.id } : {}),
         });
       }
     }
@@ -2691,9 +2693,13 @@ function evalCharPoseRaw(
   if (active.type === "grapple") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    // Anchor point: above and between start+end, biased toward destination
-    const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
-    const anchorBY = Math.min(active.fromY, ty) - 380;
+    // Attach the hook to the selected destination surface. The old midpoint
+    // heuristic visibly grappled empty board space instead of the chosen image.
+    const targetSurface = findTargetSurface(active, tx, ty, clips);
+    const anchorBX = targetSurface ? clampInsideClipX(targetSurface, tx, 36) : tx;
+    const anchorBY = targetSurface
+      ? targetSurface.boardY + Math.min(48, targetSurface.boardH * 0.12)
+      : Math.min(active.fromY, ty) - 120;
     const landingY = active.targetY ?? ty;
     const PREP_END = 0.12;
     const FIRE_END = 0.22;
@@ -4131,7 +4137,7 @@ export default function Board2Page() {
       duration,
       targetX: Math.round(tx),
       targetY: Math.round(ty),
-      ...(type === "skateTo" && target?.surface?.id ? { targetClipId: target.surface.id } : {}),
+      ...(["skateTo", "grapple"].includes(type) && target?.surface?.id ? { targetClipId: target.surface.id } : {}),
     });
     const tx = target?.x ?? startX;
     const ty = target?.y ?? startY;
@@ -9948,7 +9954,7 @@ export default function Board2Page() {
       duration,
       targetX: Math.round(ax),
       targetY: Math.round(ay),
-      ...(type === "skateTo" && target?.surface?.id ? { targetClipId: target.surface.id } : {}),
+      ...(["skateTo", "grapple"].includes(type) && target?.surface?.id ? { targetClipId: target.surface.id } : {}),
     });
     let action: CharacterAction | null = null;
     if (command === "walkTo" || command === "runTo") {
@@ -14519,7 +14525,7 @@ export default function Board2Page() {
                         targetX: Math.round(a.type === "bazooka" ? rawBx : snapped.x),
                         targetY: Math.round(a.type === "bazooka" ? rawBy : snapped.y),
                         ...(a.type === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
-                        ...(["skateTo", "bazooka"].includes(a.type) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
+                        ...(["skateTo", "grapple", "bazooka"].includes(a.type) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
                       } : a));
                       setRetargetCharActionId(null);
                       return;
@@ -14539,7 +14545,7 @@ export default function Board2Page() {
                       targetX: Math.round(characterAddMode === "bazooka" ? rawBx : snapped.x),
                       targetY: Math.round(characterAddMode === "bazooka" ? rawBy : snapped.y),
                       ...(characterAddMode === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
-                      ...(["skateTo", "bazooka"].includes(characterAddMode) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
+                      ...(["skateTo", "grapple", "bazooka"].includes(characterAddMode) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
                     };
                     updateCharacterActionsFor(activeCharacterIdRef.current, (prev) => [...prev, newAction]);
                     setCharacterAddMode(null);
