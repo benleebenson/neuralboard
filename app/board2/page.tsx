@@ -568,7 +568,13 @@ function authoredBazookaTimeline(
   return { craters, events };
 }
 
-type ResolvedCharAction = CharacterAction & { fromX: number; fromY: number };
+type CharacterTraversalMode = "solid" | "cinematic";
+
+type ResolvedCharAction = CharacterAction & {
+  fromX: number;
+  fromY: number;
+  traversalMode?: CharacterTraversalMode;
+};
 
 type CharacterBlockerTimeline = {
   resolved: ResolvedCharAction[];
@@ -1335,6 +1341,31 @@ function resolveGroundY(
   return groundProfileY(terrain, craters, x)?.y ?? desiredY;
 }
 
+// Timeline choreography is staged for the camera, not simulated as a platformer. Resolve the
+// surface nearest the authored Y so a character can flip/grapple past an upper image to a lower
+// one. Play Mode continues to use resolveGroundY/groundProfileY and its solid-body collision pass.
+function resolveCinematicGroundY(
+  x: number,
+  desiredY: number,
+  clips: CharSurfaceClip[],
+  craters: readonly StreamCrater[] = []
+): number {
+  const candidates = clips
+    .filter(isBoardSurface)
+    .filter((clip) => {
+      const pad = Math.min(40, Math.max(0, clip.boardW / 2 - 1));
+      return x >= clip.boardX + pad &&
+        x <= clip.boardX + clip.boardW - pad &&
+        clip.boardY <= desiredY + 1;
+    })
+    .sort((a, b) => b.boardY - a.boardY);
+  for (const clip of candidates) {
+    const profile = groundProfileY([clip as TerrainClip], craters, x);
+    if (profile) return profile.y;
+  }
+  return desiredY;
+}
+
 // Snap a board position to the top surface of the clip under x (for action placement).
 function snapToClipTop(
   tx: number, ty: number,
@@ -1348,14 +1379,23 @@ function snapToClipTop(
     tx >= c.boardX! && tx <= c.boardX! + (c.boardW ?? 0)
   );
   if (candidates.length === 0) return { x: tx, y: ty };
-  // Pick topmost clip whose body contains the click point (boardY <= ty <= boardY + boardH)
+  // Prefer the surface whose top is nearest the click. This lets a deliberately clicked lower
+  // image win even when another image overlaps the same horizontal lane.
   const hit = candidates
     .filter((c) => ty >= c.boardY! && ty <= c.boardY! + (c.boardH ?? 0))
-    .sort((a, b) => a.boardY! - b.boardY!)[0];  // topmost
+    .sort((a, b) => Math.abs(a.boardY! - ty) - Math.abs(b.boardY! - ty))[0];
   if (hit) {
     // Clamp x to the inner span (not on extreme edges)
     const cx = Math.max(hit.boardX! + PAD, Math.min(hit.boardX! + (hit.boardW ?? 0) - PAD, tx));
-    return { x: cx, y: resolveGroundY(cx, ty, clips, craters) };
+    const profile = groundProfileY([{
+      id: hit.id ?? "clicked-surface",
+      type: hit.type!,
+      boardX: hit.boardX!,
+      boardY: hit.boardY!,
+      boardW: hit.boardW!,
+      boardH: hit.boardH!,
+    }], craters, cx);
+    return { x: cx, y: profile?.y ?? hit.boardY! };
   }
   return { x: tx, y: ty };
 }
@@ -1492,10 +1532,13 @@ function resolveStandingSlot(
   clips: CharSurfaceClip[],
   blockers: CharacterBlockerTimeline[] = [],
   laneBias = 0,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  traversalMode: CharacterTraversalMode = "solid"
 ): { x: number; y: number } {
   const surface = findStandingSurfaceForTarget(desiredX, desiredY, targetClipId, clips);
-  const groundY = resolveGroundY(desiredX, surface?.boardY ?? desiredY, clips, craters);
+  const groundY = traversalMode === "cinematic"
+    ? resolveCinematicGroundY(desiredX, surface?.boardY ?? desiredY, surface ? [surface] : clips, craters)
+    : resolveGroundY(desiredX, surface?.boardY ?? desiredY, clips, craters);
   const baseX = surface ? clampInsideClipX(surface, desiredX + laneBias, 50) : desiredX + laneBias;
   const offsets = [0, 70, -70, 140, -140];
   const minSeps = [90, 55];
@@ -1813,7 +1856,8 @@ function resolveCharActions(
   clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
   blockers: CharacterBlockerTimeline[] = [],
   laneBias = 0,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  traversalMode: CharacterTraversalMode = "solid"
 ): ResolvedCharAction[] {
   const sorted = [...actions].sort((a, b) => a.startTime - b.startTime);
   let x = initX, y = initY;
@@ -1822,17 +1866,23 @@ function resolveCharActions(
     // Explicit targetX/Y (manual placement) always wins; otherwise resolve targetClipId against
     // the clip's current position (AI-choreographed actions).
     const resolvedTarget = resolveClipTarget(a, clips);
-    const clipTargetWins = a.type === "bazooka" || a.type === "grapple";
-    let targetX = clipTargetWins ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
-    let targetY = clipTargetWins ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
+    let targetX = a.type === "bazooka" ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
+    let targetY = a.type === "bazooka" ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
-      const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters);
+      const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters, traversalMode);
       targetX = slot.x;
       targetY = slot.y;
     }
     // startX/startY (entrance/exit flips) override the chained position for this action only —
     // the chain continues from targetX/targetY afterward, same as any other travel action.
-    const resolvedAction: ResolvedCharAction = { ...a, targetX, targetY, fromX: a.startX ?? x, fromY: a.startY ?? y };
+    const resolvedAction: ResolvedCharAction = {
+      ...a,
+      targetX,
+      targetY,
+      fromX: a.startX ?? x,
+      fromY: a.startY ?? y,
+      traversalMode,
+    };
     result.push(resolvedAction);
     if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
       const rest = resolvedActionRestPosition(resolvedAction, clips, craters);
@@ -1842,6 +1892,17 @@ function resolveCharActions(
     // their target after an evaluation-layer walk-in.
   }
   return result;
+}
+
+function resolveEditorCharActions(
+  actions: CharacterAction[],
+  initX: number,
+  initY: number,
+  clips: { id: string; boardX?: number; boardY?: number; boardW?: number; boardH?: number; type?: string }[],
+  blockers: CharacterBlockerTimeline[] = [],
+  laneBias = 0
+): ResolvedCharAction[] {
+  return resolveCharActions(actions, initX, initY, clips, blockers, laneBias, [], "cinematic");
 }
 
 // Merge auto-derived actions with manual overrides:
@@ -2693,13 +2754,10 @@ function evalCharPoseRaw(
   if (active.type === "grapple") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
-    // Attach the hook to the selected destination surface. The old midpoint
-    // heuristic visibly grappled empty board space instead of the chosen image.
-    const targetSurface = findTargetSurface(active, tx, ty, clips);
-    const anchorBX = targetSurface ? clampInsideClipX(targetSurface, tx, 36) : tx;
-    const anchorBY = targetSurface
-      ? targetSurface.boardY + Math.min(48, targetSurface.boardH * 0.12)
-      : Math.min(active.fromY, ty) - 120;
+    // The editor grapple hooks open air above the route so the move reads as a broad cinematic
+    // swing rather than a direct pull into the selected image.
+    const anchorBX = active.fromX + (tx - active.fromX) * 0.55;
+    const anchorBY = Math.min(active.fromY, ty) - 380;
     const landingY = active.targetY ?? ty;
     const PREP_END = 0.12;
     const FIRE_END = 0.22;
@@ -2758,8 +2816,23 @@ function evalCharPoseRaw(
       ropeAlpha = 1;
       hookT = t;
     } else if (progress < RELEASE_DETACH) {
-      bx = lerp(active.fromX, tx, zipT);
-      by = lerp(active.fromY, landingY - 60, zipT) + sag;
+      if (active.traversalMode === "cinematic") {
+        // Restore the authored/editor pendulum path: the hook stays in open air while the
+        // character follows a broad show-first arc to the selected destination. This deliberately
+        // ignores intervening media solids; Play Mode keeps the direct, collision-aware pull.
+        const inverseT = 1 - zipT;
+        const controlX = (active.fromX + tx) / 2;
+        const controlY = Math.max(active.fromY, landingY) + 180;
+        bx = inverseT * inverseT * active.fromX +
+          2 * inverseT * zipT * controlX +
+          zipT * zipT * tx;
+        by = inverseT * inverseT * active.fromY +
+          2 * inverseT * zipT * controlY +
+          zipT * zipT * (landingY - 60);
+      } else {
+        bx = lerp(active.fromX, tx, zipT);
+        by = lerp(active.fromY, landingY - 60, zipT) + sag;
+      }
       const movingAimA = aimAngleFromPoint(bx, by, facing, anchorBX, anchorBY);
       setFiringArm(movingAimA, movingAimA);
       ropeAlpha = 1;
@@ -4111,11 +4184,12 @@ export default function Board2Page() {
     const rawY = (clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
     const snapped = snapToClipTop(rawX, rawY, clipsRef.current, streamCratersRef.current);
     const surface = clipsRef.current
-      .find((c): c is Clip & RequiredSurfaceClip =>
+      .filter((c): c is Clip & RequiredSurfaceClip =>
         isBoardSurface(c) &&
         rawX >= c.boardX && rawX <= c.boardX + c.boardW &&
         rawY >= c.boardY && rawY <= c.boardY + c.boardH
-      );
+      )
+      .sort((a, b) => Math.abs(a.boardY - rawY) - Math.abs(b.boardY - rawY))[0];
     return { rawX, rawY, x: snapped.x, y: snapped.y, surface };
   }, []);
 
@@ -4798,7 +4872,7 @@ export default function Board2Page() {
     const merged = characterMode === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions)
       : characterActions;
-    return resolveCharActions(merged, charInit.x, charInit.y, clips);
+    return resolveEditorCharActions(merged, charInit.x, charInit.y, clips);
   }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
@@ -4811,7 +4885,7 @@ export default function Board2Page() {
     const merged = characterMode2 === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit2.x, charInit2.y, cameraKeyframes, canvasW, canvasH), characterActions2)
       : characterActions2;
-    return resolveCharActions(
+    return resolveEditorCharActions(
       merged,
       charInit2.x,
       charInit2.y,
@@ -4825,11 +4899,11 @@ export default function Board2Page() {
   // derivation stays exclusive to clips mode, while Character 2 retains the current collision
   // resolver and is available to widen settled framing without becoming the follow target.
   const cameraResolvedCharActions = useMemo(
-    () => resolveCharActions(characterActions, charInit.x, charInit.y, clips),
+    () => resolveEditorCharActions(characterActions, charInit.x, charInit.y, clips),
     [characterActions, charInit, clips],
   );
   const cameraResolvedCharActions2 = useMemo(
-    () => resolveCharActions(
+    () => resolveEditorCharActions(
       characterActions2,
       charInit2.x,
       charInit2.y,
@@ -14478,11 +14552,12 @@ export default function Board2Page() {
                     // Snap target to top of clip surface if clicked on an image/video
                     const snapped = snapToClipTop(rawBx, rawBy, clipsRef.current);
                     const clickedSurface = clipsRef.current
-                      .find((c): c is Clip & RequiredSurfaceClip =>
+                      .filter((c): c is Clip & RequiredSurfaceClip =>
                         isBoardSurface(c) &&
                         rawBx >= c.boardX && rawBx <= c.boardX + c.boardW &&
                         rawBy >= c.boardY && rawBy <= c.boardY + c.boardH
-                      );
+                      )
+                      .sort((a, b) => Math.abs(a.boardY - rawBy) - Math.abs(b.boardY - rawBy))[0];
                     if (characterStartPickId) {
                       const next = { x: Math.round(snapped.x), y: Math.round(snapped.y) };
                       if (characterStartPickId === "c2") {
@@ -14525,7 +14600,7 @@ export default function Board2Page() {
                         targetX: Math.round(a.type === "bazooka" ? rawBx : snapped.x),
                         targetY: Math.round(a.type === "bazooka" ? rawBy : snapped.y),
                         ...(a.type === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
-                        ...(["skateTo", "grapple", "bazooka"].includes(a.type) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
+                        ...((actionCanChangeRestPosition(a.type) || a.type === "bazooka") && clickedSurface?.id ? { targetClipId: clickedSurface.id } : { targetClipId: undefined }),
                       } : a));
                       setRetargetCharActionId(null);
                       return;
@@ -14545,7 +14620,7 @@ export default function Board2Page() {
                       targetX: Math.round(characterAddMode === "bazooka" ? rawBx : snapped.x),
                       targetY: Math.round(characterAddMode === "bazooka" ? rawBy : snapped.y),
                       ...(characterAddMode === "bazooka" && clickedSurface ? { targetLocalX: Math.round(rawBx-clickedSurface.boardX), targetLocalY: Math.round(rawBy-clickedSurface.boardY) } : {}),
-                      ...(["skateTo", "grapple", "bazooka"].includes(characterAddMode) && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
+                      ...((actionCanChangeRestPosition(characterAddMode) || characterAddMode === "bazooka") && clickedSurface?.id ? { targetClipId: clickedSurface.id } : {}),
                     };
                     updateCharacterActionsFor(activeCharacterIdRef.current, (prev) => [...prev, newAction]);
                     setCharacterAddMode(null);
