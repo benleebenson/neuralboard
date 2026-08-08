@@ -1,4 +1,4 @@
-export type CameraMode = "clips" | "character";
+export type CameraMode = "clips" | "character" | "follow";
 
 export type CameraKeyframeLike = {
   time: number;
@@ -22,6 +22,9 @@ export type ResolvedCharacterActionLike = {
 export type BoardClipLike = {
   id: string;
   type: string;
+  startTime?: number;
+  duration?: number;
+  holdFraction?: number;
   boardX?: number;
   boardY?: number;
   boardW?: number;
@@ -30,6 +33,32 @@ export type BoardClipLike = {
 
 export type CharacterPosition = { x: number; y: number };
 export type OccupancyWindow = { clipId: string; start: number; end: number };
+
+export type FollowFramedSurface = {
+  blockId: string;
+  clipId?: string;
+  start: number;
+  end: number;
+};
+
+export type FollowCameraNote = {
+  blockId: string;
+  time: number;
+  message: string;
+};
+
+export type FollowCameraDerivation = {
+  keyframes: CameraKeyframeLike[];
+  framedSurfaces: FollowFramedSurface[];
+  occupancyWindows: OccupancyWindow[];
+  notes: FollowCameraNote[];
+};
+
+export const FOLLOW_CAM_SAMPLE_STEP = 0.1;
+export const FOLLOW_CAM_STIFFNESS = 18;
+export const FOLLOW_CAM_DAMPING = 5;
+export const FOLLOW_CAM_VELOCITY_LAG_SECONDS = 0.16;
+export const FOLLOW_CAM_MAX_TRAIL_FRAME_FRACTION = 0.38;
 
 export const CHARACTER_TRAVEL_ACTIONS = new Set([
   "walkTo", "run", "jumpTo", "flip", "grapple", "zipline", "wallClimb", "skateTo",
@@ -272,4 +301,220 @@ export function deriveCharacterCameraKeyframes(args: {
   const byTime = new Map<number, CameraKeyframeLike>();
   for (const event of events.sort((a, b) => a.time - b.time)) byTime.set(Math.round(event.time * 1000), event);
   return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
+type FollowSample = CameraStop & { time: number };
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function smoothstep(value: number): number {
+  const t = clampNumber(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function mergeOccupancyWindows(windows: OccupancyWindow[]): OccupancyWindow[] {
+  const merged: OccupancyWindow[] = [];
+  for (const window of [...windows].sort((a, b) => a.clipId.localeCompare(b.clipId) || a.start - b.start || a.end - b.end)) {
+    const previous = merged[merged.length - 1];
+    if (previous?.clipId === window.clipId && window.start <= previous.end + 0.001) {
+      previous.end = Math.max(previous.end, window.end);
+    } else if (window.end - window.start > 0.001) {
+      merged.push({ ...window });
+    }
+  }
+  return merged.sort((a, b) => a.start - b.start || a.end - b.end || a.clipId.localeCompare(b.clipId));
+}
+
+function dynamicFollowSamples(args: {
+  duration: number;
+  canvasW: number;
+  canvasH: number;
+  boardW: number;
+  positionAt: (time: number) => CharacterPosition;
+  sampleStep: number;
+}): FollowSample[] {
+  const { duration, canvasW: W, canvasH: H, boardW, positionAt, sampleStep } = args;
+  const samples: FollowSample[] = [];
+  let previousPosition: CharacterPosition | null = null;
+  let previousTime = 0;
+  let camera: CharacterPosition | null = null;
+  const cameraVelocity: CharacterPosition = { x: 0, y: 0 };
+
+  const sampleTimes: number[] = [];
+  for (let time = 0; time < duration; time += sampleStep) sampleTimes.push(Number(time.toFixed(6)));
+  if (sampleTimes.length === 0 || Math.abs(sampleTimes[sampleTimes.length - 1] - duration) > 0.000001) {
+    sampleTimes.push(duration);
+  }
+
+  for (const t of sampleTimes) {
+    const position = positionAt(t);
+    const desired = characterStop(position, W, H, boardW, 0.4);
+    const visibleWidth = boardW / Math.max(0.05, desired.zoom);
+    const visibleHeight = visibleWidth * H / W;
+    const maxTrailX = visibleWidth * FOLLOW_CAM_MAX_TRAIL_FRAME_FRACTION;
+    const maxTrailY = visibleHeight * FOLLOW_CAM_MAX_TRAIL_FRAME_FRACTION;
+
+    if (!camera || !previousPosition) {
+      camera = { x: desired.camX, y: desired.camY };
+    } else {
+      const dt = Math.max(0.000001, t - previousTime);
+      const characterVelocity = {
+        x: (position.x - previousPosition.x) / dt,
+        y: (position.y - previousPosition.y) / dt,
+      };
+      const lagX = clampNumber(
+        characterVelocity.x * FOLLOW_CAM_VELOCITY_LAG_SECONDS,
+        -maxTrailX * 0.72,
+        maxTrailX * 0.72,
+      );
+      const lagY = clampNumber(
+        characterVelocity.y * FOLLOW_CAM_VELOCITY_LAG_SECONDS,
+        -maxTrailY * 0.72,
+        maxTrailY * 0.72,
+      );
+      const laggedTarget = { x: desired.camX - lagX, y: desired.camY - lagY };
+      cameraVelocity.x += (
+        FOLLOW_CAM_STIFFNESS * (laggedTarget.x - camera.x) - FOLLOW_CAM_DAMPING * cameraVelocity.x
+      ) * dt;
+      cameraVelocity.y += (
+        FOLLOW_CAM_STIFFNESS * (laggedTarget.y - camera.y) - FOLLOW_CAM_DAMPING * cameraVelocity.y
+      ) * dt;
+      camera.x += cameraVelocity.x * dt;
+      camera.y += cameraVelocity.y * dt;
+
+      const offsetX = camera.x - desired.camX;
+      const offsetY = camera.y - desired.camY;
+      const clampedOffsetX = clampNumber(offsetX, -maxTrailX, maxTrailX);
+      const clampedOffsetY = clampNumber(offsetY, -maxTrailY, maxTrailY);
+      if (clampedOffsetX !== offsetX && Math.sign(cameraVelocity.x) === Math.sign(offsetX)) cameraVelocity.x = 0;
+      if (clampedOffsetY !== offsetY && Math.sign(cameraVelocity.y) === Math.sign(offsetY)) cameraVelocity.y = 0;
+      camera.x = desired.camX + clampedOffsetX;
+      camera.y = desired.camY + clampedOffsetY;
+    }
+
+    samples.push({ time: t, camX: camera.x, camY: camera.y, zoom: desired.zoom });
+    previousPosition = position;
+    previousTime = t;
+  }
+  return samples;
+}
+
+function followSampleAt(samples: FollowSample[], time: number): CameraStop {
+  if (samples.length === 0) return { camX: 0, camY: 0, zoom: 1 };
+  if (time <= samples[0].time) return samples[0];
+  const last = samples[samples.length - 1];
+  if (time >= last.time) return last;
+  let high = samples.findIndex((sample) => sample.time >= time);
+  if (high <= 0) high = 1;
+  const before = samples[high - 1];
+  const after = samples[high];
+  const progress = (time - before.time) / Math.max(0.000001, after.time - before.time);
+  return {
+    camX: before.camX + (after.camX - before.camX) * progress,
+    camY: before.camY + (after.camY - before.camY) * progress,
+    zoom: before.zoom + (after.zoom - before.zoom) * progress,
+  };
+}
+
+/**
+ * Bakes the always-on spring follow camera and any frameSurface overrides into one sampled
+ * keyframe track. The frame block's transition budget is split evenly between its zoom-out and
+ * return, leaving the configured hold fraction static in the middle of the block.
+ */
+export function deriveFollowCameraKeyframes(args: {
+  actions: ResolvedCharacterActionLike[];
+  clips: BoardClipLike[];
+  duration: number;
+  canvasW: number;
+  canvasH: number;
+  boardW: number;
+  positionAt: (time: number) => CharacterPosition;
+  sampleStep?: number;
+}): FollowCameraDerivation {
+  const {
+    actions, clips, duration, canvasW: W, canvasH: H, boardW, positionAt,
+  } = args;
+  if (duration <= 0) return { keyframes: [], framedSurfaces: [], occupancyWindows: [], notes: [] };
+  const sampleStep = Math.max(0.01, args.sampleStep ?? FOLLOW_CAM_SAMPLE_STEP);
+  const followSamples = dynamicFollowSamples({ duration, canvasW: W, canvasH: H, boardW, positionAt, sampleStep });
+  const notes: FollowCameraNote[] = [];
+  const framedSurfaces: FollowFramedSurface[] = [];
+  const blocks = clips
+    .filter((clip) => clip.type === "frameSurface" && (clip.duration ?? 0) > 0 && (clip.startTime ?? 0) < duration)
+    .sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0) || a.id.localeCompare(b.id))
+    .map((block) => {
+      const start = clampNumber(block.startTime ?? 0, 0, duration);
+      const end = clampNumber(start + (block.duration ?? 0), start, duration);
+      const position = positionAt(start);
+      const surface = occupiedClipAtPosition(position, clips);
+      const stop = surface
+        ? clipStop(surface, W, H, boardW)
+        : characterStop(position, W, H, boardW, 0.3);
+      const holdFraction = clampNumber(block.holdFraction ?? 0.6, 0.1, 0.95);
+      const transitionSide = Math.max(0, (end - start) * (1 - holdFraction) / 2);
+      const framed = { blockId: block.id, clipId: surface?.id, start, end };
+      framedSurfaces.push(framed);
+      if (!surface) {
+        notes.push({
+          blockId: block.id,
+          time: start,
+          message: `Frame surface at ${start.toFixed(2)}s found bare parchment; framing Character 1 wide instead.`,
+        });
+      }
+      return {
+        start,
+        end,
+        holdStart: start + transitionSide,
+        holdEnd: end - transitionSide,
+        stop,
+      };
+    });
+
+  const times = new Set<number>(followSamples.map((sample) => Math.round(sample.time * 1_000)));
+  for (const block of blocks) {
+    for (const time of [block.start, block.holdStart, block.holdEnd, block.end]) {
+      times.add(Math.round(time * 1_000));
+    }
+  }
+
+  const keyframes = [...times]
+    .map((milliseconds) => milliseconds / 1_000)
+    .filter((time) => time >= 0 && time <= duration)
+    .sort((a, b) => a - b)
+    .map((time): CameraKeyframeLike => {
+      const follow = followSampleAt(followSamples, time);
+      let active: typeof blocks[number] | undefined;
+      for (const block of blocks) {
+        if (time >= block.start && time <= block.end) active = block;
+      }
+      if (!active) {
+        return { time: Number(time.toFixed(3)), cameraX: follow.camX, cameraY: follow.camY, boardZoom: follow.zoom, easing: "linear" };
+      }
+      const blend = time < active.holdStart
+        ? smoothstep((time - active.start) / Math.max(0.000001, active.holdStart - active.start))
+        : time <= active.holdEnd
+          ? 1
+          : 1 - smoothstep((time - active.holdEnd) / Math.max(0.000001, active.end - active.holdEnd));
+      return {
+        time: Number(time.toFixed(3)),
+        cameraX: follow.camX + (active.stop.camX - follow.camX) * blend,
+        cameraY: follow.camY + (active.stop.camY - follow.camY) * blend,
+        boardZoom: follow.zoom + (active.stop.zoom - follow.zoom) * blend,
+        easing: "linear",
+      };
+    });
+
+  const standingWindows = deriveOccupancyWindows({ actions, clips, duration, positionAt });
+  const framedWindows = framedSurfaces.flatMap((surface): OccupancyWindow[] =>
+    surface.clipId ? [{ clipId: surface.clipId, start: surface.start, end: surface.end }] : []
+  );
+
+  return {
+    keyframes,
+    framedSurfaces,
+    occupancyWindows: mergeOccupancyWindows([...standingWindows, ...framedWindows]),
+    notes,
+  };
 }

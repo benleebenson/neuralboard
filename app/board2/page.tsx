@@ -85,6 +85,7 @@ import {
   OccupancyWindow,
   characterProjectDuration,
   deriveCharacterCameraKeyframes,
+  deriveFollowCameraKeyframes,
   deriveOccupancyWindows,
   occupancyWindowAt,
 } from "@/lib/character-camera";
@@ -112,7 +113,7 @@ function validGuestSignDataUrl(value?: string): value is string {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterZoom" | "customZoom" | "narration";
+  type: "image" | "video" | "pan" | "characterZoom" | "customZoom" | "frameSurface" | "narration";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -797,6 +798,7 @@ const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7d
 const PAN_CLIP_COLOR = "#f0e6a8";
 const CHARACTER_ZOOM_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
+const FRAME_SURFACE_CLIP_COLOR = "#ffc77d";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -3928,7 +3930,7 @@ export default function Board2Page() {
   const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
   const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
   const characterDuration = characterProjectDuration(characterActions);
-  const generatedDuration = cameraKeyframeMode === "character" && characterDuration > 0
+  const generatedDuration = (cameraKeyframeMode === "character" || cameraKeyframeMode === "follow") && characterDuration > 0
     ? characterDuration
     : Math.max(0, ...clips.map((c) => c.startTime + c.duration));
   const timelineDuration = Math.max(10, generatedDuration + 2);
@@ -3937,7 +3939,7 @@ export default function Board2Page() {
   const previewW = Math.round(previewHeight * previewAspect);
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
-  const canGenerateCamera = cameraMode === "character"
+  const canGenerateCamera = cameraMode === "character" || cameraMode === "follow"
     ? showCharacter
     : clips.some((clip) => clip.boardX !== undefined || clip.type === "pan" || clip.type === "characterZoom");
 
@@ -4957,17 +4959,24 @@ export default function Board2Page() {
     [characterActions2, charInit, charInit2, clips, showCharacter, cameraResolvedCharActions],
   );
   const occupancyWindows = useMemo(() => {
-    if (cameraKeyframeMode !== "character" || characterDuration <= 0) return [];
-    return deriveOccupancyWindows({
-      actions: cameraResolvedCharActions,
-      clips,
-      duration: characterDuration,
-      positionAt: (time) => {
-        const pose = evalCharAtTime(time, cameraResolvedCharActions, charInit.x, charInit.y, clips);
-        return { x: pose.boardX, y: pose.boardY };
-      },
-    });
-  }, [cameraKeyframeMode, characterDuration, cameraResolvedCharActions, clips, charInit]);
+    if ((cameraKeyframeMode !== "character" && cameraKeyframeMode !== "follow") || characterDuration <= 0) return [];
+    const positionAt = (time: number) => {
+      const pose = evalCharAtTime(time, cameraResolvedCharActions, charInit.x, charInit.y, clips);
+      return { x: pose.boardX, y: pose.boardY };
+    };
+    if (cameraKeyframeMode === "follow") {
+      return deriveFollowCameraKeyframes({
+        actions: cameraResolvedCharActions,
+        clips,
+        duration: characterDuration,
+        canvasW,
+        canvasH,
+        boardW: BOARD_W,
+        positionAt,
+      }).occupancyWindows;
+    }
+    return deriveOccupancyWindows({ actions: cameraResolvedCharActions, clips, duration: characterDuration, positionAt });
+  }, [cameraKeyframeMode, characterDuration, cameraResolvedCharActions, clips, charInit, canvasW, canvasH]);
   useEffect(() => { occupancyWindowsRef.current = occupancyWindows; }, [occupancyWindows]);
 
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
@@ -5943,14 +5952,16 @@ export default function Board2Page() {
   }
 
   function currentPlaybackDuration(currentClips: Clip[]): number {
-    if (cameraKeyframeModeRef.current === "character" && characterDurationRef.current > 0) {
+    if ((cameraKeyframeModeRef.current === "character" || cameraKeyframeModeRef.current === "follow") && characterDurationRef.current > 0) {
       return characterDurationRef.current;
     }
-    return currentClips.reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
+    return currentClips
+      .filter((clip) => clip.type !== "frameSurface")
+      .reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
   }
 
   function activeVideoWindow(clip: Clip, time: number): { start: number; end: number } | undefined {
-    if (cameraKeyframeModeRef.current === "character") {
+    if (cameraKeyframeModeRef.current === "character" || cameraKeyframeModeRef.current === "follow") {
       return occupancyWindowAt(occupancyWindowsRef.current, clip.id, time);
     }
     return time >= clip.startTime && time < clip.startTime + clip.duration
@@ -6148,7 +6159,11 @@ export default function Board2Page() {
       const reason = isFocused
         ? "play-media-focus"
         : isActive
-        ? cameraKeyframeModeRef.current === "character" ? "character-occupancy-active" : "timeline-active"
+        ? cameraKeyframeModeRef.current === "character"
+          ? "character-occupancy-active"
+          : cameraKeyframeModeRef.current === "follow"
+            ? "follow-occupancy-or-frame-active"
+            : "timeline-active"
         : !ambientVideoEnabledRef.current
           ? "ambient-disabled"
           : isAmbient
@@ -6645,6 +6660,26 @@ export default function Board2Page() {
     const clip: Clip = { id, type: "pan", name: "Pan", sourceUrl: "", startTime, duration: 5, holdFraction: 0.5, layer: 1 };
     setClips((prev) => [...prev, clip]);
     setSelectedClipId(id);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function addFrameSurfaceClip(atTime?: number) {
+    const id = generateId();
+    const startTime = atTime ?? playheadRef.current;
+    const duration = 3;
+    const layer = freeLayerAtTime(clipsRef.current, startTime, duration, id, 1);
+    const clip: Clip = {
+      id,
+      type: "frameSurface",
+      name: "Frame current surface",
+      sourceUrl: "",
+      startTime,
+      duration,
+      holdFraction: 0.6,
+      layer,
+    };
+    setClips((prev) => [...prev, clip]);
+    setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
@@ -9287,6 +9322,54 @@ export default function Board2Page() {
   // ─ Generate camera keyframes ──────────────────────────────────────────────
 
   function generateCameraKeyframes() {
+    if (cameraModeRef.current === "follow") {
+      if (!showCharacterRef.current) {
+        setToast("Enable Character 1 before using follow camera mode");
+        return;
+      }
+      if (characterActionsRef.current.length === 0) {
+        setToast("Add or generate Character 1 actions first");
+        return;
+      }
+
+      const duration = characterProjectDuration(characterActionsRef.current);
+      const positionAt = (time: number) => {
+        const pose = evalCharAtTime(
+          time,
+          cameraResolvedCharActions,
+          charInit.x,
+          charInit.y,
+          clipsRef.current,
+          authoredAnimationsRef.current,
+        );
+        return { x: pose.boardX, y: pose.boardY };
+      };
+      const result = deriveFollowCameraKeyframes({
+        actions: cameraResolvedCharActions,
+        clips: clipsRef.current,
+        duration,
+        canvasW: canvasWRef.current,
+        canvasH: canvasHRef.current,
+        boardW: BOARD_W,
+        positionAt,
+      });
+      for (const note of result.notes) console.info(`[follow camera] ${note.message}`);
+
+      const newCameraKeyframes = result.keyframes as CameraKeyframe[];
+      setCameraKeyframes(newCameraKeyframes);
+      cameraKeyframesRef.current = newCameraKeyframes;
+      setCameraKeyframeMode("follow");
+      cameraKeyframeModeRef.current = "follow";
+      characterDurationRef.current = duration;
+      occupancyWindowsRef.current = result.occupancyWindows;
+      setKeyframesOutOfDate(false);
+      drawFrame(playheadRef.current);
+      const frameCount = result.framedSurfaces.length;
+      const noteSuffix = result.notes.length > 0 ? ` · ${result.notes.length} parchment fallback${result.notes.length === 1 ? "" : "s"}` : "";
+      setToast(`Follow camera generated · ${duration.toFixed(1)}s · ${frameCount} surface frame${frameCount === 1 ? "" : "s"}${noteSuffix}`);
+      return;
+    }
+
     if (cameraModeRef.current === "character") {
       if (!showCharacterRef.current) {
         setToast("Enable Character 1 before using character camera mode");
@@ -9720,7 +9803,7 @@ export default function Board2Page() {
       boardX: c.boardX, boardY: c.boardY, boardW: c.boardW, boardH: c.boardH,
       label: c.name,
     }));
-    const totalDurationSec = Math.max(0, ...allClips.map((c) => c.startTime + c.duration));
+    const totalDurationSec = Math.max(0, ...allClips.filter((c) => c.type !== "frameSurface").map((c) => c.startTime + c.duration));
 
     const r2 = await fetch("/api/board2/character-choreography", {
       method: "POST",
@@ -9871,7 +9954,7 @@ export default function Board2Page() {
     if (exportAudioCtx && exportAudioDest && audioBuffers.length > 0) {
       const exportStartAcTime = exportAudioCtx.currentTime;
       for (const { clip, buffer } of audioBuffers) {
-        if (clip.type === "video" && exportCameraMode === "character") {
+        if (clip.type === "video" && (exportCameraMode === "character" || exportCameraMode === "follow")) {
           for (const window of exportOccupancyWindows.filter((item) => item.clipId === clip.id)) {
             const gainNode = exportAudioCtx.createGain();
             gainNode.gain.value = effectiveClipVolume(clip);
@@ -12565,20 +12648,20 @@ export default function Board2Page() {
           >{isPlaying ? "⏸" : "▶"}</button>
           <button
             onClick={() => {
-              const next: CameraMode = cameraMode === "clips" ? "character" : "clips";
-              if (next === "character" && !showCharacter) return;
+              const next: CameraMode = cameraMode === "clips" ? "character" : cameraMode === "character" ? "follow" : "clips";
+              if ((next === "character" || next === "follow") && !showCharacter) return;
               setCameraMode(next);
               cameraModeRef.current = next;
               if (cameraKeyframesRef.current.length > 0 && next !== cameraKeyframeModeRef.current) setKeyframesOutOfDate(true);
             }}
             disabled={cameraMode === "clips" && !showCharacter}
-            title={!showCharacter && cameraMode === "clips" ? "Enable Character 1 to use character camera" : `Camera source: ${cameraMode}`}
-            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontFamily: "monospace", background: cameraMode === "character" ? "#2a2a2a" : "transparent", color: cameraMode === "character" ? "#c8f135" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: !showCharacter && cameraMode === "clips" ? "not-allowed" : "pointer", opacity: !showCharacter && cameraMode === "clips" ? 0.35 : 1, flexShrink: 0 }}
-          >{cameraMode === "character" ? "CHAR" : "CLIP"}</button>
+            title={!showCharacter && cameraMode === "clips" ? "Enable Character 1 to use character or follow camera" : `Camera source: ${cameraMode}`}
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontFamily: "monospace", background: cameraMode !== "clips" ? "#2a2a2a" : "transparent", color: cameraMode !== "clips" ? "#c8f135" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: !showCharacter && cameraMode === "clips" ? "not-allowed" : "pointer", opacity: !showCharacter && cameraMode === "clips" ? 0.35 : 1, flexShrink: 0 }}
+          >{cameraMode === "character" ? "CHAR" : cameraMode === "follow" ? "FOLL" : "CLIP"}</button>
           <button
             onClick={generateCameraKeyframes}
             disabled={!canGenerateCamera}
-            title={canGenerateCamera ? `Generate ${cameraMode}-driven camera keyframes` : cameraMode === "character" ? "Enable Character 1 first" : "Upload media first"}
+            title={canGenerateCamera ? `Generate ${cameraMode}-driven camera keyframes` : cameraMode !== "clips" ? "Enable Character 1 first" : "Upload media first"}
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canGenerateCamera ? "pointer" : "not-allowed", opacity: canGenerateCamera ? 1 : 0.35, flexShrink: 0 }}
           >⬡</button>
           <button
@@ -12847,7 +12930,7 @@ export default function Board2Page() {
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "frameSurface" ? FRAME_SURFACE_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -12872,7 +12955,7 @@ export default function Board2Page() {
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.name}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.type === "frameSurface" ? "▣ Frame Surface" : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -12946,6 +13029,9 @@ export default function Board2Page() {
                     </button>
                     <button onClick={() => { addPanClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: PAN_CLIP_COLOR }}>
                       ⟷  Add pan clip
+                    </button>
+                    <button onClick={() => { addFrameSurfaceClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: FRAME_SURFACE_CLIP_COLOR }}>
+                      ▣  Frame current surface
                     </button>
                     <button onClick={() => { addCharacterZoomClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_ZOOM_CLIP_COLOR }}>
                       ◎  Zoom on character
@@ -13334,7 +13420,7 @@ export default function Board2Page() {
 
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-        if (clip.type === "pan" || clip.type === "characterZoom" || clip.type === "customZoom") {
+        if (clip.type === "pan" || clip.type === "characterZoom" || clip.type === "customZoom" || clip.type === "frameSurface") {
           manifestClips.push(rest);
         } else if (clip.youtubeId) {
           manifestClips.push({ ...rest, needsRedownload: true });
@@ -13452,7 +13538,7 @@ export default function Board2Page() {
 
       const loadedClips: Clip[] = [];
       for (const mc of (manifest.clips ?? [])) {
-        if (mc.type === "pan" || mc.type === "characterZoom" || mc.type === "customZoom") {
+        if (mc.type === "pan" || mc.type === "characterZoom" || mc.type === "customZoom" || mc.type === "frameSurface") {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.needsRedownload) {
           loadedClips.push({ ...mc, sourceUrl: "" });
@@ -13484,8 +13570,8 @@ export default function Board2Page() {
       narrationVisemeTrackRef.current = loadedLipSyncTrack;
       narrationVisemeTrackSourceRef.current = loadedLipSyncSource;
       const loadedCameraKeyframes = manifest.cameraKeyframes ?? [];
-      const loadedCameraMode: CameraMode = manifest.cameraMode === "character" ? "character" : "clips";
-      const loadedKeyframeMode: CameraMode = manifest.cameraKeyframeMode === "character" ? "character" : "clips";
+      const loadedCameraMode: CameraMode = manifest.cameraMode === "character" || manifest.cameraMode === "follow" ? manifest.cameraMode : "clips";
+      const loadedKeyframeMode: CameraMode = manifest.cameraKeyframeMode === "character" || manifest.cameraKeyframeMode === "follow" ? manifest.cameraKeyframeMode : "clips";
       setCameraKeyframes(loadedCameraKeyframes);
       cameraKeyframesRef.current = loadedCameraKeyframes;
       setCameraMode(loadedCameraMode);
@@ -13600,10 +13686,10 @@ export default function Board2Page() {
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <div
               style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}
-              title={!showCharacter ? "Enable Character 1 to use character-centric camera mode" : "Choose what drives camera generation"}
+              title={!showCharacter ? "Enable Character 1 to use character or follow camera mode" : "Choose what drives camera generation"}
             >
-              {(["clips", "character"] as const).map((mode) => {
-                const disabled = mode === "character" && !showCharacter;
+              {(["clips", "character", "follow"] as const).map((mode) => {
+                const disabled = mode !== "clips" && !showCharacter;
                 return (
                   <button
                     key={mode}
@@ -13613,17 +13699,17 @@ export default function Board2Page() {
                       cameraModeRef.current = mode;
                       if (cameraKeyframesRef.current.length > 0 && mode !== cameraKeyframeModeRef.current) setKeyframesOutOfDate(true);
                     }}
-                    title={disabled ? "Enable Character 1 first" : `${mode === "clips" ? "Clip schedule" : "Character 1 choreography"} drives camera keyframes`}
+                    title={disabled ? "Enable Character 1 first" : `${mode === "clips" ? "Clip schedule" : mode === "character" ? "Character 1 choreography" : "Dynamic Character 1 follow with surface-frame blocks"} drives camera keyframes`}
                     style={{
                       padding: "4px 7px", fontFamily: "monospace", fontSize: 9,
-                      border: "none", borderRight: mode === "clips" ? "1px solid rgba(42,42,42,0.35)" : "none",
+                      border: "none", borderRight: mode !== "follow" ? "1px solid rgba(42,42,42,0.35)" : "none",
                       background: cameraMode === mode ? "#2a2a2a" : "#fffdf5",
                       color: cameraMode === mode ? "#c8f135" : "#2a2a2a",
                       opacity: disabled ? 0.4 : 1,
                       cursor: disabled ? "not-allowed" : "pointer",
                     }}
                   >
-                    {mode === "clips" ? "Clips" : "Character"}
+                    {mode === "clips" ? "Clips" : mode === "character" ? "Character" : "Follow"}
                   </button>
                 );
               })}
@@ -13634,8 +13720,10 @@ export default function Board2Page() {
               title={canGenerateCamera
                 ? cameraMode === "character"
                   ? "Generate camera keyframes from Character 1 choreography"
-                  : "Generate camera keyframe sequence from board positions and timeline"
-                : cameraMode === "character" ? "Enable Character 1 first" : "Upload media first"}
+                  : cameraMode === "follow"
+                    ? "Generate spring-follow camera keyframes with surface-frame overrides"
+                    : "Generate camera keyframe sequence from board positions and timeline"
+                : cameraMode !== "clips" ? "Enable Character 1 first" : "Upload media first"}
               style={{
                 ...sketchButton,
                 padding: "4px 10px",
@@ -13698,6 +13786,13 @@ export default function Board2Page() {
               title="Add a pan clip that sweeps across all board images"
             >
               ⟷ Add pan clip
+            </button>
+            <button
+              onClick={() => addFrameSurfaceClip()}
+              style={{ ...sketchButton, background: FRAME_SURFACE_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
+              title="In Follow mode, zoom out to the surface Character 1 is standing on"
+            >
+              ▣ Frame current surface
             </button>
             <button
               onClick={() => addCharacterZoomClip()}
@@ -15629,7 +15724,7 @@ export default function Board2Page() {
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "frameSurface" ? FRAME_SURFACE_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const hf = clip.holdFraction ?? HOLD_FRACTION;
@@ -15684,7 +15779,7 @@ export default function Board2Page() {
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.type === "frameSurface" ? "▣ Frame Surface" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
@@ -15997,6 +16092,12 @@ export default function Board2Page() {
                   ⌘V Paste
                 </div>
               )}
+              <div onClick={() => { addFrameSurfaceClip(contextMenu.timeSec); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.08)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = FRAME_SURFACE_CLIP_COLOR)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ▣ Frame current surface
+              </div>
               <div onClick={() => { deleteClip(contextMenu.clipId!); setContextMenu(null); }}
                 style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, color: "#ff5e3a" }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "#ffe5e5")}
@@ -16012,6 +16113,12 @@ export default function Board2Page() {
                 onMouseEnter={(e) => (e.currentTarget.style.background = PAN_CLIP_COLOR)}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
                 ⟷ Add pan here
+              </div>
+              <div onClick={() => { addFrameSurfaceClip(contextMenu.timeSec); setContextMenu(null); }}
+                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = FRAME_SURFACE_CLIP_COLOR)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                ▣ Frame current surface
               </div>
               <div onClick={() => { addCharacterZoomClip(contextMenu.timeSec); setContextMenu(null); }}
                 style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
