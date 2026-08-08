@@ -60,6 +60,14 @@ import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroun
 import { CharacterEntity } from "@/lib/character/entity";
 import { isGrounded } from "@/lib/character/grounding";
 import {
+  isRhubarbCue,
+  isVisemeTrack,
+  mergeNarrationCueTracks,
+  visemeAt,
+  type RhubarbCue,
+  type VisemeTrackPoint,
+} from "@/lib/character/lipsync";
+import {
   BAZOOKA_RAGDOLL_GROUND_DRAG,
   BAZOOKA_RAGDOLL_RECOVERY_MS,
   GUEST_BAZOOKA_MAX_HEALTH,
@@ -139,6 +147,27 @@ type Clip = {
 type TranscriptSegment = { start: number; end: number; text: string };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
 type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
+
+function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
+  return JSON.stringify(
+    clips
+      .filter((clip) => clip.type === "narration")
+      .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id))
+      .map((clip) => ({
+        id: clip.id,
+        startTime: clip.startTime,
+        duration: clip.duration,
+        sourceOffsetSec: clip.sourceOffsetSec ?? 0,
+        muted: !!clip.muted,
+        volume: clip.volume ?? 1,
+        audioSize: clip.audioBlob?.size ?? null,
+        audioType: clip.audioBlob?.type ?? null,
+        waveform: clip.waveform?.length
+          ? `${clip.waveform.length}:${clip.waveform.reduce((sum, value, index) => sum + Math.round(value * 1000) * (index + 1), 0)}`
+          : null,
+      })),
+  );
+}
 
 function narrationSentenceCues(segments: readonly TranscriptSegment[]): SpeechBubbleCue[] {
   const cues: SpeechBubbleCue[] = [];
@@ -3690,6 +3719,9 @@ export default function Board2Page() {
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
+  const [narrationVisemeTrack, setNarrationVisemeTrack] = useState<VisemeTrackPoint[]>([]);
+  const [narrationVisemeTrackSource, setNarrationVisemeTrackSource] = useState<string | null>(null);
+  const [lipSyncStatus, setLipSyncStatus] = useState<"idle" | "analyzing">("idle");
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
@@ -3893,6 +3925,8 @@ export default function Board2Page() {
   const activeCharacter: CharacterInstance = activeCharacterId === "c2"
     ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor, start: characterStart2 ?? undefined }
     : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
+  const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
+  const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
   const characterDuration = characterProjectDuration(characterActions);
   const generatedDuration = cameraKeyframeMode === "character" && characterDuration > 0
     ? characterDuration
@@ -4006,6 +4040,8 @@ export default function Board2Page() {
     longPressTimer: null,
   });
   const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
+  const narrationVisemeTrackRef = useRef<VisemeTrackPoint[]>([]);
+  const narrationVisemeTrackSourceRef = useRef<string | null>(null);
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
@@ -4559,7 +4595,7 @@ export default function Board2Page() {
             if (playWeaponArmedRef.current || playBazookaArmedRef.current) pose = { ...pose, hideArms: true };
             pose = applyPlayForceChokePose(pose);
           }
-          const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved);
+          const viseme = resolvedCharacterViseme(id, runtime?.enabled ? t : playTimeRef.current, clipsRef.current, resolved, "live");
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           const moving = state ? Math.abs(state.vx) > 40 : false;
           const actionType = playPointingRef.current && id === "c1" ? "pointAt" : state?.action === "ragdoll" ? "ragdoll" : active?.type ?? (!state
@@ -4616,7 +4652,7 @@ export default function Board2Page() {
           const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
           const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
           const duration = active?.duration ?? 2;
-          const viseme = resolvedCharacterViseme(id, t, clipsRef.current, resolved);
+          const viseme = resolvedCharacterViseme(id, t, clipsRef.current, resolved, "live");
           const face = id === "c2" ? characterFace2Ref.current : characterFaceRef.current;
           return {
             id,
@@ -4708,6 +4744,8 @@ export default function Board2Page() {
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  useEffect(() => { narrationVisemeTrackRef.current = narrationVisemeTrack; }, [narrationVisemeTrack]);
+  useEffect(() => { narrationVisemeTrackSourceRef.current = narrationVisemeTrackSource; }, [narrationVisemeTrackSource]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
@@ -4841,7 +4879,12 @@ export default function Board2Page() {
     time: number,
     sourceClips: readonly Clip[] = clipsRef.current,
     actions: readonly ResolvedCharAction[] = id === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
+    renderMode: "timeline" | "live" = "timeline",
   ): Viseme {
+    if (renderMode === "timeline") {
+      const sourceMatches = narrationVisemeTrackSourceRef.current === narrationVisemeSourceSignature(sourceClips);
+      return sourceMatches ? visemeAt(time, narrationVisemeTrackRef.current) : "rest";
+    }
     const mode = id === "c2" ? characterVisemeMode2Ref.current : characterVisemeModeRef.current;
     if (mode !== "auto") return mode;
     const narration = narrationVisemeAt(time, sourceClips);
@@ -5631,7 +5674,7 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
-          { ...pose, viseme: resolvedCharacterViseme("c1", liveRuntimeSeconds(live.c1, wallMs), currentClips, liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current)) },
+          { ...pose, viseme: resolvedCharacterViseme("c1", liveRuntimeSeconds(live.c1, wallMs), currentClips, liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current), "live") },
           boardCharacterDrawEvaluators()
         );
       }
@@ -5649,7 +5692,7 @@ export default function Board2Page() {
             ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
             : null,
           characterSkin2Ref.current,
-          { ...pose, viseme: resolvedCharacterViseme("c2", liveRuntimeSeconds(live.c2, wallMs), currentClips, liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current)) },
+          { ...pose, viseme: resolvedCharacterViseme("c2", liveRuntimeSeconds(live.c2, wallMs), currentClips, liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current), "live") },
           boardCharacterDrawEvaluators()
         );
       }
@@ -6946,6 +6989,57 @@ export default function Board2Page() {
       setToast(isVideoFile ? "Audio extracted from video" : "Narration added");
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to process file");
+    }
+  }
+
+  async function generateNarrationLipSync() {
+    if (lipSyncStatus === "analyzing") return;
+    const sourceClips = clipsRef.current
+      .filter((clip) => clip.type === "narration" && !clip.muted && (clip.volume ?? 1) > 0)
+      .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+    if (!sourceClips.length) {
+      setToast(clipsRef.current.some((clip) => clip.type === "narration") ? "Unmute narration before generating lip sync" : "Add narration before generating lip sync");
+      return;
+    }
+
+    const sourceSignature = narrationVisemeSourceSignature(clipsRef.current);
+    setLipSyncStatus("analyzing");
+    setToast("Analyzing narration…");
+    try {
+      const analyzed: Array<{ clipId: string; startTime: number; duration: number; cues: RhubarbCue[] }> = [];
+      for (const clip of sourceClips) {
+        const audio = await compileNarrationToBlob([clip]);
+        const form = new FormData();
+        form.append("audio", audio, `${clip.name || "narration"}.wav`);
+        const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
+        const data: unknown = await response.json().catch(() => null);
+        if (!response.ok) {
+          const message = data && typeof data === "object" && "error" in data
+            ? String((data as { error: unknown }).error)
+            : `Lip sync analysis failed (${response.status})`;
+          throw new Error(message);
+        }
+        if (!Array.isArray(data)) throw new Error("Lip sync bridge returned invalid cues");
+        const cues = data.filter(isRhubarbCue);
+        analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues });
+      }
+
+      if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
+        throw new Error("Narration changed during analysis. Generate lip sync again.");
+      }
+      const track = mergeNarrationCueTracks(analyzed);
+      if (!track.length) throw new Error("No speech mouth cues were detected");
+      setNarrationVisemeTrack(track);
+      setNarrationVisemeTrackSource(sourceSignature);
+      narrationVisemeTrackRef.current = track;
+      narrationVisemeTrackSourceRef.current = sourceSignature;
+      drawFrameRef.current(playheadRef.current);
+      const cueCount = analyzed.reduce((sum, item) => sum + item.cues.length, 0);
+      setToast(`Lip sync ready · ${cueCount} cue${cueCount === 1 ? "" : "s"}`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not generate lip sync");
+    } finally {
+      setLipSyncStatus("idle");
     }
   }
 
@@ -11390,7 +11484,7 @@ export default function Board2Page() {
         const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        const playViseme = playLiveSpeechViseme() ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved);
+        const playViseme = playLiveSpeechViseme() ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved, "live");
         drawPlaySpawnDoor(ctx, state, playCameraRef.current, sf, canvas.width, canvas.height);
         CharacterEntity.drawBoardCharacterToCanvas(
           ctx,
@@ -13279,6 +13373,10 @@ export default function Board2Page() {
         { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current, start: characterStart ?? undefined, face: manifestFace },
         { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current, start: characterStart2 ?? undefined, face: manifestFace2 },
       ];
+      const currentLipSyncSource = narrationVisemeSourceSignature(clipsRef.current);
+      const savedLipSyncTrack = narrationVisemeTrackSourceRef.current === currentLipSyncSource
+        ? narrationVisemeTrackRef.current
+        : [];
 
       const manifest = {
         version: 1,
@@ -13300,6 +13398,8 @@ export default function Board2Page() {
         characterFace: manifestFace,
         characterStart: characterStart ?? undefined,
         characters: manifestCharacters,
+        narrationVisemeTrack: savedLipSyncTrack,
+        narrationVisemeTrackSource: savedLipSyncTrack.length ? currentLipSyncSource : null,
         spawnDoor: spawnDoorRef.current,
       };
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
@@ -13377,6 +13477,12 @@ export default function Board2Page() {
       }
 
       setClips(loadedClips);
+      const loadedLipSyncTrack = isVisemeTrack(manifest.narrationVisemeTrack) ? manifest.narrationVisemeTrack : [];
+      const loadedLipSyncSource = typeof manifest.narrationVisemeTrackSource === "string" ? manifest.narrationVisemeTrackSource : null;
+      setNarrationVisemeTrack(loadedLipSyncTrack);
+      setNarrationVisemeTrackSource(loadedLipSyncSource);
+      narrationVisemeTrackRef.current = loadedLipSyncTrack;
+      narrationVisemeTrackSourceRef.current = loadedLipSyncSource;
       const loadedCameraKeyframes = manifest.cameraKeyframes ?? [];
       const loadedCameraMode: CameraMode = manifest.cameraMode === "character" ? "character" : "clips";
       const loadedKeyframeMode: CameraMode = manifest.cameraKeyframeMode === "character" ? "character" : "clips";
@@ -15010,6 +15116,19 @@ export default function Board2Page() {
                           )}
                         </div>
                       </ProGated>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: narrationVisemeTrackIsCurrent ? "#f0ffe0" : "transparent" }}>
+                        <button
+                          type="button"
+                          onClick={() => void generateNarrationLipSync()}
+                          disabled={lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration")}
+                          style={{ ...miniButton, background: narrationVisemeTrackIsCurrent ? "#c8f135" : "transparent", opacity: lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
+                        >
+                          {lipSyncStatus === "analyzing" ? "Analyzing narration…" : narrationVisemeTrackIsCurrent ? "✓ Lip sync generated" : narrationVisemeTrack.length ? "Regenerate lip sync" : "Generate lip sync"}
+                        </button>
+                        {narrationVisemeTrack.length > 0 && !narrationVisemeTrackIsCurrent && (
+                          <span style={{ fontFamily: "monospace", fontSize: 9, color: "#a14d00" }}>Narration changed · regenerate before preview/export</span>
+                        )}
+                      </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button
                           type="button"
