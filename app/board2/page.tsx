@@ -810,6 +810,10 @@ const AMBIENT_CENSUS_INTERVAL_MS = 5000;
 const PREVIEW_DEFAULT_H_PX = 135;
 const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
+const PREVIEW_RENDER_LONG_EDGE_PX = 960;
+const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
+const EDITOR_PLAYBACK_FPS = 30;
+const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
 const CHARACTER_COLOR = "#cdeac0";
 const DEV_MOUTH_TEST = process.env.NODE_ENV !== "production";
@@ -3725,6 +3729,7 @@ export default function Board2Page() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
+  const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
     if (typeof window === "undefined") return true;
     try {
@@ -3964,6 +3969,9 @@ export default function Board2Page() {
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
   const previewW = Math.round(previewHeight * previewAspect);
+  const previewRenderScale = Math.min(1, PREVIEW_RENDER_LONG_EDGE_PX / Math.max(canvasW, canvasH));
+  const previewRenderW = Math.max(1, Math.round(canvasW * previewRenderScale));
+  const previewRenderH = Math.max(1, Math.round(canvasH * previewRenderScale));
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
   const canGenerateCamera = cameraMode === "character"
@@ -3992,6 +4000,8 @@ export default function Board2Page() {
   const boardPanRef = useRef({ x: 20, y: 20 });
   const isSpaceDownRef = useRef(false);
   const lastRafTimeRef = useRef<number | null>(null);
+  const lastEditorFrameTimeRef = useRef(0);
+  const lastPlayheadUiTimeRef = useRef(0);
   const rafIdRef = useRef<number | null>(null);
   const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
@@ -4049,6 +4059,8 @@ export default function Board2Page() {
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const narrationAudioElsRef = useRef<Map<string, { element: HTMLAudioElement; sourceUrl: string }>>(new Map());
+  const narrationPlayRequestRef = useRef<Map<string, number>>(new Map());
   const mobileYtIframeRef = useRef<HTMLIFrameElement | null>(null);
   const mobileBoardPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const mobileGestureRef = useRef<{
@@ -4068,7 +4080,7 @@ export default function Board2Page() {
     pinchStartDist: 1, pinchStartZoom: 0.18, pinchStartPan: { x: 0, y: 0 },
     longPressTimer: null,
   });
-  const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
+  const activeNarrationRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const narrationVisemeTrackRef = useRef<VisemeTrackPoint[]>([]);
   const narrationVisemeTrackSourceRef = useRef<string | null>(null);
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
@@ -4080,6 +4092,7 @@ export default function Board2Page() {
   const characterFaceImageRef = useRef<HTMLImageElement | null>(null);
   const characterFace2ImageRef = useRef<HTMLImageElement | null>(null);
   const drawFrameRef = useRef<(time: number) => void>(() => {});
+  const previewVisibleRef = useRef(true);
   const characterActionsRef = useRef<CharacterAction[]>([]);
   const characterActions2Ref = useRef<CharacterAction[]>([]);
   const selectedCharActionIdRef = useRef<string | null>(null);
@@ -4780,6 +4793,7 @@ export default function Board2Page() {
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { previewVisibleRef.current = previewVisible; }, [previewVisible]);
   useEffect(() => {
     ambientVideoEnabledRef.current = ambientVideoEnabled;
     try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
@@ -5381,6 +5395,7 @@ export default function Board2Page() {
       if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (micRafRef.current !== null) cancelAnimationFrame(micRafRef.current);
+      clearNarrationAudioElements();
       audioCtxRef.current?.close().catch(() => {});
     };
   }, []);
@@ -5777,6 +5792,7 @@ export default function Board2Page() {
   }, [drawStreamGuestsToCtx]);
 
   const drawFrame = useCallback((time: number) => {
+    if (!previewVisibleRef.current) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -5823,7 +5839,7 @@ export default function Board2Page() {
       }
       liveCameraRef.current = liveCam;
     }
-    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current, liveCam);
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, liveCam);
   }, [renderToCtx]);
 
   useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
@@ -6281,15 +6297,15 @@ export default function Board2Page() {
           runtime.state = "dormant";
           runtime.reason = "playback-ended";
         }
-        for (const clipId of [...activeNarrationRef.current.keys()]) {
-          const entry = activeNarrationRef.current.get(clipId);
-          if (entry) { try { entry.bufNode.stop(); } catch {} try { entry.bufNode.disconnect(); } catch {} try { entry.gainNode.disconnect(); } catch {} }
-        }
-        activeNarrationRef.current.clear();
+        stopAllNarrationAudio();
         prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
-      playheadRef.current = next; setPlayhead(next);
+      playheadRef.current = next;
+      if (now - lastPlayheadUiTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
+        lastPlayheadUiTimeRef.current = now;
+        setPlayhead(next);
+      }
     }
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
@@ -6301,39 +6317,17 @@ export default function Board2Page() {
       const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
       const wasActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
       if (isActive && !wasActive && !activeNarrationRef.current.has(clip.id)) {
-        const clipId = clip.id;
-        const blobUrl = clip.sourceUrl;
-        const clipOffset = t - clip.startTime;
-        let ctx = audioCtxRef.current;
-        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
-        const audioCtxCapture = ctx;
-        fetch(blobUrl)
-          .then((r) => r.arrayBuffer())
-          .then((ab) => audioCtxCapture.decodeAudioData(ab))
-          .then((buffer) => {
-            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
-            const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
-            gainNode.connect(audioCtxCapture.destination);
-            const bufNode = audioCtxCapture.createBufferSource();
-            bufNode.buffer = buffer;
-            bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
-            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
-            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
-          })
-          .catch(() => {});
+        startNarrationAudio(clip);
+      } else if (isActive) {
+        syncNarrationAudio(clip, t);
       } else if (!isActive && wasActive) {
-        const entry = activeNarrationRef.current.get(clip.id);
-        if (entry) {
-          try { entry.bufNode.stop(); } catch {}
-          try { entry.bufNode.disconnect(); } catch {}
-          try { entry.gainNode.disconnect(); } catch {}
-          activeNarrationRef.current.delete(clip.id);
-        }
+        stopNarrationAudio(clip.id);
       }
     }
-    drawFrame(t);
+    if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
+      lastEditorFrameTimeRef.current = now;
+      drawFrame(t);
+    }
     rafIdRef.current = requestAnimationFrame(rafCallbackRef.current);
   }, [drawFrame]);
 
@@ -6342,6 +6336,8 @@ export default function Board2Page() {
   useEffect(() => {
     if (isPlaying) {
       lastRafTimeRef.current = null;
+      lastEditorFrameTimeRef.current = 0;
+      lastPlayheadUiTimeRef.current = 0;
       rafIdRef.current = requestAnimationFrame(rafLoop);
       // Spawn narration audio for any clips already active at the current playhead
       const t = playheadRef.current;
@@ -6349,28 +6345,7 @@ export default function Board2Page() {
         if (clip.type !== "narration") continue;
         if (t < clip.startTime || t >= clip.startTime + clip.duration) continue;
         if (activeNarrationRef.current.has(clip.id)) continue;
-        const clipId = clip.id;
-        const blobUrl = clip.sourceUrl;
-        const clipOffset = t - clip.startTime;
-        let ctx = audioCtxRef.current;
-        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
-        const audioCtxCapture = ctx;
-        fetch(blobUrl)
-          .then((r) => r.arrayBuffer())
-          .then((ab) => audioCtxCapture.decodeAudioData(ab))
-          .then((buffer) => {
-            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
-            const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
-            gainNode.connect(audioCtxCapture.destination);
-            const bufNode = audioCtxCapture.createBufferSource();
-            bufNode.buffer = buffer;
-            bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
-            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
-            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
-          })
-          .catch(() => {});
+        startNarrationAudio(clip);
       }
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
@@ -6387,16 +6362,8 @@ export default function Board2Page() {
         videoRangeStateRef.current.set(clip.id, false);
       }
       ambientCandidateIdsRef.current = new Set();
-      // Stop all active narration audio
-      for (const clipId of [...activeNarrationRef.current.keys()]) {
-        const entry = activeNarrationRef.current.get(clipId);
-        if (entry) {
-          try { entry.bufNode.stop(); } catch {}
-          try { entry.bufNode.disconnect(); } catch {}
-          try { entry.gainNode.disconnect(); } catch {}
-        }
-      }
-      activeNarrationRef.current.clear();
+      // Pause streamed narration elements without discarding their media state.
+      stopAllNarrationAudio();
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
@@ -6657,7 +6624,7 @@ export default function Board2Page() {
     }
     thumbnailImagesRef.current.delete(clipId);
     if (clip?.type === "narration") {
-      stopNarrationAudio(clipId);
+      removeNarrationAudioElement(clipId);
       URL.revokeObjectURL(clip.sourceUrl);
       setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
       setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
@@ -6882,17 +6849,90 @@ export default function Board2Page() {
 
   // ─ Narration audio helpers ────────────────────────────────────────────────
 
+  function narrationAudioElement(clip: Clip): HTMLAudioElement {
+    const cached = narrationAudioElsRef.current.get(clip.id);
+    if (cached?.sourceUrl === clip.sourceUrl) return cached.element;
+    if (cached) {
+      cached.element.pause();
+      cached.element.removeAttribute("src");
+      cached.element.load();
+    }
+    const element = new Audio();
+    element.preload = "metadata";
+    element.src = clip.sourceUrl;
+    narrationAudioElsRef.current.set(clip.id, { element, sourceUrl: clip.sourceUrl });
+    return element;
+  }
+
+  function narrationSourceTime(clip: Clip, timelineTime: number, element: HTMLAudioElement): number {
+    const requested = Math.max(0, (clip.sourceOffsetSec ?? 0) + (timelineTime - clip.startTime));
+    return Number.isFinite(element.duration)
+      ? Math.min(requested, Math.max(0, element.duration - 0.01))
+      : requested;
+  }
+
+  function updateNarrationAudioSettings(clip: Clip, element: HTMLAudioElement) {
+    element.muted = !!clip.muted || !!mutedLayersRef.current[clip.layer ?? 0];
+    element.volume = clamp(clip.volume ?? 1, 0, 1);
+  }
+
+  function startNarrationAudio(clip: Clip) {
+    const element = narrationAudioElement(clip);
+    const requestId = (narrationPlayRequestRef.current.get(clip.id) ?? 0) + 1;
+    narrationPlayRequestRef.current.set(clip.id, requestId);
+    activeNarrationRef.current.set(clip.id, element);
+    updateNarrationAudioSettings(clip, element);
+
+    const seekAndPlay = () => {
+      if (!isPlayingRef.current || activeNarrationRef.current.get(clip.id) !== element || narrationPlayRequestRef.current.get(clip.id) !== requestId) return;
+      try { element.currentTime = narrationSourceTime(clip, playheadRef.current, element); } catch {}
+      element.play().catch((err) => console.warn("[narration] preview playback failed", err));
+    };
+
+    if (element.readyState >= 1) seekAndPlay();
+    else {
+      element.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+      element.load();
+    }
+  }
+
+  function syncNarrationAudio(clip: Clip, timelineTime: number) {
+    const element = activeNarrationRef.current.get(clip.id);
+    if (!element) return;
+    updateNarrationAudioSettings(clip, element);
+    if (element.readyState < 2 || element.seeking) return;
+    const expected = narrationSourceTime(clip, timelineTime, element);
+    if (Math.abs(element.currentTime - expected) > 0.35) {
+      try { element.currentTime = expected; } catch {}
+    }
+    if (element.paused && isPlayingRef.current) {
+      element.play().catch((err) => console.warn("[narration] preview resume failed", err));
+    }
+  }
+
   function stopNarrationAudio(clipId: string) {
-    const entry = activeNarrationRef.current.get(clipId);
-    if (!entry) return;
-    try { entry.bufNode.stop(); } catch {}
-    try { entry.bufNode.disconnect(); } catch {}
-    try { entry.gainNode.disconnect(); } catch {}
+    narrationPlayRequestRef.current.set(clipId, (narrationPlayRequestRef.current.get(clipId) ?? 0) + 1);
+    const element = activeNarrationRef.current.get(clipId);
+    if (element) element.pause();
     activeNarrationRef.current.delete(clipId);
   }
 
   function stopAllNarrationAudio() {
     for (const clipId of [...activeNarrationRef.current.keys()]) stopNarrationAudio(clipId);
+  }
+
+  function removeNarrationAudioElement(clipId: string) {
+    stopNarrationAudio(clipId);
+    const cached = narrationAudioElsRef.current.get(clipId);
+    if (!cached) return;
+    cached.element.removeAttribute("src");
+    cached.element.load();
+    narrationAudioElsRef.current.delete(clipId);
+    narrationPlayRequestRef.current.delete(clipId);
+  }
+
+  function clearNarrationAudioElements() {
+    for (const clipId of [...narrationAudioElsRef.current.keys()]) removeNarrationAudioElement(clipId);
   }
 
   async function generateNarrationWaveform(blobUrl: string): Promise<number[]> {
@@ -9254,7 +9294,7 @@ export default function Board2Page() {
   // ─ Play / pause ───────────────────────────────────────────────────────────
 
   function togglePlay() {
-    if (isPlaying) { setIsPlaying(false); return; }
+    if (isPlaying) { setPlayhead(playheadRef.current); setIsPlaying(false); return; }
     const maxEnd = currentPlaybackDuration(clips);
     const wrapped = playheadRef.current >= maxEnd && maxEnd > 0;
     const startPh = wrapped ? 0 : playheadRef.current;
@@ -12725,8 +12765,8 @@ export default function Board2Page() {
                           if (canvas) mobileBoardImageCanvasRefs.current.set(clip.id, canvas);
                           else mobileBoardImageCanvasRefs.current.delete(clip.id);
                         }}
-                        width={Math.max(1, Math.round(clip.boardW!))}
-                        height={Math.max(1, Math.round(clip.boardH!))}
+                        width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
+                        height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                         aria-label={clip.name}
                         style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center" }}
                       />
@@ -12854,12 +12894,14 @@ export default function Board2Page() {
 
           {/* Preview PiP */}
           <div style={{ position: "absolute", top: 6, right: 6, zIndex: 10, pointerEvents: "none" }}>
-            <canvas
-              ref={canvasRef}
-              width={canvasW}
-              height={canvasH}
-              style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
-            />
+            {previewVisible && (
+              <canvas
+                ref={canvasRef}
+                width={previewRenderW}
+                height={previewRenderH}
+                style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
+              />
+            )}
           </div>
 
           {/* Export progress */}
@@ -13584,6 +13626,7 @@ export default function Board2Page() {
       const manifest = JSON.parse(strFromU8(files["manifest.json"]));
 
       // Revoke existing blob URLs
+      clearNarrationAudioElements();
       for (const clip of clipsRef.current) {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
       }
@@ -14061,8 +14104,8 @@ export default function Board2Page() {
                               if (canvas) boardImageCanvasRefs.current.set(clip.id, canvas);
                               else boardImageCanvasRefs.current.delete(clip.id);
                             }}
-                            width={Math.max(1, Math.round(clip.boardW!))}
-                            height={Math.max(1, Math.round(clip.boardH!))}
+                            width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
+                            height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                             aria-label={clip.name}
                             style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center" }}
                           />
@@ -15027,38 +15070,54 @@ export default function Board2Page() {
                   >
                     Max
                   </button>
+                  <button
+                    type="button"
+                    title={previewVisible ? "Hide preview to reduce editor rendering load" : "Show preview"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const next = !previewVisible;
+                      previewVisibleRef.current = next;
+                      setPreviewVisible(next);
+                      if (next) requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
+                    }}
+                    style={{ ...miniButton, width: 30, height: 18, padding: 0, fontSize: 8, background: previewVisible ? "rgba(255,253,245,0.9)" : "#c8f135" }}
+                  >
+                    {previewVisible ? "Hide" : "Show"}
+                  </button>
                 </div>
               </div>
-              <div style={{ position: "relative", width: previewW, height: previewHeight }}>
-                <canvas
-                  ref={canvasRef}
-                  width={canvasW}
-                  height={canvasH}
-                  style={{
-                    display: "block",
-                    width: previewW,
-                    height: previewHeight,
-                    border: "1.5px solid #2a2a2a",
-                    boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
-                    background: "#111",
-                  }}
-                />
-                <div
-                  title="Drag to resize preview"
-                  onPointerDown={handlePreviewResizePointerDown}
-                  style={{
-                    position: "absolute",
-                    left: -6,
-                    bottom: -6,
-                    width: 18,
-                    height: 18,
-                    border: "1.5px solid #2a2a2a",
-                    background: "#c8f135",
-                    cursor: "nesw-resize",
-                    boxShadow: "1px 1px 0 rgba(42,42,42,0.45)",
-                  }}
-                />
-              </div>
+              {previewVisible && (
+                <div style={{ position: "relative", width: previewW, height: previewHeight }}>
+                  <canvas
+                    ref={canvasRef}
+                    width={previewRenderW}
+                    height={previewRenderH}
+                    style={{
+                      display: "block",
+                      width: previewW,
+                      height: previewHeight,
+                      border: "1.5px solid #2a2a2a",
+                      boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
+                      background: "#111",
+                    }}
+                  />
+                  <div
+                    title="Drag to resize preview"
+                    onPointerDown={handlePreviewResizePointerDown}
+                    style={{
+                      position: "absolute",
+                      left: -6,
+                      bottom: -6,
+                      width: 18,
+                      height: 18,
+                      border: "1.5px solid #2a2a2a",
+                      background: "#c8f135",
+                      cursor: "nesw-resize",
+                      boxShadow: "1px 1px 0 rgba(42,42,42,0.45)",
+                    }}
+                  />
+                </div>
+              )}
             </div>
           </div>
 
