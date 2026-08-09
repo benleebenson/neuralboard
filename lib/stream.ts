@@ -99,7 +99,7 @@ export type StreamCamera = {
 
 export type StreamClip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterZoom";
+  type: "image" | "video" | "pan" | "characterFocus";
   name: string;
   sourceUrl: string;
   thumbnailUrl?: string;

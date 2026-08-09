@@ -81,14 +81,10 @@ import {
 } from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
-  CameraMode,
-  OccupancyWindow,
-  characterProjectDuration,
-  deriveCharacterCameraKeyframes,
-  deriveFollowCameraKeyframes,
-  deriveOccupancyWindows,
-  occupancyWindowAt,
-} from "@/lib/character-camera";
+  activeCharacterFocusBlock,
+  applyCharacterFocusCamera,
+  type CharacterFocusId,
+} from "@/lib/character-focus-camera";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
@@ -113,7 +109,7 @@ function validGuestSignDataUrl(value?: string): value is string {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterZoom" | "customZoom" | "frameSurface" | "narration";
+  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -126,6 +122,7 @@ type Clip = {
   boardW?: number;
   boardH?: number;
   holdFraction?: number;
+  focusCharacterId?: CharacterFocusId;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
   thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
   sourceBlob?: Blob;          // the actual video Blob backing sourceUrl (video clips only) — cloned
@@ -796,9 +793,8 @@ const MAGNETIC_SNAP_PX = 10;
 const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
 const CLIP_COLORS = ["#c8f135", "#5ec4ff", "#ff9f5e", "#d4a8ff", "#ff6b9d", "#7df5b0"];
 const PAN_CLIP_COLOR = "#f0e6a8";
-const CHARACTER_ZOOM_CLIP_COLOR = "#c9d4ff";
+const CHARACTER_FOCUS_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
-const FRAME_SURFACE_CLIP_COLOR = "#ffc77d";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
@@ -1996,7 +1992,7 @@ function deriveAutoCharActions(
   outputH = CANVAS_H_LAND
 ): CharacterAction[] {
   const focusClips = clips
-    .filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined))
+    .filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined))
     .sort((a, b) => a.startTime - b.startTime);
   if (focusClips.length === 0) return [];
 
@@ -2009,7 +2005,7 @@ function deriveAutoCharActions(
     const holdStart = clip.startTime;
     const holdEnd = clip.startTime + clip.duration * hf;
     const transEnd = clip.startTime + clip.duration;
-    const isPan = clip.type === "pan" || clip.type === "characterZoom";
+    const isPan = clip.type === "pan";
 
     if (isPan) {
       // Character is either not on yet (handled by characterEntranceTime hiding him) or idling in
@@ -3728,8 +3724,6 @@ export default function Board2Page() {
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
   const [cameraKeyframes, setCameraKeyframes] = useState<CameraKeyframe[]>([]);
-  const [cameraMode, setCameraMode] = useState<CameraMode>("clips");
-  const [cameraKeyframeMode, setCameraKeyframeMode] = useState<CameraMode>("clips");
   const [isSpaceDown, setIsSpaceDown] = useState(false);
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
@@ -3929,19 +3923,14 @@ export default function Board2Page() {
     : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
   const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
   const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
-  const characterDuration = characterProjectDuration(characterActions);
-  const generatedDuration = (cameraKeyframeMode === "character" || cameraKeyframeMode === "follow") && characterDuration > 0
-    ? characterDuration
-    : Math.max(0, ...clips.map((c) => c.startTime + c.duration));
+  const generatedDuration = Math.max(0, ...clips.map((c) => c.startTime + c.duration));
   const timelineDuration = Math.max(10, generatedDuration + 2);
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
   const previewW = Math.round(previewHeight * previewAspect);
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
-  const canGenerateCamera = cameraMode === "character" || cameraMode === "follow"
-    ? showCharacter
-    : clips.some((clip) => clip.boardX !== undefined || clip.type === "pan" || clip.type === "characterZoom");
+  const canGenerateCamera = clips.some((clip) => clip.boardX !== undefined || clip.type === "pan");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -3974,10 +3963,6 @@ export default function Board2Page() {
   const isExportingRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraKeyframesRef = useRef<CameraKeyframe[]>([]);
-  const cameraModeRef = useRef<CameraMode>("clips");
-  const cameraKeyframeModeRef = useRef<CameraMode>("clips");
-  const characterDurationRef = useRef(0);
-  const occupancyWindowsRef = useRef<OccupancyWindow[]>([]);
   const pxPerSecRef = useRef(DEFAULT_PX_PER_SEC);
   const timelineScrollRef = useRef(0);
   const pendingScrollLeftRef = useRef<number | null>(null);
@@ -4423,7 +4408,7 @@ export default function Board2Page() {
   }, []);
 
   const buildStreamClips = useCallback(async (maxLongEdge: number) => {
-    const streamable = clipsRef.current.filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterZoom" && c.type !== "customZoom" && c.boardX !== undefined);
+    const streamable = clipsRef.current.filter((c) => c.type !== "narration" && c.type !== "pan" && c.type !== "characterFocus" && c.type !== "customZoom" && c.boardX !== undefined);
     return Promise.all(streamable.map(async (c) => {
       const isVideo = c.type === "video";
       const thumb = isVideo ? thumbnailImagesRef.current.get(c.id) ?? null : null;
@@ -4762,9 +4747,6 @@ export default function Board2Page() {
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
   useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
-  useEffect(() => { cameraModeRef.current = cameraMode; }, [cameraMode]);
-  useEffect(() => { cameraKeyframeModeRef.current = cameraKeyframeMode; }, [cameraKeyframeMode]);
-  useEffect(() => { characterDurationRef.current = characterDuration; }, [characterDuration]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
   useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
   useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
@@ -4921,8 +4903,8 @@ export default function Board2Page() {
   }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined));
-    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan" || c.type === "characterZoom")) return Infinity;
+    const focusClips = clips.filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
   }, [characterMode, clips, resolvedCharActions]);
@@ -4940,52 +4922,13 @@ export default function Board2Page() {
     );
   }, [clips, characterActions2, characterMode2, charInit, charInit2, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
 
-  // Character-camera mode resolves stored manual + AI choreography only. Clip-schedule auto
-  // derivation stays exclusive to clips mode, while Character 2 retains the current collision
-  // resolver and is available to widen settled framing without becoming the follow target.
-  const cameraResolvedCharActions = useMemo(
-    () => resolveEditorCharActions(characterActions, charInit.x, charInit.y, clips),
-    [characterActions, charInit, clips],
-  );
-  const cameraResolvedCharActions2 = useMemo(
-    () => resolveEditorCharActions(
-      characterActions2,
-      charInit2.x,
-      charInit2.y,
-      clips,
-      showCharacter ? [{ resolved: cameraResolvedCharActions, initX: charInit.x, initY: charInit.y, entranceTime: -Infinity }] : [],
-      60,
-    ),
-    [characterActions2, charInit, charInit2, clips, showCharacter, cameraResolvedCharActions],
-  );
-  const occupancyWindows = useMemo(() => {
-    if ((cameraKeyframeMode !== "character" && cameraKeyframeMode !== "follow") || characterDuration <= 0) return [];
-    const positionAt = (time: number) => {
-      const pose = evalCharAtTime(time, cameraResolvedCharActions, charInit.x, charInit.y, clips);
-      return { x: pose.boardX, y: pose.boardY };
-    };
-    if (cameraKeyframeMode === "follow") {
-      return deriveFollowCameraKeyframes({
-        actions: cameraResolvedCharActions,
-        clips,
-        duration: characterDuration,
-        canvasW,
-        canvasH,
-        boardW: BOARD_W,
-        positionAt,
-      }).occupancyWindows;
-    }
-    return deriveOccupancyWindows({ actions: cameraResolvedCharActions, clips, duration: characterDuration, positionAt });
-  }, [cameraKeyframeMode, characterDuration, cameraResolvedCharActions, clips, charInit, canvasW, canvasH]);
-  useEffect(() => { occupancyWindowsRef.current = occupancyWindows; }, [occupancyWindows]);
-
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
   // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
   // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
   const characterEntranceTime2 = useMemo(() => {
     if (characterMode2 !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => c.type !== "narration" && (c.type === "pan" || c.type === "characterZoom" || c.boardX !== undefined));
-    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan" || c.type === "characterZoom")) return Infinity;
+    const focusClips = clips.filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions2.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
   }, [characterMode2, clips, resolvedCharActions2]);
@@ -5570,6 +5513,39 @@ export default function Board2Page() {
 
   // ─ Canvas draw ────────────────────────────────────────────────────────────
 
+  const editorCameraAtTime = useCallback((
+    time: number,
+    currentClips: Clip[],
+    currentCameraKeyframes: CameraKeyframe[],
+    W: number,
+    H: number,
+  ) => {
+    const baseCamera = interpolateCameraKeyframes(currentCameraKeyframes, time);
+    return applyCharacterFocusCamera({
+      time,
+      clips: currentClips,
+      baseCamera,
+      canvasW: W,
+      canvasH: H,
+      boardW: BOARD_W,
+      positionAt: (characterId, sampleTime) => {
+        const useC2 = characterId === "c2";
+        const enabled = useC2 ? showCharacter2Ref.current : showCharacterRef.current;
+        const entranceTime = useC2 ? characterEntranceTime2Ref.current : characterEntranceTimeRef.current;
+        if (!enabled || sampleTime < entranceTime) return null;
+        const pose = evalCharAtTime(
+          sampleTime,
+          useC2 ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
+          useC2 ? charInit2XRef.current : charInitXRef.current,
+          useC2 ? charInit2YRef.current : charInitYRef.current,
+          currentClips,
+          authoredAnimationsRef.current,
+        );
+        return { x: pose.boardX, y: pose.boardY };
+      },
+    });
+  }, []);
+
   const renderToCtx = useCallback((
     ctx: CanvasRenderingContext2D,
     time: number,
@@ -5583,7 +5559,7 @@ export default function Board2Page() {
   ) => {
     ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.fillRect(0, 0, W, H);
-    const cam = overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
+    const cam = overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
     const sf = cam.boardZoom * W / BOARD_W;
     const liveMode = liveControlEnabledRef.current;
     const authoredBazooka = !liveMode && !playModeRef.current
@@ -5663,8 +5639,11 @@ export default function Board2Page() {
     }
     ctx.globalAlpha = 1;
     let speechBubbleAnchor: SpeechBubbleAnchor | null = null;
+    const focusCharacterId = overrideCamera
+      ? null
+      : activeCharacterFocusBlock(currentClips, time)?.focusCharacterId ?? null;
     const setSpeechAnchor = (id: CharacterId, anchor: SpeechBubbleAnchor) => {
-      if (!speechBubbleAnchor || activeCharacterIdRef.current === id) speechBubbleAnchor = anchor;
+      if (!speechBubbleAnchor || (focusCharacterId ?? activeCharacterIdRef.current) === id) speechBubbleAnchor = anchor;
     };
     if (liveMode) {
       const wallMs = liveWallMs ?? performance.now();
@@ -5754,7 +5733,7 @@ export default function Board2Page() {
     }
     ctx.restore();
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
-  }, [drawStreamGuestsToCtx]);
+  }, [drawStreamGuestsToCtx, editorCameraAtTime]);
 
   const drawFrame = useCallback((time: number) => {
     const canvas = canvasRef.current;
@@ -5952,18 +5931,10 @@ export default function Board2Page() {
   }
 
   function currentPlaybackDuration(currentClips: Clip[]): number {
-    if ((cameraKeyframeModeRef.current === "character" || cameraKeyframeModeRef.current === "follow") && characterDurationRef.current > 0) {
-      return characterDurationRef.current;
-    }
-    return currentClips
-      .filter((clip) => clip.type !== "frameSurface")
-      .reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
+    return currentClips.reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
   }
 
   function activeVideoWindow(clip: Clip, time: number): { start: number; end: number } | undefined {
-    if (cameraKeyframeModeRef.current === "character" || cameraKeyframeModeRef.current === "follow") {
-      return occupancyWindowAt(occupancyWindowsRef.current, clip.id, time);
-    }
     return time >= clip.startTime && time < clip.startTime + clip.duration
       ? { start: clip.startTime, end: clip.startTime + clip.duration }
       : undefined;
@@ -6121,7 +6092,7 @@ export default function Board2Page() {
       if (!ambientVideoEnabledRef.current) {
         ambientCandidateIdsRef.current = new Set();
       } else {
-        const cam = options.overrideCamera ?? interpolateCameraKeyframes(currentCameraKeyframes, time);
+        const cam = options.overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
         const ambientSlots = Math.max(0, AMBIENT_BUDGET - foregroundIds.size);
         const candidates = videoClips
           .filter((clip) => !foregroundIds.has(clip.id))
@@ -6159,11 +6130,7 @@ export default function Board2Page() {
       const reason = isFocused
         ? "play-media-focus"
         : isActive
-        ? cameraKeyframeModeRef.current === "character"
-          ? "character-occupancy-active"
-          : cameraKeyframeModeRef.current === "follow"
-            ? "follow-occupancy-or-frame-active"
-            : "timeline-active"
+        ? "timeline-active"
         : !ambientVideoEnabledRef.current
           ? "ambient-disabled"
           : isAmbient
@@ -6663,33 +6630,29 @@ export default function Board2Page() {
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
-  function addFrameSurfaceClip(atTime?: number) {
+  function addCharacterFocusClip(atTime?: number) {
+    const focusCharacterId = activeCharacterIdRef.current;
+    const enabled = focusCharacterId === "c2" ? showCharacter2Ref.current : showCharacterRef.current;
+    if (!enabled) {
+      setToast(`Enable Character ${focusCharacterId === "c2" ? "2" : "1"} before adding a focus block`);
+      return;
+    }
     const id = generateId();
     const startTime = atTime ?? playheadRef.current;
     const duration = 3;
     const layer = freeLayerAtTime(clipsRef.current, startTime, duration, id, 1);
     const clip: Clip = {
       id,
-      type: "frameSurface",
-      name: "Frame current surface",
+      type: "characterFocus",
+      name: `Character ${focusCharacterId === "c2" ? "2" : "1"} Focus`,
       sourceUrl: "",
       startTime,
       duration,
-      holdFraction: 0.6,
       layer,
+      focusCharacterId,
     };
     setClips((prev) => [...prev, clip]);
     setClipSelection([id]);
-    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
-  }
-
-  function addCharacterZoomClip(atTime?: number) {
-    const id = generateId();
-    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    const clip: Clip = { id, type: "characterZoom", name: "Character Zoom", sourceUrl: "", startTime, duration: 3, holdFraction: 0.65, layer: 1 };
-    setClips((prev) => [...prev, clip]);
-    setSelectedClipId(id);
-    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
   // A custom zoom clip carries no media of its own — boardX/Y/W/H mark a hand-drawn region of
@@ -8541,10 +8504,16 @@ export default function Board2Page() {
           points: a.points ? a.points.map((p) => ({ ...p })) : undefined,
         }])
     );
-    const onMove = (ev: PointerEvent) => {
-      const zoom = boardZoomRef.current;
-      const dx = (ev.clientX - startX) / zoom;
-      const dy = (ev.clientY - startY) / zoom;
+    let latestDx = 0;
+    let latestDy = 0;
+    let hasMoved = false;
+    let moveFrame: number | null = null;
+    const commitMove = () => {
+      moveFrame = null;
+      if (!hasMoved) return;
+      const dx = latestDx;
+      const dy = latestDy;
+      hasMoved = false;
       setClips((prev) =>
         prev.map((c) =>
           !movingClipIds.includes(c.id) || !origClips.has(c.id) ? c : {
@@ -8573,7 +8542,19 @@ export default function Board2Page() {
         }));
       }
     };
-    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    const onMove = (ev: PointerEvent) => {
+      const zoom = boardZoomRef.current;
+      latestDx = (ev.clientX - startX) / zoom;
+      latestDy = (ev.clientY - startY) / zoom;
+      hasMoved = true;
+      if (moveFrame === null) moveFrame = window.requestAnimationFrame(commitMove);
+    };
+    const onUp = () => {
+      if (moveFrame !== null) window.cancelAnimationFrame(moveFrame);
+      commitMove();
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -8592,9 +8573,15 @@ export default function Board2Page() {
     const { boardX: ox, boardY: oy, boardW: ow, boardH: oh } = clip;
     if (ox === undefined || oy === undefined || ow === undefined || oh === undefined) return;
     const aspect = ow / oh;
-    const onMove = (ev: PointerEvent) => {
+    let latestClientX = startX;
+    let hasMoved = false;
+    let resizeFrame: number | null = null;
+    const commitResize = () => {
+      resizeFrame = null;
+      if (!hasMoved) return;
       const zoom = boardZoomRef.current;
-      const dx = (ev.clientX - startX) / zoom;
+      const dx = (latestClientX - startX) / zoom;
+      hasMoved = false;
       let nx = ox, ny = oy, nw = ow, nh = oh;
       if (corner === "se") { nw = Math.max(50, ow + dx); nh = nw / aspect; }
       else if (corner === "sw") { nw = Math.max(50, ow - dx); nh = nw / aspect; nx = ox + ow - nw; }
@@ -8608,7 +8595,17 @@ export default function Board2Page() {
         )
       );
     };
-    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    const onMove = (ev: PointerEvent) => {
+      latestClientX = ev.clientX;
+      hasMoved = true;
+      if (resizeFrame === null) resizeFrame = window.requestAnimationFrame(commitResize);
+    };
+    const onUp = () => {
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
+      commitResize();
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -9322,121 +9319,8 @@ export default function Board2Page() {
   // ─ Generate camera keyframes ──────────────────────────────────────────────
 
   function generateCameraKeyframes() {
-    if (cameraModeRef.current === "follow") {
-      if (!showCharacterRef.current) {
-        setToast("Enable Character 1 before using follow camera mode");
-        return;
-      }
-      if (characterActionsRef.current.length === 0) {
-        setToast("Add or generate Character 1 actions first");
-        return;
-      }
-
-      const duration = characterProjectDuration(characterActionsRef.current);
-      const positionAt = (time: number) => {
-        const pose = evalCharAtTime(
-          time,
-          cameraResolvedCharActions,
-          charInit.x,
-          charInit.y,
-          clipsRef.current,
-          authoredAnimationsRef.current,
-        );
-        return { x: pose.boardX, y: pose.boardY };
-      };
-      const result = deriveFollowCameraKeyframes({
-        actions: cameraResolvedCharActions,
-        clips: clipsRef.current,
-        duration,
-        canvasW: canvasWRef.current,
-        canvasH: canvasHRef.current,
-        boardW: BOARD_W,
-        positionAt,
-      });
-      for (const note of result.notes) console.info(`[follow camera] ${note.message}`);
-
-      const newCameraKeyframes = result.keyframes as CameraKeyframe[];
-      setCameraKeyframes(newCameraKeyframes);
-      cameraKeyframesRef.current = newCameraKeyframes;
-      setCameraKeyframeMode("follow");
-      cameraKeyframeModeRef.current = "follow";
-      characterDurationRef.current = duration;
-      occupancyWindowsRef.current = result.occupancyWindows;
-      setKeyframesOutOfDate(false);
-      drawFrame(playheadRef.current);
-      const frameCount = result.framedSurfaces.length;
-      const noteSuffix = result.notes.length > 0 ? ` · ${result.notes.length} parchment fallback${result.notes.length === 1 ? "" : "s"}` : "";
-      setToast(`Follow camera generated · ${duration.toFixed(1)}s · ${frameCount} surface frame${frameCount === 1 ? "" : "s"}${noteSuffix}`);
-      return;
-    }
-
-    if (cameraModeRef.current === "character") {
-      if (!showCharacterRef.current) {
-        setToast("Enable Character 1 before using character camera mode");
-        return;
-      }
-      if (characterActionsRef.current.length === 0) {
-        setToast("Add or generate Character 1 actions first");
-        return;
-      }
-
-      const duration = characterProjectDuration(characterActionsRef.current);
-      const W = canvasWRef.current;
-      const H = canvasHRef.current;
-      const positionAt = (time: number) => {
-        const pose = evalCharAtTime(
-          time,
-          cameraResolvedCharActions,
-          charInit.x,
-          charInit.y,
-          clipsRef.current,
-          authoredAnimationsRef.current,
-        );
-        return { x: pose.boardX, y: pose.boardY };
-      };
-      const secondPositionAt = showCharacter2Ref.current
-        ? (time: number) => {
-            const pose = evalCharAtTime(
-              time,
-              cameraResolvedCharActions2,
-              charInit2.x,
-              charInit2.y,
-              clipsRef.current,
-              authoredAnimationsRef.current,
-            );
-            return { x: pose.boardX, y: pose.boardY };
-          }
-        : undefined;
-      const newCameraKeyframes = deriveCharacterCameraKeyframes({
-        actions: cameraResolvedCharActions,
-        clips: clipsRef.current,
-        duration,
-        canvasW: W,
-        canvasH: H,
-        boardW: BOARD_W,
-        positionAt,
-        secondPositionAt,
-      }) as CameraKeyframe[];
-
-      setCameraKeyframes(newCameraKeyframes);
-      cameraKeyframesRef.current = newCameraKeyframes;
-      setCameraKeyframeMode("character");
-      cameraKeyframeModeRef.current = "character";
-      characterDurationRef.current = duration;
-      occupancyWindowsRef.current = deriveOccupancyWindows({
-        actions: cameraResolvedCharActions,
-        clips: clipsRef.current,
-        duration,
-        positionAt,
-      });
-      setKeyframesOutOfDate(false);
-      drawFrame(playheadRef.current);
-      setToast(`Character camera generated from ${characterActionsRef.current.length} Character 1 action${characterActionsRef.current.length === 1 ? "" : "s"} · ${duration.toFixed(1)}s`);
-      return;
-    }
-
     const allClipsSorted = clipsRef.current
-      .filter((c) => c.boardX !== undefined || c.type === "pan" || c.type === "characterZoom")
+      .filter((c) => c.boardX !== undefined || c.type === "pan")
       .sort((a, b) => a.startTime - b.startTime);
 
     if (allClipsSorted.length === 0) {
@@ -9478,27 +9362,6 @@ export default function Board2Page() {
     const panCamY = (bboxMinY + bboxMaxY) / 2;
     const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
     const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
-    const characterZoomStopAt = (t: number): Stop => {
-      const useC2 = activeCharacterIdRef.current === "c2" && showCharacter2Ref.current;
-      const enabled = useC2 ? showCharacter2Ref.current : showCharacterRef.current;
-      const entranceTime = useC2 ? characterEntranceTime2Ref.current : characterEntranceTimeRef.current;
-      if (!enabled || t < entranceTime) {
-        console.warn("Character zoom fell back to Frame All: character disabled or not entered yet", { time: t });
-        return frameAllStop;
-      }
-      const pose = evalCharAtTime(
-        t,
-        useC2 ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
-        useC2 ? charInit2XRef.current : charInitXRef.current,
-        useC2 ? charInit2YRef.current : charInitYRef.current,
-        clipsRef.current,
-        authoredAnimationsRef.current
-      );
-      const targetCharHeight = 170;
-      const zoom = clamp(0.55 * H * BOARD_W / (W * targetCharHeight), 1.1, 8);
-      return { camX: pose.boardX, camY: pose.boardY - 70, zoom };
-    };
-
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const holdStartStops: Stop[] = allClipsSorted.map((c) => {
       if (c.type === "pan") {
@@ -9506,7 +9369,6 @@ export default function Board2Page() {
           ? { camX: panStartX, camY: panCamY, zoom: panZoom }
           : frameAllStop;
       }
-      if (c.type === "characterZoom") return characterZoomStopAt(c.startTime);
       const bw = c.boardW!, bh = c.boardH!;
       const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
       return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * BOARD_W / W };
@@ -9533,13 +9395,6 @@ export default function Board2Page() {
         events.push({ absTime: holdStart, stop: { camX: panStartX, camY: panCamY, zoom: panZoom }, easing: 'ease-in-out' });
         events.push({ absTime: holdEnd,   stop: { camX: panEndX,   camY: panCamY, zoom: panZoom }, easing: 'linear' });
         events.push({ absTime: transEnd,  stop: nextStop,                                           easing: 'ease-in-out' });
-      } else if (c.type === "characterZoom") {
-        events.push({ absTime: holdStart, stop: characterZoomStopAt(holdStart), easing: 'ease-in-out' });
-        for (let t = holdStart + 0.25; t < holdEnd - 0.001; t += 0.25) {
-          events.push({ absTime: t, stop: characterZoomStopAt(t), easing: 'linear' });
-        }
-        events.push({ absTime: holdEnd, stop: characterZoomStopAt(holdEnd), easing: 'linear' });
-        events.push({ absTime: transEnd, stop: nextStop, easing: 'ease-in-out' });
       } else {
         events.push({ absTime: holdStart, stop: holdStartStops[i], easing: 'ease-in-out' });
         events.push({ absTime: holdEnd,   stop: holdStartStops[i], easing: 'ease-in-out' });
@@ -9569,8 +9424,6 @@ export default function Board2Page() {
 
     setCameraKeyframes(newCameraKeyframes);
     cameraKeyframesRef.current = newCameraKeyframes;
-    setCameraKeyframeMode("clips");
-    cameraKeyframeModeRef.current = "clips";
     setKeyframesOutOfDate(false);
     // Character choreography is a useMemo over [clips, cameraKeyframes, ...] (see resolvedCharActions
     // above), so setting cameraKeyframes here automatically re-derives auto actions from the new
@@ -9803,7 +9656,7 @@ export default function Board2Page() {
       boardX: c.boardX, boardY: c.boardY, boardW: c.boardW, boardH: c.boardH,
       label: c.name,
     }));
-    const totalDurationSec = Math.max(0, ...allClips.filter((c) => c.type !== "frameSurface").map((c) => c.startTime + c.duration));
+    const totalDurationSec = Math.max(0, ...allClips.map((c) => c.startTime + c.duration));
 
     const r2 = await fetch("/api/board2/character-choreography", {
       method: "POST",
@@ -9881,8 +9734,6 @@ export default function Board2Page() {
     const currentClips = clipsRef.current;
     const currentCameraKeyframes = cameraKeyframesRef.current;
     const currentAnnotations = annotationsRef.current;
-    const exportCameraMode = cameraKeyframeModeRef.current;
-    const exportOccupancyWindows = [...occupancyWindowsRef.current];
     const totalDur = currentPlaybackDuration(currentClips);
     const W = canvasWRef.current, H = canvasHRef.current;
     const exportCanvas = document.createElement("canvas");
@@ -9954,34 +9805,21 @@ export default function Board2Page() {
     if (exportAudioCtx && exportAudioDest && audioBuffers.length > 0) {
       const exportStartAcTime = exportAudioCtx.currentTime;
       for (const { clip, buffer } of audioBuffers) {
-        if (clip.type === "video" && (exportCameraMode === "character" || exportCameraMode === "follow")) {
-          for (const window of exportOccupancyWindows.filter((item) => item.clipId === clip.id)) {
-            const gainNode = exportAudioCtx.createGain();
-            gainNode.gain.value = effectiveClipVolume(clip);
-            gainNode.connect(exportAudioDest);
-            const bufNode = exportAudioCtx.createBufferSource();
-            bufNode.buffer = buffer;
-            bufNode.connect(gainNode);
-            bufNode.start(exportStartAcTime + window.start);
-            bufNode.stop(exportStartAcTime + Math.min(window.end, window.start + buffer.duration));
-          }
+        const gainNode = exportAudioCtx.createGain();
+        gainNode.gain.value = effectiveClipVolume(clip);
+        gainNode.connect(exportAudioDest);
+        const bufNode = exportAudioCtx.createBufferSource();
+        bufNode.buffer = buffer;
+        bufNode.connect(gainNode);
+        if (clip.type === "narration") {
+          const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
+          bufNode.start(exportStartAcTime + clip.startTime, offset, Math.min(clip.duration, buffer.duration - offset));
         } else {
-          const gainNode = exportAudioCtx.createGain();
-          gainNode.gain.value = effectiveClipVolume(clip);
-          gainNode.connect(exportAudioDest);
-          const bufNode = exportAudioCtx.createBufferSource();
-          bufNode.buffer = buffer;
-          bufNode.connect(gainNode);
-          if (clip.type === "narration") {
-            const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
-            bufNode.start(exportStartAcTime + clip.startTime, offset, Math.min(clip.duration, buffer.duration - offset));
-          } else {
-            bufNode.start(exportStartAcTime + clip.startTime);
-          }
-          // For video clips, stop at clip end (buffer may be longer than clip.duration)
-          if (clip.type === "video") {
-            bufNode.stop(exportStartAcTime + clip.startTime + clip.duration);
-          }
+          bufNode.start(exportStartAcTime + clip.startTime);
+        }
+        // For video clips, stop at clip end (buffer may be longer than clip.duration)
+        if (clip.type === "video") {
+          bufNode.stop(exportStartAcTime + clip.startTime + clip.duration);
         }
       }
     }
@@ -12647,21 +12485,9 @@ export default function Board2Page() {
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, background: isPlaying ? "#ff5e3a" : "#c8f135", color: isPlaying ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
           >{isPlaying ? "⏸" : "▶"}</button>
           <button
-            onClick={() => {
-              const next: CameraMode = cameraMode === "clips" ? "character" : cameraMode === "character" ? "follow" : "clips";
-              if ((next === "character" || next === "follow") && !showCharacter) return;
-              setCameraMode(next);
-              cameraModeRef.current = next;
-              if (cameraKeyframesRef.current.length > 0 && next !== cameraKeyframeModeRef.current) setKeyframesOutOfDate(true);
-            }}
-            disabled={cameraMode === "clips" && !showCharacter}
-            title={!showCharacter && cameraMode === "clips" ? "Enable Character 1 to use character or follow camera" : `Camera source: ${cameraMode}`}
-            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontFamily: "monospace", background: cameraMode !== "clips" ? "#2a2a2a" : "transparent", color: cameraMode !== "clips" ? "#c8f135" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: !showCharacter && cameraMode === "clips" ? "not-allowed" : "pointer", opacity: !showCharacter && cameraMode === "clips" ? 0.35 : 1, flexShrink: 0 }}
-          >{cameraMode === "character" ? "CHAR" : cameraMode === "follow" ? "FOLL" : "CLIP"}</button>
-          <button
             onClick={generateCameraKeyframes}
             disabled={!canGenerateCamera}
-            title={canGenerateCamera ? `Generate ${cameraMode}-driven camera keyframes` : cameraMode !== "clips" ? "Enable Character 1 first" : "Upload media first"}
+            title={canGenerateCamera ? "Generate camera keyframes from the clip schedule" : "Upload and place media first"}
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canGenerateCamera ? "pointer" : "not-allowed", opacity: canGenerateCamera ? 1 : 0.35, flexShrink: 0 }}
           >⬡</button>
           <button
@@ -12930,7 +12756,7 @@ export default function Board2Page() {
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "frameSurface" ? FRAME_SURFACE_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -12955,7 +12781,7 @@ export default function Board2Page() {
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.type === "frameSurface" ? "▣ Frame Surface" : clip.name}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -13030,11 +12856,8 @@ export default function Board2Page() {
                     <button onClick={() => { addPanClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: PAN_CLIP_COLOR }}>
                       ⟷  Add pan clip
                     </button>
-                    <button onClick={() => { addFrameSurfaceClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: FRAME_SURFACE_CLIP_COLOR }}>
-                      ▣  Frame current surface
-                    </button>
-                    <button onClick={() => { addCharacterZoomClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_ZOOM_CLIP_COLOR }}>
-                      ◎  Zoom on character
+                    <button onClick={() => { addCharacterFocusClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_FOCUS_CLIP_COLOR }}>
+                      ◎  Add character focus
                     </button>
                     {AI_FEATURES_ENABLED && <ProGated featureName="Neural Search">
                       <button
@@ -13086,7 +12909,7 @@ export default function Board2Page() {
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     <div>
@@ -13098,7 +12921,7 @@ export default function Board2Page() {
                         style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" } as React.CSSProperties}
                       />
                     </div>
-                    {selectedClip.type !== "narration" && (
+                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>
                           Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
@@ -13109,6 +12932,11 @@ export default function Board2Page() {
                           onChange={(e) => { const v = parseFloat(e.target.value); if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true); setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)); }}
                           style={{ width: "100%", accentColor: "#c8f135" }}
                         />
+                      </div>
+                    )}
+                    {selectedClip.type === "characterFocus" && (
+                      <div style={{ fontFamily: "monospace", fontSize: 10, lineHeight: 1.5, color: "#6a6a6a", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "8px 10px" }}>
+                        Temporarily overrides the normal camera and follows Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"}. Resize the block to set the focus duration.
                       </div>
                     )}
                     {selectedClip.type === "narration" && (
@@ -13420,7 +13248,7 @@ export default function Board2Page() {
 
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-        if (clip.type === "pan" || clip.type === "characterZoom" || clip.type === "customZoom" || clip.type === "frameSurface") {
+        if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
           manifestClips.push(rest);
         } else if (clip.youtubeId) {
           manifestClips.push({ ...rest, needsRedownload: true });
@@ -13470,8 +13298,6 @@ export default function Board2Page() {
         savedAt: new Date().toISOString(),
         clips: manifestClips,
         cameraKeyframes: cameraKeyframesRef.current,
-        cameraMode: cameraModeRef.current,
-        cameraKeyframeMode: cameraKeyframeModeRef.current,
         annotations: annotationsRef.current,
         canvasAspect,
         pxPerSec: pxPerSecRef.current,
@@ -13538,7 +13364,11 @@ export default function Board2Page() {
 
       const loadedClips: Clip[] = [];
       for (const mc of (manifest.clips ?? [])) {
-        if (mc.type === "pan" || mc.type === "characterZoom" || mc.type === "customZoom" || mc.type === "frameSurface") {
+        if (mc.type === "frameSurface") {
+          continue;
+        } else if (mc.type === "characterZoom") {
+          loadedClips.push({ ...mc, type: "characterFocus", name: "Character 1 Focus", focusCharacterId: "c1", sourceUrl: "" });
+        } else if (mc.type === "pan" || mc.type === "characterFocus" || mc.type === "customZoom") {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.needsRedownload) {
           loadedClips.push({ ...mc, sourceUrl: "" });
@@ -13569,15 +13399,11 @@ export default function Board2Page() {
       setNarrationVisemeTrackSource(loadedLipSyncSource);
       narrationVisemeTrackRef.current = loadedLipSyncTrack;
       narrationVisemeTrackSourceRef.current = loadedLipSyncSource;
-      const loadedCameraKeyframes = manifest.cameraKeyframes ?? [];
-      const loadedCameraMode: CameraMode = manifest.cameraMode === "character" || manifest.cameraMode === "follow" ? manifest.cameraMode : "clips";
-      const loadedKeyframeMode: CameraMode = manifest.cameraKeyframeMode === "character" || manifest.cameraKeyframeMode === "follow" ? manifest.cameraKeyframeMode : "clips";
+      const hadLegacyGeneratedCameraMode = manifest.cameraKeyframeMode === "character" || manifest.cameraKeyframeMode === "follow";
+      const loadedCameraKeyframes = hadLegacyGeneratedCameraMode ? [] : manifest.cameraKeyframes ?? [];
       setCameraKeyframes(loadedCameraKeyframes);
       cameraKeyframesRef.current = loadedCameraKeyframes;
-      setCameraMode(loadedCameraMode);
-      cameraModeRef.current = loadedCameraMode;
-      setCameraKeyframeMode(loadedKeyframeMode);
-      cameraKeyframeModeRef.current = loadedKeyframeMode;
+      setKeyframesOutOfDate(hadLegacyGeneratedCameraMode);
       setAnnotations(manifest.annotations ?? []);
       setSpawnDoor(manifest.spawnDoor ?? null);
       if (manifest.canvasAspect) setCanvasAspect(manifest.canvasAspect);
@@ -13637,7 +13463,11 @@ export default function Board2Page() {
         setCharacterFace2(null);
         setCharacterStart2(null);
       }
-      setToast(`Loaded "${manifest.name ?? "board"}"`);
+      setToast(
+        hadLegacyGeneratedCameraMode
+          ? `Loaded "${manifest.name ?? "board"}" · regenerate the standard camera path`
+          : `Loaded "${manifest.name ?? "board"}"`,
+      );
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
     } finally {
@@ -13684,46 +13514,10 @@ export default function Board2Page() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <div
-              style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}
-              title={!showCharacter ? "Enable Character 1 to use character or follow camera mode" : "Choose what drives camera generation"}
-            >
-              {(["clips", "character", "follow"] as const).map((mode) => {
-                const disabled = mode !== "clips" && !showCharacter;
-                return (
-                  <button
-                    key={mode}
-                    disabled={disabled}
-                    onClick={() => {
-                      setCameraMode(mode);
-                      cameraModeRef.current = mode;
-                      if (cameraKeyframesRef.current.length > 0 && mode !== cameraKeyframeModeRef.current) setKeyframesOutOfDate(true);
-                    }}
-                    title={disabled ? "Enable Character 1 first" : `${mode === "clips" ? "Clip schedule" : mode === "character" ? "Character 1 choreography" : "Dynamic Character 1 follow with surface-frame blocks"} drives camera keyframes`}
-                    style={{
-                      padding: "4px 7px", fontFamily: "monospace", fontSize: 9,
-                      border: "none", borderRight: mode !== "follow" ? "1px solid rgba(42,42,42,0.35)" : "none",
-                      background: cameraMode === mode ? "#2a2a2a" : "#fffdf5",
-                      color: cameraMode === mode ? "#c8f135" : "#2a2a2a",
-                      opacity: disabled ? 0.4 : 1,
-                      cursor: disabled ? "not-allowed" : "pointer",
-                    }}
-                  >
-                    {mode === "clips" ? "Clips" : mode === "character" ? "Character" : "Follow"}
-                  </button>
-                );
-              })}
-            </div>
             <button
               onClick={generateCameraKeyframes}
               disabled={!canGenerateCamera}
-              title={canGenerateCamera
-                ? cameraMode === "character"
-                  ? "Generate camera keyframes from Character 1 choreography"
-                  : cameraMode === "follow"
-                    ? "Generate spring-follow camera keyframes with surface-frame overrides"
-                    : "Generate camera keyframe sequence from board positions and timeline"
-                : cameraMode !== "clips" ? "Enable Character 1 first" : "Upload media first"}
+              title={canGenerateCamera ? "Generate camera keyframes from board positions and the clip schedule" : "Upload and place media first"}
               style={{
                 ...sketchButton,
                 padding: "4px 10px",
@@ -13734,7 +13528,7 @@ export default function Board2Page() {
             >
               ⬡ Generate camera keyframes
             </button>
-            {keyframesOutOfDate && cameraKeyframes.length > 0 && (
+            {keyframesOutOfDate && (
               <span style={{ fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", border: "1px solid #ff5e3a", padding: "2px 5px", whiteSpace: "nowrap" }}>
                 ↻ keyframes out of date
               </span>
@@ -13788,18 +13582,11 @@ export default function Board2Page() {
               ⟷ Add pan clip
             </button>
             <button
-              onClick={() => addFrameSurfaceClip()}
-              style={{ ...sketchButton, background: FRAME_SURFACE_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
-              title="In Follow mode, zoom out to the surface Character 1 is standing on"
+              onClick={() => addCharacterFocusClip()}
+              style={{ ...sketchButton, background: CHARACTER_FOCUS_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
+              title="Add a resizable timeline block that temporarily makes the active character the camera focus"
             >
-              ▣ Frame current surface
-            </button>
-            <button
-              onClick={() => addCharacterZoomClip()}
-              style={{ ...sketchButton, background: CHARACTER_ZOOM_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
-              title="Add a camera clip that follows and zooms on the character"
-            >
-              ◎ Zoom on character
+              ◎ Add character focus
             </button>
             <button
               onClick={() => setCustomZoomDrawMode((v) => !v)}
@@ -15445,16 +15232,16 @@ export default function Board2Page() {
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterZoom" ? "◎ Character zoom" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Sweeps across all board images
                   </div>
                 )}
-                {selectedClip.type === "characterZoom" && (
-                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#4a4a7a", background: CHARACTER_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
-                    Camera follows and zooms on the character
+                {selectedClip.type === "characterFocus" && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", color: "#4a4a7a", background: CHARACTER_FOCUS_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+                    Overrides the normal camera and follows Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"} for this block only
                   </div>
                 )}
                 {selectedClip.type === "customZoom" && (
@@ -15512,7 +15299,7 @@ export default function Board2Page() {
                   </div>
                 )}
 
-                {selectedClip.type !== "narration" && (
+                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
                     <input
@@ -15533,6 +15320,11 @@ export default function Board2Page() {
                     <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
                       Hold: {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans: {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
                     </div>
+                  </div>
+                )}
+                {selectedClip.type === "characterFocus" && (
+                  <div style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.5, color: "#5b6842", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "5px 7px" }}>
+                    The underlying image/pan camera keeps progressing and resumes automatically when this block ends.
                   </div>
                 )}
 
@@ -15724,10 +15516,11 @@ export default function Board2Page() {
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterZoom" ? CHARACTER_ZOOM_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "frameSurface" ? FRAME_SURFACE_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
-                const hf = clip.holdFraction ?? HOLD_FRACTION;
+                const isCharacterFocus = clip.type === "characterFocus";
+                const hf = isCharacterFocus ? 1 : clip.holdFraction ?? HOLD_FRACTION;
                 const innerW = clipPx - HANDLE_W * 2;
                 const holdW = Math.max(0, innerW * hf);
                 const transW = Math.max(0, innerW * (1 - hf));
@@ -15758,20 +15551,24 @@ export default function Board2Page() {
                     {/* Hold region */}
                     <div style={{ position: "absolute", left: HANDLE_W, top: 0, width: holdW, bottom: 0, background: holdColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
                       {holdW > 30 && (
-                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>hold</span>
+                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>{isCharacterFocus ? "camera override" : "hold"}</span>
                       )}
                     </div>
-                    {/* Transition region */}
-                    <div style={{ position: "absolute", left: HANDLE_W + holdW, top: 0, width: transW, bottom: 0, background: transColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
-                      {transW > 36 && (
-                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>trans</span>
-                      )}
-                    </div>
-                    {/* Divider */}
-                    <div
-                      style={{ position: "absolute", left: dividerLeft - 1, top: 0, bottom: 0, width: 3, background: "rgba(42,42,42,0.65)", cursor: "col-resize", zIndex: 5 }}
-                      onPointerDown={(e) => handleDividerPointerDown(e, clip)}
-                    />
+                    {!isCharacterFocus && (
+                      <>
+                        {/* Transition region */}
+                        <div style={{ position: "absolute", left: HANDLE_W + holdW, top: 0, width: transW, bottom: 0, background: transColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+                          {transW > 36 && (
+                            <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>trans</span>
+                          )}
+                        </div>
+                        {/* Divider */}
+                        <div
+                          style={{ position: "absolute", left: dividerLeft - 1, top: 0, bottom: 0, width: 3, background: "rgba(42,42,42,0.65)", cursor: "col-resize", zIndex: 5 }}
+                          onPointerDown={(e) => handleDividerPointerDown(e, clip)}
+                        />
+                      </>
+                    )}
                     {/* Left resize handle */}
                     <div
                       style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.25)", zIndex: 6 }}
@@ -15779,7 +15576,7 @@ export default function Board2Page() {
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterZoom" ? "◎ Char Zoom" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.type === "frameSurface" ? "▣ Frame Surface" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? "🔍 Custom Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
@@ -16092,12 +15889,6 @@ export default function Board2Page() {
                   ⌘V Paste
                 </div>
               )}
-              <div onClick={() => { addFrameSurfaceClip(contextMenu.timeSec); setContextMenu(null); }}
-                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.08)" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = FRAME_SURFACE_CLIP_COLOR)}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                ▣ Frame current surface
-              </div>
               <div onClick={() => { deleteClip(contextMenu.clipId!); setContextMenu(null); }}
                 style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, color: "#ff5e3a" }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "#ffe5e5")}
@@ -16114,17 +15905,11 @@ export default function Board2Page() {
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
                 ⟷ Add pan here
               </div>
-              <div onClick={() => { addFrameSurfaceClip(contextMenu.timeSec); setContextMenu(null); }}
+              <div onClick={() => { addCharacterFocusClip(contextMenu.timeSec); setContextMenu(null); }}
                 style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = FRAME_SURFACE_CLIP_COLOR)}
+                onMouseEnter={(e) => (e.currentTarget.style.background = CHARACTER_FOCUS_CLIP_COLOR)}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                ▣ Frame current surface
-              </div>
-              <div onClick={() => { addCharacterZoomClip(contextMenu.timeSec); setContextMenu(null); }}
-                style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = CHARACTER_ZOOM_CLIP_COLOR)}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                ◎ Zoom on character
+                ◎ Add character focus here
               </div>
               {clipboardReady && (
                 <div onClick={() => { pasteClip(); setContextMenu(null); }}
