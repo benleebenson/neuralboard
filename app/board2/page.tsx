@@ -63,6 +63,8 @@ import {
   isRhubarbCue,
   isVisemeTrack,
   mergeNarrationCueTracks,
+  offsetRhubarbChunkCues,
+  planLipSyncChunks,
   visemeAt,
   type RhubarbCue,
   type VisemeTrackPoint,
@@ -7076,21 +7078,34 @@ export default function Board2Page() {
     setToast("Analyzing narration…");
     try {
       const analyzed: Array<{ clipId: string; startTime: number; duration: number; cues: RhubarbCue[] }> = [];
-      for (const clip of sourceClips) {
-        const audio = await compileNarrationToBlob([clip]);
-        const form = new FormData();
-        form.append("audio", audio, `${clip.name || "narration"}.wav`);
-        const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
-        const data: unknown = await response.json().catch(() => null);
-        if (!response.ok) {
-          const message = data && typeof data === "object" && "error" in data
-            ? String((data as { error: unknown }).error)
-            : `Lip sync analysis failed (${response.status})`;
-          throw new Error(message);
+      for (let clipIndex = 0; clipIndex < sourceClips.length; clipIndex++) {
+        const clip = sourceClips[clipIndex];
+        const decoded = await decodeNarrationClip(clip);
+        const sourceOffset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, decoded.duration - 0.01));
+        const analysisDuration = Math.min(clip.duration, Math.max(0, decoded.duration - sourceOffset));
+        const windows = planLipSyncChunks(analysisDuration);
+        if (!windows.length) throw new Error(`No audio found in ${clip.name || "narration"}`);
+        const clipCues: RhubarbCue[] = [];
+        for (let chunkIndex = 0; chunkIndex < windows.length; chunkIndex++) {
+          const window = windows[chunkIndex];
+          setToast(`Analyzing narration ${clipIndex + 1}/${sourceClips.length} · part ${chunkIndex + 1}/${windows.length}…`);
+          const audio = audioBufferSegmentToMonoWav(decoded, sourceOffset + window.audioStart, window.audioEnd - window.audioStart);
+          const form = new FormData();
+          form.append("audio", audio, `${clip.name || "narration"}-${chunkIndex + 1}.wav`);
+          const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
+          const data: unknown = await response.json().catch(() => null);
+          if (!response.ok) {
+            const message = data && typeof data === "object" && "error" in data
+              ? String((data as { error: unknown }).error)
+              : response.status === 413
+                ? "Lip sync upload was rejected as too large"
+                : `Lip sync analysis failed (${response.status})`;
+            throw new Error(message);
+          }
+          if (!Array.isArray(data)) throw new Error("Lip sync bridge returned invalid cues");
+          clipCues.push(...offsetRhubarbChunkCues(data.filter(isRhubarbCue), window, analysisDuration));
         }
-        if (!Array.isArray(data)) throw new Error("Lip sync bridge returned invalid cues");
-        const cues = data.filter(isRhubarbCue);
-        analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues });
+        analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues: clipCues });
       }
 
       if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
@@ -16970,6 +16985,55 @@ function audioBufferToWav(buf: AudioBuffer): Blob {
     }
   }
   return new Blob([ab], { type: "audio/wav" });
+}
+
+async function decodeNarrationClip(clip: Clip): Promise<AudioBuffer> {
+  const context = new AudioContext();
+  try {
+    const bytes = clip.audioBlob
+      ? await clip.audioBlob.arrayBuffer()
+      : await fetch(clip.sourceUrl).then((response) => {
+          if (!response.ok) throw new Error(`Could not read narration (${response.status})`);
+          return response.arrayBuffer();
+        });
+    return await context.decodeAudioData(bytes);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+function audioBufferSegmentToMonoWav(
+  buffer: AudioBuffer,
+  sourceStartSeconds: number,
+  requestedDurationSeconds: number,
+): Blob {
+  const targetSampleRate = 16_000;
+  const sourceStart = Math.min(Math.max(0, sourceStartSeconds), buffer.duration);
+  const duration = Math.min(Math.max(0, requestedDurationSeconds), Math.max(0, buffer.duration - sourceStart));
+  const sampleCount = Math.max(1, Math.ceil(duration * targetSampleRate));
+  const dataLength = sampleCount * 2;
+  const bytes = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(bytes);
+  writeWavStr(view, 0, "RIFF"); view.setUint32(4, 36 + dataLength, true); writeWavStr(view, 8, "WAVE");
+  writeWavStr(view, 12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, targetSampleRate, true); view.setUint32(28, targetSampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeWavStr(view, 36, "data"); view.setUint32(40, dataLength, true);
+
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+  const sourceFrameStart = sourceStart * buffer.sampleRate;
+  const sourceFramesPerOutput = buffer.sampleRate / targetSampleRate;
+  for (let index = 0; index < sampleCount; index++) {
+    const sourcePosition = sourceFrameStart + index * sourceFramesPerOutput;
+    const lower = Math.min(buffer.length - 1, Math.floor(sourcePosition));
+    const upper = Math.min(buffer.length - 1, lower + 1);
+    const mix = sourcePosition - lower;
+    let sample = 0;
+    for (const channel of channels) sample += channel[lower] + (channel[upper] - channel[lower]) * mix;
+    sample = Math.max(-1, Math.min(1, sample / Math.max(1, channels.length)));
+    view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return new Blob([bytes], { type: "audio/wav" });
 }
 
 async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {
