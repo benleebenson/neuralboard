@@ -7072,7 +7072,7 @@ export default function Board2Page() {
     }
   }
 
-  async function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
+  function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
     if (clip.type !== "narration") return;
     const owner = activeCharacterIdRef.current;
     const applyGestureActions = (updatedClip: Clip) => {
@@ -7088,16 +7088,22 @@ export default function Board2Page() {
       setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
       return;
     }
-    if (clip.transcriptSegments?.length) {
-      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: clip.speechBubbleGestures !== false };
-      setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
-      if (updatedClip.speechBubbleGestures) applyGestureActions(updatedClip);
-      if (owner === "c2") setShowCharacter2(true);
-      else setShowCharacter(true);
+    if (!clip.transcriptSegments?.length) {
+      setToast("Transcribe this narration with Whisper first");
       return;
     }
+    const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: clip.speechBubbleGestures !== false };
+    setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
+    if (updatedClip.speechBubbleGestures) applyGestureActions(updatedClip);
+    if (owner === "c2") setShowCharacter2(true);
+    else setShowCharacter(true);
+  }
+
+  async function transcribeNarrationWithWhisper(clip: Clip) {
+    if (clip.type !== "narration" || transcribingNarrationId) return;
+    const owner = activeCharacterIdRef.current;
     setTranscribingNarrationId(clip.id);
-    setToast("Transcribing narration for speech bubbles…");
+    setToast("Transcribing narration with Whisper…");
     try {
       const audio: Blob = clip.audioBlob instanceof Blob
         ? clip.audioBlob
@@ -7113,14 +7119,18 @@ export default function Board2Page() {
             .filter((segment: TranscriptSegment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
         : [];
       if (!segments.length) throw new Error("No spoken narration was detected");
-      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: true, transcriptSegments: segments };
+      const updatedClip = { ...clip, transcriptSegments: segments };
       setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
-      applyGestureActions(updatedClip);
-      if (owner === "c2") setShowCharacter2(true);
-      else setShowCharacter(true);
-      setToast(`Speech bubbles created · ${narrationSentenceCues(segments).length} sentences`);
+      if (updatedClip.speechBubbles && updatedClip.speechBubbleGestures !== false) {
+        const resolvedOwnerActions = owner === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+        updateCharacterActionsFor(owner, (prev) => [
+          ...prev.filter((action) => action.narrationGestureClipId !== updatedClip.id),
+          ...narrationSpeechGestureActions(updatedClip, resolvedOwnerActions, owner),
+        ]);
+      }
+      setToast(`Whisper transcript ready · ${narrationSentenceCues(segments).length} sentences`);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not create speech bubbles");
+      setToast(error instanceof Error ? error.message : "Could not transcribe narration");
     } finally {
       setTranscribingNarrationId(null);
     }
@@ -13107,20 +13117,41 @@ export default function Board2Page() {
                     {selectedClip.type === "narration" && (
                       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                         <button
-                          onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                          disabled={transcribingNarrationId === selectedClip.id}
-                          style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                          onClick={() => void transcribeNarrationWithWhisper(selectedClip)}
+                          disabled={!!transcribingNarrationId}
+                          style={{ ...sketchButton, width: "100%", padding: "10px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                         >
-                          {transcribingNarrationId === selectedClip.id ? "⟳ Transcribing…" : selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Add speech bubbles"}
+                          {transcribingNarrationId === selectedClip.id
+                            ? "⟳ Whisper transcription…"
+                            : transcribingNarrationId
+                              ? "⟳ Whisper is busy…"
+                              : selectedClip.transcriptSegments?.length
+                              ? "↻ Re-transcribe with Whisper"
+                              : "✎ Transcribe with Whisper"}
                         </button>
-                        {selectedClip.speechBubbles && (
-                          <button
-                            type="button"
-                            onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
-                            style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
-                          >
-                            {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
-                          </button>
+                        {selectedClip.transcriptSegments?.length ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                              style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5" }}
+                            >
+                              {selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Speech bubbles off"}
+                            </button>
+                            {selectedClip.speechBubbles && (
+                              <button
+                                type="button"
+                                onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                                style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                              >
+                                {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                              </button>
+                            )}
+                          </>
+                        ) : (
+                          <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", lineHeight: 1.4 }}>
+                            Selection never starts Whisper. Use the button above when you want a transcript.
+                          </div>
                         )}
                       </div>
                     )}
@@ -15578,20 +15609,43 @@ export default function Board2Page() {
                 {selectedClip.type === "narration" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <button
-                      onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                      disabled={transcribingNarrationId === selectedClip.id}
-                      style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                      onClick={() => void transcribeNarrationWithWhisper(selectedClip)}
+                      disabled={!!transcribingNarrationId}
+                      style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                     >
-                      {transcribingNarrationId === selectedClip.id ? "⟳ Whisper transcription…" : selectedClip.speechBubbles ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments ?? []).length}` : "💬 Add comic speech bubbles"}
+                      {transcribingNarrationId === selectedClip.id
+                        ? "⟳ Whisper transcription…"
+                        : transcribingNarrationId
+                          ? "⟳ Whisper is busy…"
+                          : selectedClip.transcriptSegments?.length
+                          ? "↻ Re-transcribe with Whisper"
+                          : "✎ Transcribe with Whisper"}
                     </button>
-                    {selectedClip.speechBubbles && (
-                      <button
-                        type="button"
-                        onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
-                        style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
-                      >
-                        {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
-                      </button>
+                    {selectedClip.transcriptSegments?.length ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                          style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5" }}
+                        >
+                          {selectedClip.speechBubbles
+                            ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments).length}`
+                            : "💬 Speech bubbles off"}
+                        </button>
+                        {selectedClip.speechBubbles && (
+                          <button
+                            type="button"
+                            onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                            style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                          >
+                            {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", lineHeight: 1.4 }}>
+                        Selecting narration never starts Whisper.
+                      </div>
                     )}
                   </div>
                 )}
@@ -15899,7 +15953,6 @@ export default function Board2Page() {
                     onClick={(e) => {
                       e.stopPropagation();
                       setClipSelection([clip.id]);
-                      if (!clip.speechBubbles && transcribingNarrationId !== clip.id) void setNarrationSpeechBubbles(clip, true);
                     }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
