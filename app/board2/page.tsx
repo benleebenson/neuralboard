@@ -11665,10 +11665,6 @@ export default function Board2Page() {
         e.preventDefault();
         copyClip(selectedClipId);
       }
-      if (meta && e.code === "KeyV" && clipboardRef.current) {
-        e.preventDefault();
-        pasteClip();
-      }
       if (meta && e.code === "KeyD" && selectedClipId) {
         e.preventDefault();
         duplicateClip(selectedClipId);
@@ -11691,11 +11687,9 @@ export default function Board2Page() {
   });
 
   // ─ Clipboard image paste ──────────────────────────────────────────────────
-  // Separate from the Step 16.4 clip clipboard above (clipboardRef + the keydown KeyV handler,
-  // which pastes internally-copied clips). This listens for the native "paste" event and only
-  // acts when the OS clipboard actually contains image data — anything else (text paste in an
-  // input, the clip clipboard's own Cmd+V) falls through untouched since we never call
-  // preventDefault unless an image item is found.
+  // Use the native paste event for both OS clipboard images and the board's internal clip
+  // clipboard. Image data takes precedence so a previously copied board clip cannot intercept
+  // Cmd/Ctrl+V after the user chooses "Copy image" in another browser tab.
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -11705,24 +11699,37 @@ export default function Board2Page() {
         aiModalOpen || directCharacterOpen || !!imagePreviewTarget;
       if (anyModalOpen) return;
       const items = Array.from(e.clipboardData?.items ?? []);
-      const imageItems = items.filter((item) => item.type.startsWith("image/"));
-      if (imageItems.length === 0) return;
-      e.preventDefault();
-      (async () => {
-        let pastedCount = 0;
-        for (const item of imageItems) {
-          const blob = item.getAsFile();
-          if (!blob) continue;
-          if (blob.size > MAX_PASTED_IMAGE_BYTES) {
-            setToast("Image too large to paste (max 15MB)");
-            continue;
+      const itemImages = items
+        .filter((item) => item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => !!file);
+      // Some browsers expose pasted images through `files` but not `items`.
+      const imageFiles = itemImages.length > 0
+        ? itemImages
+        : Array.from(e.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        void (async () => {
+          let pastedCount = 0;
+          for (const file of imageFiles) {
+            if (file.size > MAX_PASTED_IMAGE_BYTES) {
+              setToast("Image too large to paste (max 15MB)");
+              continue;
+            }
+            const ext = file.type.split("/")[1] || "png";
+            await ingestMediaFile(file, `Pasted image ${Date.now()}.${ext}`);
+            pastedCount++;
           }
-          const ext = item.type.split("/")[1] || "png";
-          await ingestMediaFile(blob, `Pasted image ${Date.now()}.${ext}`);
-          pastedCount++;
-        }
-        if (pastedCount > 0) setToast("Image pasted");
-      })();
+          if (pastedCount > 0) setToast("Image pasted");
+        })();
+        return;
+      }
+
+      if (clipboardRef.current) {
+        e.preventDefault();
+        void pasteClip();
+      }
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
