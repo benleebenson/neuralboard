@@ -5541,7 +5541,11 @@ export default function Board2Page() {
           currentClips,
           authoredAnimationsRef.current,
         );
-        return { x: pose.boardX, y: pose.boardY };
+        return {
+          x: pose.boardX,
+          y: pose.boardY,
+          speechBubble: !!activeNarrationBubble(sampleTime, currentClips) && poseAllowsSpeechBubble(pose),
+        };
       },
     });
   }, []);

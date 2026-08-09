@@ -15,10 +15,13 @@ export type CharacterFocusBlockLike = {
   focusCharacterId?: CharacterFocusId;
 };
 
-export type CharacterFocusPosition = { x: number; y: number };
+export type CharacterFocusPosition = { x: number; y: number; speechBubble?: boolean };
 
 const CHARACTER_BOARD_HEIGHT = 170;
 const CHARACTER_FRAME_HEIGHT_RATIO = 0.55;
+const SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = 0.48;
+const CHARACTER_CAMERA_Y_OFFSET = 70;
+const SPEECH_BUBBLE_CAMERA_Y_OFFSET = 95;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -59,12 +62,18 @@ export function applyCharacterFocusCamera(args: {
 
   const position = positionAt(block.focusCharacterId ?? "c1", time);
   if (!position) return baseCamera;
+  const frameHeightRatio = position.speechBubble
+    ? SPEECH_BUBBLE_FRAME_HEIGHT_RATIO
+    : CHARACTER_FRAME_HEIGHT_RATIO;
+  const cameraYOffset = position.speechBubble
+    ? SPEECH_BUBBLE_CAMERA_Y_OFFSET
+    : CHARACTER_CAMERA_Y_OFFSET;
 
   return {
     cameraX: position.x,
-    cameraY: position.y - 70,
+    cameraY: position.y - cameraYOffset,
     boardZoom: clamp(
-      CHARACTER_FRAME_HEIGHT_RATIO * canvasH * boardW / (canvasW * CHARACTER_BOARD_HEIGHT),
+      frameHeightRatio * canvasH * boardW / (canvasW * CHARACTER_BOARD_HEIGHT),
       1.1,
       8,
     ),
