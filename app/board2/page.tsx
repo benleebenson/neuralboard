@@ -127,9 +127,9 @@ type Clip = {
   holdFraction?: number;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
   thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
-  sourceBlob?: Blob;          // the actual video Blob backing sourceUrl (video clips only) — cloned
-                               // per-instance on paste/duplicate so each <video> element gets its
-                               // own independent blob instead of sharing one decoder-limited URL
+  sourceBlob?: Blob;          // the actual image/video Blob backing sourceUrl. Keeping the bytes
+                               // makes project saves independent of temporary/revoked object URLs;
+                               // videos are cloned per-instance to avoid shared decoder limits.
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
@@ -665,7 +665,7 @@ type MediaItem = {
   type: "image" | "video";
   url: string;
   duration?: number;
-  blob?: Blob; // video only — source for cloning a fresh blob when placed on the board
+  blob?: Blob; // retained source bytes; videos use this to clone a fresh per-clip blob
   youtubeId?: string;
   ytStart?: number;
   ytEnd?: number;
@@ -833,6 +833,24 @@ function mimeToExt(mime: string, fallbackName: string): string {
   if (map[mime]) return map[mime];
   const m = fallbackName.match(/\.([a-z0-9]+)$/i);
   return m ? m[1].toLowerCase() : "bin";
+}
+
+async function renderedImageToBlob(image: HTMLImageElement): Promise<Blob> {
+  if (!image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+    throw new Error("Image pixels are not available");
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not create an image recovery canvas");
+  ctx.drawImage(image, 0, 0);
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("Could not recover image pixels"))),
+      "image/png",
+    );
+  });
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -3912,6 +3930,17 @@ export default function Board2Page() {
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
+  const selectedAnnotationIdSet = new Set(
+    selectedAnnotationIds.length > 0
+      ? selectedAnnotationIds
+      : selectedAnnotationId
+        ? [selectedAnnotationId]
+        : [],
+  );
+  const selectedTextAnnotations = annotations.filter(
+    (annotation) => annotation.type === "text" && selectedAnnotationIdSet.has(annotation.id),
+  );
+  const primarySelectedText = selectedTextAnnotations[selectedTextAnnotations.length - 1] ?? null;
   const selectedCharActionOwner: CharacterId | null = characterActions.some((a) => a.id === selectedCharActionId)
     ? "c1"
     : characterActions2.some((a) => a.id === selectedCharActionId)
@@ -6546,7 +6575,7 @@ export default function Board2Page() {
           startTime: endTime, duration: clipDuration, layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
-          sourceBlob: item.type === "video" ? item.blob : undefined,
+          sourceBlob: item.blob,
           youtubeId: item.youtubeId,
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
@@ -7132,7 +7161,7 @@ export default function Board2Page() {
         videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
       }
     }
-    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: type === "video" ? file : undefined };
+    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
     setMediaLibrary((prev) => [...prev, item]);
     if (type === "image") {
       const image = imgCacheRef.current.get(url);
@@ -8263,6 +8292,7 @@ export default function Board2Page() {
           id: clipId, type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
           startTime: endTime, duration: 4, layer,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
+          sourceBlob: blob,
         }];
       });
       setSelectedClipId(clipId);
@@ -8659,9 +8689,40 @@ export default function Board2Page() {
     if (!text) {
       deleteAnnotation(annId);
     } else {
-      setAnnotations((prev) => prev.map((a) => (a.id === annId ? { ...a, text } : a)));
+      const textarea = editingTextareaRef.current;
+      const measuredWidth = textarea ? textarea.scrollWidth / Math.max(0.05, boardZoomRef.current) : 0;
+      const measuredHeight = textarea ? textarea.scrollHeight / Math.max(0.05, boardZoomRef.current) : 0;
+      setAnnotations((prev) => prev.map((a) => (a.id === annId ? {
+        ...a,
+        text,
+        boardW: Math.max(a.boardW, measuredWidth),
+        boardH: Math.max(a.boardH, measuredHeight),
+      } : a)));
       setEditingAnnotationId(null);
     }
+    annotationToolRef.current = "pointer";
+    setAnnotationTool("pointer");
+  }
+
+  function updateSelectedAnnotations(update: (annotation: Annotation) => Annotation) {
+    const ids = selectedAnnotationIdsRef.current.length > 0
+      ? selectedAnnotationIdsRef.current
+      : selectedAnnotationId
+        ? [selectedAnnotationId]
+        : [];
+    if (ids.length === 0) return;
+    const selectedIds = new Set(ids);
+    setAnnotations((prev) => prev.map((annotation) => selectedIds.has(annotation.id) ? update(annotation) : annotation));
+  }
+
+  function updateSelectedTextAnnotations(update: (annotation: Annotation) => Annotation) {
+    updateSelectedAnnotations((annotation) => annotation.type === "text" ? update(annotation) : annotation);
+  }
+
+  function disarmAnnotationTool() {
+    annotationToolRef.current = "pointer";
+    setAnnotationTool("pointer");
+    setEmojiPickerOpen(false);
   }
 
   // ─ Annotation drag (pointer tool) ────────────────────────────────────────
@@ -8808,9 +8869,10 @@ export default function Board2Page() {
         text: "", fontFamily: annotationFontRef.current, fontSize: 80, fontWeight: "normal",
       };
       setAnnotations((prev) => [...prev, newAnn]);
-      setSelectedAnnotationId(newAnn.id);
+      setAnnotationSelection([newAnn.id]);
       setEditingAnnotationId(newAnn.id);
       setEditingAnnotationText("");
+      disarmAnnotationTool();
       return;
     }
 
@@ -8822,7 +8884,8 @@ export default function Board2Page() {
         color: "#000", emoji: annotationEmojiRef.current, fontSize: sz,
       };
       setAnnotations((prev) => [...prev, newAnn]);
-      setSelectedAnnotationId(newAnn.id);
+      setAnnotationSelection([newAnn.id]);
+      disarmAnnotationTool();
       return;
     }
 
@@ -8853,7 +8916,8 @@ export default function Board2Page() {
           boardX: minX, boardY: minY, boardW: Math.max(1, maxX - minX), boardH: Math.max(1, maxY - minY),
           points: pts,
         }]);
-        setSelectedAnnotationId(id);
+        setAnnotationSelection([id]);
+        disarmAnnotationTool();
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
@@ -8893,6 +8957,8 @@ export default function Board2Page() {
           color, highlightStyle: annotationHighlightStyleRef.current,
         }]);
       }
+      setAnnotationSelection([id]);
+      disarmAnnotationTool();
     };
     window.addEventListener("pointerup", onUp);
   }
@@ -9168,6 +9234,7 @@ export default function Board2Page() {
           startTime, duration, layer: dropLayer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
+          sourceBlob: item.blob,
         },
       ];
     });
@@ -11628,6 +11695,11 @@ export default function Board2Page() {
         cancelPendingMediaPlacement();
         return;
       }
+      if (!inInput && e.code === "Escape" && annotationToolRef.current !== "pointer") {
+        e.preventDefault();
+        disarmAnnotationTool();
+        return;
+      }
       if (e.code === "Space") {
         isSpaceDownRef.current = true;
         setIsSpaceDown(true);
@@ -13339,6 +13411,40 @@ export default function Board2Page() {
       const manifestClips: ManifestClip[] = [];
       const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
 
+      const readClipAsset = async (clip: Clip): Promise<Blob> => {
+        if (clip.sourceBlob?.size) return clip.sourceBlob;
+
+        if (clip.sourceUrl) {
+          try {
+            const response = await fetch(clip.sourceUrl);
+            if (response.ok) return await response.blob();
+          } catch {
+            // A revoked object URL or cross-origin URL can still have rendered pixels below.
+          }
+        }
+
+        if (clip.type === "image") {
+          const renderedImage = imgCacheRef.current.get(clip.sourceUrl);
+          if (renderedImage) {
+            try {
+              return await renderedImageToBlob(renderedImage);
+            } catch {
+              // Continue to the named error so the user knows which asset needs attention.
+            }
+          }
+          if (/^https?:\/\//i.test(clip.sourceUrl)) {
+            try {
+              const response = await fetch(`/api/proxy-image?url=${encodeURIComponent(clip.sourceUrl)}`);
+              if (response.ok) return await response.blob();
+            } catch {
+              // Continue to the named error below.
+            }
+          }
+        }
+
+        throw new Error(`Could not include "${clip.name || "Untitled media"}" in the saved board. Re-add that media and try again.`);
+      };
+
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
         if (clip.type === "pan" || clip.type === "characterZoom" || clip.type === "customZoom") {
@@ -13351,7 +13457,7 @@ export default function Board2Page() {
           zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
           manifestClips.push({ ...rest, assetFile, assetMime: clip.audioBlob.type || "audio/wav" });
         } else if (clip.sourceUrl) {
-          const blob = await fetch(clip.sourceUrl).then((r) => r.blob());
+          const blob = await readClipAsset(clip);
           const ext = mimeToExt(blob.type, clip.name);
           const assetFile = `assets/${clip.id}.${ext}`;
           const buf = await blob.arrayBuffer();
@@ -13473,10 +13579,10 @@ export default function Board2Page() {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
           } else if (mc.type === "image") {
             loadMedia(blobUrl, "image");
-            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           } else if (mc.type === "video") {
             createVideoElement(mc.id, blobUrl);
-            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           }
         } else {
           loadedClips.push({ ...mc, sourceUrl: mc.sourceUrl ?? "" });
@@ -14150,9 +14256,8 @@ export default function Board2Page() {
                         position: "absolute",
                         left: ann.boardX * boardZoom,
                         top: ann.boardY * boardZoom,
-                        width: ann.type === "text" ? "auto" : ann.boardW * boardZoom,
-                        height: ann.type === "text" ? "auto" : ann.boardH * boardZoom,
-                        minWidth: ann.type === "text" ? ann.boardW * boardZoom : undefined,
+                        width: ann.boardW * boardZoom,
+                        height: ann.boardH * boardZoom,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
@@ -14177,7 +14282,10 @@ export default function Board2Page() {
                           color: ann.color,
                           userSelect: "none",
                           pointerEvents: "none",
-                          whiteSpace: "pre",
+                          whiteSpace: "pre-wrap",
+                          overflow: "visible",
+                          width: "100%",
+                          height: "100%",
                           lineHeight: 1.2,
                         }}>
                           {ann.text || <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
@@ -14202,11 +14310,12 @@ export default function Board2Page() {
                             border: "1px dashed rgba(255,94,58,0.6)",
                             outline: "none",
                             resize: "none",
-                            minWidth: ann.boardW * boardZoom,
-                            minHeight: (ann.fontSize ?? 80) * boardZoom * 1.4,
+                            width: ann.boardW * boardZoom,
+                            height: ann.boardH * boardZoom,
+                            boxSizing: "border-box",
                             padding: 0,
                             lineHeight: 1.2,
-                            whiteSpace: "pre",
+                            whiteSpace: "pre-wrap",
                           }}
                         />
                       )}
@@ -14294,7 +14403,14 @@ export default function Board2Page() {
                 <ProGated featureName="Annotation tools">
                   <>
                     <button
-                      onClick={(e) => { e.stopPropagation(); setAnnotationToolbarOpen((v) => !v); }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setAnnotationToolbarOpen((open) => {
+                          const next = !open;
+                          if (!next) disarmAnnotationTool();
+                          return next;
+                        });
+                      }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
                         padding: "5px 12px", border: "1.5px solid #2a2a2a",
@@ -14331,8 +14447,10 @@ export default function Board2Page() {
                             title={title}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setAnnotationTool(id);
-                              if (id === "emoji") setEmojiPickerOpen((v) => !v);
+                              const nextTool = id !== "pointer" && annotationTool === id ? "pointer" : id;
+                              annotationToolRef.current = nextTool;
+                              setAnnotationTool(nextTool);
+                              if (nextTool === "emoji") setEmojiPickerOpen((v) => !v);
                               else setEmojiPickerOpen(false);
                             }}
                             style={{
@@ -14356,7 +14474,11 @@ export default function Board2Page() {
                           <button
                             key={c}
                             title={c}
-                            onClick={(e) => { e.stopPropagation(); setAnnotationColor(c); }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAnnotationColor(c);
+                              updateSelectedAnnotations((annotation) => ({ ...annotation, color: c }));
+                            }}
                             style={{
                               width: 18, height: 18, padding: 0,
                               background: c,
@@ -14366,13 +14488,18 @@ export default function Board2Page() {
                           />
                         ))}
 
-                        {/* Font picker — text tool only */}
-                        {annotationTool === "text" && (
+                        {/* Text controls — configure new text or edit the selected text box */}
+                        {(annotationTool === "text" || primarySelectedText) && (
                           <>
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
                             <select
-                              value={annotationFont}
-                              onChange={(e) => { e.stopPropagation(); setAnnotationFont(e.target.value); }}
+                              value={primarySelectedText?.fontFamily ?? annotationFont}
+                              onChange={(e) => {
+                                e.stopPropagation();
+                                const fontFamily = e.target.value;
+                                setAnnotationFont(fontFamily);
+                                updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontFamily }));
+                              }}
                               style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
                             >
                               <option value="Caveat">Caveat</option>
@@ -14380,6 +14507,51 @@ export default function Board2Page() {
                               <option value="Architects Daughter">Architects Daughter</option>
                               <option value="Patrick Hand">Patrick Hand</option>
                             </select>
+                            {primarySelectedText && (
+                              <>
+                                <button
+                                  type="button"
+                                  title="Make text smaller"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) - 10, 12, 300) }));
+                                  }}
+                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                >A−</button>
+                                <input
+                                  type="number"
+                                  aria-label="Text size"
+                                  min={12}
+                                  max={300}
+                                  step={2}
+                                  value={Math.round(primarySelectedText.fontSize ?? 80)}
+                                  onChange={(e) => {
+                                    const fontSize = clamp(Number(e.target.value) || 12, 12, 300);
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize }));
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                  style={{ width: 44, height: 24, boxSizing: "border-box", fontFamily: "monospace", fontSize: 9, textAlign: "center", border: "1px solid rgba(42,42,42,0.3)" }}
+                                />
+                                <button
+                                  type="button"
+                                  title="Make text larger"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) + 10, 12, 300) }));
+                                  }}
+                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                >A+</button>
+                                <button
+                                  type="button"
+                                  title="Toggle bold"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontWeight: annotation.fontWeight === "bold" ? "normal" : "bold" }));
+                                  }}
+                                  style={{ ...miniButton, width: 24, height: 24, padding: 0, fontSize: 11, fontWeight: "bold", background: primarySelectedText.fontWeight === "bold" ? "#2a2a2a" : "transparent", color: primarySelectedText.fontWeight === "bold" ? "#fff" : "#2a2a2a" }}
+                                >B</button>
+                              </>
+                            )}
                           </>
                         )}
 
