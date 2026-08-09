@@ -12857,7 +12857,7 @@ export default function Board2Page() {
                       ⟷  Add pan clip
                     </button>
                     <button onClick={() => { addCharacterFocusClip(); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: CHARACTER_FOCUS_CLIP_COLOR }}>
-                      ◎  Add character focus
+                      ◎  Zoom on character
                     </button>
                     {AI_FEATURES_ENABLED && <ProGated featureName="Neural Search">
                       <button
@@ -13584,9 +13584,9 @@ export default function Board2Page() {
             <button
               onClick={() => addCharacterFocusClip()}
               style={{ ...sketchButton, background: CHARACTER_FOCUS_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
-              title="Add a resizable timeline block that temporarily makes the active character the camera focus"
+              title="Add a resizable timeline block that overrides every other camera move and follows the active character"
             >
-              ◎ Add character focus
+              ◎ Zoom on character
             </button>
             <button
               onClick={() => setCustomZoomDrawMode((v) => !v)}
@@ -15324,7 +15324,7 @@ export default function Board2Page() {
                 )}
                 {selectedClip.type === "characterFocus" && (
                   <div style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.5, color: "#5b6842", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "5px 7px" }}>
-                    The underlying image/pan camera keeps progressing and resumes automatically when this block ends.
+                    Full camera override: image transitions, pans, and character movement cannot pull focus away. The normal camera resumes after this block ends.
                   </div>
                 )}
 
@@ -15909,7 +15909,7 @@ export default function Board2Page() {
                 style={{ padding: "7px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid rgba(42,42,42,0.12)" }}
                 onMouseEnter={(e) => (e.currentTarget.style.background = CHARACTER_FOCUS_CLIP_COLOR)}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                ◎ Add character focus here
+                ◎ Zoom on character here
               </div>
               {clipboardReady && (
                 <div onClick={() => { pasteClip(); setContextMenu(null); }}

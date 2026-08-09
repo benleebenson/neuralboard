@@ -19,15 +19,9 @@ export type CharacterFocusPosition = { x: number; y: number };
 
 const CHARACTER_BOARD_HEIGHT = 170;
 const CHARACTER_FRAME_HEIGHT_RATIO = 0.55;
-const MAX_TRANSITION_SECONDS = 0.25;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
-}
-
-function smoothstep(value: number): number {
-  const t = clamp(value, 0, 1);
-  return t * t * (3 - 2 * t);
 }
 
 /** The newest-starting block wins if blocks overlap. */
@@ -46,9 +40,9 @@ export function activeCharacterFocusBlock(
 }
 
 /**
- * Temporarily replaces the authored camera with a moving character shot. The authored camera is
- * sampled continuously underneath, so the block can ease back to the exact pan/image position it
- * would have reached without rewriting or pausing the normal camera track.
+ * Temporarily replaces the authored camera with a moving character shot. While the block is
+ * active, its camera is absolute: image transitions, pans, and other authored camera moves cannot
+ * leak into the shot. The authored camera keeps progressing separately and resumes after the block.
  */
 export function applyCharacterFocusCamera(args: {
   time: number;
@@ -66,7 +60,7 @@ export function applyCharacterFocusCamera(args: {
   const position = positionAt(block.focusCharacterId ?? "c1", time);
   if (!position) return baseCamera;
 
-  const focusCamera: CameraLike = {
+  return {
     cameraX: position.x,
     cameraY: position.y - 70,
     boardZoom: clamp(
@@ -74,17 +68,5 @@ export function applyCharacterFocusCamera(args: {
       1.1,
       8,
     ),
-  };
-  const elapsed = time - block.startTime;
-  const remaining = block.startTime + block.duration - time;
-  const transition = Math.min(MAX_TRANSITION_SECONDS, block.duration * 0.2);
-  const blend = transition <= 0
-    ? 1
-    : Math.min(smoothstep(elapsed / transition), smoothstep(remaining / transition));
-
-  return {
-    cameraX: baseCamera.cameraX + (focusCamera.cameraX - baseCamera.cameraX) * blend,
-    cameraY: baseCamera.cameraY + (focusCamera.cameraY - baseCamera.cameraY) * blend,
-    boardZoom: baseCamera.boardZoom + (focusCamera.boardZoom - baseCamera.boardZoom) * blend,
   };
 }
