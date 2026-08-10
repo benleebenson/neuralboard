@@ -63,6 +63,8 @@ import {
   isRhubarbCue,
   isVisemeTrack,
   mergeNarrationCueTracks,
+  offsetRhubarbChunkCues,
+  planLipSyncChunks,
   visemeAt,
   type RhubarbCue,
   type VisemeTrackPoint,
@@ -125,9 +127,9 @@ type Clip = {
   focusCharacterId?: CharacterFocusId;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
   thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
-  sourceBlob?: Blob;          // the actual video Blob backing sourceUrl (video clips only) — cloned
-                               // per-instance on paste/duplicate so each <video> element gets its
-                               // own independent blob instead of sharing one decoder-limited URL
+  sourceBlob?: Blob;          // the actual image/video Blob backing sourceUrl. Keeping the bytes
+                               // makes project saves independent of temporary/revoked object URLs;
+                               // videos are cloned per-instance to avoid shared decoder limits.
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
@@ -663,7 +665,7 @@ type MediaItem = {
   type: "image" | "video";
   url: string;
   duration?: number;
-  blob?: Blob; // video only — source for cloning a fresh blob when placed on the board
+  blob?: Blob; // retained source bytes; videos use this to clone a fresh per-clip blob
   youtubeId?: string;
   ytStart?: number;
   ytEnd?: number;
@@ -808,6 +810,10 @@ const AMBIENT_CENSUS_INTERVAL_MS = 5000;
 const PREVIEW_DEFAULT_H_PX = 135;
 const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
+const PREVIEW_RENDER_LONG_EDGE_PX = 960;
+const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
+const EDITOR_PLAYBACK_FPS = 30;
+const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
 const CHARACTER_COLOR = "#cdeac0";
 const DEV_MOUTH_TEST = process.env.NODE_ENV !== "production";
@@ -831,6 +837,24 @@ function mimeToExt(mime: string, fallbackName: string): string {
   if (map[mime]) return map[mime];
   const m = fallbackName.match(/\.([a-z0-9]+)$/i);
   return m ? m[1].toLowerCase() : "bin";
+}
+
+async function renderedImageToBlob(image: HTMLImageElement): Promise<Blob> {
+  if (!image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+    throw new Error("Image pixels are not available");
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not create an image recovery canvas");
+  ctx.drawImage(image, 0, 0);
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("Could not recover image pixels"))),
+      "image/png",
+    );
+  });
 }
 
 function lerp(a: number, b: number, t: number): number {
@@ -3705,6 +3729,7 @@ export default function Board2Page() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
+  const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
     if (typeof window === "undefined") return true;
     try {
@@ -3908,6 +3933,17 @@ export default function Board2Page() {
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
+  const selectedAnnotationIdSet = new Set(
+    selectedAnnotationIds.length > 0
+      ? selectedAnnotationIds
+      : selectedAnnotationId
+        ? [selectedAnnotationId]
+        : [],
+  );
+  const selectedTextAnnotations = annotations.filter(
+    (annotation) => annotation.type === "text" && selectedAnnotationIdSet.has(annotation.id),
+  );
+  const primarySelectedText = selectedTextAnnotations[selectedTextAnnotations.length - 1] ?? null;
   const selectedCharActionOwner: CharacterId | null = characterActions.some((a) => a.id === selectedCharActionId)
     ? "c1"
     : characterActions2.some((a) => a.id === selectedCharActionId)
@@ -3928,6 +3964,9 @@ export default function Board2Page() {
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
   const previewW = Math.round(previewHeight * previewAspect);
+  const previewRenderScale = Math.min(1, PREVIEW_RENDER_LONG_EDGE_PX / Math.max(canvasW, canvasH));
+  const previewRenderW = Math.max(1, Math.round(canvasW * previewRenderScale));
+  const previewRenderH = Math.max(1, Math.round(canvasH * previewRenderScale));
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
   const canGenerateCamera = clips.some((clip) => clip.boardX !== undefined || clip.type === "pan");
@@ -3954,6 +3993,8 @@ export default function Board2Page() {
   const boardPanRef = useRef({ x: 20, y: 20 });
   const isSpaceDownRef = useRef(false);
   const lastRafTimeRef = useRef<number | null>(null);
+  const lastEditorFrameTimeRef = useRef(0);
+  const lastPlayheadUiTimeRef = useRef(0);
   const rafIdRef = useRef<number | null>(null);
   const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
@@ -4007,6 +4048,8 @@ export default function Board2Page() {
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const narrationAudioElsRef = useRef<Map<string, { element: HTMLAudioElement; sourceUrl: string }>>(new Map());
+  const narrationPlayRequestRef = useRef<Map<string, number>>(new Map());
   const mobileYtIframeRef = useRef<HTMLIFrameElement | null>(null);
   const mobileBoardPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const mobileGestureRef = useRef<{
@@ -4026,7 +4069,7 @@ export default function Board2Page() {
     pinchStartDist: 1, pinchStartZoom: 0.18, pinchStartPan: { x: 0, y: 0 },
     longPressTimer: null,
   });
-  const activeNarrationRef = useRef<Map<string, { bufNode: AudioBufferSourceNode; gainNode: GainNode }>>(new Map());
+  const activeNarrationRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const narrationVisemeTrackRef = useRef<VisemeTrackPoint[]>([]);
   const narrationVisemeTrackSourceRef = useRef<string | null>(null);
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
@@ -4038,6 +4081,7 @@ export default function Board2Page() {
   const characterFaceImageRef = useRef<HTMLImageElement | null>(null);
   const characterFace2ImageRef = useRef<HTMLImageElement | null>(null);
   const drawFrameRef = useRef<(time: number) => void>(() => {});
+  const previewVisibleRef = useRef(true);
   const characterActionsRef = useRef<CharacterAction[]>([]);
   const characterActions2Ref = useRef<CharacterAction[]>([]);
   const selectedCharActionIdRef = useRef<string | null>(null);
@@ -4738,6 +4782,7 @@ export default function Board2Page() {
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   useEffect(() => { playheadRef.current = playhead; }, [playhead]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { previewVisibleRef.current = previewVisible; }, [previewVisible]);
   useEffect(() => {
     ambientVideoEnabledRef.current = ambientVideoEnabled;
     try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
@@ -5304,6 +5349,7 @@ export default function Board2Page() {
       if (micRecorderRef.current?.state === "recording") micRecorderRef.current.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       if (micRafRef.current !== null) cancelAnimationFrame(micRafRef.current);
+      clearNarrationAudioElements();
       audioCtxRef.current?.close().catch(() => {});
     };
   }, []);
@@ -5740,6 +5786,7 @@ export default function Board2Page() {
   }, [drawStreamGuestsToCtx, editorCameraAtTime]);
 
   const drawFrame = useCallback((time: number) => {
+    if (!previewVisibleRef.current) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -5786,7 +5833,7 @@ export default function Board2Page() {
       }
       liveCameraRef.current = liveCam;
     }
-    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, annotationsRef.current, liveCam);
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, liveCam);
   }, [renderToCtx]);
 
   useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
@@ -6238,15 +6285,15 @@ export default function Board2Page() {
           runtime.state = "dormant";
           runtime.reason = "playback-ended";
         }
-        for (const clipId of [...activeNarrationRef.current.keys()]) {
-          const entry = activeNarrationRef.current.get(clipId);
-          if (entry) { try { entry.bufNode.stop(); } catch {} try { entry.bufNode.disconnect(); } catch {} try { entry.gainNode.disconnect(); } catch {} }
-        }
-        activeNarrationRef.current.clear();
+        stopAllNarrationAudio();
         prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
-      playheadRef.current = next; setPlayhead(next);
+      playheadRef.current = next;
+      if (now - lastPlayheadUiTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
+        lastPlayheadUiTimeRef.current = now;
+        setPlayhead(next);
+      }
     }
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
@@ -6258,39 +6305,17 @@ export default function Board2Page() {
       const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
       const wasActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
       if (isActive && !wasActive && !activeNarrationRef.current.has(clip.id)) {
-        const clipId = clip.id;
-        const blobUrl = clip.sourceUrl;
-        const clipOffset = t - clip.startTime;
-        let ctx = audioCtxRef.current;
-        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
-        const audioCtxCapture = ctx;
-        fetch(blobUrl)
-          .then((r) => r.arrayBuffer())
-          .then((ab) => audioCtxCapture.decodeAudioData(ab))
-          .then((buffer) => {
-            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
-            const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
-            gainNode.connect(audioCtxCapture.destination);
-            const bufNode = audioCtxCapture.createBufferSource();
-            bufNode.buffer = buffer;
-            bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
-            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
-            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
-          })
-          .catch(() => {});
+        startNarrationAudio(clip);
+      } else if (isActive) {
+        syncNarrationAudio(clip, t);
       } else if (!isActive && wasActive) {
-        const entry = activeNarrationRef.current.get(clip.id);
-        if (entry) {
-          try { entry.bufNode.stop(); } catch {}
-          try { entry.bufNode.disconnect(); } catch {}
-          try { entry.gainNode.disconnect(); } catch {}
-          activeNarrationRef.current.delete(clip.id);
-        }
+        stopNarrationAudio(clip.id);
       }
     }
-    drawFrame(t);
+    if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
+      lastEditorFrameTimeRef.current = now;
+      drawFrame(t);
+    }
     rafIdRef.current = requestAnimationFrame(rafCallbackRef.current);
   }, [drawFrame]);
 
@@ -6299,6 +6324,8 @@ export default function Board2Page() {
   useEffect(() => {
     if (isPlaying) {
       lastRafTimeRef.current = null;
+      lastEditorFrameTimeRef.current = 0;
+      lastPlayheadUiTimeRef.current = 0;
       rafIdRef.current = requestAnimationFrame(rafLoop);
       // Spawn narration audio for any clips already active at the current playhead
       const t = playheadRef.current;
@@ -6306,28 +6333,7 @@ export default function Board2Page() {
         if (clip.type !== "narration") continue;
         if (t < clip.startTime || t >= clip.startTime + clip.duration) continue;
         if (activeNarrationRef.current.has(clip.id)) continue;
-        const clipId = clip.id;
-        const blobUrl = clip.sourceUrl;
-        const clipOffset = t - clip.startTime;
-        let ctx = audioCtxRef.current;
-        if (!ctx || ctx.state === "closed") { ctx = new AudioContext(); audioCtxRef.current = ctx; }
-        const audioCtxCapture = ctx;
-        fetch(blobUrl)
-          .then((r) => r.arrayBuffer())
-          .then((ab) => audioCtxCapture.decodeAudioData(ab))
-          .then((buffer) => {
-            if (!isPlayingRef.current || activeNarrationRef.current.has(clipId)) return;
-            const gainNode = audioCtxCapture.createGain();
-            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1);
-            gainNode.connect(audioCtxCapture.destination);
-            const bufNode = audioCtxCapture.createBufferSource();
-            bufNode.buffer = buffer;
-            bufNode.connect(gainNode);
-            bufNode.start(0, Math.min(Math.max(0, (clip.sourceOffsetSec ?? 0) + clipOffset), Math.max(0, buffer.duration - 0.01)));
-            bufNode.onended = () => activeNarrationRef.current.delete(clipId);
-            activeNarrationRef.current.set(clipId, { bufNode, gainNode });
-          })
-          .catch(() => {});
+        startNarrationAudio(clip);
       }
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
@@ -6344,16 +6350,8 @@ export default function Board2Page() {
         videoRangeStateRef.current.set(clip.id, false);
       }
       ambientCandidateIdsRef.current = new Set();
-      // Stop all active narration audio
-      for (const clipId of [...activeNarrationRef.current.keys()]) {
-        const entry = activeNarrationRef.current.get(clipId);
-        if (entry) {
-          try { entry.bufNode.stop(); } catch {}
-          try { entry.bufNode.disconnect(); } catch {}
-          try { entry.gainNode.disconnect(); } catch {}
-        }
-      }
-      activeNarrationRef.current.clear();
+      // Pause streamed narration elements without discarding their media state.
+      stopAllNarrationAudio();
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
@@ -6532,7 +6530,7 @@ export default function Board2Page() {
           startTime: endTime, duration: clipDuration, layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
-          sourceBlob: item.type === "video" ? item.blob : undefined,
+          sourceBlob: item.blob,
           youtubeId: item.youtubeId,
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
@@ -6614,7 +6612,7 @@ export default function Board2Page() {
     }
     thumbnailImagesRef.current.delete(clipId);
     if (clip?.type === "narration") {
-      stopNarrationAudio(clipId);
+      removeNarrationAudioElement(clipId);
       URL.revokeObjectURL(clip.sourceUrl);
       setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
       setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
@@ -6855,17 +6853,90 @@ export default function Board2Page() {
 
   // ─ Narration audio helpers ────────────────────────────────────────────────
 
+  function narrationAudioElement(clip: Clip): HTMLAudioElement {
+    const cached = narrationAudioElsRef.current.get(clip.id);
+    if (cached?.sourceUrl === clip.sourceUrl) return cached.element;
+    if (cached) {
+      cached.element.pause();
+      cached.element.removeAttribute("src");
+      cached.element.load();
+    }
+    const element = new Audio();
+    element.preload = "metadata";
+    element.src = clip.sourceUrl;
+    narrationAudioElsRef.current.set(clip.id, { element, sourceUrl: clip.sourceUrl });
+    return element;
+  }
+
+  function narrationSourceTime(clip: Clip, timelineTime: number, element: HTMLAudioElement): number {
+    const requested = Math.max(0, (clip.sourceOffsetSec ?? 0) + (timelineTime - clip.startTime));
+    return Number.isFinite(element.duration)
+      ? Math.min(requested, Math.max(0, element.duration - 0.01))
+      : requested;
+  }
+
+  function updateNarrationAudioSettings(clip: Clip, element: HTMLAudioElement) {
+    element.muted = !!clip.muted || !!mutedLayersRef.current[clip.layer ?? 0];
+    element.volume = clamp(clip.volume ?? 1, 0, 1);
+  }
+
+  function startNarrationAudio(clip: Clip) {
+    const element = narrationAudioElement(clip);
+    const requestId = (narrationPlayRequestRef.current.get(clip.id) ?? 0) + 1;
+    narrationPlayRequestRef.current.set(clip.id, requestId);
+    activeNarrationRef.current.set(clip.id, element);
+    updateNarrationAudioSettings(clip, element);
+
+    const seekAndPlay = () => {
+      if (!isPlayingRef.current || activeNarrationRef.current.get(clip.id) !== element || narrationPlayRequestRef.current.get(clip.id) !== requestId) return;
+      try { element.currentTime = narrationSourceTime(clip, playheadRef.current, element); } catch {}
+      element.play().catch((err) => console.warn("[narration] preview playback failed", err));
+    };
+
+    if (element.readyState >= 1) seekAndPlay();
+    else {
+      element.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+      element.load();
+    }
+  }
+
+  function syncNarrationAudio(clip: Clip, timelineTime: number) {
+    const element = activeNarrationRef.current.get(clip.id);
+    if (!element) return;
+    updateNarrationAudioSettings(clip, element);
+    if (element.readyState < 2 || element.seeking) return;
+    const expected = narrationSourceTime(clip, timelineTime, element);
+    if (Math.abs(element.currentTime - expected) > 0.35) {
+      try { element.currentTime = expected; } catch {}
+    }
+    if (element.paused && isPlayingRef.current) {
+      element.play().catch((err) => console.warn("[narration] preview resume failed", err));
+    }
+  }
+
   function stopNarrationAudio(clipId: string) {
-    const entry = activeNarrationRef.current.get(clipId);
-    if (!entry) return;
-    try { entry.bufNode.stop(); } catch {}
-    try { entry.bufNode.disconnect(); } catch {}
-    try { entry.gainNode.disconnect(); } catch {}
+    narrationPlayRequestRef.current.set(clipId, (narrationPlayRequestRef.current.get(clipId) ?? 0) + 1);
+    const element = activeNarrationRef.current.get(clipId);
+    if (element) element.pause();
     activeNarrationRef.current.delete(clipId);
   }
 
   function stopAllNarrationAudio() {
     for (const clipId of [...activeNarrationRef.current.keys()]) stopNarrationAudio(clipId);
+  }
+
+  function removeNarrationAudioElement(clipId: string) {
+    stopNarrationAudio(clipId);
+    const cached = narrationAudioElsRef.current.get(clipId);
+    if (!cached) return;
+    cached.element.removeAttribute("src");
+    cached.element.load();
+    narrationAudioElsRef.current.delete(clipId);
+    narrationPlayRequestRef.current.delete(clipId);
+  }
+
+  function clearNarrationAudioElements() {
+    for (const clipId of [...narrationAudioElsRef.current.keys()]) removeNarrationAudioElement(clipId);
   }
 
   async function generateNarrationWaveform(blobUrl: string): Promise<number[]> {
@@ -7009,21 +7080,34 @@ export default function Board2Page() {
     setToast("Analyzing narration…");
     try {
       const analyzed: Array<{ clipId: string; startTime: number; duration: number; cues: RhubarbCue[] }> = [];
-      for (const clip of sourceClips) {
-        const audio = await compileNarrationToBlob([clip]);
-        const form = new FormData();
-        form.append("audio", audio, `${clip.name || "narration"}.wav`);
-        const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
-        const data: unknown = await response.json().catch(() => null);
-        if (!response.ok) {
-          const message = data && typeof data === "object" && "error" in data
-            ? String((data as { error: unknown }).error)
-            : `Lip sync analysis failed (${response.status})`;
-          throw new Error(message);
+      for (let clipIndex = 0; clipIndex < sourceClips.length; clipIndex++) {
+        const clip = sourceClips[clipIndex];
+        const decoded = await decodeNarrationClip(clip);
+        const sourceOffset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, decoded.duration - 0.01));
+        const analysisDuration = Math.min(clip.duration, Math.max(0, decoded.duration - sourceOffset));
+        const windows = planLipSyncChunks(analysisDuration);
+        if (!windows.length) throw new Error(`No audio found in ${clip.name || "narration"}`);
+        const clipCues: RhubarbCue[] = [];
+        for (let chunkIndex = 0; chunkIndex < windows.length; chunkIndex++) {
+          const window = windows[chunkIndex];
+          setToast(`Analyzing narration ${clipIndex + 1}/${sourceClips.length} · part ${chunkIndex + 1}/${windows.length}…`);
+          const audio = audioBufferSegmentToMonoWav(decoded, sourceOffset + window.audioStart, window.audioEnd - window.audioStart);
+          const form = new FormData();
+          form.append("audio", audio, `${clip.name || "narration"}-${chunkIndex + 1}.wav`);
+          const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
+          const data: unknown = await response.json().catch(() => null);
+          if (!response.ok) {
+            const message = data && typeof data === "object" && "error" in data
+              ? String((data as { error: unknown }).error)
+              : response.status === 413
+                ? "Lip sync upload was rejected as too large"
+                : `Lip sync analysis failed (${response.status})`;
+            throw new Error(message);
+          }
+          if (!Array.isArray(data)) throw new Error("Lip sync bridge returned invalid cues");
+          clipCues.push(...offsetRhubarbChunkCues(data.filter(isRhubarbCue), window, analysisDuration));
         }
-        if (!Array.isArray(data)) throw new Error("Lip sync bridge returned invalid cues");
-        const cues = data.filter(isRhubarbCue);
-        analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues });
+        analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues: clipCues });
       }
 
       if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
@@ -7045,7 +7129,7 @@ export default function Board2Page() {
     }
   }
 
-  async function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
+  function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
     if (clip.type !== "narration") return;
     const owner = activeCharacterIdRef.current;
     const applyGestureActions = (updatedClip: Clip) => {
@@ -7061,16 +7145,22 @@ export default function Board2Page() {
       setCharacterActions2((prev) => prev.filter((action) => action.narrationGestureClipId !== clip.id));
       return;
     }
-    if (clip.transcriptSegments?.length) {
-      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: clip.speechBubbleGestures !== false };
-      setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
-      if (updatedClip.speechBubbleGestures) applyGestureActions(updatedClip);
-      if (owner === "c2") setShowCharacter2(true);
-      else setShowCharacter(true);
+    if (!clip.transcriptSegments?.length) {
+      setToast("Transcribe this narration with Whisper first");
       return;
     }
+    const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: clip.speechBubbleGestures !== false };
+    setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
+    if (updatedClip.speechBubbleGestures) applyGestureActions(updatedClip);
+    if (owner === "c2") setShowCharacter2(true);
+    else setShowCharacter(true);
+  }
+
+  async function transcribeNarrationWithWhisper(clip: Clip) {
+    if (clip.type !== "narration" || transcribingNarrationId) return;
+    const owner = activeCharacterIdRef.current;
     setTranscribingNarrationId(clip.id);
-    setToast("Transcribing narration for speech bubbles…");
+    setToast("Transcribing narration with Whisper…");
     try {
       const audio: Blob = clip.audioBlob instanceof Blob
         ? clip.audioBlob
@@ -7086,14 +7176,18 @@ export default function Board2Page() {
             .filter((segment: TranscriptSegment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
         : [];
       if (!segments.length) throw new Error("No spoken narration was detected");
-      const updatedClip = { ...clip, speechBubbles: true, speechBubbleGestures: true, transcriptSegments: segments };
+      const updatedClip = { ...clip, transcriptSegments: segments };
       setClips((current) => current.map((item) => item.id === clip.id ? updatedClip : item));
-      applyGestureActions(updatedClip);
-      if (owner === "c2") setShowCharacter2(true);
-      else setShowCharacter(true);
-      setToast(`Speech bubbles created · ${narrationSentenceCues(segments).length} sentences`);
+      if (updatedClip.speechBubbles && updatedClip.speechBubbleGestures !== false) {
+        const resolvedOwnerActions = owner === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+        updateCharacterActionsFor(owner, (prev) => [
+          ...prev.filter((action) => action.narrationGestureClipId !== updatedClip.id),
+          ...narrationSpeechGestureActions(updatedClip, resolvedOwnerActions, owner),
+        ]);
+      }
+      setToast(`Whisper transcript ready · ${narrationSentenceCues(segments).length} sentences`);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not create speech bubbles");
+      setToast(error instanceof Error ? error.message : "Could not transcribe narration");
     } finally {
       setTranscribingNarrationId(null);
     }
@@ -7134,7 +7228,7 @@ export default function Board2Page() {
         videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
       }
     }
-    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: type === "video" ? file : undefined };
+    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
     setMediaLibrary((prev) => [...prev, item]);
     if (type === "image") {
       const image = imgCacheRef.current.get(url);
@@ -8265,6 +8359,7 @@ export default function Board2Page() {
           id: clipId, type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
           startTime: endTime, duration: 4, layer,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
+          sourceBlob: blob,
         }];
       });
       setSelectedClipId(clipId);
@@ -8695,9 +8790,40 @@ export default function Board2Page() {
     if (!text) {
       deleteAnnotation(annId);
     } else {
-      setAnnotations((prev) => prev.map((a) => (a.id === annId ? { ...a, text } : a)));
+      const textarea = editingTextareaRef.current;
+      const measuredWidth = textarea ? textarea.scrollWidth / Math.max(0.05, boardZoomRef.current) : 0;
+      const measuredHeight = textarea ? textarea.scrollHeight / Math.max(0.05, boardZoomRef.current) : 0;
+      setAnnotations((prev) => prev.map((a) => (a.id === annId ? {
+        ...a,
+        text,
+        boardW: Math.max(a.boardW, measuredWidth),
+        boardH: Math.max(a.boardH, measuredHeight),
+      } : a)));
       setEditingAnnotationId(null);
     }
+    annotationToolRef.current = "pointer";
+    setAnnotationTool("pointer");
+  }
+
+  function updateSelectedAnnotations(update: (annotation: Annotation) => Annotation) {
+    const ids = selectedAnnotationIdsRef.current.length > 0
+      ? selectedAnnotationIdsRef.current
+      : selectedAnnotationId
+        ? [selectedAnnotationId]
+        : [];
+    if (ids.length === 0) return;
+    const selectedIds = new Set(ids);
+    setAnnotations((prev) => prev.map((annotation) => selectedIds.has(annotation.id) ? update(annotation) : annotation));
+  }
+
+  function updateSelectedTextAnnotations(update: (annotation: Annotation) => Annotation) {
+    updateSelectedAnnotations((annotation) => annotation.type === "text" ? update(annotation) : annotation);
+  }
+
+  function disarmAnnotationTool() {
+    annotationToolRef.current = "pointer";
+    setAnnotationTool("pointer");
+    setEmojiPickerOpen(false);
   }
 
   // ─ Annotation drag (pointer tool) ────────────────────────────────────────
@@ -8844,9 +8970,10 @@ export default function Board2Page() {
         text: "", fontFamily: annotationFontRef.current, fontSize: 80, fontWeight: "normal",
       };
       setAnnotations((prev) => [...prev, newAnn]);
-      setSelectedAnnotationId(newAnn.id);
+      setAnnotationSelection([newAnn.id]);
       setEditingAnnotationId(newAnn.id);
       setEditingAnnotationText("");
+      disarmAnnotationTool();
       return;
     }
 
@@ -8858,7 +8985,8 @@ export default function Board2Page() {
         color: "#000", emoji: annotationEmojiRef.current, fontSize: sz,
       };
       setAnnotations((prev) => [...prev, newAnn]);
-      setSelectedAnnotationId(newAnn.id);
+      setAnnotationSelection([newAnn.id]);
+      disarmAnnotationTool();
       return;
     }
 
@@ -8889,7 +9017,8 @@ export default function Board2Page() {
           boardX: minX, boardY: minY, boardW: Math.max(1, maxX - minX), boardH: Math.max(1, maxY - minY),
           points: pts,
         }]);
-        setSelectedAnnotationId(id);
+        setAnnotationSelection([id]);
+        disarmAnnotationTool();
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
@@ -8929,6 +9058,8 @@ export default function Board2Page() {
           color, highlightStyle: annotationHighlightStyleRef.current,
         }]);
       }
+      setAnnotationSelection([id]);
+      disarmAnnotationTool();
     };
     window.addEventListener("pointerup", onUp);
   }
@@ -9204,6 +9335,7 @@ export default function Board2Page() {
           startTime, duration, layer: dropLayer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
+          sourceBlob: item.blob,
         },
       ];
     });
@@ -9213,7 +9345,7 @@ export default function Board2Page() {
   // ─ Play / pause ───────────────────────────────────────────────────────────
 
   function togglePlay() {
-    if (isPlaying) { setIsPlaying(false); return; }
+    if (isPlaying) { setPlayhead(playheadRef.current); setIsPlaying(false); return; }
     const maxEnd = currentPlaybackDuration(clips);
     const wrapped = playheadRef.current >= maxEnd && maxEnd > 0;
     const startPh = wrapped ? 0 : playheadRef.current;
@@ -11553,6 +11685,11 @@ export default function Board2Page() {
         cancelPendingMediaPlacement();
         return;
       }
+      if (!inInput && e.code === "Escape" && annotationToolRef.current !== "pointer") {
+        e.preventDefault();
+        disarmAnnotationTool();
+        return;
+      }
       if (e.code === "Space") {
         isSpaceDownRef.current = true;
         setIsSpaceDown(true);
@@ -11590,10 +11727,6 @@ export default function Board2Page() {
         e.preventDefault();
         copyClip(selectedClipId);
       }
-      if (meta && e.code === "KeyV" && clipboardRef.current) {
-        e.preventDefault();
-        pasteClip();
-      }
       if (meta && e.code === "KeyD" && selectedClipId) {
         e.preventDefault();
         duplicateClip(selectedClipId);
@@ -11616,11 +11749,9 @@ export default function Board2Page() {
   });
 
   // ─ Clipboard image paste ──────────────────────────────────────────────────
-  // Separate from the Step 16.4 clip clipboard above (clipboardRef + the keydown KeyV handler,
-  // which pastes internally-copied clips). This listens for the native "paste" event and only
-  // acts when the OS clipboard actually contains image data — anything else (text paste in an
-  // input, the clip clipboard's own Cmd+V) falls through untouched since we never call
-  // preventDefault unless an image item is found.
+  // Use the native paste event for both OS clipboard images and the board's internal clip
+  // clipboard. Image data takes precedence so a previously copied board clip cannot intercept
+  // Cmd/Ctrl+V after the user chooses "Copy image" in another browser tab.
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -11630,24 +11761,37 @@ export default function Board2Page() {
         aiModalOpen || directCharacterOpen || !!imagePreviewTarget;
       if (anyModalOpen) return;
       const items = Array.from(e.clipboardData?.items ?? []);
-      const imageItems = items.filter((item) => item.type.startsWith("image/"));
-      if (imageItems.length === 0) return;
-      e.preventDefault();
-      (async () => {
-        let pastedCount = 0;
-        for (const item of imageItems) {
-          const blob = item.getAsFile();
-          if (!blob) continue;
-          if (blob.size > MAX_PASTED_IMAGE_BYTES) {
-            setToast("Image too large to paste (max 15MB)");
-            continue;
+      const itemImages = items
+        .filter((item) => item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => !!file);
+      // Some browsers expose pasted images through `files` but not `items`.
+      const imageFiles = itemImages.length > 0
+        ? itemImages
+        : Array.from(e.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        void (async () => {
+          let pastedCount = 0;
+          for (const file of imageFiles) {
+            if (file.size > MAX_PASTED_IMAGE_BYTES) {
+              setToast("Image too large to paste (max 15MB)");
+              continue;
+            }
+            const ext = file.type.split("/")[1] || "png";
+            await ingestMediaFile(file, `Pasted image ${Date.now()}.${ext}`);
+            pastedCount++;
           }
-          const ext = item.type.split("/")[1] || "png";
-          await ingestMediaFile(blob, `Pasted image ${Date.now()}.${ext}`);
-          pastedCount++;
-        }
-        if (pastedCount > 0) setToast("Image pasted");
-      })();
+          if (pastedCount > 0) setToast("Image pasted");
+        })();
+        return;
+      }
+
+      if (clipboardRef.current) {
+        e.preventDefault();
+        void pasteClip();
+      }
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
@@ -12549,8 +12693,8 @@ export default function Board2Page() {
                           if (canvas) mobileBoardImageCanvasRefs.current.set(clip.id, canvas);
                           else mobileBoardImageCanvasRefs.current.delete(clip.id);
                         }}
-                        width={Math.max(1, Math.round(clip.boardW!))}
-                        height={Math.max(1, Math.round(clip.boardH!))}
+                        width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
+                        height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                         aria-label={clip.name}
                         style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center" }}
                       />
@@ -12678,12 +12822,14 @@ export default function Board2Page() {
 
           {/* Preview PiP */}
           <div style={{ position: "absolute", top: 6, right: 6, zIndex: 10, pointerEvents: "none" }}>
-            <canvas
-              ref={canvasRef}
-              width={canvasW}
-              height={canvasH}
-              style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
-            />
+            {previewVisible && (
+              <canvas
+                ref={canvasRef}
+                width={previewRenderW}
+                height={previewRenderH}
+                style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
+              />
+            )}
           </div>
 
           {/* Export progress */}
@@ -12946,20 +13092,41 @@ export default function Board2Page() {
                     {selectedClip.type === "narration" && (
                       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                         <button
-                          onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                          disabled={transcribingNarrationId === selectedClip.id}
-                          style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                          onClick={() => void transcribeNarrationWithWhisper(selectedClip)}
+                          disabled={!!transcribingNarrationId}
+                          style={{ ...sketchButton, width: "100%", padding: "10px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                         >
-                          {transcribingNarrationId === selectedClip.id ? "⟳ Transcribing…" : selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Add speech bubbles"}
+                          {transcribingNarrationId === selectedClip.id
+                            ? "⟳ Whisper transcription…"
+                            : transcribingNarrationId
+                              ? "⟳ Whisper is busy…"
+                              : selectedClip.transcriptSegments?.length
+                              ? "↻ Re-transcribe with Whisper"
+                              : "✎ Transcribe with Whisper"}
                         </button>
-                        {selectedClip.speechBubbles && (
-                          <button
-                            type="button"
-                            onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
-                            style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
-                          >
-                            {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
-                          </button>
+                        {selectedClip.transcriptSegments?.length ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                              style={{ ...sketchButton, width: "100%", padding: "10px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5" }}
+                            >
+                              {selectedClip.speechBubbles ? "💬 Speech bubbles on" : "💬 Speech bubbles off"}
+                            </button>
+                            {selectedClip.speechBubbles && (
+                              <button
+                                type="button"
+                                onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                                style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                              >
+                                {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                              </button>
+                            )}
+                          </>
+                        ) : (
+                          <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", lineHeight: 1.4 }}>
+                            Selection never starts Whisper. Use the button above when you want a transcript.
+                          </div>
                         )}
                       </div>
                     )}
@@ -13250,6 +13417,40 @@ export default function Board2Page() {
       const manifestClips: ManifestClip[] = [];
       const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
 
+      const readClipAsset = async (clip: Clip): Promise<Blob> => {
+        if (clip.sourceBlob?.size) return clip.sourceBlob;
+
+        if (clip.sourceUrl) {
+          try {
+            const response = await fetch(clip.sourceUrl);
+            if (response.ok) return await response.blob();
+          } catch {
+            // A revoked object URL or cross-origin URL can still have rendered pixels below.
+          }
+        }
+
+        if (clip.type === "image") {
+          const renderedImage = imgCacheRef.current.get(clip.sourceUrl);
+          if (renderedImage) {
+            try {
+              return await renderedImageToBlob(renderedImage);
+            } catch {
+              // Continue to the named error so the user knows which asset needs attention.
+            }
+          }
+          if (/^https?:\/\//i.test(clip.sourceUrl)) {
+            try {
+              const response = await fetch(`/api/proxy-image?url=${encodeURIComponent(clip.sourceUrl)}`);
+              if (response.ok) return await response.blob();
+            } catch {
+              // Continue to the named error below.
+            }
+          }
+        }
+
+        throw new Error(`Could not include "${clip.name || "Untitled media"}" in the saved board. Re-add that media and try again.`);
+      };
+
       for (const clip of clipsRef.current) {
         const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
         if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
@@ -13262,7 +13463,7 @@ export default function Board2Page() {
           zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
           manifestClips.push({ ...rest, assetFile, assetMime: clip.audioBlob.type || "audio/wav" });
         } else if (clip.sourceUrl) {
-          const blob = await fetch(clip.sourceUrl).then((r) => r.blob());
+          const blob = await readClipAsset(clip);
           const ext = mimeToExt(blob.type, clip.name);
           const assetFile = `assets/${clip.id}.${ext}`;
           const buf = await blob.arrayBuffer();
@@ -13356,6 +13557,7 @@ export default function Board2Page() {
       const manifest = JSON.parse(strFromU8(files["manifest.json"]));
 
       // Revoke existing blob URLs
+      clearNarrationAudioElements();
       for (const clip of clipsRef.current) {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
       }
@@ -13386,10 +13588,10 @@ export default function Board2Page() {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
           } else if (mc.type === "image") {
             loadMedia(blobUrl, "image");
-            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           } else if (mc.type === "video") {
             createVideoElement(mc.id, blobUrl);
-            loadedClips.push({ ...mc, sourceUrl: blobUrl });
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           }
         } else {
           loadedClips.push({ ...mc, sourceUrl: mc.sourceUrl ?? "" });
@@ -13805,8 +14007,8 @@ export default function Board2Page() {
                               if (canvas) boardImageCanvasRefs.current.set(clip.id, canvas);
                               else boardImageCanvasRefs.current.delete(clip.id);
                             }}
-                            width={Math.max(1, Math.round(clip.boardW!))}
-                            height={Math.max(1, Math.round(clip.boardH!))}
+                            width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
+                            height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                             aria-label={clip.name}
                             style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center" }}
                           />
@@ -14031,9 +14233,8 @@ export default function Board2Page() {
                         position: "absolute",
                         left: ann.boardX * boardZoom,
                         top: ann.boardY * boardZoom,
-                        width: ann.type === "text" ? "auto" : ann.boardW * boardZoom,
-                        height: ann.type === "text" ? "auto" : ann.boardH * boardZoom,
-                        minWidth: ann.type === "text" ? ann.boardW * boardZoom : undefined,
+                        width: ann.boardW * boardZoom,
+                        height: ann.boardH * boardZoom,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
@@ -14058,7 +14259,10 @@ export default function Board2Page() {
                           color: ann.color,
                           userSelect: "none",
                           pointerEvents: "none",
-                          whiteSpace: "pre",
+                          whiteSpace: "pre-wrap",
+                          overflow: "visible",
+                          width: "100%",
+                          height: "100%",
                           lineHeight: 1.2,
                         }}>
                           {ann.text || <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
@@ -14083,11 +14287,12 @@ export default function Board2Page() {
                             border: "1px dashed rgba(255,94,58,0.6)",
                             outline: "none",
                             resize: "none",
-                            minWidth: ann.boardW * boardZoom,
-                            minHeight: (ann.fontSize ?? 80) * boardZoom * 1.4,
+                            width: ann.boardW * boardZoom,
+                            height: ann.boardH * boardZoom,
+                            boxSizing: "border-box",
                             padding: 0,
                             lineHeight: 1.2,
-                            whiteSpace: "pre",
+                            whiteSpace: "pre-wrap",
                           }}
                         />
                       )}
@@ -14175,7 +14380,14 @@ export default function Board2Page() {
                 <ProGated featureName="Annotation tools">
                   <>
                     <button
-                      onClick={(e) => { e.stopPropagation(); setAnnotationToolbarOpen((v) => !v); }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setAnnotationToolbarOpen((open) => {
+                          const next = !open;
+                          if (!next) disarmAnnotationTool();
+                          return next;
+                        });
+                      }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
                         padding: "5px 12px", border: "1.5px solid #2a2a2a",
@@ -14212,8 +14424,10 @@ export default function Board2Page() {
                             title={title}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setAnnotationTool(id);
-                              if (id === "emoji") setEmojiPickerOpen((v) => !v);
+                              const nextTool = id !== "pointer" && annotationTool === id ? "pointer" : id;
+                              annotationToolRef.current = nextTool;
+                              setAnnotationTool(nextTool);
+                              if (nextTool === "emoji") setEmojiPickerOpen((v) => !v);
                               else setEmojiPickerOpen(false);
                             }}
                             style={{
@@ -14237,7 +14451,11 @@ export default function Board2Page() {
                           <button
                             key={c}
                             title={c}
-                            onClick={(e) => { e.stopPropagation(); setAnnotationColor(c); }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAnnotationColor(c);
+                              updateSelectedAnnotations((annotation) => ({ ...annotation, color: c }));
+                            }}
                             style={{
                               width: 18, height: 18, padding: 0,
                               background: c,
@@ -14247,13 +14465,18 @@ export default function Board2Page() {
                           />
                         ))}
 
-                        {/* Font picker — text tool only */}
-                        {annotationTool === "text" && (
+                        {/* Text controls — configure new text or edit the selected text box */}
+                        {(annotationTool === "text" || primarySelectedText) && (
                           <>
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
                             <select
-                              value={annotationFont}
-                              onChange={(e) => { e.stopPropagation(); setAnnotationFont(e.target.value); }}
+                              value={primarySelectedText?.fontFamily ?? annotationFont}
+                              onChange={(e) => {
+                                e.stopPropagation();
+                                const fontFamily = e.target.value;
+                                setAnnotationFont(fontFamily);
+                                updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontFamily }));
+                              }}
                               style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
                             >
                               <option value="Caveat">Caveat</option>
@@ -14261,6 +14484,51 @@ export default function Board2Page() {
                               <option value="Architects Daughter">Architects Daughter</option>
                               <option value="Patrick Hand">Patrick Hand</option>
                             </select>
+                            {primarySelectedText && (
+                              <>
+                                <button
+                                  type="button"
+                                  title="Make text smaller"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) - 10, 12, 300) }));
+                                  }}
+                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                >A−</button>
+                                <input
+                                  type="number"
+                                  aria-label="Text size"
+                                  min={12}
+                                  max={300}
+                                  step={2}
+                                  value={Math.round(primarySelectedText.fontSize ?? 80)}
+                                  onChange={(e) => {
+                                    const fontSize = clamp(Number(e.target.value) || 12, 12, 300);
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize }));
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                  style={{ width: 44, height: 24, boxSizing: "border-box", fontFamily: "monospace", fontSize: 9, textAlign: "center", border: "1px solid rgba(42,42,42,0.3)" }}
+                                />
+                                <button
+                                  type="button"
+                                  title="Make text larger"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) + 10, 12, 300) }));
+                                  }}
+                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                >A+</button>
+                                <button
+                                  type="button"
+                                  title="Toggle bold"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontWeight: annotation.fontWeight === "bold" ? "normal" : "bold" }));
+                                  }}
+                                  style={{ ...miniButton, width: 24, height: 24, padding: 0, fontSize: 11, fontWeight: "bold", background: primarySelectedText.fontWeight === "bold" ? "#2a2a2a" : "transparent", color: primarySelectedText.fontWeight === "bold" ? "#fff" : "#2a2a2a" }}
+                                >B</button>
+                              </>
+                            )}
                           </>
                         )}
 
@@ -14705,38 +14973,54 @@ export default function Board2Page() {
                   >
                     Max
                   </button>
+                  <button
+                    type="button"
+                    title={previewVisible ? "Hide preview to reduce editor rendering load" : "Show preview"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const next = !previewVisible;
+                      previewVisibleRef.current = next;
+                      setPreviewVisible(next);
+                      if (next) requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
+                    }}
+                    style={{ ...miniButton, width: 30, height: 18, padding: 0, fontSize: 8, background: previewVisible ? "rgba(255,253,245,0.9)" : "#c8f135" }}
+                  >
+                    {previewVisible ? "Hide" : "Show"}
+                  </button>
                 </div>
               </div>
-              <div style={{ position: "relative", width: previewW, height: previewHeight }}>
-                <canvas
-                  ref={canvasRef}
-                  width={canvasW}
-                  height={canvasH}
-                  style={{
-                    display: "block",
-                    width: previewW,
-                    height: previewHeight,
-                    border: "1.5px solid #2a2a2a",
-                    boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
-                    background: "#111",
-                  }}
-                />
-                <div
-                  title="Drag to resize preview"
-                  onPointerDown={handlePreviewResizePointerDown}
-                  style={{
-                    position: "absolute",
-                    left: -6,
-                    bottom: -6,
-                    width: 18,
-                    height: 18,
-                    border: "1.5px solid #2a2a2a",
-                    background: "#c8f135",
-                    cursor: "nesw-resize",
-                    boxShadow: "1px 1px 0 rgba(42,42,42,0.45)",
-                  }}
-                />
-              </div>
+              {previewVisible && (
+                <div style={{ position: "relative", width: previewW, height: previewHeight }}>
+                  <canvas
+                    ref={canvasRef}
+                    width={previewRenderW}
+                    height={previewRenderH}
+                    style={{
+                      display: "block",
+                      width: previewW,
+                      height: previewHeight,
+                      border: "1.5px solid #2a2a2a",
+                      boxShadow: "2px 2px 6px rgba(0,0,0,0.35)",
+                      background: "#111",
+                    }}
+                  />
+                  <div
+                    title="Drag to resize preview"
+                    onPointerDown={handlePreviewResizePointerDown}
+                    style={{
+                      position: "absolute",
+                      left: -6,
+                      bottom: -6,
+                      width: 18,
+                      height: 18,
+                      border: "1.5px solid #2a2a2a",
+                      background: "#c8f135",
+                      cursor: "nesw-resize",
+                      boxShadow: "1px 1px 0 rgba(42,42,42,0.45)",
+                    }}
+                  />
+                </div>
+              )}
             </div>
           </div>
 
@@ -15289,20 +15573,43 @@ export default function Board2Page() {
                 {selectedClip.type === "narration" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <button
-                      onClick={() => void setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
-                      disabled={transcribingNarrationId === selectedClip.id}
-                      style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5", opacity: transcribingNarrationId === selectedClip.id ? 0.55 : 1 }}
+                      onClick={() => void transcribeNarrationWithWhisper(selectedClip)}
+                      disabled={!!transcribingNarrationId}
+                      style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                     >
-                      {transcribingNarrationId === selectedClip.id ? "⟳ Whisper transcription…" : selectedClip.speechBubbles ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments ?? []).length}` : "💬 Add comic speech bubbles"}
+                      {transcribingNarrationId === selectedClip.id
+                        ? "⟳ Whisper transcription…"
+                        : transcribingNarrationId
+                          ? "⟳ Whisper is busy…"
+                          : selectedClip.transcriptSegments?.length
+                          ? "↻ Re-transcribe with Whisper"
+                          : "✎ Transcribe with Whisper"}
                     </button>
-                    {selectedClip.speechBubbles && (
-                      <button
-                        type="button"
-                        onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
-                        style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
-                      >
-                        {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
-                      </button>
+                    {selectedClip.transcriptSegments?.length ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setNarrationSpeechBubbles(selectedClip, !selectedClip.speechBubbles)}
+                          style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: selectedClip.speechBubbles ? "#c8f135" : "#fffdf5" }}
+                        >
+                          {selectedClip.speechBubbles
+                            ? `💬 Speech bubbles on · ${narrationSentenceCues(selectedClip.transcriptSegments).length}`
+                            : "💬 Speech bubbles off"}
+                        </button>
+                        {selectedClip.speechBubbles && (
+                          <button
+                            type="button"
+                            onClick={() => setNarrationSpeechGestures(selectedClip, selectedClip.speechBubbleGestures === false)}
+                            style={{ ...miniButton, background: selectedClip.speechBubbleGestures === false ? "transparent" : "#f4b942" }}
+                          >
+                            {selectedClip.speechBubbleGestures === false ? "Talking hands off" : "Talking hands on"}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", lineHeight: 1.4 }}>
+                        Selecting narration never starts Whisper.
+                      </div>
                     )}
                   </div>
                 )}
@@ -15620,7 +15927,6 @@ export default function Board2Page() {
                     onClick={(e) => {
                       e.stopPropagation();
                       setClipSelection([clip.id]);
-                      if (!clip.speechBubbles && transcribingNarrationId !== clip.id) void setNarrationSpeechBubbles(clip, true);
                     }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
                   >
@@ -16579,6 +16885,55 @@ function audioBufferToWav(buf: AudioBuffer): Blob {
     }
   }
   return new Blob([ab], { type: "audio/wav" });
+}
+
+async function decodeNarrationClip(clip: Clip): Promise<AudioBuffer> {
+  const context = new AudioContext();
+  try {
+    const bytes = clip.audioBlob
+      ? await clip.audioBlob.arrayBuffer()
+      : await fetch(clip.sourceUrl).then((response) => {
+          if (!response.ok) throw new Error(`Could not read narration (${response.status})`);
+          return response.arrayBuffer();
+        });
+    return await context.decodeAudioData(bytes);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+function audioBufferSegmentToMonoWav(
+  buffer: AudioBuffer,
+  sourceStartSeconds: number,
+  requestedDurationSeconds: number,
+): Blob {
+  const targetSampleRate = 16_000;
+  const sourceStart = Math.min(Math.max(0, sourceStartSeconds), buffer.duration);
+  const duration = Math.min(Math.max(0, requestedDurationSeconds), Math.max(0, buffer.duration - sourceStart));
+  const sampleCount = Math.max(1, Math.ceil(duration * targetSampleRate));
+  const dataLength = sampleCount * 2;
+  const bytes = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(bytes);
+  writeWavStr(view, 0, "RIFF"); view.setUint32(4, 36 + dataLength, true); writeWavStr(view, 8, "WAVE");
+  writeWavStr(view, 12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, targetSampleRate, true); view.setUint32(28, targetSampleRate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeWavStr(view, 36, "data"); view.setUint32(40, dataLength, true);
+
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, channel) => buffer.getChannelData(channel));
+  const sourceFrameStart = sourceStart * buffer.sampleRate;
+  const sourceFramesPerOutput = buffer.sampleRate / targetSampleRate;
+  for (let index = 0; index < sampleCount; index++) {
+    const sourcePosition = sourceFrameStart + index * sourceFramesPerOutput;
+    const lower = Math.min(buffer.length - 1, Math.floor(sourcePosition));
+    const upper = Math.min(buffer.length - 1, lower + 1);
+    const mix = sourcePosition - lower;
+    let sample = 0;
+    for (const channel of channels) sample += channel[lower] + (channel[upper] - channel[lower]) * mix;
+    sample = Math.max(-1, Math.min(1, sample / Math.max(1, channels.length)));
+    view.setInt16(44 + index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  return new Blob([bytes], { type: "audio/wav" });
 }
 
 async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {

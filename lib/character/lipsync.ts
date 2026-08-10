@@ -3,6 +3,15 @@ import type { Viseme } from "@/lib/stream";
 export type RhubarbMouthShape = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "X";
 export type RhubarbCue = { start: number; end: number; value: RhubarbMouthShape };
 export type VisemeTrackPoint = { t: number; viseme: Viseme };
+export type LipSyncChunkWindow = {
+  nominalStart: number;
+  nominalEnd: number;
+  audioStart: number;
+  audioEnd: number;
+};
+
+export const LIP_SYNC_CHUNK_SECONDS = 60;
+export const LIP_SYNC_CHUNK_CONTEXT_SECONDS = 0.25;
 
 export const RHUBARB_TO_VISEME: Readonly<Record<RhubarbMouthShape, Viseme>> = {
   A: "closed",
@@ -36,6 +45,42 @@ export function isRhubarbCue(value: unknown): value is RhubarbCue {
   return typeof cue.start === "number" && Number.isFinite(cue.start) && cue.start >= 0 &&
     typeof cue.end === "number" && Number.isFinite(cue.end) && cue.end > cue.start &&
     typeof cue.value === "string" && Object.prototype.hasOwnProperty.call(RHUBARB_TO_VISEME, cue.value);
+}
+
+export function planLipSyncChunks(
+  duration: number,
+  chunkSeconds = LIP_SYNC_CHUNK_SECONDS,
+  contextSeconds = LIP_SYNC_CHUNK_CONTEXT_SECONDS,
+): LipSyncChunkWindow[] {
+  if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(chunkSeconds) || chunkSeconds <= 0) return [];
+  const safeContext = Number.isFinite(contextSeconds) ? Math.max(0, contextSeconds) : 0;
+  const chunks: LipSyncChunkWindow[] = [];
+  for (let nominalStart = 0; nominalStart < duration; nominalStart += chunkSeconds) {
+    const nominalEnd = Math.min(duration, nominalStart + chunkSeconds);
+    chunks.push({
+      nominalStart,
+      nominalEnd,
+      audioStart: Math.max(0, nominalStart - safeContext),
+      audioEnd: Math.min(duration, nominalEnd + safeContext),
+    });
+  }
+  return chunks;
+}
+
+export function offsetRhubarbChunkCues(
+  cues: readonly RhubarbCue[],
+  window: LipSyncChunkWindow,
+  totalDuration: number,
+): RhubarbCue[] {
+  const ownsFinalBoundary = window.nominalEnd >= totalDuration;
+  return cues.flatMap((cue) => {
+    if (!isRhubarbCue(cue)) return [];
+    const start = Math.max(0, window.audioStart + cue.start);
+    const end = Math.min(totalDuration, window.audioStart + cue.end);
+    const midpoint = (start + end) / 2;
+    const owned = midpoint >= window.nominalStart && (ownsFinalBoundary ? midpoint <= window.nominalEnd : midpoint < window.nominalEnd);
+    return owned && end > start ? [{ start, end, value: cue.value }] : [];
+  });
 }
 
 export function mergeNarrationCueTracks(inputs: readonly NarrationTrackInput[]): VisemeTrackPoint[] {
