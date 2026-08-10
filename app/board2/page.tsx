@@ -109,6 +109,11 @@ function validGuestSignDataUrl(value?: string): value is string {
   return !!value && value.startsWith("data:image/") && value.length <= MAX_GUEST_SIGN_DATA_URL_BYTES;
 }
 
+// Lightweight provenance tag for the "complete recipe" save format: how did this element get onto
+// the board? Used only as a training-data signal — never read by playback/export. Defaults to
+// "manual" wherever not explicitly set at creation time.
+type ClipSource = "manual" | "neuralSearch" | "top5" | "auto";
+
 type Clip = {
   id: string;
   type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration";
@@ -116,6 +121,7 @@ type Clip = {
   sourceUrl: string;
   startTime: number;
   duration: number;
+  source?: ClipSource; // provenance: manual upload/drag, Neural Search, Top 5, or auto-derived. See ClipSource.
   layer?: number;    // 0-4 for visual clips, undefined for narration. Default: 1
   volume?: number;   // 0-1, default 1. Applies to video and narration clips
   muted?: boolean;   // explicit mute (overrides volume). Default: false
@@ -167,6 +173,62 @@ function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
           : null,
       })),
   );
+}
+
+// ─── "Complete recipe" save schema (schemaVersion 1) ───────────────────────────
+// See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
+// the flat manifest the app has always saved: it nests the same data plus lightweight provenance
+// tags and two "resolved" snapshots (camera + character position) baked at save time from the
+// exact functions the renderer uses, so the file captures the actual outcome, not just the inputs
+// that would need the app re-run to reproduce. Old saves (no `schemaVersion`) are schema v0 and
+// are loaded through the original flat-field path — see loadBoard's normalizeLoadedManifest.
+type RecipeCameraSample = { time: number; cameraX: number; cameraY: number; boardZoom: number };
+type RecipeCharacterSample = { time: number; x: number; y: number; physique: "slim" | "jacked" };
+type RecipeVideoRef =
+  | { kind: "youtube"; youtubeId: string; ytStart?: number; ytEnd?: number }
+  | { kind: "unavailable" };
+
+// Sample points for the resolved snapshots: every RECIPE_SAMPLE_STEP seconds across the board's
+// duration, plus every "interesting" boundary time (camera keyframes, action starts/ends,
+// characterFocus blocks) so the snapshot doesn't miss a sharp transition between two coarse
+// samples. Deduped and capped so a very long or busy board can't blow up save time.
+const RECIPE_SAMPLE_STEP = 0.5;
+const RECIPE_MAX_SAMPLES = 500;
+function buildRecipeSampleTimes(totalDurationSec: number, extraTimes: readonly number[]): number[] {
+  const times = new Set<number>();
+  const roundedTotal = Math.max(0, totalDurationSec);
+  for (let t = 0; t <= roundedTotal + 1e-6; t += RECIPE_SAMPLE_STEP) {
+    times.add(Math.round(Math.min(t, roundedTotal) * 1000) / 1000);
+  }
+  times.add(Math.round(roundedTotal * 1000) / 1000);
+  for (const t of extraTimes) {
+    if (Number.isFinite(t) && t >= 0 && t <= roundedTotal) times.add(Math.round(t * 1000) / 1000);
+  }
+  const sorted = Array.from(times).sort((a, b) => a - b);
+  if (sorted.length <= RECIPE_MAX_SAMPLES) return sorted;
+  const stride = sorted.length / RECIPE_MAX_SAMPLES;
+  const picked: number[] = [];
+  for (let i = 0; i < RECIPE_MAX_SAMPLES; i++) picked.push(sorted[Math.floor(i * stride)]);
+  return picked;
+}
+
+function blobToDataUri(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read blob"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function tryBlobUrlToDataUri(blobUrl: string): Promise<string | undefined> {
+  try {
+    const res = await fetch(blobUrl);
+    if (!res.ok) return undefined;
+    return await blobToDataUri(await res.blob());
+  } catch {
+    return undefined;
+  }
 }
 
 function narrationSentenceCues(segments: readonly TranscriptSegment[]): SpeechBubbleCue[] {
@@ -461,6 +523,7 @@ type Annotation = {
   highlightStyle?: "rect" | "underline" | "curlyBrace";
   points?: Array<{ x: number; y: number }>;  // pen
   emoji?: string;                              // emoji
+  source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
 };
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
@@ -488,6 +551,8 @@ type CharacterAction = {
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
   narrationGestureClipId?: string;
   narrationGestureCueIndex?: number;
+  source?: ClipSource; // provenance: "auto" mirrors aiGenerated, else "manual". Narrower in practice
+                        // (never neuralSearch/top5) but shares the ClipSource union for one schema.
 };
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch" | "explainGesture";
@@ -669,6 +734,7 @@ type MediaItem = {
   youtubeId?: string;
   ytStart?: number;
   ytEnd?: number;
+  source?: ClipSource; // provenance passthrough for the resulting Clip; defaults to "manual"
 };
 
 type PendingMediaPlacement = {
@@ -731,6 +797,8 @@ type NeuralPlaceholder = {
   thumbnailUrl: string;
   viewCount: number;
   durationSec: number;
+  source?: "neuralSearch" | "top5"; // which search flow produced this placeholder; read by
+                                     // handleYtConfirm to tag the resulting Clip's provenance.
 };
 
 // Neural Search: a not-yet-downloaded Google Image candidate placed on the board as a
@@ -1993,6 +2061,7 @@ function narrationSpeechGestureActions(
       startTime,
       duration,
       aiGenerated: true,
+      source: "auto" as const,
       narrationGestureClipId: clip.id,
       narrationGestureCueIndex: cue.index,
     }];
@@ -3766,6 +3835,7 @@ export default function Board2Page() {
   const [saveName, setSaveName] = useState("My Board");
   const [isSaving, setIsSaving] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
+  const [isExportingBoardData, setIsExportingBoardData] = useState(false);
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -4143,6 +4213,11 @@ export default function Board2Page() {
   const streamSnapshotQueuedRef = useRef(false);
   const streamSnapshotBusyRef = useRef(false);
   const spawnDoorRef = useRef<SpawnDoor | null>(null);
+  // "Complete recipe" save format: a stable project id + the original creation timestamp,
+  // generated once and carried forward across saves (and adopted from a loaded project so
+  // re-saving an opened board doesn't mint a new id/createdAt). See buildRecipeManifest().
+  const recipeProjectIdRef = useRef<string | null>(null);
+  const recipeCreatedAtRef = useRef<string | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamGuestEntitiesRef = useRef<Map<string, CharacterEntity>>(new Map());
@@ -6534,6 +6609,7 @@ export default function Board2Page() {
           youtubeId: item.youtubeId,
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
+          source: item.source ?? "manual",
         },
       ];
     });
@@ -7307,6 +7383,11 @@ export default function Board2Page() {
     const sourcePlaceholderId = ytSel.placeholderId;
     const placeholderBoardX = ytSel.boardX;
     const placeholderBoardY = ytSel.boardY;
+    // Provenance: a placeholder click carries its origin (Neural Search vs Top 5); a pasted/typed
+    // URL search has no placeholder at all, so it's a manual add.
+    const clipSource: ClipSource = sourcePlaceholderId
+      ? (neuralPlaceholders.find((p) => p.id === sourcePlaceholderId)?.source ?? "manual")
+      : "manual";
 
     // Close the modal instantly — download continues in the background via a toast
     setYtModalOpen(false);
@@ -7354,6 +7435,7 @@ export default function Board2Page() {
             youtubeId: ytSel.id,
             ytStart: start,
             ytEnd: end,
+            source: clipSource,
           });
         } else {
           const clipId = generateId();
@@ -7371,6 +7453,7 @@ export default function Board2Page() {
               sourceDurationSec: meta.sourceDurationSec,
               sourceBlob: blob,
               youtubeId: ytSel.id, ytStart: start, ytEnd: end,
+              source: clipSource,
             }];
           });
           setSelectedClipId(clipId);
@@ -7433,7 +7516,7 @@ export default function Board2Page() {
         return {
           id: generateId(), boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           videoId: v.videoId, title: v.title, channel: v.channel, thumbnailUrl: v.thumbnailUrl,
-          viewCount: v.viewCount, durationSec: v.durationSec,
+          viewCount: v.viewCount, durationSec: v.durationSec, source: "neuralSearch" as const,
         };
       });
       const newImagePlaceholders: ImagePlaceholder[] = images.map((img) => {
@@ -7531,6 +7614,7 @@ export default function Board2Page() {
         fontFamily: "Permanent Marker",
         fontSize: 180,
         fontWeight: "bold",
+        source: "top5",
       });
 
       const newPlaceholders: NeuralPlaceholder[] = [];
@@ -7554,6 +7638,7 @@ export default function Board2Page() {
           fontFamily: "Permanent Marker",
           fontSize: item.rank === 2 ? 150 : 140,
           fontWeight: item.rank <= 2 ? "bold" : "normal",
+          source: "top5",
         });
 
         // Item label annotation
@@ -7569,6 +7654,7 @@ export default function Board2Page() {
           fontFamily: "Caveat",
           fontSize: 60,
           fontWeight: "normal",
+          source: "top5",
         });
 
         // Video placeholders for this rank
@@ -7586,6 +7672,7 @@ export default function Board2Page() {
             thumbnailUrl: v.thumbnailUrl,
             viewCount: v.viewCount,
             durationSec: v.durationSec,
+            source: "top5",
           });
         });
       });
@@ -7852,6 +7939,7 @@ export default function Board2Page() {
         fontFamily: "Permanent Marker",
         fontSize: 170,
         fontWeight: "bold",
+        source: "top5",
       });
       newAnnotations.push({
         id: generateId(),
@@ -7865,6 +7953,7 @@ export default function Board2Page() {
         fontFamily: "Caveat",
         fontSize: 48,
         fontWeight: "normal",
+        source: "top5",
       });
     }
     annotationsRef.current = [...annotationsRef.current, ...newAnnotations];
@@ -7912,6 +8001,7 @@ export default function Board2Page() {
           youtubeId: acc.videoId,
           ytStart: acc.trimStart,
           ytEnd: acc.trimEnd,
+          source: "top5",
         };
         clipsRef.current = [...clipsRef.current, clip];
         setClips((prev) => [...prev, clip]);
@@ -8360,6 +8450,7 @@ export default function Board2Page() {
           startTime: endTime, duration: 4, layer,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
           sourceBlob: blob,
+          source: "neuralSearch" as const,
         }];
       });
       setSelectedClipId(clipId);
@@ -9654,6 +9745,7 @@ export default function Board2Page() {
         ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, BOARD_H) } : {}),
         ...(a.highlightStyle != null ? { highlightStyle: a.highlightStyle } : {}),
         ...(a.emoji != null ? { emoji: String(a.emoji) } : {}),
+        source: "auto" as const,
       }));
     setAnnotations((prev) => [...prev, ...newAnnotations]);
     setToast(`Generated ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`);
@@ -9833,6 +9925,7 @@ export default function Board2Page() {
           ...(a.viaSurfaceId ? { viaSurfaceId: a.viaSurfaceId } : {}),
           ...(a.type === "emote" && a.emoji ? { emoji: a.emoji } : {}),
           aiGenerated: true,
+          source: "auto" as const,
         } as CharacterAction;
       });
 
@@ -12644,6 +12737,12 @@ export default function Board2Page() {
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isExporting ? "#ff5e3a" : "transparent", color: isExporting ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
           >{isExporting ? "✕" : "⬇"}</button>
           <button
+            onClick={exportBoardData}
+            disabled={isExportingBoardData}
+            title="Export board data (.json) — the complete recipe of this board"
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: isExportingBoardData ? "wait" : "pointer", opacity: isExportingBoardData ? 0.5 : 1, flexShrink: 0 }}
+          >🧾</button>
+          <button
             onClick={() => setSaveModalOpen(true)}
             title="Save / load project"
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
@@ -13396,129 +13495,233 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  async function saveBoard() {
-    if (isSaving) return;
-    setIsSaving(true);
-    setToast("Saving…");
-    try {
-      type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob"> & {
-        assetFile?: string;
-        assetMime?: string;
-      };
-      type ManifestFace = {
-        faceAspect: number;
-        mouthAnchor?: HeadLocalPoint;
-        assetFile: string;
-        assetMime: string;
-      };
-      type ManifestCharacter = Omit<CharacterInstance, "faceBlobUrl" | "faceAspect"> & {
-        face?: ManifestFace | null;
-      };
-      const manifestClips: ManifestClip[] = [];
-      const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
+  // Builds the full "complete recipe" manifest (schemaVersion 1) — the shared core of both
+  // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
+  // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
+  // comment near narrationVisemeSourceSignature for the shape and design rationale.
+  async function buildRecipeManifest(embedMedia: boolean) {
+    type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob"> & {
+      assetFile?: string;
+      assetMime?: string;
+      assetDataUri?: string;
+      videoRef?: RecipeVideoRef;
+      thumbnailDataUri?: string;
+    };
+    type ManifestFace = {
+      faceAspect: number;
+      mouthAnchor?: HeadLocalPoint;
+      assetFile?: string;
+      assetDataUri?: string;
+      assetMime: string;
+    };
+    type ManifestCharacter = Omit<CharacterInstance, "faceBlobUrl" | "faceAspect"> & {
+      face?: ManifestFace | null;
+      resolvedPositionTrack: RecipeCharacterSample[];
+    };
+    const manifestClips: ManifestClip[] = [];
+    const zipFiles: Record<string, [Uint8Array, { level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 }]> = {};
 
-      const readClipAsset = async (clip: Clip): Promise<Blob> => {
-        if (clip.sourceBlob?.size) return clip.sourceBlob;
+    const readClipAsset = async (clip: Clip): Promise<Blob> => {
+      if (clip.sourceBlob?.size) return clip.sourceBlob;
 
-        if (clip.sourceUrl) {
+      if (clip.sourceUrl) {
+        try {
+          const response = await fetch(clip.sourceUrl);
+          if (response.ok) return await response.blob();
+        } catch {
+          // A revoked object URL or cross-origin URL can still have rendered pixels below.
+        }
+      }
+
+      if (clip.type === "image") {
+        const renderedImage = imgCacheRef.current.get(clip.sourceUrl);
+        if (renderedImage) {
           try {
-            const response = await fetch(clip.sourceUrl);
+            return await renderedImageToBlob(renderedImage);
+          } catch {
+            // Continue to the named error so the user knows which asset needs attention.
+          }
+        }
+        if (/^https?:\/\//i.test(clip.sourceUrl)) {
+          try {
+            const response = await fetch(`/api/proxy-image?url=${encodeURIComponent(clip.sourceUrl)}`);
             if (response.ok) return await response.blob();
           } catch {
-            // A revoked object URL or cross-origin URL can still have rendered pixels below.
+            // Continue to the named error below.
           }
         }
+      }
 
-        if (clip.type === "image") {
-          const renderedImage = imgCacheRef.current.get(clip.sourceUrl);
-          if (renderedImage) {
-            try {
-              return await renderedImageToBlob(renderedImage);
-            } catch {
-              // Continue to the named error so the user knows which asset needs attention.
-            }
-          }
-          if (/^https?:\/\//i.test(clip.sourceUrl)) {
-            try {
-              const response = await fetch(`/api/proxy-image?url=${encodeURIComponent(clip.sourceUrl)}`);
-              if (response.ok) return await response.blob();
-            } catch {
-              // Continue to the named error below.
-            }
-          }
+      throw new Error(`Could not include "${clip.name || "Untitled media"}" in the saved board. Re-add that media and try again.`);
+    };
+
+    for (const clip of clipsRef.current) {
+      const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
+      const withSource = { ...rest, source: rest.source ?? ("manual" as ClipSource) };
+      if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
+        manifestClips.push(withSource);
+      } else if (clip.youtubeId) {
+        if (embedMedia) {
+          manifestClips.push({
+            ...withSource,
+            videoRef: { kind: "youtube", youtubeId: clip.youtubeId, ytStart: clip.ytStart, ytEnd: clip.ytEnd },
+            thumbnailDataUri: clip.thumbnailBlobUrl ? await tryBlobUrlToDataUri(clip.thumbnailBlobUrl) : undefined,
+          });
+        } else {
+          manifestClips.push({ ...withSource, needsRedownload: true });
         }
-
-        throw new Error(`Could not include "${clip.name || "Untitled media"}" in the saved board. Re-add that media and try again.`);
-      };
-
-      for (const clip of clipsRef.current) {
-        const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-        if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
-          manifestClips.push(rest);
-        } else if (clip.youtubeId) {
-          manifestClips.push({ ...rest, needsRedownload: true });
-        } else if (clip.type === "narration" && clip.audioBlob) {
+      } else if (clip.type === "narration" && clip.audioBlob) {
+        if (embedMedia) {
+          manifestClips.push({ ...withSource, assetDataUri: await blobToDataUri(clip.audioBlob), assetMime: clip.audioBlob.type || "audio/wav" });
+        } else {
           const buf = await clip.audioBlob.arrayBuffer();
           const assetFile = `assets/${clip.id}.${mimeToExt(clip.audioBlob.type, clip.name)}`;
           zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
-          manifestClips.push({ ...rest, assetFile, assetMime: clip.audioBlob.type || "audio/wav" });
-        } else if (clip.sourceUrl) {
+          manifestClips.push({ ...withSource, assetFile, assetMime: clip.audioBlob.type || "audio/wav" });
+        }
+      } else if (clip.sourceUrl) {
+        if (embedMedia && clip.type === "video") {
+          // Uploaded (non-YouTube) video: no durable reference exists for it, so skip byte
+          // embedding (would bloat the JSON) and keep only a thumbnail for visual context.
+          manifestClips.push({
+            ...withSource,
+            videoRef: { kind: "unavailable" },
+            thumbnailDataUri: clip.thumbnailBlobUrl ? await tryBlobUrlToDataUri(clip.thumbnailBlobUrl) : undefined,
+          });
+        } else if (embedMedia) {
+          const blob = await readClipAsset(clip);
+          manifestClips.push({ ...withSource, assetDataUri: await blobToDataUri(blob), assetMime: blob.type });
+        } else {
           const blob = await readClipAsset(clip);
           const ext = mimeToExt(blob.type, clip.name);
           const assetFile = `assets/${clip.id}.${ext}`;
           const buf = await blob.arrayBuffer();
           zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
-          manifestClips.push({ ...rest, assetFile, assetMime: blob.type });
-        } else {
-          manifestClips.push(rest);
+          manifestClips.push({ ...withSource, assetFile, assetMime: blob.type });
         }
+      } else {
+        manifestClips.push(withSource);
       }
+    }
 
-      const saveFaceAsset = async (face: CharacterFaceSettings | null, assetFile: string): Promise<ManifestFace | null> => {
-        if (!face?.faceBlobUrl) return null;
-        const blob = await fetch(face.faceBlobUrl).then((r) => r.blob());
-        const buf = await blob.arrayBuffer();
-        zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
-        return {
-          faceAspect: face.faceAspect,
-          mouthAnchor: face.mouthAnchor,
-          assetFile,
-          assetMime: blob.type || "image/png",
-        };
-      };
-      const manifestFace = await saveFaceAsset(characterFaceRef.current, "assets/character-face-c1.png");
-      const manifestFace2 = await saveFaceAsset(characterFace2Ref.current, "assets/character-face-c2.png");
-      const manifestCharacters: ManifestCharacter[] = [
-        { id: "c1", enabled: showCharacterRef.current, accentColor: "#2a2a2a", mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current, start: characterStart ?? undefined, face: manifestFace },
-        { id: "c2", enabled: showCharacter2Ref.current, accentColor: "#3a3a5a", mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current, start: characterStart2 ?? undefined, face: manifestFace2 },
-      ];
-      const currentLipSyncSource = narrationVisemeSourceSignature(clipsRef.current);
-      const savedLipSyncTrack = narrationVisemeTrackSourceRef.current === currentLipSyncSource
-        ? narrationVisemeTrackRef.current
-        : [];
+    const saveFaceAsset = async (face: CharacterFaceSettings | null, assetKey: string): Promise<ManifestFace | null> => {
+      if (!face?.faceBlobUrl) return null;
+      const blob = await fetch(face.faceBlobUrl).then((r) => r.blob());
+      if (embedMedia) {
+        return { faceAspect: face.faceAspect, mouthAnchor: face.mouthAnchor, assetDataUri: await blobToDataUri(blob), assetMime: blob.type || "image/png" };
+      }
+      const buf = await blob.arrayBuffer();
+      zipFiles[assetKey] = [new Uint8Array(buf), { level: 0 }];
+      return { faceAspect: face.faceAspect, mouthAnchor: face.mouthAnchor, assetFile: assetKey, assetMime: blob.type || "image/png" };
+    };
+    const manifestFace = await saveFaceAsset(characterFaceRef.current, "assets/character-face-c1.png");
+    const manifestFace2 = await saveFaceAsset(characterFace2Ref.current, "assets/character-face-c2.png");
 
-      const manifest = {
-        version: 1,
-        name: saveName,
-        savedAt: new Date().toISOString(),
+    const currentLipSyncSource = narrationVisemeSourceSignature(clipsRef.current);
+    const savedLipSyncTrack = narrationVisemeTrackSourceRef.current === currentLipSyncSource
+      ? narrationVisemeTrackRef.current
+      : [];
+
+    const totalDurationSec = Math.max(0, ...clipsRef.current.map((c) => c.startTime + c.duration), 0);
+    const cameraMode: "clips" | "follow" = clipsRef.current.some((c) => c.type === "characterFocus") ? "follow" : "clips";
+
+    // Resolved camera track: reuse editorCameraAtTime, the exact function the renderer calls every
+    // frame, so this snapshot (including the character-focus/follow overlay, otherwise never
+    // persisted anywhere) is byte-faithful to what was actually shown.
+    const cameraExtraTimes = [
+      ...cameraKeyframesRef.current.map((k) => k.time),
+      ...clipsRef.current.filter((c) => c.type === "characterFocus").flatMap((c) => [c.startTime, c.startTime + c.duration]),
+    ];
+    const cameraSampleTimes = buildRecipeSampleTimes(totalDurationSec, cameraExtraTimes);
+    const resolvedCameraTrack: RecipeCameraSample[] = cameraSampleTimes.map((t) => {
+      const cam = editorCameraAtTime(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+      return { time: t, cameraX: cam.cameraX, cameraY: cam.cameraY, boardZoom: cam.boardZoom };
+    });
+
+    // Resolved character position track: same idea, reuse evalCharAtTime (what the renderer
+    // samples every frame) instead of reimplementing pose resolution for the snapshot.
+    const buildCharacterTrack = (
+      enabled: boolean,
+      resolvedActions: ResolvedCharAction[],
+      rawActions: CharacterAction[],
+      initX: number,
+      initY: number,
+      entranceTime: number,
+    ): RecipeCharacterSample[] => {
+      if (!enabled) return [];
+      const extra = rawActions.flatMap((a) => [a.startTime, a.startTime + a.duration]);
+      const times = buildRecipeSampleTimes(totalDurationSec, extra).filter((t) => !Number.isFinite(entranceTime) || t >= entranceTime);
+      return times.map((t) => {
+        const pose = evalCharAtTime(t, resolvedActions, initX, initY, clipsRef.current, authoredAnimationsRef.current);
+        return { time: t, x: pose.boardX, y: pose.boardY, physique: physiqueAt(t, rawActions) };
+      });
+    };
+    const resolvedPositionTrackC1 = buildCharacterTrack(
+      showCharacterRef.current, resolvedCharActionsRef.current, characterActionsRef.current,
+      charInitXRef.current, charInitYRef.current, characterEntranceTimeRef.current,
+    );
+    const resolvedPositionTrackC2 = buildCharacterTrack(
+      showCharacter2Ref.current, resolvedCharActions2Ref.current, characterActions2Ref.current,
+      charInit2XRef.current, charInit2YRef.current, characterEntranceTime2Ref.current,
+    );
+
+    if (!recipeProjectIdRef.current) {
+      recipeProjectIdRef.current = (typeof crypto !== "undefined" && "randomUUID" in crypto)
+        ? crypto.randomUUID()
+        : `proj_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    }
+    if (!recipeCreatedAtRef.current) recipeCreatedAtRef.current = new Date().toISOString();
+
+    const manifest = {
+      schemaVersion: 1 as const,
+      meta: {
+        projectId: recipeProjectIdRef.current,
+        title: saveName,
+        aspectRatio: canvasAspect,
+        totalDurationSec,
+        createdAt: recipeCreatedAtRef.current,
+        modifiedAt: new Date().toISOString(),
+      },
+      board: {
         clips: manifestClips,
-        cameraKeyframes: cameraKeyframesRef.current,
-        annotations: annotationsRef.current,
-        canvasAspect,
         pxPerSec: pxPerSecRef.current,
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
-        characterActions: characterActionsRef.current,
-        showCharacter: showCharacterRef.current,
-        characterMode: characterModeRef.current,
-        characterSkin: characterSkinRef.current,
-        characterFace: manifestFace,
-        characterStart: characterStart ?? undefined,
-        characters: manifestCharacters,
-        narrationVisemeTrack: savedLipSyncTrack,
-        narrationVisemeTrackSource: savedLipSyncTrack.length ? currentLipSyncSource : null,
         spawnDoor: spawnDoorRef.current,
-      };
+      },
+      annotations: annotationsRef.current,
+      narration: {
+        visemeTrack: savedLipSyncTrack,
+        visemeTrackFingerprint: savedLipSyncTrack.length ? currentLipSyncSource : null,
+      },
+      camera: {
+        mode: cameraMode,
+        keyframes: cameraKeyframesRef.current,
+        resolvedTrack: resolvedCameraTrack,
+      },
+      characters: {
+        c1: {
+          id: "c1" as const, enabled: showCharacterRef.current, accentColor: "#2a2a2a",
+          mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current,
+          start: characterStart ?? undefined, face: manifestFace, resolvedPositionTrack: resolvedPositionTrackC1,
+        } satisfies ManifestCharacter,
+        c2: {
+          id: "c2" as const, enabled: showCharacter2Ref.current, accentColor: "#3a3a5a",
+          mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current,
+          start: characterStart2 ?? undefined, face: manifestFace2, resolvedPositionTrack: resolvedPositionTrackC2,
+        } satisfies ManifestCharacter,
+      },
+    };
+
+    return { manifest, zipFiles };
+  }
+
+  async function saveBoard() {
+    if (isSaving) return;
+    setIsSaving(true);
+    setToast("Saving…");
+    try {
+      const { manifest, zipFiles } = await buildRecipeManifest(false);
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
       const zipped = zipSync(zipFiles);
@@ -13540,6 +13743,32 @@ export default function Board2Page() {
     }
   }
 
+  // "Export board data": the same complete recipe as Save Board, but as a single self-contained
+  // .json (no zip) with images/audio/faces inlined as base64 data URIs — a training-data snapshot
+  // the owner can study offline without the app. Video bytes are intentionally not embedded (see
+  // buildRecipeManifest); YouTube-sourced clips keep a durable youtubeId+trim reference instead.
+  async function exportBoardData() {
+    if (isExportingBoardData) return;
+    setIsExportingBoardData(true);
+    setToast("Preparing board data…");
+    try {
+      const { manifest } = await buildRecipeManifest(true);
+      const json = JSON.stringify(manifest, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(saveName || "board").replace(/[^a-z0-9_-]/gi, "_")}-recipe.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setToast(`Board data exported (${(blob.size / (1024 * 1024)).toFixed(2)} MB)`);
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Board data export failed");
+    } finally {
+      setIsExportingBoardData(false);
+    }
+  }
+
   async function loadBoard(file: File) {
     if (isLoadingProject) return;
     setIsLoadingProject(true);
@@ -13554,7 +13783,35 @@ export default function Board2Page() {
       const buffer = await file.arrayBuffer();
       const files = unzipSync(new Uint8Array(buffer));
       if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
-      const manifest = JSON.parse(strFromU8(files["manifest.json"]));
+      const rawManifest = JSON.parse(strFromU8(files["manifest.json"]));
+
+      // schemaVersion >= 1 is the nested "complete recipe" format (see buildRecipeManifest).
+      // Older saves have no schemaVersion field at all — treat them as v0 and read the flat
+      // shape the app has always written. Normalizing here means the reconstruction logic below
+      // (asset restore, legacy clip-type migration, character/lip-sync restore) never has to
+      // branch on version itself — it only ever sees today's familiar flat field names.
+      const schemaVersion = typeof rawManifest?.schemaVersion === "number" ? rawManifest.schemaVersion : 0;
+      const manifest = schemaVersion >= 1 ? {
+        version: 1,
+        name: rawManifest.meta?.title,
+        savedAt: rawManifest.meta?.modifiedAt,
+        clips: rawManifest.board?.clips ?? [],
+        cameraKeyframes: rawManifest.camera?.keyframes ?? [],
+        cameraKeyframeMode: undefined as string | undefined, // v1 saves never carry the legacy flag
+        annotations: rawManifest.annotations ?? [],
+        canvasAspect: rawManifest.meta?.aspectRatio,
+        pxPerSec: rawManifest.board?.pxPerSec,
+        boardZoom: rawManifest.board?.boardZoom,
+        boardPan: rawManifest.board?.boardPan,
+        characters: [rawManifest.characters?.c1, rawManifest.characters?.c2].filter(Boolean),
+        narrationVisemeTrack: rawManifest.narration?.visemeTrack ?? [],
+        narrationVisemeTrackSource: rawManifest.narration?.visemeTrackFingerprint ?? null,
+        spawnDoor: rawManifest.board?.spawnDoor ?? null,
+      } : rawManifest;
+      if (schemaVersion >= 1) {
+        if (typeof rawManifest.meta?.projectId === "string") recipeProjectIdRef.current = rawManifest.meta.projectId;
+        if (typeof rawManifest.meta?.createdAt === "string") recipeCreatedAtRef.current = rawManifest.meta.createdAt;
+      }
 
       // Revoke existing blob URLs
       clearNarrationAudioElements();
@@ -15724,6 +15981,14 @@ export default function Board2Page() {
                 style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
               >
                 {isExporting ? "✕ Cancel" : "⬇ Export"}
+              </button>
+              <button
+                onClick={exportBoardData}
+                disabled={isExportingBoardData}
+                title="Export board data (.json) — the complete recipe of this board: clips, timing, camera, character choreography, and provenance"
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isExportingBoardData ? 0.5 : 1, cursor: isExportingBoardData ? "wait" : "pointer" }}
+              >
+                {isExportingBoardData ? "…" : "🧾 Board Data"}
               </button>
               <div style={{ display: "flex", gap: 3 }}>
                 {(["16:9", "9:16"] as const).map((a) => (
