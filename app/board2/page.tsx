@@ -85,7 +85,7 @@ import {
   applyCharacterFocusCamera,
   type CharacterFocusId,
 } from "@/lib/character-focus-camera";
-import { AI_FEATURES_ENABLED, DEBUG_STREAM, STREAM_OWNER_USER_ID } from "./config";
+import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
 
@@ -13538,9 +13538,11 @@ export default function Board2Page() {
               </span>
             )}
           </div>
-          <ProGated featureName="Play Mode">
-            <button onClick={enterPlayMode} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }} title="Full-window direct character control">▶ Play</button>
-          </ProGated>
+          {LIVE_FEATURES_ENABLED && (
+            <ProGated featureName="Play Mode">
+              <button onClick={enterPlayMode} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }} title="Full-window direct character control">▶ Play</button>
+            </ProGated>
+          )}
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
@@ -14960,6 +14962,7 @@ export default function Board2Page() {
                           </button>
                         )}
                       </div>
+                      {LIVE_FEATURES_ENABLED && (
                       <ProGated featureName="Live Character Control">
                         <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: liveControlEnabled ? "#f0ffe0" : "transparent" }}>
                           <button
@@ -15002,6 +15005,7 @@ export default function Board2Page() {
                           )}
                         </div>
                       </ProGated>
+                      )}
                       <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: narrationVisemeTrackIsCurrent ? "#f0ffe0" : "transparent" }}>
                         <button
                           type="button"
