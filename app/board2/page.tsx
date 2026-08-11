@@ -9,6 +9,7 @@ import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
+import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import {
   STREAM_FPS,
   HOST_STREAM_SKIN,
@@ -113,6 +114,11 @@ function validGuestSignDataUrl(value?: string): value is string {
 // the board? Used only as a training-data signal — never read by playback/export. Defaults to
 // "manual" wherever not explicitly set at creation time.
 type ClipSource = "manual" | "neuralSearch" | "top5" | "auto";
+type RecipeProvenance = "manual" | "neuralSearch" | "top5" | "autoDerived";
+
+function recipeProvenance(source?: ClipSource): RecipeProvenance {
+  return source === "auto" ? "autoDerived" : source ?? "manual";
+}
 
 type Clip = {
   id: string;
@@ -188,15 +194,15 @@ function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
   );
 }
 
-// ─── "Complete recipe" save schema (schemaVersion 1) ───────────────────────────
+// ─── "Complete recipe" save schema (schemaVersion 2) ───────────────────────────
 // See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
 // the flat manifest the app has always saved: it nests the same data plus lightweight provenance
 // tags and two "resolved" snapshots (camera + character position) baked at save time from the
 // exact functions the renderer uses, so the file captures the actual outcome, not just the inputs
 // that would need the app re-run to reproduce. Old saves (no `schemaVersion`) are schema v0 and
 // are loaded through the original flat-field path — see loadBoard's normalizeLoadedManifest.
-type RecipeCameraSample = { time: number; cameraX: number; cameraY: number; boardZoom: number };
-type RecipeCharacterSample = { time: number; x: number; y: number; physique: "slim" | "jacked" };
+type RecipeCameraSample = { time: number; cameraX: number; cameraY: number; boardZoom: number; source: "autoDerived" };
+type RecipeCharacterSample = { time: number; x: number; y: number; physique: "slim" | "jacked"; source: "autoDerived" };
 type RecipeVideoRef =
   | { kind: "youtube"; youtubeId: string; ytStart?: number; ytEnd?: number }
   | { kind: "unavailable" };
@@ -4232,6 +4238,8 @@ export default function Board2Page() {
   // re-saving an opened board doesn't mint a new id/createdAt). See buildRecipeManifest().
   const recipeProjectIdRef = useRef<string | null>(null);
   const recipeCreatedAtRef = useRef<string | null>(null);
+  const recipeTrainingExampleRef = useRef(false);
+  const recipeLibraryFilenameRef = useRef<string | null>(null);
   const streamGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamRenderedGuestFramesRef = useRef<Map<string, GuestCharacterFrame>>(new Map());
   const streamGuestEntitiesRef = useRef<Map<string, CharacterEntity>>(new Map());
@@ -4991,6 +4999,24 @@ export default function Board2Page() {
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
+  useEffect(() => {
+    const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
+    if (!pendingFile) return;
+    sessionStorage.removeItem(BOARD_LIBRARY_PENDING_FILE);
+    void (async () => {
+      try {
+        const directory = await getBoardsDirectory({ prompt: false, write: false });
+        if (!directory) throw new Error("Boards folder permission expired. Open the library and grant access again.");
+        const file = await (await directory.getFileHandle(pendingFile)).getFile();
+        recipeLibraryFilenameRef.current = pendingFile;
+        await loadBoard(file);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Could not open the library board.");
+      }
+    })();
+    // loadBoard is a component-local file loader; this intentionally runs once on editor mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function resolvedCharacterViseme(
     id: CharacterId,
@@ -13551,7 +13577,7 @@ export default function Board2Page() {
               />
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700, padding: "10px 0" }}>
-                  {isSaving ? "Saving…" : "💾 Download .nbp"}
+                  {isSaving ? "Saving…" : "💾 Save .nbp"}
                 </button>
                 <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1, padding: "10px 0" }}>Cancel</button>
               </div>
@@ -13564,12 +13590,13 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  // Builds the full "complete recipe" manifest (schemaVersion 1) — the shared core of both
+  // Builds the full "complete recipe" manifest (schemaVersion 2) — the shared core of both
   // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
   async function buildRecipeManifest(embedMedia: boolean) {
-    type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob"> & {
+    type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob" | "source"> & {
+      source: RecipeProvenance;
       assetFile?: string;
       assetMime?: string;
       assetDataUri?: string;
@@ -13583,8 +13610,9 @@ export default function Board2Page() {
       assetDataUri?: string;
       assetMime: string;
     };
-    type ManifestCharacter = Omit<CharacterInstance, "faceBlobUrl" | "faceAspect"> & {
+    type ManifestCharacter = Omit<CharacterInstance, "faceBlobUrl" | "faceAspect" | "actions"> & {
       face?: ManifestFace | null;
+      actions: Array<Omit<CharacterAction, "source"> & { source: RecipeProvenance }>;
       resolvedPositionTrack: RecipeCharacterSample[];
     };
     const manifestClips: ManifestClip[] = [];
@@ -13626,7 +13654,7 @@ export default function Board2Page() {
 
     for (const clip of clipsRef.current) {
       const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
-      const withSource = { ...rest, source: rest.source ?? ("manual" as ClipSource) };
+      const withSource = { ...rest, source: recipeProvenance(rest.source) };
       if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
         manifestClips.push(withSource);
       } else if (clip.youtubeId) {
@@ -13692,7 +13720,9 @@ export default function Board2Page() {
       : [];
 
     const totalDurationSec = Math.max(0, ...clipsRef.current.map((c) => c.startTime + c.duration), 0);
-    const cameraMode: "clips" | "follow" = clipsRef.current.some((c) => c.type === "characterFocus") ? "follow" : "clips";
+    const cameraMode: "clips" | "character" | "follow" = clipsRef.current.some((c) => c.type === "characterFocus")
+      ? "follow"
+      : (showCharacterRef.current && characterModeRef.current === "auto" ? "character" : "clips");
 
     // Resolved camera track: reuse editorCameraAtTime, the exact function the renderer calls every
     // frame, so this snapshot (including the character-focus/follow overlay, otherwise never
@@ -13704,7 +13734,7 @@ export default function Board2Page() {
     const cameraSampleTimes = buildRecipeSampleTimes(totalDurationSec, cameraExtraTimes);
     const resolvedCameraTrack: RecipeCameraSample[] = cameraSampleTimes.map((t) => {
       const cam = editorCameraAtTime(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
-      return { time: t, cameraX: cam.cameraX, cameraY: cam.cameraY, boardZoom: cam.boardZoom };
+      return { time: t, cameraX: cam.cameraX, cameraY: cam.cameraY, boardZoom: cam.boardZoom, source: "autoDerived" };
     });
 
     // Resolved character position track: same idea, reuse evalCharAtTime (what the renderer
@@ -13722,7 +13752,7 @@ export default function Board2Page() {
       const times = buildRecipeSampleTimes(totalDurationSec, extra).filter((t) => !Number.isFinite(entranceTime) || t >= entranceTime);
       return times.map((t) => {
         const pose = evalCharAtTime(t, resolvedActions, initX, initY, clipsRef.current, authoredAnimationsRef.current);
-        return { time: t, x: pose.boardX, y: pose.boardY, physique: physiqueAt(t, rawActions) };
+        return { time: t, x: pose.boardX, y: pose.boardY, physique: physiqueAt(t, rawActions), source: "autoDerived" };
       });
     };
     const resolvedPositionTrackC1 = buildCharacterTrack(
@@ -13745,8 +13775,7 @@ export default function Board2Page() {
       .filter((clip) => clip.type === "image" || clip.type === "video")
       .map((clip) => {
         const {
-          startTime: _startTime, duration: _duration, layer: _layer,
-          volume: _volume, muted: _muted, holdFraction: _holdFraction,
+          startTime: _startTime, duration: _duration, holdFraction: _holdFraction,
           mediaId: _mediaId, featured: _featured,
           ...media
         } = clip;
@@ -13767,18 +13796,42 @@ export default function Board2Page() {
           volume: clip.volume,
           muted: clip.muted,
           holdFraction: clip.holdFraction,
+          source: recipeProvenance(clip.source === "autoDerived" ? "auto" : clip.source as ClipSource | undefined),
         };
       });
+
+    const snapshotThumbnail = (() => {
+      try {
+        return canvasRef.current?.toDataURL("image/jpeg", 0.78);
+      } catch {
+        return undefined;
+      }
+    })();
+    const normalizeRecipeAction = (action: CharacterAction) => ({
+      ...action,
+      source: recipeProvenance(action.source ?? (action.aiGenerated ? "auto" : "manual")),
+    });
+    const normalizedAnnotations = annotationsRef.current.map((annotation) => ({
+      ...annotation,
+      source: recipeProvenance(annotation.source),
+    }));
 
     const manifest = {
       schemaVersion: 2 as const,
       meta: {
+        id: recipeProjectIdRef.current,
         projectId: recipeProjectIdRef.current,
         title: saveName,
         aspectRatio: canvasAspect,
+        duration: totalDurationSec,
         totalDurationSec,
         createdAt: recipeCreatedAtRef.current,
         modifiedAt: new Date().toISOString(),
+        trainingExample: recipeTrainingExampleRef.current,
+      },
+      snapshot: {
+        thumbnailDataUri: snapshotThumbnail,
+        capturedAtSec: playheadRef.current,
       },
       board: {
         media: boardMedia,
@@ -13790,25 +13843,32 @@ export default function Board2Page() {
       timeline: {
         blocks: timelineBlocks,
       },
-      annotations: annotationsRef.current,
+      annotations: normalizedAnnotations,
       narration: {
+        clipIds: manifestClips.filter((clip) => clip.type === "narration").map((clip) => clip.id),
         visemeTrack: savedLipSyncTrack,
         visemeTrackFingerprint: savedLipSyncTrack.length ? currentLipSyncSource : null,
       },
       camera: {
         mode: cameraMode,
-        keyframes: cameraKeyframesRef.current,
+        inputs: {
+          holdFractions: Object.fromEntries(clipsRef.current.filter(isBoardMediaClip).map((clip) => [clip.id, clip.holdFraction ?? HOLD_FRACTION])),
+          panBlocks: timelineBlocks.filter((block) => block.type === "pan" || block.type === "customZoom"),
+          frameSurfaceBlocks: timelineBlocks.filter((block) => block.type === "image" || block.type === "video"),
+          characterZoomBlocks: timelineBlocks.filter((block) => block.type === "characterFocus"),
+        },
+        keyframes: cameraKeyframesRef.current.map((keyframe) => ({ ...keyframe, source: "manual" as const })),
         resolvedTrack: resolvedCameraTrack,
       },
       characters: {
         c1: {
           id: "c1" as const, enabled: showCharacterRef.current, accentColor: "#2a2a2a",
-          mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current,
+          mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current.map(normalizeRecipeAction),
           start: characterStart ?? undefined, face: manifestFace, resolvedPositionTrack: resolvedPositionTrackC1,
         } satisfies ManifestCharacter,
         c2: {
           id: "c2" as const, enabled: showCharacter2Ref.current, accentColor: "#3a3a5a",
-          mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current,
+          mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current.map(normalizeRecipeAction),
           start: characterStart2 ?? undefined, face: manifestFace2, resolvedPositionTrack: resolvedPositionTrackC2,
         } satisfies ManifestCharacter,
       },
@@ -13829,14 +13889,29 @@ export default function Board2Page() {
       const zippedBytes = new Uint8Array(zipped.byteLength);
       zippedBytes.set(zipped);
       const dlBlob = new Blob([zippedBytes.buffer], { type: "application/zip" });
-      const url = URL.createObjectURL(dlBlob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${(saveName || "board").replace(/[^a-z0-9_-]/gi, "_")}.nbp`;
-      a.click();
-      URL.revokeObjectURL(url);
+      let savedToFolder = false;
+      try {
+        const directory = await getBoardsDirectory({ prompt: true, write: true });
+        if (directory) {
+          const meta = manifest.meta;
+          const fileName = recipeLibraryFilenameRef.current ?? safeBoardFilename(meta.title || "board", meta.id);
+          await writeBoardFile(directory, fileName, zippedBytes);
+          recipeLibraryFilenameRef.current = fileName;
+          savedToFolder = true;
+        }
+      } catch (error) {
+        if ((error as DOMException)?.name !== "AbortError") throw error;
+      }
+      if (!savedToFolder) {
+        const url = URL.createObjectURL(dlBlob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = safeBoardFilename(manifest.meta.title || "board", manifest.meta.id);
+        a.click();
+        URL.revokeObjectURL(url);
+      }
       setSaveModalOpen(false);
-      setToast("Board saved!");
+      setToast(savedToFolder ? "Board saved to library!" : "Board downloaded!");
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Save failed");
     } finally {
@@ -13924,8 +13999,9 @@ export default function Board2Page() {
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
       } : rawManifest;
       if (schemaVersion >= 1) {
-        if (typeof rawManifest.meta?.projectId === "string") recipeProjectIdRef.current = rawManifest.meta.projectId;
+        if (typeof (rawManifest.meta?.id ?? rawManifest.meta?.projectId) === "string") recipeProjectIdRef.current = rawManifest.meta.id ?? rawManifest.meta.projectId;
         if (typeof rawManifest.meta?.createdAt === "string") recipeCreatedAtRef.current = rawManifest.meta.createdAt;
+        recipeTrainingExampleRef.current = rawManifest.meta?.trainingExample === true;
       }
 
       // Revoke existing blob URLs
@@ -14122,6 +14198,7 @@ export default function Board2Page() {
           )}
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
+          <a href="/board2/library" style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, color: "#2a2a2a", textDecoration: "none" }}>▦ Library</a>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
           {session?.user ? (
             <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
@@ -17238,7 +17315,7 @@ export default function Board2Page() {
             />
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700 }}>
-                {isSaving ? "Saving…" : "💾 Download .nbp"}
+                {isSaving ? "Saving…" : "💾 Save .nbp"}
               </button>
               <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1 }}>Cancel</button>
             </div>
