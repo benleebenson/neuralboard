@@ -159,6 +159,10 @@ type Clip = {
   // `mediaId` is persisted by timeline blocks so multiple blocks can reference one asset.
   mediaId?: string;
   featured?: boolean;
+  // automated narration draft provenance:
+  provenance?: "browserFound";
+  sourceAttributionUrl?: string;
+  searchQuery?: string;
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -170,8 +174,83 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
+type AutoNarrationImageSegment = TranscriptSegment & { query: string };
+type BrowserFoundImage = { dataUrl: string; sourceUrl: string; width: number; height: number };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
 type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
+
+const AUTO_IMAGE_QUERY_STOP_WORDS = new Set([
+  "about", "after", "again", "against", "also", "because", "before", "being", "between", "could", "does", "doing",
+  "during", "each", "from", "have", "having", "into", "just", "more", "most", "other", "over", "really", "said",
+  "some", "such", "than", "that", "their", "them", "then", "there", "these", "they", "thing", "think", "this",
+  "those", "through", "very", "want", "what", "when", "where", "which", "while", "with", "would", "your", "youre",
+  "i", "im", "ive", "me", "my", "we", "our", "ours", "us", "a", "an", "and", "are", "as", "at", "be", "but",
+  "by", "do", "for", "had", "has", "he", "her", "here", "him", "his", "how", "if", "in", "is", "it", "its",
+  "of", "on", "or", "she", "so", "the", "to", "up", "was", "were", "will",
+]);
+
+function deriveAutoImageQuery(text: string, index: number): string {
+  const words = text.toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g) ?? [];
+  const useful: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of words) {
+    const word = raw.replace(/^'+|'+$/g, "");
+    const key = word.replace(/'/g, "");
+    if (key.length < 3 || AUTO_IMAGE_QUERY_STOP_WORDS.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    useful.push(word);
+    if (useful.length >= 7) break;
+  }
+  if (useful.length) return useful.join(" ");
+  return words.slice(0, 7).join(" ") || `narration scene ${index + 1}`;
+}
+
+function buildAutoNarrationSegments(
+  transcriptSegments: TranscriptSegment[],
+  durationSec: number,
+  secondsPerImage: number,
+): AutoNarrationImageSegment[] {
+  const safeDuration = Math.max(0.1, durationSec);
+  const requestedCount = Math.max(1, Math.ceil(safeDuration / secondsPerImage));
+  const count = Math.min(24, requestedCount);
+  const windowDuration = safeDuration / count;
+  const cleanSegments = transcriptSegments
+    .filter((segment) => segment.end > segment.start && segment.text.trim())
+    .sort((a, b) => a.start - b.start);
+  return Array.from({ length: count }, (_, index) => {
+    const start = index * windowDuration;
+    const end = index === count - 1 ? safeDuration : (index + 1) * windowDuration;
+    const chunks = cleanSegments.flatMap((segment) => {
+      const overlapStart = Math.max(start, segment.start);
+      const overlapEnd = Math.min(end, segment.end);
+      if (overlapEnd <= overlapStart) return [];
+      const words = segment.text.trim().split(/\s+/).filter(Boolean);
+      if (!words.length) return [];
+      const segmentDuration = Math.max(0.001, segment.end - segment.start);
+      const firstWord = Math.floor((overlapStart - segment.start) / segmentDuration * words.length);
+      const lastWord = Math.max(firstWord + 1, Math.ceil((overlapEnd - segment.start) / segmentDuration * words.length));
+      return [words.slice(firstWord, lastWord).join(" ")];
+    });
+    const nearest = cleanSegments.reduce<TranscriptSegment | null>((best, segment) => {
+      if (!best) return segment;
+      const center = (start + end) / 2;
+      const distance = Math.abs((segment.start + segment.end) / 2 - center);
+      const bestDistance = Math.abs((best.start + best.end) / 2 - center);
+      return distance < bestDistance ? segment : best;
+    }, null);
+    const text = chunks.join(" ").trim() || nearest?.text.trim() || "narration scene";
+    return { start, end, text, query: deriveAutoImageQuery(text, index) };
+  });
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = /^data:([^;,]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) throw new Error("Image finder returned an invalid image payload");
+  const bytes = atob(match[2]);
+  const output = new Uint8Array(bytes.length);
+  for (let index = 0; index < bytes.length; index++) output[index] = bytes.charCodeAt(index);
+  return new Blob([output], { type: match[1] });
+}
 
 function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
   return JSON.stringify(
@@ -3834,6 +3913,9 @@ export default function Board2Page() {
   const [narrationVisemeTrack, setNarrationVisemeTrack] = useState<VisemeTrackPoint[]>([]);
   const [narrationVisemeTrackSource, setNarrationVisemeTrackSource] = useState<string | null>(null);
   const [lipSyncStatus, setLipSyncStatus] = useState<"idle" | "analyzing">("idle");
+  const [autoImageSeconds, setAutoImageSeconds] = useState(4);
+  const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
+  const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
@@ -7225,6 +7307,190 @@ export default function Board2Page() {
       setToast(isVideoFile ? "Audio extracted from video" : "Narration added");
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to process file");
+    }
+  }
+
+  async function autoBuildFromNarration() {
+    if (autoBuildPhase) return;
+    const narrationClips = clipsRef.current
+      .filter((clip) => clip.type === "narration")
+      .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+    if (!narrationClips.length) {
+      setAutoBuildError("Add or record narration first");
+      setToast("Add narration before auto-building");
+      return;
+    }
+
+    const toastId = generateId();
+    const createdBlobUrls: string[] = [];
+    let placed = false;
+    setAutoBuildError(null);
+    setAutoBuildPhase("Transcribing…");
+    setDownloadToasts((prev) => [...prev, { id: toastId, title: "Auto-build narration images", status: "downloading" }]);
+    try {
+      const narrationStart = narrationClips[0].startTime;
+      const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
+      const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
+      const audio = await compileNarrationToBlob(narrationClips);
+      if (audio.size > 25 * 1024 * 1024) throw new Error("Narration is too long for transcription (25MB max)");
+
+      const form = new FormData();
+      form.append("audio", audio, "narration.wav");
+      const transcriptResponse = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
+      const transcriptData = await transcriptResponse.json().catch(() => null) as {
+        error?: string;
+        transcript?: string;
+        durationSec?: number;
+        segments?: Array<{ start?: number; end?: number; text?: string }>;
+      } | null;
+      if (!transcriptResponse.ok) throw new Error(transcriptData?.error || `Transcription failed (${transcriptResponse.status})`);
+      const transcript = transcriptData?.transcript?.trim() ?? "";
+      if (!transcript) throw new Error("No spoken narration was detected");
+      let transcriptSegments: TranscriptSegment[] = Array.isArray(transcriptData?.segments)
+        ? transcriptData.segments.map((segment) => ({
+            start: Number(segment.start),
+            end: Number(segment.end),
+            text: String(segment.text ?? "").trim(),
+          })).filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
+        : [];
+      const transcriptionDuration = Math.max(compiledDuration, Number(transcriptData?.durationSec) || 0);
+      if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
+      const segments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
+
+      const found: Array<{ segment: AutoNarrationImageSegment; image: BrowserFoundImage }> = [];
+      for (let index = 0; index < segments.length; index++) {
+        const segment = segments[index];
+        setAutoBuildPhase(`Finding images (${index + 1}/${segments.length})…`);
+        const imageResponse = await fetch("/api/board2/find-images", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: segment.query, count: 1 }),
+        });
+        const imageData = await imageResponse.json().catch(() => null) as {
+          error?: string;
+          code?: string;
+          images?: BrowserFoundImage[];
+        } | null;
+        if (!imageResponse.ok) {
+          const suffix = imageData?.code === "blocked" ? " (Google bot-check)" : "";
+          throw new Error(`${imageData?.error || `Image search failed (${imageResponse.status})`}${suffix}`);
+        }
+        const image = imageData?.images?.find((candidate) =>
+          candidate?.dataUrl?.startsWith("data:image/") && candidate.width > 0 && candidate.height > 0
+        );
+        if (!image) throw new Error(`No usable image found for “${segment.query}”`);
+        found.push({ segment, image });
+      }
+
+      setAutoBuildPhase("Placing…");
+      const mediaItems = found.map(({ segment, image }, index) => {
+        const blob = dataUrlToBlob(image.dataUrl);
+        const url = URL.createObjectURL(blob);
+        createdBlobUrls.push(url);
+        loadMedia(url, "image");
+        return {
+          item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url },
+          segment,
+          image,
+          index,
+        };
+      });
+      setMediaLibrary((prev) => [...prev, ...mediaItems.map(({ item }) => item)]);
+
+      const count = mediaItems.length;
+      const columns = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count * 4 / 3))));
+      const rows = Math.ceil(count / columns);
+      const marginX = 180;
+      const marginY = 180;
+      const gap = 90;
+      const cellW = (BOARD_W - marginX * 2 - gap * (columns - 1)) / columns;
+      const cellH = (BOARD_H - marginY * 2 - gap * (rows - 1)) / rows;
+      const nextClips = [...clipsRef.current];
+      const autoClips: Clip[] = mediaItems.map(({ item, segment, image, index }) => {
+        const scale = Math.min(1, (cellW - 36) / image.width, (cellH - 36) / image.height);
+        const boardW = Math.max(80, Math.round(image.width * scale));
+        const boardH = Math.max(60, Math.round(image.height * scale));
+        const column = index % columns;
+        const row = Math.floor(index / columns);
+        const boardX = marginX + column * (cellW + gap) + (cellW - boardW) / 2;
+        const boardY = marginY + row * (cellH + gap) + (cellH - boardH) / 2;
+        const startTime = narrationStart + segment.start;
+        const duration = Math.max(0.1, segment.end - segment.start);
+        const id = generateId();
+        const clip: Clip = {
+          id,
+          type: "image",
+          name: item.name,
+          sourceUrl: item.url,
+          startTime,
+          duration,
+          layer: freeLayerAtTime(nextClips, startTime, duration, id, 1),
+          boardX,
+          boardY,
+          boardW,
+          boardH,
+          holdFraction: 0.7,
+          featured: true,
+          provenance: "browserFound",
+          sourceAttributionUrl: image.sourceUrl,
+          searchQuery: segment.query,
+        };
+        nextClips.push(clip);
+        return clip;
+      });
+      clipsRef.current = nextClips;
+      setClips(nextClips);
+      setClipSelection(autoClips.map((clip) => clip.id));
+      placed = true;
+
+      setAutoBuildPhase("Generating camera…");
+      const W = canvasWRef.current;
+      const H = canvasHRef.current;
+      const cameraStops = autoClips.map((clip) => {
+        const scale = CLIP_FOCUS_RATIO * Math.min(W / clip.boardW!, H / clip.boardH!);
+        return {
+          cameraX: clip.boardX! + clip.boardW! / 2,
+          cameraY: clip.boardY! + clip.boardH! / 2,
+          boardZoom: scale * BOARD_W / W,
+        };
+      });
+      const events: CameraKeyframe[] = [];
+      for (let index = 0; index < autoClips.length; index++) {
+        const clip = autoClips[index];
+        const stop = cameraStops[index];
+        const nextStop = cameraStops[index + 1] ?? stop;
+        events.push({ time: clip.startTime, ...stop, easing: "ease-in-out" });
+        events.push({ time: clip.startTime + clip.duration * (clip.holdFraction ?? 0.7), ...stop, easing: "ease-in-out" });
+        events.push({ time: clip.startTime + clip.duration, ...nextStop, easing: "ease-in-out" });
+      }
+      const seenTimes = new Set<number>();
+      const generatedCamera = events
+        .sort((a, b) => a.time - b.time)
+        .filter((keyframe) => {
+          const rounded = Math.round(keyframe.time * 1000);
+          if (seenTimes.has(rounded)) return false;
+          seenTimes.add(rounded);
+          return true;
+        })
+        .map((keyframe) => ({ ...keyframe, time: parseFloat(keyframe.time.toFixed(3)) }));
+      cameraKeyframesRef.current = generatedCamera;
+      setCameraKeyframes(generatedCamera);
+      setKeyframesOutOfDate(false);
+      setShowCharacter(false);
+      setShowCharacter2(false);
+      drawFrameRef.current(playheadRef.current);
+
+      setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "done" } : toast));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
+      setToast(`Draft ready · ${autoClips.length} featured images + timed camera`);
+    } catch (error) {
+      if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
+      const message = error instanceof Error ? error.message : "Could not auto-build the narration draft";
+      setAutoBuildError(message);
+      setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 6000);
+    } finally {
+      setAutoBuildPhase(null);
     }
   }
 
@@ -13228,6 +13494,27 @@ export default function Board2Page() {
                       >
                         ↑  Upload audio / mp4
                       </button>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <button
+                          onClick={() => void autoBuildFromNarration()}
+                          disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
+                          style={{ ...sketchButton, flex: 1, textAlign: "left", padding: "10px 14px", fontSize: 12, background: "#ffd45c", opacity: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1 }}
+                        >
+                          {autoBuildPhase ? `⟳  ${autoBuildPhase}` : "🖼  Auto-build from narration"}
+                        </button>
+                        <label style={{ fontSize: 10, whiteSpace: "nowrap" }}>
+                          <input
+                            type="number"
+                            min={2}
+                            max={12}
+                            value={autoImageSeconds}
+                            disabled={!!autoBuildPhase}
+                            onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 2, 12))}
+                            style={{ width: 38, padding: 6, border: "1.5px solid #2a2a2a", fontFamily: "monospace" }}
+                          /> sec
+                        </label>
+                      </div>
+                      {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
                     <button
@@ -14310,6 +14597,45 @@ export default function Board2Page() {
                 style={{ display: "none" }}
                 onChange={handleNarrationUpload}
               />
+              <div style={{ width: "100%", border: "1.5px dashed #7a5b00", background: "#fff7d6", padding: 8, boxSizing: "border-box" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 9, fontWeight: 700, color: "#6a4b00", textTransform: "uppercase", letterSpacing: 0.6 }}>Image draft pace</span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, color: "#6a4b00" }}>
+                    every
+                    <input
+                      type="number"
+                      min={2}
+                      max={12}
+                      step={1}
+                      value={autoImageSeconds}
+                      disabled={!!autoBuildPhase}
+                      onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 2, 12))}
+                      style={{ width: 38, padding: "2px 3px", border: "1px solid #7a5b00", background: "#fff", fontFamily: "monospace", fontSize: 10 }}
+                    />
+                    sec
+                  </label>
+                </div>
+                <button
+                  onClick={() => void autoBuildFromNarration()}
+                  disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
+                  title="Transcribe the compiled narration, find real images, place timed featured clips, and generate an editable camera path"
+                  style={{
+                    ...sketchButton,
+                    width: "100%",
+                    padding: "7px 8px",
+                    fontSize: 10,
+                    fontWeight: 700,
+                    background: "#ffd45c",
+                    opacity: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1,
+                    cursor: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
+                </button>
+                {autoBuildError && !autoBuildPhase && (
+                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
+                )}
+              </div>
             </ProGated>
             {isRecording && (
               <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#ff5e3a", fontFamily: "monospace" }}>
