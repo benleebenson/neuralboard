@@ -148,7 +148,20 @@ type Clip = {
   ytStart?: number;
   ytEnd?: number;
   needsRedownload?: boolean;
+  // Image/video clips are board media projected into a timeline block. `featured: false`
+  // means the board entity still exists but currently has no timeline appearance.
+  // `mediaId` is persisted by timeline blocks so multiple blocks can reference one asset.
+  mediaId?: string;
+  featured?: boolean;
 };
+
+function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
+  return clip.type === "image" || clip.type === "video";
+}
+
+function isFeaturedTimelineClip(clip: Clip): boolean {
+  return !isBoardMediaClip(clip) || clip.featured !== false;
+}
 
 type TranscriptSegment = { start: number; end: number; text: string };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
@@ -2085,7 +2098,7 @@ function deriveAutoCharActions(
   outputH = CANVAS_H_LAND
 ): CharacterAction[] {
   const focusClips = clips
-    .filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined))
+    .filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined))
     .sort((a, b) => a.startTime - b.startTime);
   if (focusClips.length === 0) return [];
 
@@ -3789,6 +3802,7 @@ export default function Board2Page() {
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const selectionSurfaceRef = useRef<"board" | "timeline">("timeline");
   const [mutedLayers, setMutedLayers] = useState<Record<number, boolean>>({});
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -4029,7 +4043,7 @@ export default function Board2Page() {
     : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
   const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
   const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
-  const generatedDuration = Math.max(0, ...clips.map((c) => c.startTime + c.duration));
+  const generatedDuration = Math.max(0, ...clips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
   const timelineDuration = Math.max(10, generatedDuration + 2);
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
@@ -4039,7 +4053,7 @@ export default function Board2Page() {
   const previewRenderH = Math.max(1, Math.round(canvasH * previewRenderScale));
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
-  const canGenerateCamera = clips.some((clip) => clip.boardX !== undefined || clip.type === "pan");
+  const canGenerateCamera = clips.some((clip) => isFeaturedTimelineClip(clip) && (clip.boardX !== undefined || clip.type === "pan"));
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -5023,7 +5037,7 @@ export default function Board2Page() {
   }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    const focusClips = clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
     if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
@@ -5047,7 +5061,7 @@ export default function Board2Page() {
   // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
   const characterEntranceTime2 = useMemo(() => {
     if (characterMode2 !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    const focusClips = clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
     if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions2.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
@@ -6057,11 +6071,11 @@ export default function Board2Page() {
   }
 
   function currentPlaybackDuration(currentClips: Clip[]): number {
-    return currentClips.reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
+    return currentClips.filter(isFeaturedTimelineClip).reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
   }
 
   function activeVideoWindow(clip: Clip, time: number): { start: number; end: number } | undefined {
-    return time >= clip.startTime && time < clip.startTime + clip.duration
+    return isFeaturedTimelineClip(clip) && time >= clip.startTime && time < clip.startTime + clip.duration
       ? { start: clip.startTime, end: clip.startTime + clip.duration }
       : undefined;
   }
@@ -6658,6 +6672,18 @@ export default function Board2Page() {
   }
 
   function deleteClip(clipId: string) {
+    const clip = clipsRef.current.find((c) => c.id === clipId);
+    if (clip && isBoardMediaClip(clip)) {
+      // Timeline deletion removes only the appearance. The board entity/source/geometry remains.
+      setClips((prev) => prev.map((candidate) => candidate.id === clipId
+        ? { ...candidate, mediaId: candidate.mediaId ?? candidate.id, featured: false }
+        : candidate));
+      setSelectedClipIds((prev) => prev.filter((id) => id !== clipId));
+      selectedClipIdsRef.current = selectedClipIdsRef.current.filter((id) => id !== clipId);
+      setSelectedClipId((prev) => (prev === clipId ? null : prev));
+      if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+      return;
+    }
     const vid = videoElsRef.current.get(clipId);
     if (vid) {
       vid.pause(); vid.src = "";
@@ -6673,7 +6699,6 @@ export default function Board2Page() {
       try { audioNodes.gainNode.gain.value = 0; audioNodes.sourceNode.disconnect(); audioNodes.gainNode.disconnect(); } catch {}
       videoAudioNodesRef.current.delete(clipId);
     }
-    const clip = clipsRef.current.find((c) => c.id === clipId);
     // Every video clip now owns an independent blob (Step 16.12) — the only exception is a
     // clip still using the original upload's URL, which the media library needs to keep alive
     // so the same file can be dragged onto the board again later.
@@ -6697,6 +6722,42 @@ export default function Board2Page() {
     setSelectedClipIds((prev) => prev.filter((id) => id !== clipId));
     selectedClipIdsRef.current = selectedClipIdsRef.current.filter((id) => id !== clipId);
     setSelectedClipId((prev) => (prev === clipId ? null : prev));
+  }
+
+  function deleteBoardMedia(clipId: string) {
+    const clip = clipsRef.current.find((candidate) => candidate.id === clipId);
+    if (!clip || !isBoardMediaClip(clip)) return;
+    const noun = clip.type === "image" ? "image" : "video";
+    if (!window.confirm(`Delete this ${noun} from the board? This removes it and any timeline blocks that feature it.`)) return;
+
+    const mediaId = clip.mediaId ?? clip.id;
+    // Remove all appearances referencing this entity, including future duplicate blocks.
+    setClips((prev) => prev.filter((candidate) =>
+      candidate.id !== clipId && (!isBoardMediaClip(candidate) || (candidate.mediaId ?? candidate.id) !== mediaId)));
+    const vid = videoElsRef.current.get(clipId);
+    if (vid) {
+      vid.pause();
+      vid.src = "";
+      videoHiddenContainerRef.current?.removeChild(vid);
+      videoElsRef.current.delete(clipId);
+    }
+    thumbnailImagesRef.current.delete(clipId);
+    setSelectedClipIds([]);
+    selectedClipIdsRef.current = [];
+    setSelectedClipId(null);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function addBoardMediaToTimeline(clipId: string) {
+    const endTime = clipsRef.current.filter(isFeaturedTimelineClip).reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), 0);
+    setClips((prev) => prev.map((clip) => clip.id === clipId
+      ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: true, startTime: endTime,
+          layer: freeLayerAtTime(prev.filter(isFeaturedTimelineClip), endTime, clip.duration, clip.id, clip.layer ?? 1) }
+      : clip));
+    selectionSurfaceRef.current = "timeline";
+    setClipSelection([clipId]);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+    setToast("Added to timeline");
   }
 
   function addPanClip(atTime?: number) {
@@ -8673,6 +8734,7 @@ export default function Board2Page() {
   // ─ Board clip drag ────────────────────────────────────────────────────────
 
   function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
+    selectionSurfaceRef.current = "board";
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -9196,6 +9258,7 @@ export default function Board2Page() {
     clip: Clip,
     kind: "move" | "resize-left" | "resize-right"
   ) {
+    selectionSurfaceRef.current = "timeline";
     e.stopPropagation();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     if (!selectedClipIdsRef.current.includes(clip.id)) setClipSelection([clip.id]);
@@ -9547,7 +9610,7 @@ export default function Board2Page() {
 
   function generateCameraKeyframes() {
     const allClipsSorted = clipsRef.current
-      .filter((c) => c.boardX !== undefined || c.type === "pan")
+      .filter((c) => isFeaturedTimelineClip(c) && (c.boardX !== undefined || c.type === "pan"))
       .sort((a, b) => a.startTime - b.startTime);
 
     if (allClipsSorted.length === 0) {
@@ -9819,7 +9882,7 @@ export default function Board2Page() {
 
   async function handleGenerateChoreography() {
     const allClips = clipsRef.current;
-    const boardClips = allClips.filter((c) => c.boardX !== undefined && (c.type === "image" || c.type === "video"));
+    const boardClips = allClips.filter((c) => isFeaturedTimelineClip(c) && c.boardX !== undefined && (c.type === "image" || c.type === "video"));
     if (boardClips.length === 0) { setChoreoError("Place some clips on the board first"); return; }
 
     const narrationClips = allClips.filter((c) => c.type === "narration");
@@ -9884,7 +9947,7 @@ export default function Board2Page() {
       boardX: c.boardX, boardY: c.boardY, boardW: c.boardW, boardH: c.boardH,
       label: c.name,
     }));
-    const totalDurationSec = Math.max(0, ...allClips.map((c) => c.startTime + c.duration));
+    const totalDurationSec = Math.max(0, ...allClips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
 
     const r2 = await fetch("/api/board2/character-choreography", {
       method: "POST",
@@ -11800,7 +11863,8 @@ export default function Board2Page() {
         const charActionId = selectedCharActionIdRef.current;
         if (clipIds.length > 0) {
           e.preventDefault();
-          clipIds.forEach((id) => deleteClip(id));
+          if (selectionSurfaceRef.current === "board") clipIds.forEach((id) => deleteBoardMedia(id));
+          else clipIds.forEach((id) => deleteClip(id));
           selectedClipIdsRef.current = [];
           setSelectedClipIds([]);
           setSelectedClipId(null);
@@ -11936,6 +12000,7 @@ export default function Board2Page() {
     const target = e.target as HTMLElement;
     const clipEl = target.closest("[data-mbclipid]");
     const hitClipId = clipEl ? (clipEl as HTMLElement).dataset.mbclipid ?? null : null;
+    if (hitClipId) selectionSurfaceRef.current = "board";
 
     g.type = "deciding";
     g.hitClipId = hitClipId;
@@ -13004,7 +13069,7 @@ export default function Board2Page() {
               ))}
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
-              {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
+              {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
                 const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
@@ -13025,7 +13090,7 @@ export default function Board2Page() {
                       overflow: "hidden",
                     }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
-                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); setMobileDrawer("props"); }}
+                    onClick={(e) => { e.stopPropagation(); selectionSurfaceRef.current = "timeline"; setSelectedClipId(clip.id); setMobileDrawer("props"); }}
                   >
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
@@ -13038,7 +13103,7 @@ export default function Board2Page() {
                 );
               })}
 
-              {clips.filter((c) => c.type === "narration").map((clip) => {
+              {clips.filter((c) => isFeaturedTimelineClip(c) && c.type === "narration").map((clip) => {
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 return (
@@ -13056,7 +13121,7 @@ export default function Board2Page() {
                       touchAction: "none",
                     }}
                     onPointerDown={(e) => handleClipPointerDown(e, clip, "move")}
-                    onClick={(e) => { e.stopPropagation(); setSelectedClipId(clip.id); setMobileDrawer("props"); }}
+                    onClick={(e) => { e.stopPropagation(); selectionSurfaceRef.current = "timeline"; setSelectedClipId(clip.id); setMobileDrawer("props"); }}
                   >
                     <span style={{ position: "absolute", left: 4, right: HANDLE_W + 2, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#5a1530", pointerEvents: "none" }}>
                       {clip.speechBubbles ? "💬" : "🎙"} {clip.name}
@@ -13245,9 +13310,13 @@ export default function Board2Page() {
                       <button onClick={() => { duplicateClip(selectedClipId!); setMobileDrawer(null); }} style={{ ...miniButton, flex: 1, padding: "8px", fontSize: 12 }}>⎘ Dup</button>
                     </div>
                     <button
-                      onClick={() => { deleteClip(selectedClipId!); setMobileDrawer(null); }}
+                      onClick={() => {
+                        if (selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip)) deleteBoardMedia(selectedClipId!);
+                        else deleteClip(selectedClipId!);
+                        setMobileDrawer(null);
+                      }}
                       style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", width: "100%", padding: "10px", fontSize: 13, textAlign: "center" }}
-                    >✕ Delete clip</button>
+                    >✕ {selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}</button>
                   </div>
                 </>
               )}
@@ -13262,7 +13331,7 @@ export default function Board2Page() {
             <div style={{ position: "fixed", left: 16, right: 16, bottom: 36, zIndex: 301, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>
               <div onClick={() => { copyClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, borderBottom: "1px solid rgba(42,42,42,0.08)", cursor: "pointer", touchAction: "manipulation" }}>⌘ Copy</div>
               <div onClick={() => { duplicateClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, borderBottom: "1px solid rgba(42,42,42,0.08)", cursor: "pointer", touchAction: "manipulation" }}>⎘ Duplicate</div>
-              <div onClick={() => { deleteClip(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, color: "#ff5e3a", cursor: "pointer", touchAction: "manipulation" }}>✕ Delete</div>
+              <div onClick={() => { deleteBoardMedia(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ padding: "14px 16px", fontFamily: "monospace", fontSize: 13, color: "#ff5e3a", cursor: "pointer", touchAction: "manipulation" }}>✕ Delete from board…</div>
             </div>
           </>
         )}
@@ -13672,8 +13741,37 @@ export default function Board2Page() {
     }
     if (!recipeCreatedAtRef.current) recipeCreatedAtRef.current = new Date().toISOString();
 
+    const boardMedia = manifestClips
+      .filter((clip) => clip.type === "image" || clip.type === "video")
+      .map((clip) => {
+        const {
+          startTime: _startTime, duration: _duration, layer: _layer,
+          volume: _volume, muted: _muted, holdFraction: _holdFraction,
+          mediaId: _mediaId, featured: _featured,
+          ...media
+        } = clip;
+        return media;
+      });
+    const timelineBlocks = manifestClips
+      .filter((clip) => (clip.type !== "image" && clip.type !== "video") || clip.featured !== false)
+      .map((clip) => {
+        if (clip.type !== "image" && clip.type !== "video") return clip;
+        return {
+          id: clip.id,
+          type: clip.type,
+          name: clip.name,
+          mediaId: clip.mediaId ?? clip.id,
+          startTime: clip.startTime,
+          duration: clip.duration,
+          layer: clip.layer,
+          volume: clip.volume,
+          muted: clip.muted,
+          holdFraction: clip.holdFraction,
+        };
+      });
+
     const manifest = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       meta: {
         projectId: recipeProjectIdRef.current,
         title: saveName,
@@ -13683,11 +13781,14 @@ export default function Board2Page() {
         modifiedAt: new Date().toISOString(),
       },
       board: {
-        clips: manifestClips,
+        media: boardMedia,
         pxPerSec: pxPerSecRef.current,
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
         spawnDoor: spawnDoorRef.current,
+      },
+      timeline: {
+        blocks: timelineBlocks,
       },
       annotations: annotationsRef.current,
       narration: {
@@ -13791,11 +13892,25 @@ export default function Board2Page() {
       // (asset restore, legacy clip-type migration, character/lip-sync restore) never has to
       // branch on version itself — it only ever sees today's familiar flat field names.
       const schemaVersion = typeof rawManifest?.schemaVersion === "number" ? rawManifest.schemaVersion : 0;
+      const normalizedRecipeClips = schemaVersion >= 2
+        ? [
+            ...(rawManifest.board?.media ?? []).map((media: Record<string, unknown>) => {
+              const mediaId = String(media.id ?? "");
+              const block = (rawManifest.timeline?.blocks ?? []).find((candidate: Record<string, unknown>) =>
+                String(candidate.mediaId ?? candidate.id ?? "") === mediaId);
+              return block
+                ? { ...media, ...block, id: mediaId, mediaId, featured: true }
+                : { ...media, id: mediaId, mediaId, featured: false, startTime: 0, duration: 4 };
+            }),
+            ...(rawManifest.timeline?.blocks ?? []).filter((block: Record<string, unknown>) =>
+              block.type !== "image" && block.type !== "video"),
+          ]
+        : rawManifest.board?.clips ?? [];
       const manifest = schemaVersion >= 1 ? {
         version: 1,
         name: rawManifest.meta?.title,
         savedAt: rawManifest.meta?.modifiedAt,
-        clips: rawManifest.board?.clips ?? [],
+        clips: normalizedRecipeClips,
         cameraKeyframes: rawManifest.camera?.keyframes ?? [],
         cameraKeyframeMode: undefined as string | undefined, // v1 saves never carry the legacy flag
         annotations: rawManifest.annotations ?? [],
@@ -13855,7 +13970,10 @@ export default function Board2Page() {
         }
       }
 
-      setClips(loadedClips);
+      const migratedClips = loadedClips.map((clip) => isBoardMediaClip(clip)
+        ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: clip.featured !== false }
+        : clip);
+      setClips(migratedClips);
       const loadedLipSyncTrack = isVisemeTrack(manifest.narrationVisemeTrack) ? manifest.narrationVisemeTrack : [];
       const loadedLipSyncSource = typeof manifest.narrationVisemeTrackSource === "string" ? manifest.narrationVisemeTrackSource : null;
       setNarrationVisemeTrack(loadedLipSyncTrack);
@@ -15938,11 +16056,19 @@ export default function Board2Page() {
                 )}
 
                 <div style={{ marginTop: "auto" }}>
+                  {isBoardMediaClip(selectedClip) && selectedClip.featured === false && (
+                    <button
+                      onClick={() => addBoardMediaToTimeline(selectedClip.id)}
+                      style={{ ...miniButton, marginBottom: 8, background: "#c8f135" }}
+                    >＋ Add to timeline</button>
+                  )}
                   <button
-                    onClick={() => deleteClip(selectedClip.id)}
+                    onClick={() => selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip)
+                      ? deleteBoardMedia(selectedClip.id)
+                      : deleteClip(selectedClip.id)}
                     style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
                   >
-                    ✕ Delete clip
+                    ✕ {selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}
                   </button>
                 </div>
               </>
@@ -16095,7 +16221,7 @@ export default function Board2Page() {
               })()}
 
               {/* Visual clips (image / video / pan) */}
-              {clips.filter((c) => c.type !== "narration").map((clip, ci) => {
+              {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
                 const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
@@ -16168,7 +16294,7 @@ export default function Board2Page() {
               })}
 
               {/* Narration clips row */}
-              {clips.filter((c) => c.type === "narration").map((clip) => {
+              {clips.filter((c) => isFeaturedTimelineClip(c) && c.type === "narration").map((clip) => {
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 return (
