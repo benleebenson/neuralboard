@@ -975,6 +975,14 @@ type YtSearchResult = {
 type YtModalView = "search" | "trim";
 type YtTab = "paste" | "search";
 
+type YtSearchApiVideo = {
+  title?: unknown;
+  url?: unknown;
+  duration?: unknown;
+  durationSecs?: unknown;
+  thumb?: unknown;
+};
+
 type DownloadToast = { id: string; title: string; status: "downloading" | "done" | "error"; error?: string };
 
 // Neural Search: a not-yet-downloaded YouTube candidate placed on the board as a clickable
@@ -1428,6 +1436,34 @@ function parseTimestampSec(s: string): number | null {
 function extractYouTubeId(url: string): string | null {
   const m = url.match(/(?:v=|youtu\.be\/|\/shorts\/)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
+}
+
+function normalizeYtSearchResponse(data: unknown): YtSearchResult[] {
+  if (!data || typeof data !== "object") return [];
+  const videos = (data as { videos?: unknown }).videos;
+  if (!Array.isArray(videos)) return [];
+
+  return videos.flatMap((raw) => {
+    if (!raw || typeof raw !== "object") return [];
+    const video = raw as YtSearchApiVideo;
+    const url = typeof video.url === "string" ? video.url : "";
+    const id = extractYouTubeId(url);
+    if (!id) return [];
+
+    const duration = typeof video.duration === "string" || typeof video.duration === "number"
+      ? video.duration
+      : typeof video.durationSecs === "number"
+        ? video.durationSecs
+        : 0;
+
+    return [{
+      id,
+      title: typeof video.title === "string" ? video.title : "YouTube clip",
+      channel: "",
+      duration,
+      thumbnail: typeof video.thumb === "string" ? video.thumb : "",
+    }];
+  });
 }
 
 // ─── Annotation canvas helpers ────────────────────────────────────────────────
@@ -7791,8 +7827,8 @@ export default function Board2Page() {
         body: JSON.stringify({ query: ytQuery, limit: 12, shortsOnly: shortsOnlyOverride !== undefined ? shortsOnlyOverride : ytShortsOnly }),
       });
       if (!res.ok) throw new Error(`Search failed (${res.status})`);
-      const data = await res.json();
-      setYtResults(Array.isArray(data) ? data : []);
+      const data: unknown = await res.json();
+      setYtResults(normalizeYtSearchResponse(data));
     } catch (e) {
       setYtError(e instanceof Error ? e.message : "Search failed");
     } finally {
@@ -8305,25 +8341,15 @@ export default function Board2Page() {
         body: JSON.stringify({ query, limit: 8 }),
       });
       if (!res.ok) return;
-      const raw = await res.json() as Array<Record<string, unknown>>;
-      const newVideos = (Array.isArray(raw) ? raw : []).map((r) => {
-        const dur = r.duration_seconds ?? r.durationSec;
-        const durStr = typeof r.duration === "string" ? r.duration : undefined;
-        let durationSec = typeof dur === "number" ? dur : 0;
-        if (!durationSec && durStr) {
-          const parts = durStr.split(":").map(Number);
-          if (parts.length === 2) durationSec = (parts[0] || 0) * 60 + (parts[1] || 0);
-          else if (parts.length === 3) durationSec = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
-        }
-        return {
-          videoId: (r.id ?? r.videoId) as string,
-          title: String(r.title ?? "YouTube clip"),
-          channel: String(r.channel ?? r.channelTitle ?? ""),
-          thumbnailUrl: String(r.thumbnail ?? r.thumbnailUrl ?? ""),
-          viewCount: Number(r.viewCount ?? r.view_count ?? r.views ?? 0),
-          durationSec,
-        };
-      }).filter((v) => !!v.videoId);
+      const data: unknown = await res.json();
+      const newVideos = normalizeYtSearchResponse(data).map((video) => ({
+        videoId: video.id,
+        title: video.title,
+        channel: video.channel,
+        thumbnailUrl: video.thumbnail,
+        viewCount: 0,
+        durationSec: parseDurationSec(video.duration),
+      }));
 
       if (newVideos.length > 0) {
         setMobileTop5ResultsByRank((prev) => {
