@@ -259,6 +259,8 @@ type Clip = {
   provenance?: "browserFound";
   sourceAttributionUrl?: string;
   searchQuery?: string;
+  imagePlanReason?: string;
+  imagePlanModel?: string;
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -270,7 +272,7 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
-type AutoNarrationImageSegment = TranscriptSegment & { query: string };
+type AutoNarrationImageSegment = TranscriptSegment & { query: string; reason?: string; planModel?: string };
 type BrowserFoundImage = { dataUrl: string; sourceUrl: string; width: number; height: number };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
 type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
@@ -7478,7 +7480,57 @@ export default function Board2Page() {
         : [];
       const transcriptionDuration = Math.max(compiledDuration, Number(transcriptData.durationSec) || 0);
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
-      const segments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
+      const keywordFallbackSegments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
+      let segments = keywordFallbackSegments;
+      setAutoBuildPhase("Planning visuals…");
+      try {
+        const planResponse = await fetch("/api/board2/plan-images", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript,
+            segments: transcriptSegments,
+            durationSec: transcriptionDuration,
+            secondsPerImage: autoImageSeconds,
+          }),
+        });
+        const planData = await planResponse.json().catch(() => null) as {
+          error?: string;
+          model?: string;
+          plan?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
+        } | null;
+        if (!planResponse.ok) {
+          throw new Error(planData?.error || `Editorial planner failed (${planResponse.status})`);
+        }
+        const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
+        const editorialPlan = Array.isArray(planData?.plan)
+          ? planData.plan.flatMap((item) => {
+              const query = typeof item.query === "string" ? item.query.trim() : "";
+              const startTime = Number(item.startTime);
+              const reason = typeof item.reason === "string" ? item.reason.trim() : "";
+              return query && reason && Number.isFinite(startTime)
+                ? [{ query, startTime: clamp(startTime, 0, Math.max(0, transcriptionDuration - 0.1)), reason }]
+                : [];
+            }).sort((a, b) => a.startTime - b.startTime)
+          : [];
+        if (!editorialPlan.length) throw new Error("Editorial planner returned no usable images");
+        segments = editorialPlan.map((item, index) => {
+          const end = editorialPlan[index + 1]?.startTime ?? transcriptionDuration;
+          return {
+            start: item.startTime,
+            end: Math.max(item.startTime + 0.1, end),
+            text: item.reason,
+            query: item.query,
+            reason: item.reason,
+            planModel,
+          };
+        });
+      } catch (plannerError) {
+        // The previous deterministic planner remains the safety net for malformed model output,
+        // missing configuration, timeouts, and transient OpenAI failures.
+        console.warn("[board2:auto-build] Editorial image planning failed; using keyword fallback", plannerError);
+        setAutoBuildPhase("Using keyword fallback…");
+      }
 
       const found: Array<{ segment: AutoNarrationImageSegment; image: BrowserFoundImage }> = [];
       for (let index = 0; index < segments.length; index++) {
@@ -7557,6 +7609,8 @@ export default function Board2Page() {
           provenance: "browserFound",
           sourceAttributionUrl: image.sourceUrl,
           searchQuery: segment.query,
+          imagePlanReason: segment.reason,
+          imagePlanModel: segment.planModel,
         };
         nextClips.push(clip);
         return clip;
