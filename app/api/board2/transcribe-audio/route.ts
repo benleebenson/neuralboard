@@ -6,6 +6,8 @@ import { logApiCost } from "@/lib/supabase";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+const WHISPER_FILE_LIMIT_BYTES = 25 * 1024 * 1024;
+
 export async function POST(req: NextRequest) {
   try {
     const session = await getServerSession(authOptions);
@@ -27,8 +29,10 @@ export async function POST(req: NextRequest) {
     if (!audioFile) {
       return NextResponse.json({ error: "No audio file provided" }, { status: 400 });
     }
-    if (audioFile.size > 25 * 1024 * 1024) {
-      return NextResponse.json({ error: "File too large (max 25MB)" }, { status: 400 });
+    // Vercel enforces its non-configurable 4.5 MB Function payload limit before this handler.
+    // Board 2 sends ~60 second mono 16 kHz chunks (~1.9 MB); this guard is Whisper's own limit.
+    if (audioFile.size > WHISPER_FILE_LIMIT_BYTES) {
+      return NextResponse.json({ error: "File too large for Whisper (max 25MB)" }, { status: 413 });
     }
 
     // Determine extension from MIME type

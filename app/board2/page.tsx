@@ -71,6 +71,14 @@ import {
   type VisemeTrackPoint,
 } from "@/lib/character/lipsync";
 import {
+  TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
+  TRANSCRIPTION_CHUNK_SECONDS,
+  TRANSCRIPTION_SAMPLE_RATE,
+  mergeTranscriptionChunks,
+  type MergedTranscription,
+  type TranscriptionChunk,
+} from "@/lib/audio/transcription";
+import {
   BAZOOKA_RAGDOLL_GROUND_DRAG,
   BAZOOKA_RAGDOLL_RECOVERY_MS,
   GUEST_BAZOOKA_MAX_HEALTH,
@@ -91,6 +99,94 @@ import {
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
+
+type TranscriptionApiResponse = {
+  error?: string;
+  transcript?: string;
+  durationSec?: number;
+  segments?: Array<{ start?: number; end?: number; text?: string }>;
+};
+
+async function postTranscriptionAudio(audio: Blob, filename: string): Promise<TranscriptionApiResponse> {
+  const form = new FormData();
+  form.append("audio", audio, filename);
+  const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
+  const data = await response.json().catch(() => null) as TranscriptionApiResponse | null;
+  if (!response.ok) {
+    throw new Error(
+      data?.error || (response.status === 413
+        ? "Transcription upload was rejected as too large"
+        : `Transcription failed (${response.status})`),
+    );
+  }
+  return data ?? {};
+}
+
+async function transcribeAudioBlob(
+  audio: Blob,
+  filename: string,
+  onChunk?: (current: number, total: number) => void,
+): Promise<MergedTranscription> {
+  // Preserve the existing direct path for already-small recordings (including short live WebM
+  // chunks that some browsers cannot decodeAudioData reliably). Multipart overhead still leaves
+  // ample room below Vercel's 4.5 MB limit.
+  if (audio.size <= 3 * 1024 * 1024) {
+    onChunk?.(1, 1);
+    const data = await postTranscriptionAudio(audio, filename);
+    const segments = (Array.isArray(data.segments) ? data.segments : []).flatMap((segment) => {
+      const start = Number(segment.start);
+      const end = Number(segment.end);
+      const text = String(segment.text ?? "").trim();
+      return Number.isFinite(start) && Number.isFinite(end) && end > start && text
+        ? [{ start, end, text }]
+        : [];
+    });
+    return {
+      transcript: String(data.transcript ?? "").trim(),
+      durationSec: Math.max(0, Number(data.durationSec) || 0),
+      segments,
+    };
+  }
+
+  const context = new AudioContext();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await context.decodeAudioData(await audio.arrayBuffer());
+  } finally {
+    await context.close().catch(() => {});
+  }
+
+  const windows = planLipSyncChunks(
+    decoded.duration,
+    TRANSCRIPTION_CHUNK_SECONDS,
+    TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
+  );
+  if (!windows.length) throw new Error("No audio found for transcription");
+
+  const chunks: TranscriptionChunk[] = [];
+  for (let index = 0; index < windows.length; index++) {
+    const window = windows[index];
+    onChunk?.(index + 1, windows.length);
+    // Mono 16 kHz PCM keeps every ~60 second multipart request around 1.9 MB, safely below
+    // Vercel's fixed 4.5 MB Function payload limit and Whisper's 25 MB file limit.
+    const chunkAudio = audioBufferSegmentToMonoWav(
+      decoded,
+      window.audioStart,
+      window.audioEnd - window.audioStart,
+    );
+    const data = await postTranscriptionAudio(
+      chunkAudio,
+      `${filename.replace(/\.[^.]+$/, "")}-part-${index + 1}.wav`,
+    );
+    chunks.push({
+      window,
+      transcript: String(data.transcript ?? ""),
+      segments: Array.isArray(data.segments) ? data.segments : [],
+    });
+  }
+
+  return mergeTranscriptionChunks(chunks, decoded.duration);
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -7332,28 +7428,19 @@ export default function Board2Page() {
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
       const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
       const audio = await compileNarrationToBlob(narrationClips);
-      if (audio.size > 25 * 1024 * 1024) throw new Error("Narration is too long for transcription (25MB max)");
-
-      const form = new FormData();
-      form.append("audio", audio, "narration.wav");
-      const transcriptResponse = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
-      const transcriptData = await transcriptResponse.json().catch(() => null) as {
-        error?: string;
-        transcript?: string;
-        durationSec?: number;
-        segments?: Array<{ start?: number; end?: number; text?: string }>;
-      } | null;
-      if (!transcriptResponse.ok) throw new Error(transcriptData?.error || `Transcription failed (${transcriptResponse.status})`);
-      const transcript = transcriptData?.transcript?.trim() ?? "";
+      const transcriptData = await transcribeAudioBlob(audio, "narration.wav", (current, total) => {
+        if (total > 1) setAutoBuildPhase(`Transcribing (${current}/${total})…`);
+      });
+      const transcript = transcriptData.transcript.trim();
       if (!transcript) throw new Error("No spoken narration was detected");
-      let transcriptSegments: TranscriptSegment[] = Array.isArray(transcriptData?.segments)
+      let transcriptSegments: TranscriptSegment[] = Array.isArray(transcriptData.segments)
         ? transcriptData.segments.map((segment) => ({
             start: Number(segment.start),
             end: Number(segment.end),
             text: String(segment.text ?? "").trim(),
           })).filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start && segment.text)
         : [];
-      const transcriptionDuration = Math.max(compiledDuration, Number(transcriptData?.durationSec) || 0);
+      const transcriptionDuration = Math.max(compiledDuration, Number(transcriptData.durationSec) || 0);
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
       const segments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
 
@@ -7594,11 +7681,9 @@ export default function Board2Page() {
       const audio: Blob = clip.audioBlob instanceof Blob
         ? clip.audioBlob
         : await fetch(clip.sourceUrl).then((response) => response.blob());
-      const form = new FormData();
-      form.append("audio", audio, `${clip.name || "narration"}.wav`);
-      const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Transcription failed");
+      const data = await transcribeAudioBlob(audio, `${clip.name || "narration"}.wav`, (current, total) => {
+        if (total > 1) setToast(`Transcribing narration with Whisper · part ${current}/${total}…`);
+      });
       const segments: TranscriptSegment[] = Array.isArray(data.segments)
         ? data.segments
             .map((segment: TranscriptSegment) => ({ start: Number(segment.start), end: Number(segment.end), text: String(segment.text ?? "").trim() }))
@@ -10118,14 +10203,15 @@ export default function Board2Page() {
     if (aiTab === "audio") {
       if (!aiAudioFile) return;
       setAiPhase("Transcribing audio...");
-      const fd = new FormData();
-      fd.append("audio", aiAudioFile);
-      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
-      if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
-      const d = await r.json();
-      if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
-      if (!d.transcript?.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
-      transcript = d.transcript;
+      try {
+        const data = await transcribeAudioBlob(aiAudioFile, aiAudioFile.name || "annotations-audio");
+        if (!data.transcript.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
+        transcript = data.transcript;
+      } catch (error) {
+        setAiError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
+        setAiPhase(null);
+        return;
+      }
     }
 
     const ok = await applyAnnotationsFromTranscript(transcript);
@@ -10152,22 +10238,17 @@ export default function Board2Page() {
       return;
     }
 
-    if (blob.size > 25 * 1024 * 1024) {
-      setAiError("Narration too long — exceeds 25MB. Please split into shorter recordings.");
-      setAiPhase(null);
-      return;
-    }
-
     setAiPhase("Transcribing...");
-    const fd = new FormData();
-    fd.append("audio", blob, "narration.wav");
-    const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
-    if (!r) { setAiError("Network error during transcription. Try again."); setAiPhase(null); return; }
-    const d = await r.json();
-    if (!r.ok) { setAiError(d.error || "Transcription failed"); setAiPhase(null); return; }
-    if (!d.transcript?.trim()) { setAiError("Couldn't understand the narration. Try pasting the script instead."); setAiPhase(null); return; }
-
-    await applyAnnotationsFromTranscript(d.transcript);
+    try {
+      const data = await transcribeAudioBlob(blob, "narration.wav", (current, total) => {
+        if (total > 1) setAiPhase(`Transcribing (${current}/${total})...`);
+      });
+      if (!data.transcript.trim()) { setAiError("Couldn't understand the narration. Try pasting the script instead."); setAiPhase(null); return; }
+      await applyAnnotationsFromTranscript(data.transcript);
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
+      setAiPhase(null);
+    }
   }
 
   // ─ AI character choreography ────────────────────────────────────────────────
@@ -10198,17 +10279,16 @@ export default function Board2Page() {
         setChoreoPhase(null);
         return;
       }
-      if (blob.size > 25 * 1024 * 1024) {
-        setChoreoError("Narration too long — exceeds 25MB. Please split into shorter recordings.");
+      let d: MergedTranscription;
+      try {
+        d = await transcribeAudioBlob(blob, "narration.wav", (current, total) => {
+          if (total > 1) setChoreoPhase(`Transcribing (${current}/${total})...`);
+        });
+      } catch (error) {
+        setChoreoError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
         setChoreoPhase(null);
         return;
       }
-      const fd = new FormData();
-      fd.append("audio", blob, "narration.wav");
-      const r = await fetch("/api/board2/transcribe-audio", { method: "POST", body: fd }).catch(() => null);
-      if (!r) { setChoreoError("Network error during transcription. Try again."); setChoreoPhase(null); return; }
-      const d = await r.json();
-      if (!r.ok) { setChoreoError(d.error || "Transcription failed"); setChoreoPhase(null); return; }
       if (!d.transcript?.trim()) { setChoreoError("Couldn't understand the narration. Try pasting a direction instead."); setChoreoPhase(null); return; }
       // compileNarrationToBlob renders narration clips relative to the first clip's startTime —
       // segment timestamps come back relative to that same origin, so offset them back onto the
@@ -10849,12 +10929,8 @@ export default function Board2Page() {
     playLiveSpeechBusyRef.current = true;
     setPlayLiveSpeechStatus("transcribing");
     try {
-      const form = new FormData();
       const extension = blob.type.includes("mp4") ? "m4a" : "webm";
-      form.append("audio", blob, `play-live-${sequence}.${extension}`);
-      const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || "Live transcription failed");
+      const data = await transcribeAudioBlob(blob, `play-live-${sequence}.${extension}`);
       const transcript = String(data.transcript ?? "").trim();
       if (transcript) {
         setPlayLiveSpeechText(transcript);
@@ -17537,7 +17613,7 @@ export default function Board2Page() {
               {aiTab === "audio" ? (
                 <div>
                   <p style={{ fontSize: 11, color: "#6a6a6a", margin: "0 0 10px", lineHeight: 1.5 }}>
-                    Upload a narration recording (.mp3, .wav, .m4a, .webm) — max 25MB. Whisper will transcribe it, then GPT-4o will generate annotations.
+                    Upload a narration recording (.mp3, .wav, .m4a, .webm). Long recordings are compressed and transcribed in parts before GPT-4o generates annotations.
                   </p>
                   <input
                     type="file"
@@ -17546,7 +17622,6 @@ export default function Board2Page() {
                     onChange={(e) => {
                       const f = e.target.files?.[0] ?? null;
                       if (!f) return;
-                      if (f.size > 25 * 1024 * 1024) { setAiError("File too large (max 25MB)"); return; }
                       setAiAudioFile(f);
                       setAiError(null);
                     }}
@@ -17701,7 +17776,7 @@ function audioBufferSegmentToMonoWav(
   sourceStartSeconds: number,
   requestedDurationSeconds: number,
 ): Blob {
-  const targetSampleRate = 16_000;
+  const targetSampleRate = TRANSCRIPTION_SAMPLE_RATE;
   const sourceStart = Math.min(Math.max(0, sourceStartSeconds), buffer.duration);
   const duration = Math.min(Math.max(0, requestedDurationSeconds), Math.max(0, buffer.duration - sourceStart));
   const sampleCount = Math.max(1, Math.ceil(duration * targetSampleRate));
@@ -17745,13 +17820,14 @@ async function compileNarrationToBlob(narrationClips: Clip[]): Promise<Blob> {
   } finally {
     await tmpCtx.close().catch(() => {});
   }
-  const sampleRate = decoded[0].buffer.sampleRate;
+  // Compile directly to Whisper's preferred mono 16 kHz format. Long timelines are then split
+  // into bounded requests by transcribeAudioBlob instead of crossing Vercel as one large WAV.
+  const sampleRate = TRANSCRIPTION_SAMPLE_RATE;
   const firstStart = sorted[0].startTime;
   const lastClip = sorted[sorted.length - 1];
   const totalDur = lastClip.startTime + lastClip.duration - firstStart;
   const totalSamples = Math.ceil(totalDur * sampleRate);
-  const numChannels = Math.max(...decoded.map((d) => d.buffer.numberOfChannels));
-  const offCtx = new OfflineAudioContext(numChannels, totalSamples, sampleRate);
+  const offCtx = new OfflineAudioContext(1, totalSamples, sampleRate);
   for (const { clip, buffer } of decoded) {
     const node = offCtx.createBufferSource();
     node.buffer = buffer;
