@@ -258,6 +258,7 @@ type Clip = {
   // automated narration draft provenance:
   provenance?: "browserFound";
   sourceAttributionUrl?: string;
+  imageSearchSource?: "google" | "bing" | "openverse";
   searchQuery?: string;
   imagePlanReason?: string;
   imagePlanModel?: string;
@@ -273,7 +274,13 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 
 type TranscriptSegment = { start: number; end: number; text: string };
 type AutoNarrationImageSegment = TranscriptSegment & { query: string; reason?: string; planModel?: string };
-type BrowserFoundImage = { dataUrl: string; sourceUrl: string; width: number; height: number };
+type BrowserFoundImage = {
+  dataUrl: string;
+  sourceUrl: string;
+  width: number;
+  height: number;
+  source: "google" | "bing" | "openverse";
+};
 type SpeechBubbleCue = TranscriptSegment & { index: number };
 type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
 
@@ -4050,6 +4057,7 @@ export default function Board2Page() {
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
+  const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [toast, setToast] = useState<string | null>(null);
@@ -7459,6 +7467,7 @@ export default function Board2Page() {
     const createdBlobUrls: string[] = [];
     let placed = false;
     setAutoBuildError(null);
+    setAutoBuildSummary(null);
     setAutoBuildPhase("Transcribing…");
     setDownloadToasts((prev) => [...prev, { id: toastId, title: "Auto-build narration images", status: "downloading" }]);
     try {
@@ -7533,28 +7542,35 @@ export default function Board2Page() {
       }
 
       const found: Array<{ segment: AutoNarrationImageSegment; image: BrowserFoundImage }> = [];
+      const skipped: Array<{ index: number; query: string; reason: string }> = [];
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
         setAutoBuildPhase(`Finding images (${index + 1}/${segments.length})…`);
-        const imageResponse = await fetch("/api/board2/find-images", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query: segment.query, count: 1 }),
-        });
-        const imageData = await imageResponse.json().catch(() => null) as {
-          error?: string;
-          code?: string;
-          images?: BrowserFoundImage[];
-        } | null;
-        if (!imageResponse.ok) {
-          const suffix = imageData?.code === "blocked" ? " (Google bot-check)" : "";
-          throw new Error(`${imageData?.error || `Image search failed (${imageResponse.status})`}${suffix}`);
+        try {
+          const imageResponse = await fetch("/api/board2/find-images", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: segment.query, count: 1 }),
+          });
+          const imageData = await imageResponse.json().catch(() => null) as {
+            error?: string;
+            code?: string;
+            images?: BrowserFoundImage[];
+          } | null;
+          if (!imageResponse.ok) {
+            throw new Error(imageData?.error || `Image search failed (${imageResponse.status})`);
+          }
+          const image = imageData?.images?.find((candidate) =>
+            candidate?.dataUrl?.startsWith("data:image/") && candidate.width > 0 && candidate.height > 0 &&
+            (candidate.source === "google" || candidate.source === "bing" || candidate.source === "openverse")
+          );
+          if (!image) throw new Error("No source returned a usable image");
+          found.push({ segment, image });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "Image search failed";
+          skipped.push({ index, query: segment.query, reason });
+          console.warn(`[board2:auto-build] Skipping image slot ${index + 1}/${segments.length} for “${segment.query}”: ${reason}`);
         }
-        const image = imageData?.images?.find((candidate) =>
-          candidate?.dataUrl?.startsWith("data:image/") && candidate.width > 0 && candidate.height > 0
-        );
-        if (!image) throw new Error(`No usable image found for “${segment.query}”`);
-        found.push({ segment, image });
       }
 
       setAutoBuildPhase("Placing…");
@@ -7574,7 +7590,7 @@ export default function Board2Page() {
 
       const count = mediaItems.length;
       const columns = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count * 4 / 3))));
-      const rows = Math.ceil(count / columns);
+      const rows = Math.max(1, Math.ceil(count / columns));
       const marginX = 180;
       const marginY = 180;
       const gap = 90;
@@ -7608,6 +7624,7 @@ export default function Board2Page() {
           featured: true,
           provenance: "browserFound",
           sourceAttributionUrl: image.sourceUrl,
+          imageSearchSource: image.source,
           searchQuery: segment.query,
           imagePlanReason: segment.reason,
           imagePlanModel: segment.planModel,
@@ -7620,49 +7637,58 @@ export default function Board2Page() {
       setClipSelection(autoClips.map((clip) => clip.id));
       placed = true;
 
-      setAutoBuildPhase("Generating camera…");
-      const W = canvasWRef.current;
-      const H = canvasHRef.current;
-      const cameraStops = autoClips.map((clip) => {
-        const scale = CLIP_FOCUS_RATIO * Math.min(W / clip.boardW!, H / clip.boardH!);
-        return {
-          cameraX: clip.boardX! + clip.boardW! / 2,
-          cameraY: clip.boardY! + clip.boardH! / 2,
-          boardZoom: scale * BOARD_W / W,
-        };
-      });
-      const events: CameraKeyframe[] = [];
-      for (let index = 0; index < autoClips.length; index++) {
-        const clip = autoClips[index];
-        const stop = cameraStops[index];
-        const nextStop = cameraStops[index + 1] ?? stop;
-        events.push({ time: clip.startTime, ...stop, easing: "ease-in-out" });
-        events.push({ time: clip.startTime + clip.duration * (clip.holdFraction ?? 0.7), ...stop, easing: "ease-in-out" });
-        events.push({ time: clip.startTime + clip.duration, ...nextStop, easing: "ease-in-out" });
+      if (autoClips.length) {
+        setAutoBuildPhase("Generating camera…");
+        const W = canvasWRef.current;
+        const H = canvasHRef.current;
+        const cameraStops = autoClips.map((clip) => {
+          const scale = CLIP_FOCUS_RATIO * Math.min(W / clip.boardW!, H / clip.boardH!);
+          return {
+            cameraX: clip.boardX! + clip.boardW! / 2,
+            cameraY: clip.boardY! + clip.boardH! / 2,
+            boardZoom: scale * BOARD_W / W,
+          };
+        });
+        const events: CameraKeyframe[] = [];
+        for (let index = 0; index < autoClips.length; index++) {
+          const clip = autoClips[index];
+          const stop = cameraStops[index];
+          const nextStop = cameraStops[index + 1] ?? stop;
+          events.push({ time: clip.startTime, ...stop, easing: "ease-in-out" });
+          events.push({ time: clip.startTime + clip.duration * (clip.holdFraction ?? 0.7), ...stop, easing: "ease-in-out" });
+          events.push({ time: clip.startTime + clip.duration, ...nextStop, easing: "ease-in-out" });
+        }
+        const seenTimes = new Set<number>();
+        const generatedCamera = events
+          .sort((a, b) => a.time - b.time)
+          .filter((keyframe) => {
+            const rounded = Math.round(keyframe.time * 1000);
+            if (seenTimes.has(rounded)) return false;
+            seenTimes.add(rounded);
+            return true;
+          })
+          .map((keyframe) => ({ ...keyframe, time: parseFloat(keyframe.time.toFixed(3)) }));
+        cameraKeyframesRef.current = generatedCamera;
+        setCameraKeyframes(generatedCamera);
+        setKeyframesOutOfDate(false);
+        setShowCharacter(false);
+        setShowCharacter2(false);
+        drawFrameRef.current(playheadRef.current);
       }
-      const seenTimes = new Set<number>();
-      const generatedCamera = events
-        .sort((a, b) => a.time - b.time)
-        .filter((keyframe) => {
-          const rounded = Math.round(keyframe.time * 1000);
-          if (seenTimes.has(rounded)) return false;
-          seenTimes.add(rounded);
-          return true;
-        })
-        .map((keyframe) => ({ ...keyframe, time: parseFloat(keyframe.time.toFixed(3)) }));
-      cameraKeyframesRef.current = generatedCamera;
-      setCameraKeyframes(generatedCamera);
-      setKeyframesOutOfDate(false);
-      setShowCharacter(false);
-      setShowCharacter2(false);
-      drawFrameRef.current(playheadRef.current);
 
       setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "done" } : toast));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
-      setToast(`Draft ready · ${autoClips.length} featured images + timed camera`);
+      const unavailable = segments.length - autoClips.length;
+      const summary = `Placed ${autoClips.length}/${segments.length} images (${unavailable} unavailable).`;
+      const skippedSlots = skipped.length
+        ? ` Skipped: ${skipped.map(({ index, query }) => `#${index + 1} “${query}”`).join(", ")}.`
+        : "";
+      setAutoBuildSummary(`${summary}${skippedSlots}`);
+      setToast(summary);
     } catch (error) {
       if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
       const message = error instanceof Error ? error.message : "Could not auto-build the narration draft";
+      setAutoBuildSummary(null);
       setAutoBuildError(message);
       setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 6000);
@@ -13671,6 +13697,7 @@ export default function Board2Page() {
                         </label>
                       </div>
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
+                      {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
                     <button
@@ -14790,6 +14817,9 @@ export default function Board2Page() {
                 </button>
                 {autoBuildError && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
+                )}
+                {autoBuildSummary && !autoBuildPhase && (
+                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>
                 )}
               </div>
             </ProGated>

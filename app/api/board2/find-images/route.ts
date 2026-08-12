@@ -3,13 +3,14 @@ import { getServerSession } from "next-auth";
 import { authOptions, isUserPro } from "@/lib/auth";
 
 export const runtime = "nodejs";
-export const maxDuration = 90;
+export const maxDuration = 150;
 
 type BridgeImage = {
   dataUrl: string;
   sourceUrl: string;
   width: number;
   height: number;
+  source: "google" | "bing" | "openverse";
 };
 
 function isBridgeImage(value: unknown): value is BridgeImage {
@@ -17,7 +18,8 @@ function isBridgeImage(value: unknown): value is BridgeImage {
   const image = value as Partial<BridgeImage>;
   return typeof image.dataUrl === "string" && image.dataUrl.startsWith("data:image/") &&
     typeof image.sourceUrl === "string" && /^https?:\/\//.test(image.sourceUrl) &&
-    Number.isFinite(image.width) && Number.isFinite(image.height);
+    Number.isFinite(image.width) && Number.isFinite(image.height) &&
+    (image.source === "google" || image.source === "bing" || image.source === "openverse");
 }
 
 export async function POST(req: NextRequest) {
@@ -52,7 +54,7 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({ query, count }),
       cache: "no-store",
-      signal: AbortSignal.timeout(75_000),
+      signal: AbortSignal.timeout(140_000),
     });
     const data: unknown = await bridgeResponse.json().catch(() => null);
     if (!bridgeResponse.ok) {
@@ -67,9 +69,6 @@ export async function POST(req: NextRequest) {
     const images = data && typeof data === "object" && "images" in data && Array.isArray((data as { images: unknown }).images)
       ? (data as { images: unknown[] }).images.filter(isBridgeImage).slice(0, count)
       : [];
-    if (!images.length) {
-      return NextResponse.json({ error: "Image finder returned no usable images" }, { status: 502 });
-    }
     return NextResponse.json({ ok: true, query, images });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Image finder request failed";
