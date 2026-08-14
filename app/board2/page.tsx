@@ -5249,12 +5249,12 @@ export default function Board2Page() {
     actions: readonly ResolvedCharAction[] = id === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current,
     renderMode: "timeline" | "live" = "timeline",
   ): Viseme {
+    const mode = id === "c2" ? characterVisemeMode2Ref.current : characterVisemeModeRef.current;
+    if (mode !== "auto") return mode;
     if (renderMode === "timeline") {
       const sourceMatches = narrationVisemeTrackSourceRef.current === narrationVisemeSourceSignature(sourceClips);
       return sourceMatches ? visemeAt(time, narrationVisemeTrackRef.current) : "rest";
     }
-    const mode = id === "c2" ? characterVisemeMode2Ref.current : characterVisemeModeRef.current;
-    if (mode !== "auto") return mode;
     const narration = narrationVisemeAt(time, sourceClips);
     if (narration !== "rest") return narration;
     return actionSpeechVisemeAt(time, actions, id);
