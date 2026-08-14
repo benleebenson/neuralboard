@@ -1099,6 +1099,84 @@ const CHARACTER_COLOR = "#cdeac0";
 const DEV_MOUTH_TEST = true;
 const VISEME_OPTIONS = Object.keys(VISEME_MOUTH) as Viseme[];
 
+type Gesture = "neutral" | "open" | "pointUp" | "thinking" | "self" | "outward" | "shrug";
+type GestureTestMode = Gesture | "auto";
+
+type GesturePose = {
+  leftArmA: number;
+  rightArmA: number;
+  leftForeA: number;
+  rightForeA: number;
+  headTilt: number;
+  bodyLean: number;
+  headBob: number;
+};
+
+type GestureTestTransition = {
+  from: GesturePose;
+  to: GesturePose;
+  startMs: number;
+};
+
+const GESTURE_OPTIONS: Gesture[] = ["neutral", "open", "pointUp", "thinking", "self", "outward", "shrug"];
+const DEFAULT_TALK_GESTURE: Gesture = "open";
+const GESTURE_TRANSITION_SECONDS = 0.25;
+const gestureRadians = (degrees: number) => degrees * Math.PI / 180;
+
+// Angles are absolute limb angles measured from vertical-down. The right arm is the
+// facing-side arm in character-local space; the renderer's facing scale mirrors the
+// complete silhouette without maintaining a second set of left-facing constants.
+const GESTURE_POSES: Record<Gesture, GesturePose> = {
+  neutral: {
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-10),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(-10),
+    headTilt: 0, bodyLean: 0, headBob: 0,
+  },
+  open: {
+    leftArmA: gestureRadians(45), rightArmA: gestureRadians(-45),
+    leftForeA: gestureRadians(110), rightForeA: gestureRadians(-110),
+    headTilt: 0, bodyLean: 0, headBob: 0,
+  },
+  pointUp: {
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-180),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(-180),
+    headTilt: gestureRadians(-3), bodyLean: gestureRadians(-2), headBob: 0,
+  },
+  thinking: {
+    leftArmA: gestureRadians(-40), rightArmA: gestureRadians(-100),
+    leftForeA: gestureRadians(-160), rightForeA: gestureRadians(120),
+    headTilt: gestureRadians(9), bodyLean: gestureRadians(2), headBob: 0,
+  },
+  self: {
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-55),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(80),
+    headTilt: gestureRadians(2), bodyLean: gestureRadians(1), headBob: 0,
+  },
+  outward: {
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-80),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(-100),
+    headTilt: gestureRadians(-2), bodyLean: gestureRadians(2), headBob: 0,
+  },
+  shrug: {
+    leftArmA: gestureRadians(45), rightArmA: gestureRadians(-45),
+    leftForeA: gestureRadians(135), rightForeA: gestureRadians(-135),
+    headTilt: gestureRadians(3), bodyLean: 0, headBob: -4,
+  },
+};
+
+function interpolateGesturePose(from: GesturePose, to: GesturePose, progress: number): GesturePose {
+  const t = easeInOutCubic(clamp(progress, 0, 1));
+  return {
+    leftArmA: lerp(from.leftArmA, to.leftArmA, t),
+    rightArmA: lerp(from.rightArmA, to.rightArmA, t),
+    leftForeA: lerp(from.leftForeA, to.leftForeA, t),
+    rightForeA: lerp(from.rightForeA, to.rightForeA, t),
+    headTilt: lerp(from.headTilt, to.headTilt, t),
+    bodyLean: lerp(from.bodyLean, to.bodyLean, t),
+    headBob: lerp(from.headBob, to.headBob, t),
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 let _idCounter = 0;
@@ -2857,7 +2935,8 @@ function evalCharPoseRaw(
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
   faceAspect = 1,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  gesturePose: GesturePose = GESTURE_POSES[DEFAULT_TALK_GESTURE],
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
   // Relaxed arms stay visibly away from the torso; the idle bob below is head/breathing only.
@@ -3441,55 +3520,29 @@ function evalCharPoseRaw(
   }
 
   if (active.type === "explainGesture") {
-    // Conversational presenter gestures keyed by wrist targets: side holds, small point-up/down,
-    // and modest two-hand spreads. Keep the hands expressive without turning every beat into a pose.
-    const localT = Math.max(0, time - active.startTime);
-    const seed = seededRandom(active.id);
-    const poseTargets = [
-      { t: 0, left: { x: -42, y: -54 }, right: { x: 42, y: -56 }, lean: 0.01, tilt: -0.01 },
-      { t: 0.16, left: { x: -48, y: -60 }, right: { x: 34, y: -82 }, lean: -0.018, tilt: 0.03 },
-      { t: 0.32, left: { x: -46, y: -50 }, right: { x: 52, y: -44 }, lean: 0.022, tilt: 0.005 },
-      { t: 0.5, left: { x: -32, y: -80 }, right: { x: 50, y: -58 }, lean: 0.02, tilt: -0.025 },
-      { t: 0.68, left: { x: -54, y: -58 }, right: { x: 54, y: -62 }, lean: 0, tilt: 0.012 },
-      { t: 0.84, left: { x: -50, y: -42 }, right: { x: 38, y: -78 }, lean: -0.018, tilt: 0.03 },
-      { t: 1, left: { x: -42, y: -54 }, right: { x: 42, y: -56 }, lean: 0.01, tilt: -0.01 },
-    ];
-    const cycle = 3.6 + seed * 0.55;
-    const cycleT = ((localT + seed * cycle) % cycle) / cycle;
-    let poseIndex = 0;
-    while (poseIndex < poseTargets.length - 2 && cycleT > poseTargets[poseIndex + 1].t) poseIndex++;
-    const a = poseTargets[poseIndex];
-    const b = poseTargets[poseIndex + 1];
-    const blend = easeInOutCubic(clamp((cycleT - a.t) / Math.max(0.001, b.t - a.t), 0, 1));
-    const handDrift = Math.sin(localT * 8.2 + seed * 8) * 1.35;
-    const interpPoint = (pa: { x: number; y: number }, pb: { x: number; y: number }, side: -1 | 1) => ({
-      x: lerp(pa.x, pb.x, blend) + side * handDrift,
-      y: lerp(pa.y, pb.y, blend) + Math.sin(localT * 6.4 + seed * 5 + side) * 1.05,
-    });
-    const leftHand = interpPoint(a.left, b.left, -1);
-    const rightHand = interpPoint(a.right, b.right, 1);
-    const leftArm = solveArmToLocalPoint(leftHand.x, leftHand.y, -1);
-    const rightArm = solveArmToLocalPoint(rightHand.x, rightHand.y, 1);
-    const intro = easeInOutCubic(clamp(localT / 0.22, 0, 1));
-    const exit = easeInOutCubic(clamp((active.startTime + active.duration - time) / 0.22, 0, 1));
+    const localT = Math.max(0, stationaryElapsed);
+    const intro = easeInOutCubic(clamp(localT / GESTURE_TRANSITION_SECONDS, 0, 1));
+    const exit = easeInOutCubic(clamp((stationaryActive.duration - localT) / GESTURE_TRANSITION_SECONDS, 0, 1));
     const gestureAlpha = Math.min(intro, exit);
+    const heldPose = interpolateGesturePose(GESTURE_POSES.neutral, gesturePose, gestureAlpha);
     const facing: 1 | -1 = active.targetX !== undefined && Math.abs(active.targetX - active.fromX) > 3
       ? active.targetX >= active.fromX ? 1 : -1
       : 1;
 
-    return applyAuthoredPose({
-      boardX: active.fromX, boardY: active.fromY, facing,
-      headBob: Math.sin(localT * 3.4 + seed) * 0.75 - (1 - intro) * 1.4,
-      bodyLean: lerp(0, lerp(a.lean, b.lean, blend), gestureAlpha),
-      headTilt: lerp(0, lerp(a.tilt, b.tilt, blend), gestureAlpha),
-      leftLegA: 0.1 + Math.sin(localT * 0.75) * 0.045,
-      rightLegA: -0.1 - Math.sin(localT * 0.75 + 1.3) * 0.045,
-      leftArmA: lerp(CHAR_RELAX_ARM_A, leftArm.armA, gestureAlpha),
-      rightArmA: lerp(-CHAR_RELAX_ARM_A, rightArm.armA, gestureAlpha),
-      leftForeA: lerp(CHAR_RELAX_FORE_A, leftArm.foreA, gestureAlpha),
-      rightForeA: lerp(-CHAR_RELAX_FORE_A, rightArm.foreA, gestureAlpha),
+    return {
+      boardX: stationaryActive.fromX, boardY: stationaryActive.fromY, facing,
+      headBob: heldPose.headBob,
+      bodyLean: heldPose.bodyLean,
+      headTilt: heldPose.headTilt,
+      spinAngle: authoredPose?.poseRotation ? authoredPose.poseRotation * facing : undefined,
+      leftLegA: 0.1,
+      rightLegA: -0.1,
+      leftArmA: heldPose.leftArmA,
+      rightArmA: heldPose.rightArmA,
+      leftForeA: heldPose.leftForeA,
+      rightForeA: heldPose.rightForeA,
       airY: 0,
-    }, authoredPose);
+    };
   }
 
   if (active.type === "bazooka") {
@@ -3779,7 +3832,9 @@ function evalCharPoseRaw(
           clips,
           authoredAnimations,
           hasFace,
-          faceAspect
+          faceAspect,
+          craters,
+          gesturePose,
         );
     const facing = priorPose.facing ?? 1;
     const standing = standingCharPose(a.fromX, a.fromY, facing, time);
@@ -3832,12 +3887,13 @@ function evalCharAtTime(
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
   faceAspect = 1,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  gesturePose: GesturePose = GESTURE_POSES[DEFAULT_TALK_GESTURE],
 ): CharPoseResult {
-  const base = evalCharPoseRaw(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters);
+  const base = evalCharPoseRaw(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters, gesturePose);
   const dt = MOMENTUM_SAMPLE_DT;
   const sampleRoot = (t: number) => {
-    const p = evalCharPoseRaw(Math.max(0, t), resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters);
+    const p = evalCharPoseRaw(Math.max(0, t), resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect, craters, gesturePose);
     return { x: p.boardX, y: p.boardY + p.airY };
   };
   const r0 = sampleRoot(time);
@@ -3931,11 +3987,12 @@ function evalLiveCharacterAtWallTime(
   authoredAnimations: Record<string, AuthoredAnimation> = {},
   hasFace = false,
   faceAspect = 1,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  gesturePose: GesturePose = GESTURE_POSES[DEFAULT_TALK_GESTURE],
 ): CharPoseResult {
   const t = liveRuntimeSeconds(runtime, wallMs);
   const resolved = liveResolvedActions(runtime, clips, craters);
-  let pose = evalCharAtTime(t, resolved, runtime.initX, runtime.initY, clips, authoredAnimations, hasFace, faceAspect, craters);
+  let pose = evalCharAtTime(t, resolved, runtime.initX, runtime.initY, clips, authoredAnimations, hasFace, faceAspect, craters, gesturePose);
   if (runtime.blendFromPose && runtime.blendStartWallMs > 0) {
     const blendT = clamp((wallMs - runtime.blendStartWallMs) / Math.max(0.001, runtime.blendDuration * 1000), 0, 1);
     if (blendT < 1) pose = lerpCharPose(runtime.blendFromPose, pose, blendT);
@@ -4108,6 +4165,8 @@ export default function Board2Page() {
   const [characterSkin2, setCharacterSkin2] = useState<CharacterSkin>("stick");
   const [characterViseme, setCharacterViseme] = useState<Viseme | "auto">("auto");
   const [characterViseme2, setCharacterViseme2] = useState<Viseme | "auto">("auto");
+  const [characterGesture, setCharacterGesture] = useState<GestureTestMode>("auto");
+  const [characterGesture2, setCharacterGesture2] = useState<GestureTestMode>("auto");
   const [characterStart, setCharacterStart] = useState<{ x: number; y: number } | null>(null);
   const [characterStart2, setCharacterStart2] = useState<{ x: number; y: number } | null>(null);
   const [characterStartPickId, setCharacterStartPickId] = useState<CharacterId | null>(null);
@@ -4418,6 +4477,11 @@ export default function Board2Page() {
   const characterVisemeMode2Ref = useRef<Viseme | "auto">("auto");
   const characterVisemeRef = useRef<Viseme>("rest");
   const characterViseme2Ref = useRef<Viseme>("rest");
+  const characterGestureModeRef = useRef<GestureTestMode>("auto");
+  const characterGestureMode2Ref = useRef<GestureTestMode>("auto");
+  const characterGestureTransitionRef = useRef<GestureTestTransition | null>(null);
+  const characterGestureTransition2Ref = useRef<GestureTestTransition | null>(null);
+  const characterGestureTestRafRef = useRef<Record<CharacterId, number | null>>({ c1: null, c2: null });
   const activeCharacterIdRef = useRef<CharacterId>("c1");
   const playLiveSpeechEnabledRef = useRef(false);
   const playLiveSpeechBubblesRef = useRef(false);
@@ -4537,7 +4601,10 @@ export default function Board2Page() {
     const runtime = liveCharactersRef.current[id];
     const hasFace = id === "c2" ? !!(characterFace2Ref.current && characterFace2ImageRef.current) : !!(characterFaceRef.current && characterFaceImageRef.current);
     const faceAspect = id === "c2" ? clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6) : clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-    const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
+    const resolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
+    const time = liveRuntimeSeconds(runtime, wallMs);
+    const gesture = resolvedCharacterGesture(id, time, resolved, "live", wallMs);
+    const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current, gesture);
     runtime.currentPose = pose;
     return pose;
   }, []);
@@ -4937,7 +5004,7 @@ export default function Board2Page() {
           const t = runtime?.enabled ? liveRuntimeSeconds(runtime, wallMs) : 0;
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
           let pose = runtime?.enabled && state
-            ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current))
+            ? (runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current, resolvedCharacterGesture(id, t, resolved, "live", wallMs)))
             : state ? sharedPlayPoseFromPhysics(state, playTimeRef.current) : null;
           if (pose && id === "c1") {
             if (state && playPointingRef.current) {
@@ -5002,7 +5069,7 @@ export default function Board2Page() {
           const t = liveRuntimeSeconds(runtime, wallMs);
           const resolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
           const active = resolved.find((a) => t >= a.startTime && t <= a.startTime + a.duration);
-          const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
+          const pose = runtime.currentPose ?? evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current, resolvedCharacterGesture(id, t, resolved, "live", wallMs));
           const progress = active ? clamp((t - active.startTime) / Math.max(0.001, active.duration), 0, 1) : 0;
           const duration = active?.duration ?? 2;
           const viseme = resolvedCharacterViseme(id, t, clipsRef.current, resolved, "live");
@@ -5242,6 +5309,29 @@ export default function Board2Page() {
     // loadBoard is a component-local file loader; this intentionally runs once on editor mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function resolvedCharacterGesture(
+    id: CharacterId,
+    time: number,
+    actions: readonly ResolvedCharAction[],
+    renderMode: "timeline" | "live" = "timeline",
+    nowMs: number = performance.now(),
+  ): GesturePose {
+    const mode = id === "c2" ? characterGestureMode2Ref.current : characterGestureModeRef.current;
+
+    // Keep the forced test value first, before any render-mode-specific automatic source is
+    // considered. This is the same precedence rule as the mouth test resolver.
+    const forced = mode !== "auto" ? GESTURE_POSES[mode] : null;
+    const automatic = GESTURE_POSES[DEFAULT_TALK_GESTURE];
+    const target = forced ?? automatic;
+    const transition = id === "c2" ? characterGestureTransition2Ref.current : characterGestureTransitionRef.current;
+    void time;
+    void actions;
+    void renderMode;
+    if (!transition) return target;
+    const progress = (nowMs - transition.startMs) / (GESTURE_TRANSITION_SECONDS * 1000);
+    return progress >= 1 ? target : interpolateGesturePose(transition.from, transition.to, progress);
+  }
 
   function resolvedCharacterViseme(
     id: CharacterId,
@@ -6041,7 +6131,9 @@ export default function Board2Page() {
       if (live.c1.enabled) {
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
+        const resolved = liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current);
+        const liveTime = liveRuntimeSeconds(live.c1, wallMs);
+        const pose = evalLiveCharacterAtWallTime(live.c1, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current, resolvedCharacterGesture("c1", liveTime, resolved, "live", wallMs));
         live.c1.currentPose = pose;
         if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c1, wallMs), liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
@@ -6059,7 +6151,9 @@ export default function Board2Page() {
       if (live.c2.enabled) {
         const hasFace = !!(characterFace2Ref.current && characterFace2ImageRef.current);
         const faceAspect = clamp(characterFace2Ref.current?.faceAspect ?? 1, 0.75, 1.6);
-        const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
+        const resolved = liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current);
+        const liveTime = liveRuntimeSeconds(live.c2, wallMs);
+        const pose = evalLiveCharacterAtWallTime(live.c2, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current, resolvedCharacterGesture("c2", liveTime, resolved, "live", wallMs));
         live.c2.currentPose = pose;
         if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, hasFace, faceAspect, physiqueAt(liveRuntimeSeconds(live.c2, wallMs), liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current))));
         CharacterEntity.drawBoardCharacterToCanvas(
@@ -6077,7 +6171,7 @@ export default function Board2Page() {
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
     } else if (showCharacterRef.current && !playModeRef.current) {
       const resolved = resolvedCharActionsRef.current;
-      const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters);
+      const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c1", time, resolved, "timeline"));
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true,
@@ -6098,7 +6192,7 @@ export default function Board2Page() {
     }
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
       const resolved = resolvedCharActions2Ref.current;
-      const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters);
+      const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c2", time, resolved, "timeline"));
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, showCharacter2Ref.current,
@@ -6216,6 +6310,7 @@ export default function Board2Page() {
       const pose = evalCharAtTime(
         time, resolved, initX, initY, currentClips, authoredAnimationsRef.current,
         !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
+        resolvedCharacterGesture(id, time, resolved, "timeline"),
       );
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
@@ -6292,7 +6387,50 @@ export default function Board2Page() {
       if (canvas) drawCharacterBoardOverlay(canvas, playhead);
     }
     drawBoardImageOverlays(playhead);
-  }, [clips, drawBoardImageOverlays, drawCharacterBoardOverlay, playhead, resolvedCharActions, resolvedCharActions2, showCharacter, showCharacter2, characterFace, characterFace2, characterSkin, characterSkin2]);
+  }, [clips, drawBoardImageOverlays, drawCharacterBoardOverlay, playhead, resolvedCharActions, resolvedCharActions2, showCharacter, showCharacter2, characterFace, characterFace2, characterSkin, characterSkin2, characterGesture, characterGesture2]);
+
+  function setCharacterGestureTestMode(id: CharacterId, mode: GestureTestMode) {
+    const now = performance.now();
+    const actions = id === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+    const current = resolvedCharacterGesture(id, playheadRef.current, actions, "timeline", now);
+    const target = GESTURE_POSES[mode === "auto" ? DEFAULT_TALK_GESTURE : mode];
+    const transition = { from: current, to: target, startMs: now };
+
+    if (id === "c2") {
+      characterGestureMode2Ref.current = mode;
+      characterGestureTransition2Ref.current = transition;
+      setCharacterGesture2(mode);
+    } else {
+      characterGestureModeRef.current = mode;
+      characterGestureTransitionRef.current = transition;
+      setCharacterGesture(mode);
+    }
+
+    const previousRaf = characterGestureTestRafRef.current[id];
+    if (previousRaf !== null) cancelAnimationFrame(previousRaf);
+    const redraw = (wallMs: number) => {
+      drawFrameRef.current(playheadRef.current);
+      for (const canvas of [boardCharacterCanvasRef.current, mobileBoardCharacterCanvasRef.current]) {
+        if (canvas) drawCharacterBoardOverlay(canvas, playheadRef.current);
+      }
+      if (wallMs - now < GESTURE_TRANSITION_SECONDS * 1000) {
+        characterGestureTestRafRef.current[id] = requestAnimationFrame(redraw);
+        return;
+      }
+      if (id === "c2") characterGestureTransition2Ref.current = null;
+      else characterGestureTransitionRef.current = null;
+      characterGestureTestRafRef.current[id] = null;
+      drawFrameRef.current(playheadRef.current);
+    };
+    redraw(now);
+  }
+
+  useEffect(() => () => {
+    for (const id of ["c1", "c2"] as const) {
+      const raf = characterGestureTestRafRef.current[id];
+      if (raf !== null) cancelAnimationFrame(raf);
+    }
+  }, []);
 
   // ─ Video audio routing ────────────────────────────────────────────────────
 
@@ -10657,7 +10795,9 @@ export default function Board2Page() {
     if (runtime?.enabled && runtime.actions.length > 0) {
       const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
       const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-      const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
+      const resolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
+      const time = liveRuntimeSeconds(runtime, wallMs);
+      const pose = evalLiveCharacterAtWallTime(runtime, wallMs, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current, resolvedCharacterGesture("c1", time, resolved, "live", wallMs));
       runtime.currentPose = pose;
       return pose;
     }
@@ -10903,6 +11043,10 @@ export default function Board2Page() {
 
   function applyPlayTalkingGestures(pose: CharPoseResult, wallMs: number): CharPoseResult {
     if (!playTalkingGesturesRef.current) return pose;
+    // The V-key Talk intent may occupy idle, but it never takes arm ownership from a real action.
+    // Weapon/bazooka modes are checked explicitly because their held pose is applied later.
+    if ((pose.actionType ?? "idle") !== "idle" && pose.actionType !== "explainGesture") return pose;
+    if (playWeaponArmedRef.current || playBazookaArmedRef.current) return pose;
     const time = wallMs / 1000;
     const action: ResolvedCharAction = {
       id: "play-talking-gestures",
@@ -10914,7 +11058,8 @@ export default function Board2Page() {
       fromX: pose.boardX,
       fromY: pose.boardY,
     };
-    const talking = evalCharAtTime(time, [action], pose.boardX, pose.boardY, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current);
+    const gesture = resolvedCharacterGesture("c1", time, [action], "live", wallMs);
+    const talking = evalCharAtTime(time, [action], pose.boardX, pose.boardY, clipsRef.current, authoredAnimationsRef.current, false, 1, streamCratersRef.current, gesture);
     return {
       ...pose,
       leftArmA: talking.leftArmA,
@@ -10922,6 +11067,7 @@ export default function Board2Page() {
       leftForeA: talking.leftForeA,
       rightForeA: talking.rightForeA,
       headTilt: talking.headTilt,
+      headBob: pose.headBob + talking.headBob,
       bodyLean: pose.bodyLean + talking.bodyLean,
       forceHandOpen: talking.forceHandOpen,
       actionType: "explainGesture",
@@ -12102,10 +12248,10 @@ export default function Board2Page() {
       if (runtime?.enabled && runtime.actions.length > 0) {
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
-        playPose = evalLiveCharacterAtWallTime(runtime, wall, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current);
-        runtime.currentPose = playPose;
         playDrawTime = liveRuntimeSeconds(runtime, wall);
         playDrawResolved = liveResolvedActions(runtime, clipsRef.current, streamCratersRef.current);
+        playPose = evalLiveCharacterAtWallTime(runtime, wall, clipsRef.current, authoredAnimationsRef.current, hasFace, faceAspect, streamCratersRef.current, resolvedCharacterGesture("c1", playDrawTime, playDrawResolved, "live", wall));
+        runtime.currentPose = playPose;
         state.x = playPose.boardX;
         state.y = playPose.boardY;
         state.facing = playPose.facing;
@@ -16346,6 +16492,21 @@ export default function Board2Page() {
                             <option value="auto">auto</option>
                             {VISEME_OPTIONS.map((viseme) => (
                               <option key={viseme} value={viseme}>{viseme}</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      {DEV_MOUTH_TEST && (
+                        <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 10 }}>
+                          <span>Gesture test</span>
+                          <select
+                            value={activeCharacterId === "c2" ? characterGesture2 : characterGesture}
+                            onChange={(event) => setCharacterGestureTestMode(activeCharacterId, event.target.value as GestureTestMode)}
+                            style={{ flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 10, border: "1px solid #2a2a2a", background: "#fffdf4", padding: "3px 5px" }}
+                          >
+                            <option value="auto">auto</option>
+                            {GESTURE_OPTIONS.map((gesture) => (
+                              <option key={gesture} value={gesture}>{gesture}</option>
                             ))}
                           </select>
                         </label>
