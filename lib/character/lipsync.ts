@@ -121,6 +121,35 @@ export function visemeAt(time: number, track: readonly VisemeTrackPoint[]): Vise
   return high >= 0 ? track[high].viseme : "rest";
 }
 
+/** How long a gap between words stays closed-mouthed before going blank. */
+export const SPEECH_GAP_HOLD_SEC = 0.6;
+
+/**
+ * Like visemeAt, but holds the mouth closed during short inter-word gaps so it
+ * doesn't pop in and out mid-sentence. Real silences still return "rest" (blank).
+ */
+export function speechAwareVisemeAt(
+  time: number,
+  track: readonly VisemeTrackPoint[],
+  gapHoldSec: number = SPEECH_GAP_HOLD_SEC,
+): Viseme {
+  if (!Number.isFinite(time) || track.length === 0 || time < track[0].t) return "rest";
+  let low = 0;
+  let high = track.length - 1;
+  while (low <= high) {
+    const mid = low + Math.floor((high - low) / 2);
+    if (track[mid].t <= time) low = mid + 1;
+    else high = mid - 1;
+  }
+  if (high < 0) return "rest";
+  const current = track[high].viseme;
+  if (current !== "rest") return current;
+  const spokeRecently = high > 0 && time - track[high].t < gapHoldSec;
+  const next = track[high + 1];
+  const aboutToSpeak = !!next && next.t - time < gapHoldSec;
+  return spokeRecently || aboutToSpeak ? "closed" : "rest";
+}
+
 export function isVisemeTrack(value: unknown): value is VisemeTrackPoint[] {
   if (!Array.isArray(value)) return false;
   const visemes = new Set<Viseme>(["rest", "closed", "slightOpen", "open", "wide", "round", "pucker", "teeth", "tongue"]);

@@ -67,6 +67,7 @@ import {
   offsetRhubarbChunkCues,
   planLipSyncChunks,
   visemeAt,
+  speechAwareVisemeAt,
   type RhubarbCue,
   type VisemeTrackPoint,
 } from "@/lib/character/lipsync";
@@ -5253,7 +5254,7 @@ export default function Board2Page() {
     if (mode !== "auto") return mode;
     if (renderMode === "timeline") {
       const sourceMatches = narrationVisemeTrackSourceRef.current === narrationVisemeSourceSignature(sourceClips);
-      return sourceMatches ? visemeAt(time, narrationVisemeTrackRef.current) : "rest";
+      return sourceMatches ? speechAwareVisemeAt(time, narrationVisemeTrackRef.current) : "rest";
     }
     const narration = narrationVisemeAt(time, sourceClips);
     if (narration !== "rest") return narration;
