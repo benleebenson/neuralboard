@@ -22,7 +22,7 @@ export const MOUTH_PALETTE = {
   MOUTH_TEETH: "#faf7f0",
   MOUTH_TONGUE: "#e88ba8",
 } as const;
-export const MOUTH_OUTLINE_WEIGHT_MULTIPLIER = 1.5;
+export const MOUTH_OUTLINE_WEIGHT_MULTIPLIER = 0.6;
 
 type MouthDrawing = "none" | "line" | "narrow" | "openBean" | "fatCrescent" | "dot" | "teethBand" | "tongueOpen";
 
