@@ -16,26 +16,34 @@ const MIRROR_H = 260;
 const MIRROR_OFFSET = 140;
 const LAUNCHER_ALWAYS_VISIBLE = true;
 export const DEFAULT_MOUTH_ANCHOR: HeadLocalPoint = { x: 0, y: 0.35 };
+export const MOUTH_PALETTE = {
+  MOUTH_OUTLINE: "#2a2a2a",
+  MOUTH_INTERIOR: "#d94a4a",
+  MOUTH_TEETH: "#faf7f0",
+  MOUTH_TONGUE: "#e88ba8",
+} as const;
+export const MOUTH_OUTLINE_WEIGHT_MULTIPLIER = 1.5;
+
+type MouthDrawing = "none" | "line" | "narrow" | "openBean" | "fatCrescent" | "dot" | "teethBand" | "tongueOpen";
+
 export const VISEME_MOUTH: Record<Viseme, {
+  drawing: MouthDrawing;
   cx: number;
   cy: number;
   w: number;
   h: number;
-  fill?: "dark" | "none";
-  curve?: number;
+  scale?: number;
   forward?: number;
-  teethH?: number;
-  tongue?: boolean;
 }> = {
-  rest: { cx: 0, cy: 0, w: 0, h: 0 },
-  closed: { cx: 0, cy: 0, w: 0.46, h: 0.045, curve: 0.075 },
-  slightOpen: { cx: 0, cy: 0, w: 0.4, h: 0.095 },
-  open: { cx: 0, cy: 0, w: 0.36, h: 0.24, fill: "dark" },
-  wide: { cx: 0, cy: 0, w: 0.54, h: 0.25, fill: "dark" },
-  round: { cx: 0, cy: 0, w: 0.32, h: 0.27, fill: "dark" },
-  pucker: { cx: 0, cy: 0, w: 0.22, h: 0.19, fill: "dark", forward: 0.1 },
-  teeth: { cx: 0, cy: 0, w: 0.46, h: 0.14, teethH: 0.06 },
-  tongue: { cx: 0, cy: 0, w: 0.4, h: 0.24, fill: "dark", tongue: true },
+  rest: { drawing: "none", cx: 0, cy: 0, w: 0, h: 0 },
+  closed: { drawing: "line", cx: 0, cy: 0, w: 0.5, h: 0.12 },
+  slightOpen: { drawing: "narrow", cx: 0, cy: 0, w: 0.58, h: 0.24 },
+  open: { drawing: "openBean", cx: 0, cy: 0, w: 0.66, h: 0.38, scale: 0.75 },
+  wide: { drawing: "openBean", cx: 0, cy: 0, w: 0.66, h: 0.38 },
+  round: { drawing: "fatCrescent", cx: 0, cy: 0, w: 0.66, h: 0.38, scale: 0.6 },
+  pucker: { drawing: "dot", cx: 0, cy: 0, w: 0.24, h: 0.21, forward: 0.1 },
+  teeth: { drawing: "teethBand", cx: 0, cy: 0, w: 0.62, h: 0.24 },
+  tongue: { drawing: "tongueOpen", cx: 0, cy: 0, w: 0.66, h: 0.32 },
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -50,55 +58,186 @@ function drawCharacterMouth(
   headRX: number,
   headRY: number,
   headTilt: number,
+  limbStrokeWidth: number,
 ) {
   if (viseme === "rest") return;
   const spec = VISEME_MOUTH[viseme] ?? VISEME_MOUTH.rest;
   const base = anchor ?? DEFAULT_MOUTH_ANCHOR;
   const x = (base.x + spec.cx + (spec.forward ?? 0)) * headRX;
   const y = (base.y + spec.cy) * headRY;
-  const w = spec.w * headRX;
-  const h = spec.h * headRY;
-  const dark = "#201715";
+  const scale = spec.scale ?? 1;
+  const w = spec.w * headRX * scale;
+  const h = spec.h * headRY * scale;
+  const outlineWidth = Math.max(1, limbStrokeWidth * MOUTH_OUTLINE_WEIGHT_MULTIPLIER);
+  const detailWidth = Math.max(0.75, outlineWidth * 0.32);
+
+  const traceNarrow = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.51, y - h * 0.08);
+    ctx.bezierCurveTo(x - w * 0.28, y - h * 0.36, x + w * 0.2, y - h * 0.34, x + w * 0.51, y - h * 0.04);
+    ctx.bezierCurveTo(x + w * 0.43, y + h * 0.41, x + w * 0.08, y + h * 0.62, x - w * 0.2, y + h * 0.55);
+    ctx.bezierCurveTo(x - w * 0.43, y + h * 0.5, x - w * 0.57, y + h * 0.2, x - w * 0.51, y - h * 0.08);
+    ctx.closePath();
+  };
+  const traceOpenBean = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.53, y - h * 0.08);
+    ctx.bezierCurveTo(x - w * 0.46, y - h * 0.4, x - w * 0.1, y - h * 0.54, x + w * 0.23, y - h * 0.43);
+    ctx.bezierCurveTo(x + w * 0.5, y - h * 0.34, x + w * 0.56, y - h * 0.05, x + w * 0.47, y + h * 0.19);
+    ctx.bezierCurveTo(x + w * 0.37, y + h * 0.49, x + w * 0.06, y + h * 0.62, x - w * 0.22, y + h * 0.49);
+    ctx.bezierCurveTo(x - w * 0.49, y + h * 0.38, x - w * 0.61, y + h * 0.13, x - w * 0.53, y - h * 0.08);
+    ctx.closePath();
+  };
+  const traceFatCrescent = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.48, y - h * 0.18);
+    ctx.bezierCurveTo(x - w * 0.25, y - h * 0.48, x + w * 0.27, y - h * 0.39, x + w * 0.47, y - h * 0.04);
+    ctx.bezierCurveTo(x + w * 0.58, y + h * 0.17, x + w * 0.37, y + h * 0.4, x + w * 0.12, y + h * 0.46);
+    ctx.bezierCurveTo(x + w * 0.22, y + h * 0.25, x + w * 0.15, y + h * 0.07, x, y - h * 0.02);
+    ctx.bezierCurveTo(x - w * 0.14, y - h * 0.12, x - w * 0.31, y - h * 0.08, x - w * 0.48, y - h * 0.18);
+    ctx.closePath();
+  };
+  const traceDot = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.42, y - h * 0.08);
+    ctx.bezierCurveTo(x - w * 0.4, y - h * 0.42, x - w * 0.06, y - h * 0.57, x + w * 0.25, y - h * 0.41);
+    ctx.bezierCurveTo(x + w * 0.51, y - h * 0.28, x + w * 0.52, y + h * 0.11, x + w * 0.31, y + h * 0.37);
+    ctx.bezierCurveTo(x + w * 0.1, y + h * 0.6, x - w * 0.26, y + h * 0.48, x - w * 0.41, y + h * 0.2);
+    ctx.bezierCurveTo(x - w * 0.48, y + h * 0.1, x - w * 0.48, y, x - w * 0.42, y - h * 0.08);
+    ctx.closePath();
+  };
+  const traceTeethBand = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.52, y - h * 0.2);
+    ctx.bezierCurveTo(x - w * 0.27, y - h * 0.32, x + w * 0.21, y - h * 0.3, x + w * 0.52, y - h * 0.16);
+    ctx.bezierCurveTo(x + w * 0.56, y + h * 0.05, x + w * 0.47, y + h * 0.24, x + w * 0.31, y + h * 0.33);
+    ctx.bezierCurveTo(x + w * 0.05, y + h * 0.48, x - w * 0.28, y + h * 0.42, x - w * 0.47, y + h * 0.25);
+    ctx.bezierCurveTo(x - w * 0.55, y + h * 0.12, x - w * 0.56, y - h * 0.05, x - w * 0.52, y - h * 0.2);
+    ctx.closePath();
+  };
+  const traceTongueOpen = () => {
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.52, y - h * 0.1);
+    ctx.bezierCurveTo(x - w * 0.43, y - h * 0.43, x - w * 0.08, y - h * 0.54, x + w * 0.24, y - h * 0.42);
+    ctx.bezierCurveTo(x + w * 0.49, y - h * 0.32, x + w * 0.55, y - h * 0.04, x + w * 0.46, y + h * 0.18);
+    ctx.bezierCurveTo(x + w * 0.35, y + h * 0.48, x + w * 0.04, y + h * 0.59, x - w * 0.23, y + h * 0.46);
+    ctx.bezierCurveTo(x - w * 0.48, y + h * 0.34, x - w * 0.6, y + h * 0.11, x - w * 0.52, y - h * 0.1);
+    ctx.closePath();
+  };
+  const fillAndStroke = (trace: () => void, fill: string) => {
+    trace();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.stroke();
+  };
+
   ctx.save();
   ctx.translate(headCX, headCY);
   ctx.rotate(headTilt);
-  ctx.strokeStyle = "#2a2a2a";
-  ctx.lineWidth = Math.max(1, headRX * 0.075);
+  ctx.strokeStyle = MOUTH_PALETTE.MOUTH_OUTLINE;
+  ctx.lineWidth = outlineWidth;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  if (viseme === "closed") {
+
+  if (spec.drawing === "line") {
     ctx.beginPath();
-    ctx.moveTo(x - w / 2, y);
-    ctx.quadraticCurveTo(x, y + (spec.curve ?? 0) * headRY, x + w / 2, y);
+    ctx.moveTo(x - w * 0.5, y - h * 0.06);
+    ctx.bezierCurveTo(x - w * 0.2, y + h * 0.52, x + w * 0.19, y + h * 0.56, x + w * 0.5, y - h * 0.02);
     ctx.stroke();
     ctx.restore();
     return;
   }
-  if (viseme === "teeth") {
-    ctx.fillStyle = "#fffdf5";
+
+  if (spec.drawing === "narrow") {
+    fillAndStroke(traceNarrow, MOUTH_PALETTE.MOUTH_INTERIOR);
     ctx.beginPath();
-    ctx.roundRect(x - w / 2, y - h / 2, w, Math.max(1, (spec.teethH ?? 0.08) * headRY), Math.max(1, headRX * 0.03));
+    ctx.moveTo(x - w * 0.4, y - h * 0.05);
+    ctx.bezierCurveTo(x - w * 0.2, y - h * 0.24, x + w * 0.19, y - h * 0.23, x + w * 0.4, y - h * 0.03);
+    ctx.bezierCurveTo(x + w * 0.32, y + h * 0.24, x + w * 0.06, y + h * 0.38, x - w * 0.18, y + h * 0.33);
+    ctx.bezierCurveTo(x - w * 0.34, y + h * 0.29, x - w * 0.43, y + h * 0.12, x - w * 0.4, y - h * 0.05);
+    ctx.closePath();
+    ctx.fillStyle = MOUTH_PALETTE.MOUTH_TEETH;
     ctx.fill();
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(x - w / 2, y + h * 0.08);
-    ctx.lineTo(x + w / 2, y + h * 0.08);
+    traceNarrow();
     ctx.stroke();
     ctx.restore();
     return;
   }
-  ctx.beginPath();
-  ctx.ellipse(x, y, w / 2, h / 2, 0, 0, Math.PI * 2);
-  if (spec.fill === "dark") {
-    ctx.fillStyle = dark;
-    ctx.fill();
-  }
-  ctx.stroke();
-  if (spec.tongue) {
-    ctx.strokeStyle = "#e98b80";
-    ctx.lineWidth = Math.max(1, headRX * 0.055);
+
+  if (spec.drawing === "openBean") {
+    fillAndStroke(traceOpenBean, MOUTH_PALETTE.MOUTH_INTERIOR);
     ctx.beginPath();
-    ctx.arc(x, y + h * 0.2, w * 0.24, Math.PI * 1.08, Math.PI * 1.92);
+    ctx.moveTo(x - w * 0.4, y - h * 0.09);
+    ctx.bezierCurveTo(x - w * 0.24, y - h * 0.29, x + w * 0.1, y - h * 0.36, x + w * 0.36, y - h * 0.24);
+    ctx.bezierCurveTo(x + w * 0.33, y - h * 0.11, x + w * 0.21, y - h * 0.02, x + w * 0.05, y + h * 0.02);
+    ctx.bezierCurveTo(x - w * 0.14, y + h * 0.07, x - w * 0.31, y + h * 0.02, x - w * 0.4, y - h * 0.09);
+    ctx.closePath();
+    ctx.fillStyle = MOUTH_PALETTE.MOUTH_TEETH;
+    ctx.fill();
+    ctx.strokeStyle = MOUTH_PALETTE.MOUTH_OUTLINE;
+    ctx.lineWidth = detailWidth;
+    ctx.stroke();
+    ctx.lineWidth = outlineWidth;
+    traceOpenBean();
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (spec.drawing === "fatCrescent") {
+    fillAndStroke(traceFatCrescent, MOUTH_PALETTE.MOUTH_INTERIOR);
+    ctx.restore();
+    return;
+  }
+
+  if (spec.drawing === "dot") {
+    fillAndStroke(traceDot, MOUTH_PALETTE.MOUTH_INTERIOR);
+    ctx.restore();
+    return;
+  }
+
+  if (spec.drawing === "teethBand") {
+    fillAndStroke(traceTeethBand, MOUTH_PALETTE.MOUTH_TEETH);
+    ctx.lineWidth = detailWidth;
+    for (const tickX of [-0.22, 0.02, 0.25]) {
+      ctx.beginPath();
+      ctx.moveTo(x + w * tickX, y - h * 0.2);
+      ctx.bezierCurveTo(x + w * (tickX - 0.01), y - h * 0.08, x + w * (tickX + 0.01), y + h * 0.04, x + w * tickX, y + h * 0.15);
+      ctx.stroke();
+    }
+    ctx.lineWidth = outlineWidth;
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.4, y + h * 0.48);
+    ctx.bezierCurveTo(x - w * 0.16, y + h * 0.68, x + w * 0.18, y + h * 0.67, x + w * 0.39, y + h * 0.45);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  if (spec.drawing === "tongueOpen") {
+    fillAndStroke(traceTongueOpen, MOUTH_PALETTE.MOUTH_INTERIOR);
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.39, y - h * 0.1);
+    ctx.bezierCurveTo(x - w * 0.22, y - h * 0.3, x + w * 0.11, y - h * 0.35, x + w * 0.35, y - h * 0.23);
+    ctx.bezierCurveTo(x + w * 0.31, y - h * 0.1, x + w * 0.19, y - h * 0.02, x + w * 0.04, y + h * 0.01);
+    ctx.bezierCurveTo(x - w * 0.13, y + h * 0.05, x - w * 0.3, y + h * 0.01, x - w * 0.39, y - h * 0.1);
+    ctx.closePath();
+    ctx.fillStyle = MOUTH_PALETTE.MOUTH_TEETH;
+    ctx.fill();
+    ctx.strokeStyle = MOUTH_PALETTE.MOUTH_OUTLINE;
+    ctx.lineWidth = detailWidth;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.34, y + h * 0.12);
+    ctx.bezierCurveTo(x - w * 0.18, y + h * 0.02, x + w * 0.16, y + h * 0.03, x + w * 0.35, y + h * 0.16);
+    ctx.bezierCurveTo(x + w * 0.3, y + h * 0.38, x + w * 0.05, y + h * 0.49, x - w * 0.2, y + h * 0.4);
+    ctx.bezierCurveTo(x - w * 0.31, y + h * 0.36, x - w * 0.36, y + h * 0.24, x - w * 0.34, y + h * 0.12);
+    ctx.closePath();
+    ctx.fillStyle = MOUTH_PALETTE.MOUTH_TONGUE;
+    ctx.fill();
+    ctx.stroke();
+    ctx.lineWidth = outlineWidth;
+    traceTongueOpen();
     ctx.stroke();
   }
   ctx.restore();
@@ -899,7 +1038,7 @@ export function drawBoardCharacterToCanvas(
   // adopting the crop oval's aspect ratio (headRX/headRY) instead of staying perfectly round.
   const headCX = neckTopX - Math.sin(headTilt) * headRY * 0.35;
   const headCY = neckTopY - Math.cos(headTilt) * headRY;
-  const drawMouth = () => drawCharacterMouth(ctx, p.viseme ?? "rest", characterFace?.mouthAnchor, headCX, headCY, headRX, headRY, headTilt);
+  const drawMouth = () => drawCharacterMouth(ctx, p.viseme ?? "rest", characterFace?.mouthAnchor, headCX, headCY, headRX, headRY, headTilt, lw);
   if (hasFace && characterFace?.image) {
     ctx.save();
     ctx.translate(headCX, headCY);
