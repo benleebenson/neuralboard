@@ -8191,11 +8191,10 @@ export default function Board2Page() {
 
     (async () => {
       try {
-        const url = `https://www.youtube.com/watch?v=${ytSel.id}`;
         const dlRes = await fetch("/api/ytdl", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url, start, end }),
+          body: JSON.stringify({ id: ytSel.id, start, end }),
         });
         if (!dlRes.ok) {
           const err = await dlRes.json().catch(() => ({})) as { error?: string };
@@ -8756,7 +8755,7 @@ export default function Board2Page() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            url: `https://www.youtube.com/watch?v=${acc.videoId}`,
+            id: acc.videoId,
             start: acc.trimStart,
             end: acc.trimEnd,
           }),
@@ -14911,7 +14910,7 @@ export default function Board2Page() {
       const dlRes = await fetch("/api/ytdl", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${clip.youtubeId}`, start: clip.ytStart ?? 0, end: clip.ytEnd ?? 30 }),
+        body: JSON.stringify({ id: clip.youtubeId, start: clip.ytStart ?? 0, end: clip.ytEnd ?? 30 }),
       });
       if (!dlRes.ok) {
         const err = await dlRes.json().catch(() => ({})) as { error?: string };
