@@ -102,8 +102,17 @@ import {
 } from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
 import {
+  easeInOutCubic,
+  interpolateCameraKeyframes as interpolateCameraTrack,
+  type CameraKeyframe,
+} from "@/lib/camera-keyframes";
+import {
+  CHARACTER_FOCUS_MIN_TRANSITION_SECONDS,
+  DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS,
+  DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
   activeCharacterFocusBlock,
   applyCharacterFocusCamera,
+  normalizeCharacterFocusTransitionSeconds,
   type CharacterFocusId,
 } from "@/lib/character-focus-camera";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
@@ -200,14 +209,6 @@ async function transcribeAudioBlob(
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type CameraKeyframe = {
-  time: number;
-  cameraX: number;
-  cameraY: number;
-  boardZoom: number;
-  easing?: 'linear' | 'ease-in-out'; // applied when interpolating TO this keyframe
-};
-
 function streamDebugLog(...args: unknown[]) {
   if (DEBUG_STREAM) console.log("[stream:host]", ...args);
 }
@@ -243,6 +244,8 @@ type Clip = {
   boardH?: number;
   holdFraction?: number;
   focusCharacterId?: CharacterFocusId;
+  focusLeadInSeconds?: number;
+  focusLeadOutSeconds?: number;
   sourceDurationSec?: number; // natural duration of the video blob (for ambient loop modulo)
   thumbnailBlobUrl?: string;  // URL.createObjectURL of the captured first frame (video clips)
   sourceBlob?: Blob;          // the actual image/video Blob backing sourceUrl. Keeping the bytes
@@ -392,7 +395,7 @@ function narrationGestureSourceSignature(clips: readonly Clip[]): string {
   return narrationVisemeSourceSignature(clips);
 }
 
-// ─── "Complete recipe" save schema (schemaVersion 3) ───────────────────────────
+// ─── "Complete recipe" save schema (schemaVersion 4) ───────────────────────────
 // See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
 // the flat manifest the app has always saved: it nests the same data plus lightweight provenance
 // tags and two "resolved" snapshots (camera + character position) baked at save time from the
@@ -1312,10 +1315,6 @@ function getVideoMeta(url: string): Promise<{ duration: number; w: number; h: nu
   });
 }
 
-function easeInOutCubic(t: number): number {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
 function easeInQuad(t: number): number {
   return t * t;
 }
@@ -1328,27 +1327,11 @@ function interpolateCameraKeyframes(
   kfs: CameraKeyframe[],
   time: number
 ): { cameraX: number; cameraY: number; boardZoom: number } {
-  if (kfs.length === 0) return { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
-  const sorted = [...kfs].sort((a, b) => a.time - b.time);
-  if (time <= sorted[0].time) {
-    const { cameraX, cameraY, boardZoom } = sorted[0];
-    return { cameraX, cameraY, boardZoom };
-  }
-  if (time >= sorted[sorted.length - 1].time) {
-    const last = sorted[sorted.length - 1];
-    return { cameraX: last.cameraX, cameraY: last.cameraY, boardZoom: last.boardZoom };
-  }
-  let lo = 0;
-  while (lo < sorted.length - 2 && sorted[lo + 1].time <= time) lo++;
-  const a = sorted[lo];
-  const b = sorted[lo + 1];
-  const rawT = (time - a.time) / (b.time - a.time);
-  const t = b.easing === 'linear' ? rawT : easeInOutCubic(rawT);
-  return {
-    cameraX: lerp(a.cameraX, b.cameraX, t),
-    cameraY: lerp(a.cameraY, b.cameraY, t),
-    boardZoom: lerp(a.boardZoom, b.boardZoom, t),
-  };
+  return interpolateCameraTrack(
+    kfs,
+    time,
+    { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 },
+  );
 }
 
 function magneticSnap(
@@ -6021,11 +6004,10 @@ export default function Board2Page() {
     W: number,
     H: number,
   ) => {
-    const baseCamera = interpolateCameraKeyframes(currentCameraKeyframes, time);
     return applyCharacterFocusCamera({
       time,
       clips: currentClips,
-      baseCamera,
+      baseCameraAt: (sampleTime) => interpolateCameraKeyframes(currentCameraKeyframes, sampleTime),
       canvasW: W,
       canvasH: H,
       boardW: BOARD_W,
@@ -7207,6 +7189,8 @@ export default function Board2Page() {
       duration,
       layer,
       focusCharacterId,
+      focusLeadInSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS,
+      focusLeadOutSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
     };
     setClips((prev) => [...prev, clip]);
     setClipSelection([id]);
@@ -14007,8 +13991,30 @@ export default function Board2Page() {
                       </div>
                     )}
                     {selectedClip.type === "characterFocus" && (
-                      <div style={{ fontFamily: "monospace", fontSize: 10, lineHeight: 1.5, color: "#6a6a6a", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "8px 10px" }}>
-                        Temporarily overrides the normal camera and follows Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"}. Resize the block to set the focus duration.
+                      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                          <label>
+                            <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Lead-in pan (s)</div>
+                            <input
+                              type="number" inputMode="decimal" step={0.05} min={CHARACTER_FOCUS_MIN_TRANSITION_SECONDS}
+                              value={(selectedClip.focusLeadInSeconds ?? DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS).toFixed(2)}
+                              onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= CHARACTER_FOCUS_MIN_TRANSITION_SECONDS) setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, focusLeadInSeconds: v } : c)); }}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 14, padding: "8px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" }}
+                            />
+                          </label>
+                          <label>
+                            <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Lead-out pan (s)</div>
+                            <input
+                              type="number" inputMode="decimal" step={0.05} min={CHARACTER_FOCUS_MIN_TRANSITION_SECONDS}
+                              value={(selectedClip.focusLeadOutSeconds ?? DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS).toFixed(2)}
+                              onChange={(e) => { const v = parseFloat(e.target.value); if (!isNaN(v) && v >= CHARACTER_FOCUS_MIN_TRANSITION_SECONDS) setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, focusLeadOutSeconds: v } : c)); }}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 14, padding: "8px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" }}
+                            />
+                          </label>
+                        </div>
+                        <div style={{ fontFamily: "monospace", fontSize: 10, lineHeight: 1.5, color: "#6a6a6a", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "8px 10px" }}>
+                          Pans to Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"}, holds, then pans toward the next framing. Both pans stay inside this block.
+                        </div>
                       </div>
                     )}
                     {selectedClip.type === "narration" && (
@@ -14322,7 +14328,7 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  // Builds the full "complete recipe" manifest (schemaVersion 3) — the shared core of both
+  // Builds the full "complete recipe" manifest (schemaVersion 4) — the shared core of both
   // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
@@ -14553,7 +14559,7 @@ export default function Board2Page() {
     }));
 
     const manifest = {
-      schemaVersion: 3 as const,
+      schemaVersion: 4 as const,
       meta: {
         id: recipeProjectIdRef.current,
         projectId: recipeProjectIdRef.current,
@@ -14788,9 +14794,25 @@ export default function Board2Page() {
         }
       }
 
-      const migratedClips = loadedClips.map((clip) => isBoardMediaClip(clip)
-        ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: clip.featured !== false }
-        : clip);
+      const migratedClips = loadedClips.map((clip) => {
+        if (isBoardMediaClip(clip)) {
+          return { ...clip, mediaId: clip.mediaId ?? clip.id, featured: clip.featured !== false };
+        }
+        if (clip.type === "characterFocus") {
+          return {
+            ...clip,
+            focusLeadInSeconds: normalizeCharacterFocusTransitionSeconds(
+              clip.focusLeadInSeconds,
+              DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS,
+            ),
+            focusLeadOutSeconds: normalizeCharacterFocusTransitionSeconds(
+              clip.focusLeadOutSeconds,
+              DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
+            ),
+          };
+        }
+        return clip;
+      });
       setClips(migratedClips);
       const loadedLipSyncTrack = isVisemeTrack(manifest.narrationVisemeTrack) ? manifest.narrationVisemeTrack : [];
       const loadedLipSyncSource = typeof manifest.narrationVisemeTrackSource === "string" ? manifest.narrationVisemeTrackSource : null;
@@ -14993,7 +15015,7 @@ export default function Board2Page() {
             <button
               onClick={() => addCharacterFocusClip()}
               style={{ ...sketchButton, background: CHARACTER_FOCUS_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
-              title="Add a resizable timeline block that overrides every other camera move and follows the active character"
+              title="Add a resizable block that pans to the active character, follows them, then pans toward the next framing"
             >
               ◎ Zoom on character
             </button>
@@ -16800,7 +16822,7 @@ export default function Board2Page() {
                 )}
                 {selectedClip.type === "characterFocus" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#4a4a7a", background: CHARACTER_FOCUS_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
-                    Overrides the normal camera and follows Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"} for this block only
+                    Pans to Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"}, follows them, then pans toward the next framing
                   </div>
                 )}
                 {selectedClip.type === "customZoom" && (
@@ -16905,8 +16927,40 @@ export default function Board2Page() {
                   </div>
                 )}
                 {selectedClip.type === "characterFocus" && (
-                  <div style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.5, color: "#5b6842", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "5px 7px" }}>
-                    Full camera override: image transitions, pans, and character movement cannot pull focus away. The normal camera resumes after this block ends.
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                      <label>
+                        <div style={{ ...panelLabelStyle, marginBottom: 4 }}>Lead-in pan (s)</div>
+                        <input
+                          type="number" step={0.05} min={CHARACTER_FOCUS_MIN_TRANSITION_SECONDS}
+                          value={(selectedClip.focusLeadInSeconds ?? DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS).toFixed(2)}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (!isNaN(v) && v >= CHARACTER_FOCUS_MIN_TRANSITION_SECONDS) {
+                              setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, focusLeadInSeconds: v } : c));
+                            }
+                          }}
+                          style={{ width: "100%", fontFamily: "monospace", fontSize: 10, padding: "4px 5px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
+                        />
+                      </label>
+                      <label>
+                        <div style={{ ...panelLabelStyle, marginBottom: 4 }}>Lead-out pan (s)</div>
+                        <input
+                          type="number" step={0.05} min={CHARACTER_FOCUS_MIN_TRANSITION_SECONDS}
+                          value={(selectedClip.focusLeadOutSeconds ?? DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS).toFixed(2)}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            if (!isNaN(v) && v >= CHARACTER_FOCUS_MIN_TRANSITION_SECONDS) {
+                              setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, focusLeadOutSeconds: v } : c));
+                            }
+                          }}
+                          style={{ width: "100%", fontFamily: "monospace", fontSize: 10, padding: "4px 5px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
+                        />
+                      </label>
+                    </div>
+                    <div style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.5, color: "#5b6842", background: "#eef7d4", border: "1px solid rgba(42,42,42,0.2)", padding: "5px 7px" }}>
+                      Lead-in, hold, and lead-out all fit inside this block. The exit heads toward the next framing.
+                    </div>
                   </div>
                 )}
 
@@ -17149,7 +17203,7 @@ export default function Board2Page() {
                     {/* Hold region */}
                     <div style={{ position: "absolute", left: HANDLE_W, top: 0, width: holdW, bottom: 0, background: holdColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
                       {holdW > 30 && (
-                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>{isCharacterFocus ? "camera override" : "hold"}</span>
+                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>{isCharacterFocus ? "focus shot" : "hold"}</span>
                       )}
                     </div>
                     {!isCharacterFocus && (
