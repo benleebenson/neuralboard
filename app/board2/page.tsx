@@ -72,6 +72,15 @@ import {
   type VisemeTrackPoint,
 } from "@/lib/character/lipsync";
 import {
+  GESTURE_NAMES,
+  applyGestureDwellRules,
+  isGestureTrack,
+  speechAwareGestureAt,
+  tagNarrationGestures,
+  type Gesture,
+  type GestureTrackPoint,
+} from "@/lib/character/gestures";
+import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
   TRANSCRIPTION_SAMPLE_RATE,
@@ -379,7 +388,11 @@ function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
   );
 }
 
-// ─── "Complete recipe" save schema (schemaVersion 2) ───────────────────────────
+function narrationGestureSourceSignature(clips: readonly Clip[]): string {
+  return narrationVisemeSourceSignature(clips);
+}
+
+// ─── "Complete recipe" save schema (schemaVersion 3) ───────────────────────────
 // See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
 // the flat manifest the app has always saved: it nests the same data plus lightweight provenance
 // tags and two "resolved" snapshots (camera + character position) baked at save time from the
@@ -1099,7 +1112,6 @@ const CHARACTER_COLOR = "#cdeac0";
 const DEV_MOUTH_TEST = true;
 const VISEME_OPTIONS = Object.keys(VISEME_MOUTH) as Viseme[];
 
-type Gesture = "neutral" | "open" | "pointUp" | "thinking" | "self" | "outward" | "shrug";
 type GestureTestMode = Gesture | "auto";
 
 type GesturePose = {
@@ -1118,8 +1130,8 @@ type GestureTestTransition = {
   startMs: number;
 };
 
-const GESTURE_OPTIONS: Gesture[] = ["neutral", "open", "pointUp", "thinking", "self", "outward", "shrug"];
-const DEFAULT_TALK_GESTURE: Gesture = "open";
+const GESTURE_OPTIONS: Gesture[] = [...GESTURE_NAMES];
+const DEFAULT_TALK_GESTURE: Gesture = "neutral";
 const GESTURE_TRANSITION_SECONDS = 0.25;
 const gestureRadians = (degrees: number) => degrees * Math.PI / 180;
 
@@ -4111,6 +4123,9 @@ export default function Board2Page() {
   const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
   const [narrationVisemeTrack, setNarrationVisemeTrack] = useState<VisemeTrackPoint[]>([]);
   const [narrationVisemeTrackSource, setNarrationVisemeTrackSource] = useState<string | null>(null);
+  const [narrationGestureTrack, setNarrationGestureTrack] = useState<GestureTrackPoint[]>([]);
+  const [narrationGestureTrackSource, setNarrationGestureTrackSource] = useState<string | null>(null);
+  const [smartGestures, setSmartGestures] = useState(false);
   const [lipSyncStatus, setLipSyncStatus] = useState<"idle" | "analyzing">("idle");
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
@@ -4333,6 +4348,9 @@ export default function Board2Page() {
     : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
   const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
   const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
+  const currentNarrationGestureSource = useMemo(() => narrationGestureSourceSignature(clips), [clips]);
+  const narrationGestureTrackIsCurrent = narrationGestureTrack.length > 0 && narrationGestureTrackSource === currentNarrationGestureSource;
+  const narrationSpeechTracksAreCurrent = narrationVisemeTrackIsCurrent && narrationGestureTrackIsCurrent;
   const generatedDuration = Math.max(0, ...clips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
   const timelineDuration = Math.max(10, generatedDuration + 2);
   const timelineWidth = timelineDuration * pxPerSec;
@@ -4446,6 +4464,8 @@ export default function Board2Page() {
   const activeNarrationRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const narrationVisemeTrackRef = useRef<VisemeTrackPoint[]>([]);
   const narrationVisemeTrackSourceRef = useRef<string | null>(null);
+  const narrationGestureTrackRef = useRef<GestureTrackPoint[]>([]);
+  const narrationGestureTrackSourceRef = useRef<string | null>(null);
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
@@ -5166,6 +5186,8 @@ export default function Board2Page() {
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { narrationVisemeTrackRef.current = narrationVisemeTrack; }, [narrationVisemeTrack]);
   useEffect(() => { narrationVisemeTrackSourceRef.current = narrationVisemeTrackSource; }, [narrationVisemeTrackSource]);
+  useEffect(() => { narrationGestureTrackRef.current = narrationGestureTrack; }, [narrationGestureTrack]);
+  useEffect(() => { narrationGestureTrackSourceRef.current = narrationGestureTrackSource; }, [narrationGestureTrackSource]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
@@ -5322,12 +5344,15 @@ export default function Board2Page() {
     // Keep the forced test value first, before any render-mode-specific automatic source is
     // considered. This is the same precedence rule as the mouth test resolver.
     const forced = mode !== "auto" ? GESTURE_POSES[mode] : null;
-    const automatic = GESTURE_POSES[DEFAULT_TALK_GESTURE];
+    const sourceMatches = renderMode === "timeline"
+      && narrationGestureTrackSourceRef.current === narrationGestureSourceSignature(clipsRef.current);
+    const trackedGesture = sourceMatches
+      ? speechAwareGestureAt(time, narrationGestureTrackRef.current)
+      : "neutral";
+    const automatic = GESTURE_POSES[trackedGesture];
     const target = forced ?? automatic;
     const transition = id === "c2" ? characterGestureTransition2Ref.current : characterGestureTransitionRef.current;
-    void time;
     void actions;
-    void renderMode;
     if (!transition) return target;
     const progress = (nowMs - transition.startMs) / (GESTURE_TRANSITION_SECONDS * 1000);
     return progress >= 1 ? target : interpolateGesturePose(transition.from, transition.to, progress);
@@ -6393,7 +6418,11 @@ export default function Board2Page() {
     const now = performance.now();
     const actions = id === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
     const current = resolvedCharacterGesture(id, playheadRef.current, actions, "timeline", now);
-    const target = GESTURE_POSES[mode === "auto" ? DEFAULT_TALK_GESTURE : mode];
+    const sourceMatches = narrationGestureTrackSourceRef.current === narrationGestureSourceSignature(clipsRef.current);
+    const automatic = sourceMatches
+      ? speechAwareGestureAt(playheadRef.current, narrationGestureTrackRef.current)
+      : "neutral";
+    const target = GESTURE_POSES[mode === "auto" ? automatic : mode];
     const transition = { from: current, to: target, startMs: now };
 
     if (id === "c2") {
@@ -7851,6 +7880,7 @@ export default function Board2Page() {
     setToast("Analyzing narration…");
     try {
       const analyzed: Array<{ clipId: string; startTime: number; duration: number; cues: RhubarbCue[] }> = [];
+      const timedTranscript: TranscriptSegment[] = [];
       for (let clipIndex = 0; clipIndex < sourceClips.length; clipIndex++) {
         const clip = sourceClips[clipIndex];
         const decoded = await decodeNarrationClip(clip);
@@ -7879,20 +7909,105 @@ export default function Board2Page() {
           clipCues.push(...offsetRhubarbChunkCues(data.filter(isRhubarbCue), window, analysisDuration));
         }
         analyzed.push({ clipId: clip.id, startTime: clip.startTime, duration: clip.duration, cues: clipCues });
+
+        const storedSegments = (clip.transcriptSegments ?? []).flatMap((segment): TranscriptSegment[] => {
+          const localStart = Math.max(0, segment.start - sourceOffset);
+          const localEnd = Math.min(analysisDuration, segment.end - sourceOffset);
+          const text = segment.text.trim();
+          return localEnd > localStart && text
+            ? [{ start: clip.startTime + localStart, end: clip.startTime + localEnd, text }]
+            : [];
+        });
+        if (storedSegments.length) {
+          timedTranscript.push(...storedSegments);
+        } else {
+          setToast(`Transcribing gestures ${clipIndex + 1}/${sourceClips.length}…`);
+          const speechAudio = audioBufferSegmentToMonoWav(decoded, sourceOffset, analysisDuration);
+          const transcription = await transcribeAudioBlob(speechAudio, `${clip.name || "narration"}-gestures.wav`);
+          const generatedSegments = transcription.segments.flatMap((segment): TranscriptSegment[] => {
+            const start = Math.max(0, segment.start);
+            const end = Math.min(analysisDuration, segment.end);
+            const text = segment.text.trim();
+            return end > start && text
+              ? [{ start: clip.startTime + start, end: clip.startTime + end, text }]
+              : [];
+          });
+          if (generatedSegments.length) timedTranscript.push(...generatedSegments);
+          else if (transcription.transcript.trim()) {
+            timedTranscript.push({
+              start: clip.startTime,
+              end: clip.startTime + analysisDuration,
+              text: transcription.transcript.trim(),
+            });
+          }
+        }
+      }
+
+      const track = mergeNarrationCueTracks(analyzed);
+      if (!track.length) throw new Error("No speech mouth cues were detected");
+      const transcript = timedTranscript
+        .sort((a, b) => a.start - b.start || a.end - b.end)
+        .map((segment) => segment.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!transcript) throw new Error("No transcript was available for gesture generation");
+      const transcriptStart = sourceClips[0].startTime;
+      const transcriptEnd = Math.max(...sourceClips.map((clip) => clip.startTime + clip.duration));
+      const ruleBasedTrack = tagNarrationGestures({
+        transcript,
+        // Whisper word timings are currently discarded; the tagger intentionally derives
+        // sentence-level timing from the newly generated viseme speech regions instead.
+        wordTimings: [],
+        visemeTrack: track,
+        transcriptStart,
+        transcriptEnd,
+      });
+      let gestureTrack = ruleBasedTrack;
+      let smartGestureFallback = false;
+      if (smartGestures) {
+        setToast("Planning smart gestures…");
+        try {
+          const response = await fetch("/api/board2/gesture-track", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ transcript, segments: timedTranscript, transcriptStart, transcriptEnd }),
+          });
+          const data: unknown = await response.json().catch(() => null);
+          const candidate = data && typeof data === "object" && "track" in data
+            ? (data as { track?: unknown }).track
+            : null;
+          if (!response.ok || !isGestureTrack(candidate)) {
+            const message = data && typeof data === "object" && "error" in data
+              ? String((data as { error?: unknown }).error)
+              : "Smart gestures returned an invalid track";
+            throw new Error(message);
+          }
+          gestureTrack = applyGestureDwellRules(candidate, transcriptStart, transcriptEnd);
+        } catch (error) {
+          console.warn("[board2:gestures] Smart gesture generation failed; using rules", error);
+          smartGestureFallback = true;
+          gestureTrack = ruleBasedTrack;
+        }
       }
 
       if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
         throw new Error("Narration changed during analysis. Generate lip sync again.");
       }
-      const track = mergeNarrationCueTracks(analyzed);
-      if (!track.length) throw new Error("No speech mouth cues were detected");
       setNarrationVisemeTrack(track);
       setNarrationVisemeTrackSource(sourceSignature);
       narrationVisemeTrackRef.current = track;
       narrationVisemeTrackSourceRef.current = sourceSignature;
+      setNarrationGestureTrack(gestureTrack);
+      setNarrationGestureTrackSource(sourceSignature);
+      narrationGestureTrackRef.current = gestureTrack;
+      narrationGestureTrackSourceRef.current = sourceSignature;
       drawFrameRef.current(playheadRef.current);
       const cueCount = analyzed.reduce((sum, item) => sum + item.cues.length, 0);
-      setToast(`Lip sync ready · ${cueCount} cue${cueCount === 1 ? "" : "s"}`);
+      const gestureCount = gestureTrack.filter((point) => point.gesture !== "neutral").length;
+      setToast(smartGestureFallback
+        ? `Smart gestures failed · using rule-based track (${gestureCount} gestures)`
+        : `Lip sync + gestures ready · ${cueCount} mouth cue${cueCount === 1 ? "" : "s"} · ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}`);
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Could not generate lip sync");
     } finally {
@@ -14207,7 +14322,7 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  // Builds the full "complete recipe" manifest (schemaVersion 2) — the shared core of both
+  // Builds the full "complete recipe" manifest (schemaVersion 3) — the shared core of both
   // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
@@ -14335,6 +14450,10 @@ export default function Board2Page() {
     const savedLipSyncTrack = narrationVisemeTrackSourceRef.current === currentLipSyncSource
       ? narrationVisemeTrackRef.current
       : [];
+    const currentGestureSource = narrationGestureSourceSignature(clipsRef.current);
+    const savedGestureTrack = narrationGestureTrackSourceRef.current === currentGestureSource
+      ? narrationGestureTrackRef.current
+      : [];
 
     const totalDurationSec = Math.max(0, ...clipsRef.current.map((c) => c.startTime + c.duration), 0);
     const cameraMode: "clips" | "character" | "follow" = clipsRef.current.some((c) => c.type === "characterFocus")
@@ -14434,7 +14553,7 @@ export default function Board2Page() {
     }));
 
     const manifest = {
-      schemaVersion: 2 as const,
+      schemaVersion: 3 as const,
       meta: {
         id: recipeProjectIdRef.current,
         projectId: recipeProjectIdRef.current,
@@ -14465,6 +14584,9 @@ export default function Board2Page() {
         clipIds: manifestClips.filter((clip) => clip.type === "narration").map((clip) => clip.id),
         visemeTrack: savedLipSyncTrack,
         visemeTrackFingerprint: savedLipSyncTrack.length ? currentLipSyncSource : null,
+        gestureTrack: savedGestureTrack,
+        gestureTrackFingerprint: savedGestureTrack.length ? currentGestureSource : null,
+        smartGestures,
       },
       camera: {
         mode: cameraMode,
@@ -14613,6 +14735,9 @@ export default function Board2Page() {
         characters: [rawManifest.characters?.c1, rawManifest.characters?.c2].filter(Boolean),
         narrationVisemeTrack: rawManifest.narration?.visemeTrack ?? [],
         narrationVisemeTrackSource: rawManifest.narration?.visemeTrackFingerprint ?? null,
+        narrationGestureTrack: rawManifest.narration?.gestureTrack ?? [],
+        narrationGestureTrackSource: rawManifest.narration?.gestureTrackFingerprint ?? null,
+        smartGestures: rawManifest.narration?.smartGestures === true,
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
       } : rawManifest;
       if (schemaVersion >= 1) {
@@ -14673,6 +14798,13 @@ export default function Board2Page() {
       setNarrationVisemeTrackSource(loadedLipSyncSource);
       narrationVisemeTrackRef.current = loadedLipSyncTrack;
       narrationVisemeTrackSourceRef.current = loadedLipSyncSource;
+      const loadedGestureTrack = isGestureTrack(manifest.narrationGestureTrack) ? manifest.narrationGestureTrack : [];
+      const loadedGestureSource = typeof manifest.narrationGestureTrackSource === "string" ? manifest.narrationGestureTrackSource : null;
+      setNarrationGestureTrack(loadedGestureTrack);
+      setNarrationGestureTrackSource(loadedGestureSource);
+      narrationGestureTrackRef.current = loadedGestureTrack;
+      narrationGestureTrackSourceRef.current = loadedGestureSource;
+      setSmartGestures(manifest.smartGestures === true);
       const hadLegacyGeneratedCameraMode = manifest.cameraKeyframeMode === "character" || manifest.cameraKeyframeMode === "follow";
       const loadedCameraKeyframes = hadLegacyGeneratedCameraMode ? [] : manifest.cameraKeyframes ?? [];
       setCameraKeyframes(loadedCameraKeyframes);
@@ -16401,16 +16533,25 @@ export default function Board2Page() {
                         </div>
                       </ProGated>
                       )}
-                      <div style={{ display: "flex", flexDirection: "column", gap: 4, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: narrationVisemeTrackIsCurrent ? "#f0ffe0" : "transparent" }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: narrationSpeechTracksAreCurrent ? "#f0ffe0" : "transparent" }}>
                         <button
                           type="button"
                           onClick={() => void generateNarrationLipSync()}
                           disabled={lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration")}
-                          style={{ ...miniButton, background: narrationVisemeTrackIsCurrent ? "#c8f135" : "transparent", opacity: lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
+                          style={{ ...miniButton, background: narrationSpeechTracksAreCurrent ? "#c8f135" : "transparent", opacity: lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
                         >
-                          {lipSyncStatus === "analyzing" ? "Analyzing narration…" : narrationVisemeTrackIsCurrent ? "✓ Lip sync generated" : narrationVisemeTrack.length ? "Regenerate lip sync" : "Generate lip sync"}
+                          {lipSyncStatus === "analyzing" ? "Analyzing narration…" : narrationSpeechTracksAreCurrent ? "✓ Lip sync + gestures generated" : narrationVisemeTrack.length || narrationGestureTrack.length ? "Regenerate lip sync + gestures" : "Generate lip sync + gestures"}
                         </button>
-                        {narrationVisemeTrack.length > 0 && !narrationVisemeTrackIsCurrent && (
+                        <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "monospace", fontSize: 10, cursor: lipSyncStatus === "analyzing" ? "default" : "pointer" }}>
+                          <input
+                            type="checkbox"
+                            checked={smartGestures}
+                            disabled={lipSyncStatus === "analyzing"}
+                            onChange={(event) => setSmartGestures(event.target.checked)}
+                          />
+                          Smart gestures (AI)
+                        </label>
+                        {(narrationVisemeTrack.length > 0 || narrationGestureTrack.length > 0) && !narrationSpeechTracksAreCurrent && (
                           <span style={{ fontFamily: "monospace", fontSize: 9, color: "#a14d00" }}>Narration changed · regenerate before preview/export</span>
                         )}
                       </div>
