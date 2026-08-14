@@ -1095,7 +1095,7 @@ const EDITOR_PLAYBACK_FPS = 30;
 const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
 const CHARACTER_COLOR = "#cdeac0";
-const DEV_MOUTH_TEST = process.env.NODE_ENV !== "production";
+const DEV_MOUTH_TEST = true;
 const VISEME_OPTIONS = Object.keys(VISEME_MOUTH) as Viseme[];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
