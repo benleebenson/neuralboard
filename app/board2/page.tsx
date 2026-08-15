@@ -115,6 +115,12 @@ import {
   normalizeCharacterFocusTransitionSeconds,
   type CharacterFocusId,
 } from "@/lib/character-focus-camera";
+import {
+  layoutOrganicTopicClusters,
+  organicBoardSizeForImageCount,
+  stableOrganicLayoutSeed,
+} from "@/lib/board2/organic-topic-layout";
+import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
@@ -251,6 +257,7 @@ type Clip = {
   sourceBlob?: Blob;          // the actual image/video Blob backing sourceUrl. Keeping the bytes
                                // makes project saves independent of temporary/revoked object URLs;
                                // videos are cloned per-instance to avoid shared decoder limits.
+  previewUrl?: string;        // low-resolution editor-only image; originals remain in sourceBlob/sourceUrl
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
@@ -275,6 +282,11 @@ type Clip = {
   searchQuery?: string;
   imagePlanReason?: string;
   imagePlanModel?: string;
+  autoTopicId?: string;
+  autoTopicTitle?: string;
+  autoTopicStartTime?: number;
+  autoTopicEndTime?: number;
+  autoLayoutSeed?: number;
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -286,7 +298,16 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
-type AutoNarrationImageSegment = TranscriptSegment & { query: string; reason?: string; planModel?: string };
+type AutoNarrationImageSegment = TranscriptSegment & {
+  query: string;
+  reason?: string;
+  planModel?: string;
+  topicId?: string;
+  topicTitle?: string;
+  topicStartTime?: number;
+  topicEndTime?: number;
+  topicIndex?: number;
+};
 type BrowserFoundImage = {
   dataUrl: string;
   sourceUrl: string;
@@ -329,8 +350,8 @@ function buildAutoNarrationSegments(
   secondsPerImage: number,
 ): AutoNarrationImageSegment[] {
   const safeDuration = Math.max(0.1, durationSec);
-  const requestedCount = Math.max(1, Math.ceil(safeDuration / secondsPerImage));
-  const count = Math.min(24, requestedCount);
+  const requestedCount = Math.max(1, Math.round(safeDuration / secondsPerImage));
+  const count = Math.min(1000, requestedCount);
   const windowDuration = safeDuration / count;
   const cleanSegments = transcriptSegments
     .filter((segment) => segment.end > segment.start && segment.text.trim())
@@ -357,7 +378,17 @@ function buildAutoNarrationSegments(
       return distance < bestDistance ? segment : best;
     }, null);
     const text = chunks.join(" ").trim() || nearest?.text.trim() || "narration scene";
-    return { start, end, text, query: deriveAutoImageQuery(text, index) };
+    return {
+      start,
+      end,
+      text,
+      query: deriveAutoImageQuery(text, index),
+      topicId: "topic-0",
+      topicTitle: "Narration Overview",
+      topicStartTime: 0,
+      topicEndTime: safeDuration,
+      topicIndex: 0,
+    };
   });
 }
 
@@ -368,6 +399,29 @@ function dataUrlToBlob(dataUrl: string): Blob {
   const output = new Uint8Array(bytes.length);
   for (let index = 0; index < bytes.length; index++) output[index] = bytes.charCodeAt(index);
   return new Blob([output], { type: match[1] });
+}
+
+async function createImagePreviewBlob(source: Blob, maxLongEdge = 640): Promise<Blob> {
+  const bitmap = await createImageBitmap(source);
+  try {
+    const scale = Math.min(1, maxLongEdge / Math.max(bitmap.width, bitmap.height));
+    if (scale >= 1) return source;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) return source;
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return await new Promise<Blob>((resolve) => canvas.toBlob(
+      (blob) => resolve(blob ?? source),
+      "image/webp",
+      0.78,
+    ));
+  } finally {
+    bitmap.close();
+  }
 }
 
 function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
@@ -732,6 +786,7 @@ type Annotation = {
   boardH: number;
   color: string;
   text?: string;
+  textAlign?: "left" | "center" | "right";
   fontFamily?: string;
   fontSize?: number;
   fontWeight?: "normal" | "bold";
@@ -744,6 +799,8 @@ type Annotation = {
   points?: Array<{ x: number; y: number }>;  // pen
   emoji?: string;                              // emoji
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
+  autoTopicId?: string;
+  autoLayoutSeed?: number;
 };
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
@@ -1108,6 +1165,8 @@ const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
 const PREVIEW_RENDER_LONG_EDGE_PX = 960;
 const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
+const PREVIEW_IMAGE_CACHE_LIMIT = 72;
+const EXPORT_IMAGE_CACHE_LIMIT = 16;
 const EDITOR_PLAYBACK_FPS = 30;
 const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
@@ -1600,7 +1659,13 @@ function drawAnnotationsToCanvas(
       ctx.font = `${ann.fontWeight ?? "normal"} ${fs}px '${ann.fontFamily ?? "Caveat"}', cursive`;
       ctx.fillStyle = ann.color;
       ctx.textBaseline = "top";
-      ctx.fillText(ann.text, toSX(ann.boardX), toSY(ann.boardY));
+      ctx.textAlign = ann.textAlign ?? "left";
+      const textX = ann.textAlign === "center"
+        ? ann.boardX + ann.boardW / 2
+        : ann.textAlign === "right"
+          ? ann.boardX + ann.boardW
+          : ann.boardX;
+      ctx.fillText(ann.text, toSX(textX), toSY(ann.boardY));
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
       const ax = toSX(ann.arrowStartX), ay = toSY(ann.arrowStartY!);
@@ -1999,10 +2064,11 @@ function resolveStandingSlot(
 function cameraViewport(
   cam: { cameraX: number; cameraY: number; boardZoom: number },
   outputW: number,
-  outputH: number
+  outputH: number,
+  boardWidth = BOARD_W,
 ): CameraViewport {
-  const visibleW = BOARD_W / Math.max(0.05, cam.boardZoom);
-  const visibleH = outputH * BOARD_W / (Math.max(0.05, cam.boardZoom) * outputW);
+  const visibleW = boardWidth / Math.max(0.05, cam.boardZoom);
+  const visibleH = outputH * boardWidth / (Math.max(0.05, cam.boardZoom) * outputW);
   return {
     left: cam.cameraX - visibleW / 2,
     right: cam.cameraX + visibleW / 2,
@@ -4116,6 +4182,8 @@ export default function Board2Page() {
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
+  const [boardDimensions, setBoardDimensions] = useState({ width: BOARD_W, height: BOARD_H });
+  const [boardViewportSize, setBoardViewportSize] = useState({ width: VIEWPORT_W, height: VIEWPORT_H });
   const [toast, setToast] = useState<string | null>(null);
   const [cameraKeyframes, setCameraKeyframes] = useState<CameraKeyframe[]>([]);
   const [isSpaceDown, setIsSpaceDown] = useState(false);
@@ -4345,6 +4413,22 @@ export default function Board2Page() {
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
   const canGenerateCamera = clips.some((clip) => isFeaturedTimelineClip(clip) && (clip.boardX !== undefined || clip.type === "pan"));
+  const visibleBoardClips = useMemo(() => {
+    const zoom = Math.max(0.001, boardZoom);
+    const viewportLeft = -boardPan.x / zoom;
+    const viewportTop = -boardPan.y / zoom;
+    const viewportWidth = boardViewportSize.width / zoom;
+    const viewportHeight = boardViewportSize.height / zoom;
+    const paddingX = Math.max(260, viewportWidth * 0.35);
+    const paddingY = Math.max(220, viewportHeight * 0.35);
+    return clips.filter((clip) => {
+      if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
+      return clip.boardX + clip.boardW >= viewportLeft - paddingX &&
+        clip.boardX <= viewportLeft + viewportWidth + paddingX &&
+        clip.boardY + clip.boardH >= viewportTop - paddingY &&
+        clip.boardY <= viewportTop + viewportHeight + paddingY;
+    });
+  }, [clips, boardPan, boardZoom, boardViewportSize]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -4366,6 +4450,7 @@ export default function Board2Page() {
   const canvasHRef = useRef(canvasH);
   const boardZoomRef = useRef(0.18);
   const boardPanRef = useRef({ x: 20, y: 20 });
+  const boardDimensionsRef = useRef({ width: BOARD_W, height: BOARD_H });
   const isSpaceDownRef = useRef(false);
   const lastRafTimeRef = useRef<number | null>(null);
   const lastEditorFrameTimeRef = useRef(0);
@@ -4374,6 +4459,8 @@ export default function Board2Page() {
   const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
@@ -4730,7 +4817,7 @@ export default function Board2Page() {
     return {
       cameraX: p.boardX,
       cameraY: p.boardY - (wide ? 40 : 80),
-      boardZoom: clamp(canvasHRef.current * BOARD_W / (canvasWRef.current * targetHeight), wide ? 0.25 : 0.35, wide ? 1.8 : 2.4),
+      boardZoom: clamp(canvasHRef.current * boardDimensionsRef.current.width / (canvasWRef.current * targetHeight), wide ? 0.25 : 0.35, wide ? 1.8 : 2.4),
     };
   }, []);
 
@@ -4749,7 +4836,7 @@ export default function Board2Page() {
       camera: {
         cameraX: surface.boardX! + surface.boardW! / 2,
         cameraY: surface.boardY! + surface.boardH! / 2,
-        boardZoom: clamp(sf * BOARD_W / canvasWRef.current, 0.25, 5),
+        boardZoom: clamp(sf * boardDimensionsRef.current.width / canvasWRef.current, 0.25, 5),
       },
     };
   }, [liveCharacterCameraTarget]);
@@ -5184,6 +5271,7 @@ export default function Board2Page() {
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  useEffect(() => { boardDimensionsRef.current = boardDimensions; }, [boardDimensions]);
   useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
@@ -5803,14 +5891,27 @@ export default function Board2Page() {
 
   // Fit board to container on mount
   useEffect(() => {
+    const container = boardContainerRef.current;
+    if (!container) return;
+    const update = () => {
+      const rect = container.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) setBoardViewportSize({ width: rect.width, height: rect.height });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [isMobile]);
+
+  useEffect(() => {
     const timeout = setTimeout(() => {
       const container = boardContainerRef.current;
       if (!container) return;
       const { width, height } = container.getBoundingClientRect();
       if (width === 0 || height === 0) return;
-      const zoom = Math.min((width - 60) / BOARD_W, (height - 60) / BOARD_H);
-      const panX = (width - BOARD_W * zoom) / 2;
-      const panY = (height - BOARD_H * zoom) / 2;
+      const zoom = Math.min((width - 60) / boardDimensionsRef.current.width, (height - 60) / boardDimensionsRef.current.height);
+      const panX = (width - boardDimensionsRef.current.width * zoom) / 2;
+      const panY = (height - boardDimensionsRef.current.height * zoom) / 2;
       setBoardZoom(zoom);
       setBoardPan({ x: panX, y: panY });
     }, 30);
@@ -6010,7 +6111,7 @@ export default function Board2Page() {
       baseCameraAt: (sampleTime) => interpolateCameraKeyframes(currentCameraKeyframes, sampleTime),
       canvasW: W,
       canvasH: H,
-      boardW: BOARD_W,
+      boardW: boardDimensionsRef.current.width,
       positionAt: (characterId, sampleTime) => {
         const useC2 = characterId === "c2";
         const enabled = useC2 ? showCharacter2Ref.current : showCharacterRef.current;
@@ -6042,12 +6143,13 @@ export default function Board2Page() {
     H: number,
     currentAnnotations: Annotation[],
     overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null,
-    liveWallMs?: number
+    liveWallMs?: number,
+    quality: "preview" | "export" = "preview",
   ) => {
     ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
-    const sf = cam.boardZoom * W / BOARD_W;
+    const sf = cam.boardZoom * W / boardDimensionsRef.current.width;
     const liveMode = liveControlEnabledRef.current;
     const authoredBazooka = !liveMode && !playModeRef.current
       ? authoredBazookaTimeline(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current], currentClips, streamCratersRef.current)
@@ -6063,9 +6165,18 @@ export default function Board2Page() {
       const sx = (bx + bw / 2 - cam.cameraX) * sf + W / 2;
       const sy = (by + bh / 2 - cam.cameraY) * sf + H / 2;
       const sw = bw * sf, sh = bh * sf;
+      const cullMarginX = W * 0.35;
+      const cullMarginY = H * 0.35;
+      if (sx + sw / 2 < -cullMarginX || sx - sw / 2 > W + cullMarginX || sy + sh / 2 < -cullMarginY || sy - sh / 2 > H + cullMarginY) {
+        continue;
+      }
       ctx.globalAlpha = 1;
       if (clip.type === "image") {
-        const img = imgCacheRef.current.get(clip.sourceUrl);
+        const renderUrl = clip.previewUrl ?? clip.sourceUrl;
+        const img = quality === "export"
+          ? exportImgCacheRef.current.get(clip.sourceUrl) ?? imgCacheRef.current.get(renderUrl)
+          : imgCacheRef.current.get(renderUrl);
+        if (!img && quality === "preview") loadMedia(renderUrl, "image");
         if (img?.complete && img.naturalWidth > 0) {
           drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,renderCraters.filter(crater=>crater.clipId===clip.id));
         }
@@ -6288,7 +6399,7 @@ export default function Board2Page() {
     ctx.imageSmoothingQuality = "high";
     const W = canvas.width;
     const H = canvas.height;
-    const sf = W / BOARD_W;
+    const sf = W / boardDimensionsRef.current.width;
     const cam = { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
     const currentClips = clipsRef.current;
     const authoredBazooka = authoredBazookaTimeline(
@@ -6369,10 +6480,12 @@ export default function Board2Page() {
     const shake = bazookaShake(authoredBazooka.events, time * 1000);
     for (const clip of currentClips) {
       if (clip.type !== "image" || clip.boardX === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
-      const image = imgCacheRef.current.get(clip.sourceUrl);
-      for (const refs of [boardImageCanvasRefs.current, mobileBoardImageCanvasRefs.current]) {
-        const canvas = refs.get(clip.id);
-        if (!canvas) continue;
+      const renderUrl = clip.previewUrl ?? clip.sourceUrl;
+      const canvases = [boardImageCanvasRefs.current.get(clip.id), mobileBoardImageCanvasRefs.current.get(clip.id)].filter(Boolean) as HTMLCanvasElement[];
+      if (!canvases.length) continue;
+      const image = imgCacheRef.current.get(renderUrl);
+      if (!image) loadMedia(renderUrl, "image");
+      for (const canvas of canvases) {
         const ctx = canvas.getContext("2d");
         if (!ctx) continue;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -6582,7 +6695,7 @@ export default function Board2Page() {
     if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) {
       return { candidate: false, distance: Number.POSITIVE_INFINITY, reason: "no-board-rect" };
     }
-    const vp = cameraViewport(cam, W, H);
+    const vp = cameraViewport(cam, W, H, boardDimensionsRef.current.width);
     const mx = vp.width * AMBIENT_VIEWPORT_EXPAND;
     const my = vp.height * AMBIENT_VIEWPORT_EXPAND;
     const left = vp.left - mx;
@@ -6859,9 +6972,46 @@ export default function Board2Page() {
         };
         img.src = url;
         imgCacheRef.current.set(url, img);
+        while (imgCacheRef.current.size > PREVIEW_IMAGE_CACHE_LIMIT) {
+          const oldestUrl = imgCacheRef.current.keys().next().value as string | undefined;
+          if (!oldestUrl || oldestUrl === url) break;
+          const oldest = imgCacheRef.current.get(oldestUrl);
+          if (oldest) oldest.src = "";
+          imgCacheRef.current.delete(oldestUrl);
+        }
       }
     }
     // Video: per-clip elements are created by createVideoElement instead
+  }
+
+  function ensureExportImage(clip: Clip): Promise<void> {
+    if (clip.type !== "image" || !clip.sourceUrl) return Promise.resolve();
+    const cached = exportImgCacheRef.current.get(clip.sourceUrl);
+    if (cached?.complete && cached.naturalWidth > 0) {
+      exportImgCacheRef.current.delete(clip.sourceUrl);
+      exportImgCacheRef.current.set(clip.sourceUrl, cached);
+      return Promise.resolve();
+    }
+    const pending = exportImgLoadRef.current.get(clip.sourceUrl);
+    if (pending) return pending;
+    const promise = new Promise<void>((resolve) => {
+      const image = new Image();
+      image.onload = () => {
+        exportImgCacheRef.current.set(clip.sourceUrl, image);
+        while (exportImgCacheRef.current.size > EXPORT_IMAGE_CACHE_LIMIT) {
+          const oldestUrl = exportImgCacheRef.current.keys().next().value as string | undefined;
+          if (!oldestUrl || oldestUrl === clip.sourceUrl) break;
+          const oldest = exportImgCacheRef.current.get(oldestUrl);
+          if (oldest) oldest.src = "";
+          exportImgCacheRef.current.delete(oldestUrl);
+        }
+        resolve();
+      };
+      image.onerror = () => resolve();
+      image.src = clip.sourceUrl;
+    }).finally(() => exportImgLoadRef.current.delete(clip.sourceUrl));
+    exportImgLoadRef.current.set(clip.sourceUrl, promise);
+    return promise;
   }
 
   async function captureVideoThumbnail(clipId: string, srcUrl: string): Promise<void> {
@@ -7643,7 +7793,7 @@ export default function Board2Page() {
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
       const keywordFallbackSegments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
       let segments = keywordFallbackSegments;
-      setAutoBuildPhase("Planning visuals…");
+      setAutoBuildPhase(`Planning images (0/${keywordFallbackSegments.length})…`);
       try {
         const planResponse = await fetch("/api/board2/plan-images", {
           method: "POST",
@@ -7658,14 +7808,24 @@ export default function Board2Page() {
         const planData = await planResponse.json().catch(() => null) as {
           error?: string;
           model?: string;
+          targetCount?: number;
+          chunkCount?: number;
+          plannerCallCount?: number;
           plan?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
+          topics?: Array<{
+            topicTitle?: unknown;
+            startTime?: unknown;
+            endTime?: unknown;
+            images?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
+          }>;
         } | null;
         if (!planResponse.ok) {
           throw new Error(planData?.error || `Editorial planner failed (${planResponse.status})`);
         }
+        setAutoBuildPhase(`Planning images (${Number(planData?.targetCount) || keywordFallbackSegments.length}/${Number(planData?.targetCount) || keywordFallbackSegments.length})…`);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
-        const editorialPlan = Array.isArray(planData?.plan)
-          ? planData.plan.flatMap((item) => {
+        const parsePlanImages = (items: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }> | undefined) => Array.isArray(items)
+          ? items.flatMap((item) => {
               const query = typeof item.query === "string" ? item.query.trim() : "";
               const startTime = Number(item.startTime);
               const reason = typeof item.reason === "string" ? item.reason.trim() : "";
@@ -7674,6 +7834,36 @@ export default function Board2Page() {
                 : [];
             }).sort((a, b) => a.startTime - b.startTime)
           : [];
+        const rawTopics = Array.isArray(planData?.topics) ? planData.topics : [];
+        const parsedTopics = rawTopics.flatMap((topic, topicIndex) => {
+          const topicTitle = typeof topic.topicTitle === "string" ? topic.topicTitle.replace(/\s+/g, " ").trim() : "";
+          const topicStartTime = Number(topic.startTime);
+          const topicEndTime = Number(topic.endTime);
+          const images = parsePlanImages(topic.images);
+          return topicTitle && Number.isFinite(topicStartTime) && Number.isFinite(topicEndTime) && topicEndTime > topicStartTime && images.length
+            ? [{
+                topicId: `topic-${topicIndex}`,
+                topicTitle,
+                topicStartTime: clamp(topicStartTime, 0, transcriptionDuration),
+                topicEndTime: clamp(topicEndTime, 0, transcriptionDuration),
+                topicIndex,
+                images,
+              }]
+            : [];
+        });
+        const topicGroupingValid = rawTopics.length > 0 && parsedTopics.length === rawTopics.length;
+        const implicitImages = parsePlanImages(planData?.plan);
+        const editorialPlan = topicGroupingValid
+          ? parsedTopics.flatMap((topic) => topic.images.map((image) => ({ ...image, ...topic })))
+              .sort((a, b) => a.startTime - b.startTime)
+          : implicitImages.map((image) => ({
+              ...image,
+              topicId: "topic-0",
+              topicTitle: "Narration Overview",
+              topicStartTime: 0,
+              topicEndTime: transcriptionDuration,
+              topicIndex: 0,
+            }));
         if (!editorialPlan.length) throw new Error("Editorial planner returned no usable images");
         segments = editorialPlan.map((item, index) => {
           const end = editorialPlan[index + 1]?.startTime ?? transcriptionDuration;
@@ -7684,6 +7874,11 @@ export default function Board2Page() {
             query: item.query,
             reason: item.reason,
             planModel,
+            topicId: item.topicId,
+            topicTitle: item.topicTitle,
+            topicStartTime: item.topicStartTime,
+            topicEndTime: item.topicEndTime,
+            topicIndex: item.topicIndex,
           };
         });
       } catch (plannerError) {
@@ -7693,7 +7888,12 @@ export default function Board2Page() {
         setAutoBuildPhase("Using keyword fallback…");
       }
 
-      const found: Array<{ segment: AutoNarrationImageSegment; image: BrowserFoundImage }> = [];
+      const found: Array<{
+        segment: AutoNarrationImageSegment;
+        image: Omit<BrowserFoundImage, "dataUrl">;
+        sourceBlob: Blob;
+        previewBlob: Blob;
+      }> = [];
       const skipped: Array<{ index: number; query: string; reason: string }> = [];
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
@@ -7717,7 +7917,15 @@ export default function Board2Page() {
             (candidate.source === "google" || candidate.source === "bing" || candidate.source === "openverse")
           );
           if (!image) throw new Error("No source returned a usable image");
-          found.push({ segment, image });
+          const sourceBlob = dataUrlToBlob(image.dataUrl);
+          const previewBlob = await createImagePreviewBlob(sourceBlob);
+          const imageMetadata = {
+            sourceUrl: image.sourceUrl,
+            width: image.width,
+            height: image.height,
+            source: image.source,
+          };
+          found.push({ segment, image: imageMetadata, sourceBlob, previewBlob });
         } catch (error) {
           const reason = error instanceof Error ? error.message : "Image search failed";
           skipped.push({ index, query: segment.query, reason });
@@ -7726,37 +7934,85 @@ export default function Board2Page() {
       }
 
       setAutoBuildPhase("Placing…");
-      const mediaItems = found.map(({ segment, image }, index) => {
-        const blob = dataUrlToBlob(image.dataUrl);
-        const url = URL.createObjectURL(blob);
+      const mediaItems = found.map(({ segment, image, sourceBlob, previewBlob }, index) => {
+        const url = URL.createObjectURL(sourceBlob);
+        const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
         createdBlobUrls.push(url);
-        loadMedia(url, "image");
+        if (previewUrl !== url) createdBlobUrls.push(previewUrl);
         return {
           item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url },
           segment,
           image,
+          sourceBlob,
+          previewUrl,
           index,
         };
       });
       setMediaLibrary((prev) => [...prev, ...mediaItems.map(({ item }) => item)]);
 
-      const count = mediaItems.length;
-      const columns = Math.min(5, Math.max(1, Math.ceil(Math.sqrt(count * 4 / 3))));
-      const rows = Math.max(1, Math.ceil(count / columns));
-      const marginX = 180;
-      const marginY = 180;
-      const gap = 90;
-      const cellW = (BOARD_W - marginX * 2 - gap * (columns - 1)) / columns;
-      const cellH = (BOARD_H - marginY * 2 - gap * (rows - 1)) / rows;
+      const layoutSeed = stableOrganicLayoutSeed(JSON.stringify({
+        transcript,
+        topics: segments.map((segment) => [segment.topicTitle, segment.query, segment.start]),
+      }));
+      const topicDefinitions = Array.from(new Map(
+        segments.map((segment) => [segment.topicId ?? "topic-0", {
+          id: segment.topicId ?? "topic-0",
+          title: segment.topicTitle ?? "Narration Overview",
+          startTime: segment.topicStartTime ?? 0,
+          endTime: segment.topicEndTime ?? transcriptionDuration,
+          topicIndex: segment.topicIndex ?? 0,
+        }]),
+      ).values()).sort((a, b) => a.topicIndex - b.topicIndex);
+      const requestedBoardSize = organicBoardSizeForImageCount(mediaItems.length, BOARD_W, BOARD_H);
+      const layoutBoardDimensions = {
+        width: Math.max(boardDimensionsRef.current.width, requestedBoardSize.width),
+        height: Math.max(boardDimensionsRef.current.height, requestedBoardSize.height),
+      };
+      boardDimensionsRef.current = layoutBoardDimensions;
+      setBoardDimensions(layoutBoardDimensions);
+      const placedTopics = layoutOrganicTopicClusters({
+        boardWidth: layoutBoardDimensions.width,
+        boardHeight: layoutBoardDimensions.height,
+        seed: layoutSeed,
+        occupied: clipsRef.current.flatMap((clip) =>
+          clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
+            ? [{ x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH }]
+            : []),
+        topics: topicDefinitions.map((topic) => ({
+          ...topic,
+          images: mediaItems
+            .filter(({ segment }) => (segment.topicId ?? "topic-0") === topic.id)
+            .map(({ item, segment, image }) => ({
+              id: item.id,
+              width: image.width,
+              height: image.height,
+              startTime: segment.start,
+            })),
+        })),
+      });
+      const placementByMediaId = new Map(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image])));
+      const autoTopicAnnotations: Annotation[] = placedTopics.map((topic) => ({
+        id: generateId(),
+        type: "text",
+        boardX: topic.label.x,
+        boardY: topic.label.y,
+        boardW: topic.label.width,
+        boardH: topic.label.height,
+        color: "#2a2a2a",
+        text: topic.title,
+        textAlign: "center",
+        fontFamily: "Caveat",
+        fontSize: Math.round(topic.label.height * 0.72),
+        fontWeight: "bold",
+        source: "auto",
+        autoTopicId: topic.id,
+        autoLayoutSeed: layoutSeed,
+      }));
+      setAnnotations((prev) => [...prev, ...autoTopicAnnotations]);
       const nextClips = [...clipsRef.current];
-      const autoClips: Clip[] = mediaItems.map(({ item, segment, image, index }) => {
-        const scale = Math.min(1, (cellW - 36) / image.width, (cellH - 36) / image.height);
-        const boardW = Math.max(80, Math.round(image.width * scale));
-        const boardH = Math.max(60, Math.round(image.height * scale));
-        const column = index % columns;
-        const row = Math.floor(index / columns);
-        const boardX = marginX + column * (cellW + gap) + (cellW - boardW) / 2;
-        const boardY = marginY + row * (cellH + gap) + (cellH - boardH) / 2;
+      const autoClips: Clip[] = mediaItems.map(({ item, segment, image, sourceBlob, previewUrl }) => {
+        const placement = placementByMediaId.get(item.id);
+        if (!placement) throw new Error(`Organic placement missing for ${item.name}`);
         const startTime = narrationStart + segment.start;
         const duration = Math.max(0.1, segment.end - segment.start);
         const id = generateId();
@@ -7765,13 +8021,16 @@ export default function Board2Page() {
           type: "image",
           name: item.name,
           sourceUrl: item.url,
+          sourceBlob,
+          previewUrl,
+          source: "auto",
           startTime,
           duration,
           layer: freeLayerAtTime(nextClips, startTime, duration, id, 1),
-          boardX,
-          boardY,
-          boardW,
-          boardH,
+          boardX: placement.x,
+          boardY: placement.y,
+          boardW: placement.width,
+          boardH: placement.height,
           holdFraction: 0.7,
           featured: true,
           provenance: "browserFound",
@@ -7780,6 +8039,11 @@ export default function Board2Page() {
           searchQuery: segment.query,
           imagePlanReason: segment.reason,
           imagePlanModel: segment.planModel,
+          autoTopicId: segment.topicId ?? "topic-0",
+          autoTopicTitle: segment.topicTitle ?? "Narration Overview",
+          autoTopicStartTime: segment.topicStartTime,
+          autoTopicEndTime: segment.topicEndTime,
+          autoLayoutSeed: layoutSeed,
         };
         nextClips.push(clip);
         return clip;
@@ -7793,33 +8057,24 @@ export default function Board2Page() {
         setAutoBuildPhase("Generating camera…");
         const W = canvasWRef.current;
         const H = canvasHRef.current;
-        const cameraStops = autoClips.map((clip) => {
-          const scale = CLIP_FOCUS_RATIO * Math.min(W / clip.boardW!, H / clip.boardH!);
-          return {
-            cameraX: clip.boardX! + clip.boardW! / 2,
-            cameraY: clip.boardY! + clip.boardH! / 2,
-            boardZoom: scale * BOARD_W / W,
-          };
+        const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
+          clips: autoClips.map((clip) => ({
+            id: clip.id,
+            startTime: clip.startTime,
+            duration: clip.duration,
+            holdFraction: clip.holdFraction,
+            boardX: clip.boardX!,
+            boardY: clip.boardY!,
+            boardW: clip.boardW!,
+            boardH: clip.boardH!,
+            topicId: clip.autoTopicId,
+          })),
+          topicBounds: placedTopics.map((topic) => ({ topicId: topic.id, ...topic.bounds })),
+          canvasWidth: W,
+          canvasHeight: H,
+          boardWidth: layoutBoardDimensions.width,
+          imageFocusRatio: CLIP_FOCUS_RATIO,
         });
-        const events: CameraKeyframe[] = [];
-        for (let index = 0; index < autoClips.length; index++) {
-          const clip = autoClips[index];
-          const stop = cameraStops[index];
-          const nextStop = cameraStops[index + 1] ?? stop;
-          events.push({ time: clip.startTime, ...stop, easing: "ease-in-out" });
-          events.push({ time: clip.startTime + clip.duration * (clip.holdFraction ?? 0.7), ...stop, easing: "ease-in-out" });
-          events.push({ time: clip.startTime + clip.duration, ...nextStop, easing: "ease-in-out" });
-        }
-        const seenTimes = new Set<number>();
-        const generatedCamera = events
-          .sort((a, b) => a.time - b.time)
-          .filter((keyframe) => {
-            const rounded = Math.round(keyframe.time * 1000);
-            if (seenTimes.has(rounded)) return false;
-            seenTimes.add(rounded);
-            return true;
-          })
-          .map((keyframe) => ({ ...keyframe, time: parseFloat(keyframe.time.toFixed(3)) }));
         cameraKeyframesRef.current = generatedCamera;
         setCameraKeyframes(generatedCamera);
         setKeyframesOutOfDate(false);
@@ -10329,6 +10584,56 @@ export default function Board2Page() {
   // ─ Generate camera keyframes ──────────────────────────────────────────────
 
   function generateCameraKeyframes() {
+    const topicAwareClips = clipsRef.current
+      .filter((clip) => isFeaturedTimelineClip(clip) && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+      .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+    const hasTopicClusters = topicAwareClips.some((clip) => !!clip.autoTopicId);
+    const hasPanBlocks = clipsRef.current.some((clip) => isFeaturedTimelineClip(clip) && clip.type === "pan");
+    if (hasTopicClusters && !hasPanBlocks) {
+      const topicIds = Array.from(new Set(topicAwareClips.flatMap((clip) => clip.autoTopicId ? [clip.autoTopicId] : [])));
+      const topicBounds = topicIds.flatMap((topicId) => {
+        const rects = [
+          ...topicAwareClips.filter((clip) => clip.autoTopicId === topicId).map((clip) => ({
+            x: clip.boardX!, y: clip.boardY!, width: clip.boardW!, height: clip.boardH!,
+          })),
+          ...annotationsRef.current.filter((annotation) => annotation.autoTopicId === topicId).map((annotation) => ({
+            x: annotation.boardX, y: annotation.boardY, width: annotation.boardW, height: annotation.boardH,
+          })),
+        ];
+        if (!rects.length) return [];
+        const minX = Math.min(...rects.map((rect) => rect.x));
+        const minY = Math.min(...rects.map((rect) => rect.y));
+        const maxX = Math.max(...rects.map((rect) => rect.x + rect.width));
+        const maxY = Math.max(...rects.map((rect) => rect.y + rect.height));
+        return [{ topicId, x: minX, y: minY, width: maxX - minX, height: maxY - minY }];
+      });
+      const generated = buildTopicClusterCameraKeyframes({
+        clips: topicAwareClips.map((clip) => ({
+          id: clip.id,
+          startTime: clip.startTime,
+          duration: clip.duration,
+          holdFraction: clip.holdFraction,
+          boardX: clip.boardX!,
+          boardY: clip.boardY!,
+          boardW: clip.boardW!,
+          boardH: clip.boardH!,
+          topicId: clip.autoTopicId,
+        })),
+        topicBounds,
+        canvasWidth: canvasWRef.current,
+        canvasHeight: canvasHRef.current,
+        boardWidth: boardDimensionsRef.current.width,
+        imageFocusRatio: CLIP_FOCUS_RATIO,
+      });
+      if (generated.length) {
+        setCameraKeyframes(generated);
+        cameraKeyframesRef.current = generated;
+        setKeyframesOutOfDate(false);
+        drawFrame(playheadRef.current);
+        setToast(`Camera keyframes generated: ${topicAwareClips.length} clips + ${topicIds.length} topic establishing beat${topicIds.length === 1 ? "" : "s"}`);
+        return;
+      }
+    }
     const allClipsSorted = clipsRef.current
       .filter((c) => isFeaturedTimelineClip(c) && (c.boardX !== undefined || c.type === "pan"))
       .sort((a, b) => a.startTime - b.startTime);
@@ -10762,6 +11067,12 @@ export default function Board2Page() {
     ambientCandidateIdsRef.current = new Set();
     lastAmbientEvalAtRef.current = 0;
     drawableFailureCountRef.current = 0;
+    exportImgCacheRef.current.clear();
+    exportImgLoadRef.current.clear();
+    const exportImagesForWindow = (time: number) => currentClips.filter((clip) =>
+      clip.type === "image" && clip.startTime <= time + 12 && clip.startTime + clip.duration >= time - 2
+    );
+    await Promise.all(exportImagesForWindow(0).map((clip) => ensureExportImage(clip)));
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
 
@@ -10798,6 +11109,9 @@ export default function Board2Page() {
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
       exportAudioCtx?.close().catch(() => {});
+      for (const image of exportImgCacheRef.current.values()) image.src = "";
+      exportImgCacheRef.current.clear();
+      exportImgLoadRef.current.clear();
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -10861,9 +11175,10 @@ export default function Board2Page() {
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
+      for (const clip of exportImagesForWindow(elapsed)) void ensureExportImage(clip);
       evaluateVideoPlaybackStates(elapsed, currentClips, currentCameraKeyframes, W, H, { force: prevExportElapsed < 0, audioMode: "silent" });
       prevExportElapsed = elapsed;
-      renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations);
+      renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "export");
       exportRafRef.current = requestAnimationFrame(exportFrame);
     }
     exportRafRef.current = requestAnimationFrame(exportFrame);
@@ -10874,7 +11189,7 @@ export default function Board2Page() {
   function playBoardPointFromClient(clientX: number, clientY: number, canvas: HTMLCanvasElement): { rawX: number; rawY: number; x: number; y: number; surface?: RequiredSurfaceClip } | null {
     const rect = canvas.getBoundingClientRect();
     const cam = playCameraRef.current;
-    const sf = cam.boardZoom * rect.width / BOARD_W;
+    const sf = cam.boardZoom * rect.width / boardDimensionsRef.current.width;
     const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
     const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
     const snapped = snapToClipTop(rawX, rawY, clipsRef.current, streamCratersRef.current);
@@ -12018,7 +12333,7 @@ export default function Board2Page() {
   function steerPlayCharacter(clientX: number, clientY: number, canvas: HTMLCanvasElement) {
     const rect = canvas.getBoundingClientRect();
     const cam = playCameraRef.current;
-    const sf = cam.boardZoom * rect.width / BOARD_W;
+    const sf = cam.boardZoom * rect.width / boardDimensionsRef.current.width;
     const rawX = (clientX - rect.left - rect.width / 2) / sf + cam.cameraX;
     const rawY = (clientY - rect.top - rect.height / 2) / sf + cam.cameraY;
     playCursorRef.current = { x: rawX, y: rawY };
@@ -12101,7 +12416,7 @@ export default function Board2Page() {
     const pointer = playPointerRef.current;
     const rect = e.currentTarget.getBoundingClientRect();
     const cam = playCameraRef.current;
-    const sf = cam.boardZoom * rect.width / BOARD_W;
+    const sf = cam.boardZoom * rect.width / boardDimensionsRef.current.width;
     playCursorRef.current = {
       x: (e.clientX - rect.left - rect.width / 2) / sf + cam.cameraX,
       y: (e.clientY - rect.top - rect.height / 2) / sf + cam.cameraY,
@@ -12413,7 +12728,7 @@ export default function Board2Page() {
       if (ctx) {
         const shake=bazookaShake(playBazookaEventsRef.current,nowMs);ctx.save();ctx.translate(shake.x,shake.y);
         renderToCtx(ctx, now, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, playCameraRef.current);
-        const sf = playCameraRef.current.boardZoom * canvas.width / BOARD_W;
+        const sf = playCameraRef.current.boardZoom * canvas.width / boardDimensionsRef.current.width;
         const hasFace = !!(characterFaceRef.current && characterFaceImageRef.current);
         const faceAspect = clamp(characterFaceRef.current?.faceAspect ?? 1, 0.75, 1.6);
         const playViseme = playLiveSpeechViseme() ?? resolvedCharacterViseme("c1", now, clipsRef.current, playDrawResolved, "live");
@@ -13543,8 +13858,8 @@ export default function Board2Page() {
           onPointerCancel={handleMobileBoardPointerUp}
         >
           {/* Board surface */}
-          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: BOARD_W * boardZoom, height: BOARD_H * boardZoom, background: BOARD_SURFACE_COLOR, border: "1.5px dashed rgba(42,42,42,0.2)" }}>
-            {clips.filter((c) => c.boardX !== undefined).map((clip) => {
+          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: boardDimensions.width * boardZoom, height: boardDimensions.height * boardZoom, background: BOARD_SURFACE_COLOR, border: "1.5px dashed rgba(42,42,42,0.2)" }}>
+            {visibleBoardClips.map((clip) => {
               const isSel = clip.id === selectedClipId;
               return (
                 <div
@@ -13932,11 +14247,11 @@ export default function Board2Page() {
                         <label style={{ fontSize: 10, whiteSpace: "nowrap" }}>
                           <input
                             type="number"
-                            min={2}
+                            min={3}
                             max={12}
                             value={autoImageSeconds}
                             disabled={!!autoBuildPhase}
-                            onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 2, 12))}
+                            onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 3, 12))}
                             style={{ width: 38, padding: 6, border: "1.5px solid #2a2a2a", fontFamily: "monospace" }}
                           /> sec
                         </label>
@@ -14390,7 +14705,7 @@ export default function Board2Page() {
     };
 
     for (const clip of clipsRef.current) {
-      const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, ...rest } = clip;
+      const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, previewUrl: _p, ...rest } = clip;
       const withSource = { ...rest, source: recipeProvenance(rest.source) };
       if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
         manifestClips.push(withSource);
@@ -14576,6 +14891,7 @@ export default function Board2Page() {
       },
       board: {
         media: boardMedia,
+        dimensions: boardDimensionsRef.current,
         pxPerSec: pxPerSecRef.current,
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
@@ -14737,6 +15053,7 @@ export default function Board2Page() {
         pxPerSec: rawManifest.board?.pxPerSec,
         boardZoom: rawManifest.board?.boardZoom,
         boardPan: rawManifest.board?.boardPan,
+        boardDimensions: rawManifest.board?.dimensions,
         characters: [rawManifest.characters?.c1, rawManifest.characters?.c2].filter(Boolean),
         narrationVisemeTrack: rawManifest.narration?.visemeTrack ?? [],
         narrationVisemeTrackSource: rawManifest.narration?.visemeTrackFingerprint ?? null,
@@ -14755,6 +15072,7 @@ export default function Board2Page() {
       clearNarrationAudioElements();
       for (const clip of clipsRef.current) {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
+        if (clip.previewUrl?.startsWith("blob:") && clip.previewUrl !== clip.sourceUrl) URL.revokeObjectURL(clip.previewUrl);
       }
       if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
       if (characterFace2Ref.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFace2Ref.current.faceBlobUrl);
@@ -14782,8 +15100,9 @@ export default function Board2Page() {
           if (mc.type === "narration") {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
           } else if (mc.type === "image") {
-            loadMedia(blobUrl, "image");
-            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
+            const previewBlob = await createImagePreviewBlob(blob);
+            const previewUrl = previewBlob === blob ? blobUrl : URL.createObjectURL(previewBlob);
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob, previewUrl });
           } else if (mc.type === "video") {
             createVideoElement(mc.id, blobUrl);
             loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
@@ -14837,6 +15156,14 @@ export default function Board2Page() {
       if (manifest.pxPerSec) { pxPerSecRef.current = manifest.pxPerSec; setPxPerSec(manifest.pxPerSec); }
       if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
       if (manifest.boardPan) { boardPanRef.current = manifest.boardPan; setBoardPan(manifest.boardPan); }
+      if (manifest.boardDimensions?.width >= BOARD_W && manifest.boardDimensions?.height >= BOARD_H) {
+        const loadedDimensions = { width: Number(manifest.boardDimensions.width), height: Number(manifest.boardDimensions.height) };
+        boardDimensionsRef.current = loadedDimensions;
+        setBoardDimensions(loadedDimensions);
+      } else {
+        boardDimensionsRef.current = { width: BOARD_W, height: BOARD_H };
+        setBoardDimensions({ width: BOARD_W, height: BOARD_H });
+      }
       if (manifest.name) setSaveName(manifest.name);
       const loadFace = (face: ManifestFace | null | undefined): CharacterFaceSettings | null => {
         if (!face?.assetFile || !files[face.assetFile]) return null;
@@ -15087,12 +15414,12 @@ export default function Board2Page() {
                     every
                     <input
                       type="number"
-                      min={2}
+                      min={3}
                       max={12}
                       step={1}
                       value={autoImageSeconds}
                       disabled={!!autoBuildPhase}
-                      onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 2, 12))}
+                      onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 3, 12))}
                       style={{ width: 38, padding: "2px 3px", border: "1px solid #7a5b00", background: "#fff", fontFamily: "monospace", fontSize: 10 }}
                     />
                     sec
@@ -15217,8 +15544,8 @@ export default function Board2Page() {
                   position: "absolute",
                   left: boardPan.x,
                   top: boardPan.y,
-                  width: BOARD_W * boardZoom,
-                  height: BOARD_H * boardZoom,
+                  width: boardDimensions.width * boardZoom,
+                  height: boardDimensions.height * boardZoom,
                   background: BOARD_SURFACE_COLOR,
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
@@ -15235,7 +15562,7 @@ export default function Board2Page() {
                   );
                 })()}
                 {/* eslint-disable-next-line react-hooks/refs */}
-                {clips.filter((c) => c.boardX !== undefined).map((clip) => {
+                {visibleBoardClips.map((clip) => {
                   const isSel = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                   return (
                     <div
@@ -15528,6 +15855,7 @@ export default function Board2Page() {
                           width: "100%",
                           height: "100%",
                           lineHeight: 1.2,
+                          textAlign: ann.textAlign ?? "left",
                         }}>
                           {ann.text || <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
                         </div>
@@ -15556,6 +15884,7 @@ export default function Board2Page() {
                             boxSizing: "border-box",
                             padding: 0,
                             lineHeight: 1.2,
+                            textAlign: ann.textAlign ?? "left",
                             whiteSpace: "pre-wrap",
                           }}
                         />

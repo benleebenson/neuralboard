@@ -4,14 +4,20 @@ import { authOptions, isUserPro } from "@/lib/auth";
 import { logApiCost } from "@/lib/supabase";
 import {
   buildEditorialImagePlanPrompt,
+  buildEditorialPlanningChunks,
+  buildEditorialTopicOutlinePrompt,
   EDITORIAL_IMAGE_PLAN_MODEL,
   editorialImageTargetCount,
+  IMPLICIT_EDITORIAL_TOPIC_TITLE,
+  MAX_EDITORIAL_IMAGES_PER_CALL,
+  type EditorialTopicOutline,
   type EditorialTranscriptSegment,
-  parseEditorialImagePlan,
+  parseEditorialTopicOutline,
+  parseEditorialTopicPlan,
 } from "@/lib/board2/editorial-image-plan";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 const INPUT_USD_PER_MILLION_TOKENS = 0.25;
 const OUTPUT_USD_PER_MILLION_TOKENS = 2.00;
@@ -60,61 +66,109 @@ export async function POST(req: NextRequest) {
     if (!Number.isFinite(durationSec) || durationSec <= 0) {
       return NextResponse.json({ error: "durationSec must be positive" }, { status: 400 });
     }
-    if (!Number.isFinite(secondsPerImage) || secondsPerImage < 2 || secondsPerImage > 12) {
-      return NextResponse.json({ error: "secondsPerImage must be between 2 and 12" }, { status: 400 });
+    if (!Number.isFinite(secondsPerImage) || secondsPerImage < 3 || secondsPerImage > 12) {
+      return NextResponse.json({ error: "secondsPerImage must be between 3 and 12" }, { status: 400 });
     }
 
     const segments = cleanTranscriptSegments(body.segments, durationSec);
     const targetCount = editorialImageTargetCount(durationSec, secondsPerImage);
-    const prompt = buildEditorialImagePlanPrompt({
-      transcript,
-      segments,
-      durationSec,
-      secondsPerImage,
-      targetCount,
-    });
+    type Usage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    const aggregateUsage: Required<Usage> = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    const callPlanner = async (prompt: { system: string; user: string }, maxCompletionTokens: number) => {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiKey}` },
+        body: JSON.stringify({
+          model: EDITORIAL_IMAGE_PLAN_MODEL,
+          reasoning_effort: "low",
+          max_completion_tokens: maxCompletionTokens,
+          messages: [
+            { role: "system", content: prompt.system },
+            { role: "user", content: prompt.user },
+          ],
+        }),
+        cache: "no-store",
+        signal: AbortSignal.timeout(90_000),
+      });
+      const data: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const apiError = data && typeof data === "object" && "error" in data
+          ? (data as { error?: { message?: unknown } }).error?.message
+          : null;
+        throw new Error(typeof apiError === "string" ? apiError : `Image planner failed (${response.status})`);
+      }
+      const completion = data && typeof data === "object"
+        ? data as { choices?: Array<{ message?: { content?: unknown } }>; usage?: Usage }
+        : {};
+      const usage = completion.usage ?? {};
+      aggregateUsage.prompt_tokens += usage.prompt_tokens ?? 0;
+      aggregateUsage.completion_tokens += usage.completion_tokens ?? 0;
+      aggregateUsage.total_tokens += usage.total_tokens ?? 0;
+      return typeof completion.choices?.[0]?.message?.content === "string" ? completion.choices[0].message.content : "";
+    };
 
-    const planResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${openaiKey}`,
-      },
-      body: JSON.stringify({
-        model: EDITORIAL_IMAGE_PLAN_MODEL,
-        reasoning_effort: "low",
-        max_completion_tokens: Math.min(4000, Math.max(800, targetCount * 180)),
-        messages: [
-          { role: "system", content: prompt.system },
-          { role: "user", content: prompt.user },
-        ],
-      }),
-      cache: "no-store",
-      signal: AbortSignal.timeout(50_000),
-    });
-    const responseData: unknown = await planResponse.json().catch(() => null);
-    if (!planResponse.ok) {
-      const apiError = responseData && typeof responseData === "object" && "error" in responseData
-        ? (responseData as { error?: { message?: unknown } }).error?.message
-        : null;
-      return NextResponse.json(
-        { error: typeof apiError === "string" ? apiError : `Image planner failed (${planResponse.status})` },
-        { status: 502 },
-      );
+    const chunks = buildEditorialPlanningChunks(durationSec, targetCount);
+    let topicOutline: EditorialTopicOutline[] = [];
+    let plannerCallCount = 0;
+    if (chunks.length > 1) {
+      const outlinePrompt = buildEditorialTopicOutlinePrompt({ transcript, segments, durationSec });
+      const outlineText = await callPlanner(outlinePrompt, 2400);
+      plannerCallCount += 1;
+      topicOutline = parseEditorialTopicOutline(outlineText, durationSec);
+    }
+    if (!topicOutline.length) {
+      topicOutline = [{ topicTitle: IMPLICIT_EDITORIAL_TOPIC_TITLE, startTime: 0, endTime: durationSec }];
     }
 
-    const completion = responseData && typeof responseData === "object"
-      ? responseData as {
-          choices?: Array<{ message?: { content?: unknown } }>;
-          usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-        }
-      : {};
-    const responseText = typeof completion.choices?.[0]?.message?.content === "string"
-      ? completion.choices[0].message.content
-      : "";
-    const plan = parseEditorialImagePlan(responseText, durationSec, targetCount);
+    const planChunk = async (chunk: (typeof chunks)[number]) => {
+      const windowSegments = segments.filter((segment) => segment.end > chunk.startTime && segment.start < chunk.endTime);
+      const prompt = buildEditorialImagePlanPrompt({
+        transcript,
+        segments: windowSegments,
+        durationSec,
+        secondsPerImage,
+        targetCount: chunk.targetCount,
+        ...(chunks.length > 1 ? { planningWindow: { ...chunk, topicOutline } } : {}),
+      });
+      const responseText = await callPlanner(prompt, Math.min(12_000, Math.max(1200, chunk.targetCount * 240)));
+      plannerCallCount += 1;
+      const parsed = parseEditorialTopicPlan(responseText, durationSec, chunk.targetCount, {
+        normalizeFirstTimestamp: chunks.length === 1,
+        normalizeLastTopicEnd: chunks.length === 1,
+      });
+      const isLastChunk = chunk.index === chunks.length - 1;
+      const images = parsed.flatMap((topic) => topic.images).filter((image) =>
+        image.startTime >= chunk.startTime - 0.01 && (isLastChunk ? image.startTime <= chunk.endTime : image.startTime < chunk.endTime)
+      ).slice(0, chunk.targetCount);
+      return { images, topics: parsed };
+    };
 
-    const usage = completion.usage ?? {};
+    const chunkResults: Awaited<ReturnType<typeof planChunk>>[] = new Array(chunks.length);
+    let nextChunkIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(3, chunks.length) }, async () => {
+      while (nextChunkIndex < chunks.length) {
+        const index = nextChunkIndex++;
+        chunkResults[index] = await planChunk(chunks[index]);
+      }
+    }));
+
+    const seenQueries = new Set<string>();
+    const plan = chunkResults.flatMap((result) => result.images).sort((a, b) => a.startTime - b.startTime).filter((image) => {
+      const key = image.query.toLowerCase();
+      if (seenQueries.has(key)) return false;
+      seenQueries.add(key);
+      return true;
+    }).slice(0, targetCount);
+    if (plan.length) plan[0] = { ...plan[0], startTime: 0 };
+    const topics = chunks.length === 1
+      ? chunkResults[0].topics
+      : topicOutline.flatMap((outline, index) => {
+          const isLast = index === topicOutline.length - 1;
+          const images = plan.filter((image) => image.startTime >= outline.startTime && (isLast ? image.startTime <= outline.endTime : image.startTime < outline.endTime));
+          return images.length ? [{ ...outline, images }] : [];
+        });
+
+    const usage = aggregateUsage;
     const costUsd = +(
       (usage.prompt_tokens ?? 0) * INPUT_USD_PER_MILLION_TOKENS / 1_000_000
       + (usage.completion_tokens ?? 0) * OUTPUT_USD_PER_MILLION_TOKENS / 1_000_000
@@ -132,6 +186,10 @@ export async function POST(req: NextRequest) {
       ok: true,
       model: EDITORIAL_IMAGE_PLAN_MODEL,
       targetCount,
+      chunkCount: chunks.length,
+      plannerCallCount,
+      maxImagesPerCall: MAX_EDITORIAL_IMAGES_PER_CALL,
+      topics,
       plan,
     });
   } catch (error: unknown) {
