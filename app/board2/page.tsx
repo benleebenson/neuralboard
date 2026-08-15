@@ -121,6 +121,7 @@ import {
   stableOrganicLayoutSeed,
 } from "@/lib/board2/organic-topic-layout";
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
+import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
@@ -1431,6 +1432,21 @@ function freeLayerAtTime(clips: Clip[], start: number, duration: number, exclude
     if (!layerOverlap(clips, start, duration, excludeId, l)) return l;
   }
   return preferLayer;
+}
+
+function resolveManualTimelineInsertion(
+  clips: Clip[],
+  requestedStart: number,
+  duration: number,
+  preferredLayer = 1,
+): TimelineInsertionPlacement {
+  return resolveTimelineInsertion(
+    clips.filter((clip) => clip.type !== "narration" && isFeaturedTimelineClip(clip)),
+    requestedStart,
+    duration,
+    preferredLayer,
+    N_LAYERS,
+  );
 }
 
 function endOfLayer(clips: Clip[], layer: number, excludeId: string): number {
@@ -7138,7 +7154,11 @@ export default function Board2Page() {
     return findFreeBoardPos(existing, clipW, clipH, camX, camY);
   }
 
-  async function addClipAndPlaceOnBoard(item: MediaItem, center?: { x: number; y: number }) {
+  async function addClipAndPlaceOnBoard(
+    item: MediaItem,
+    center?: { x: number; y: number },
+    requestedStart = playheadRef.current,
+  ) {
     // Wait for image to load so we get natural dimensions
     if (item.type === "image") {
       const img = imgCacheRef.current.get(item.url);
@@ -7154,8 +7174,7 @@ export default function Board2Page() {
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
     if (item.type === "video") createVideoElement(clipId, item.url);
     setClips((prev) => {
-      const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-      const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, clipDuration);
       const pos = center
         ? {
             boardX: clamp(center.x - w / 2, 0, BOARD_W - w),
@@ -7166,7 +7185,7 @@ export default function Board2Page() {
         ...prev,
         {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
-          startTime: endTime, duration: clipDuration, layer,
+          startTime: placement.startTime, duration: clipDuration, layer: placement.layer,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
           sourceBlob: item.blob,
@@ -7299,11 +7318,15 @@ export default function Board2Page() {
   }
 
   function addBoardMediaToTimeline(clipId: string) {
-    const endTime = clipsRef.current.filter(isFeaturedTimelineClip).reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), 0);
-    setClips((prev) => prev.map((clip) => clip.id === clipId
-      ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: true, startTime: endTime,
-          layer: freeLayerAtTime(prev.filter(isFeaturedTimelineClip), endTime, clip.duration, clip.id, clip.layer ?? 1) }
-      : clip));
+    const requestedStart = playheadRef.current;
+    setClips((prev) => {
+      const target = prev.find((clip) => clip.id === clipId);
+      if (!target) return prev;
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, target.duration, target.layer ?? 1);
+      return prev.map((clip) => clip.id === clipId
+        ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: true, startTime: placement.startTime, layer: placement.layer }
+        : clip);
+    });
     selectionSurfaceRef.current = "timeline";
     setClipSelection([clipId]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
@@ -7312,9 +7335,16 @@ export default function Board2Page() {
 
   function addPanClip(atTime?: number) {
     const id = generateId();
-    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    const clip: Clip = { id, type: "pan", name: "Pan", sourceUrl: "", startTime, duration: 5, holdFraction: 0.5, layer: 1 };
-    setClips((prev) => [...prev, clip]);
+    const requestedStart = atTime ?? playheadRef.current;
+    const duration = 5;
+    setClips((prev) => {
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, duration);
+      const clip: Clip = {
+        id, type: "pan", name: "Pan", sourceUrl: "",
+        startTime: placement.startTime, duration, holdFraction: 0.5, layer: placement.layer,
+      };
+      return [...prev, clip];
+    });
     setSelectedClipId(id);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
@@ -7327,22 +7357,24 @@ export default function Board2Page() {
       return;
     }
     const id = generateId();
-    const startTime = atTime ?? playheadRef.current;
+    const requestedStart = atTime ?? playheadRef.current;
     const duration = 3;
-    const layer = freeLayerAtTime(clipsRef.current, startTime, duration, id, 1);
-    const clip: Clip = {
-      id,
-      type: "characterFocus",
-      name: `Character ${focusCharacterId === "c2" ? "2" : "1"} Focus`,
-      sourceUrl: "",
-      startTime,
-      duration,
-      layer,
-      focusCharacterId,
-      focusLeadInSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS,
-      focusLeadOutSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
-    };
-    setClips((prev) => [...prev, clip]);
+    setClips((prev) => {
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, duration);
+      const clip: Clip = {
+        id,
+        type: "characterFocus",
+        name: `Character ${focusCharacterId === "c2" ? "2" : "1"} Focus`,
+        sourceUrl: "",
+        startTime: placement.startTime,
+        duration,
+        layer: placement.layer,
+        focusCharacterId,
+        focusLeadInSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_IN_SECONDS,
+        focusLeadOutSeconds: DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
+      };
+      return [...prev, clip];
+    });
     setClipSelection([id]);
   }
 
@@ -7352,14 +7384,18 @@ export default function Board2Page() {
   // aspect ratio without any special-casing there.
   function addCustomZoomClip(boardX: number, boardY: number, boardW: number, boardH: number, atTime?: number) {
     const id = generateId();
-    const startTime = atTime ?? clipsRef.current.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-    const clip: Clip = {
-      id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
-      startTime, duration: 3, holdFraction: 0.65, layer: 1,
-      boardX: Math.round(boardX), boardY: Math.round(boardY),
-      boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
-    };
-    setClips((prev) => [...prev, clip]);
+    const requestedStart = atTime ?? playheadRef.current;
+    const duration = 3;
+    setClips((prev) => {
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, duration);
+      const clip: Clip = {
+        id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
+        startTime: placement.startTime, duration, holdFraction: 0.65, layer: placement.layer,
+        boardX: Math.round(boardX), boardY: Math.round(boardY),
+        boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
+      };
+      return [...prev, clip];
+    });
     setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
@@ -7500,23 +7536,25 @@ export default function Board2Page() {
   async function pasteClip() {
     const src = clipboardRef.current;
     if (!src) return;
-    const startTime = playheadRef.current;
+    const requestedStart = playheadRef.current;
     const newId = generateId();
     const cloned = src.type === "video" ? await cloneVideoSource(src) : null;
-    // Recompute against the freshest clips (cloning is async and other edits may land meanwhile)
-    const layer = freeLayerAtTime(clipsRef.current, startTime, src.duration, "", src.layer ?? 1);
-    const newClip: Clip = {
-      ...src, id: newId, startTime, layer,
+    const clonedClip: Clip = {
+      ...src, id: newId, startTime: requestedStart,
       ...(cloned ? { sourceUrl: cloned.sourceUrl, sourceBlob: cloned.sourceBlob } : {}),
     };
     if (src.type === "video") {
       // Pre-set thumbnail so createVideoElement skips re-capture (same source video)
       const srcThumb = thumbnailImagesRef.current.get(src.id);
-      if (srcThumb !== undefined) thumbnailImagesRef.current.set(newClip.id, srcThumb);
-      createVideoElement(newClip.id, newClip.sourceUrl);
+      if (srcThumb !== undefined) thumbnailImagesRef.current.set(clonedClip.id, srcThumb);
+      createVideoElement(clonedClip.id, clonedClip.sourceUrl);
     }
-    setClips((prev) => [...prev, newClip]);
-    setSelectedClipId(newClip.id);
+    // Recompute against the freshest clips (cloning is async and other edits may land meanwhile).
+    setClips((prev) => {
+      const placement = resolveManualTimelineInsertion(prev, requestedStart, src.duration, src.layer ?? 1);
+      return [...prev, { ...clonedClip, startTime: placement.startTime, layer: placement.layer }];
+    });
+    setSelectedClipId(clonedClip.id);
   }
 
   async function duplicateClip(clipId: string) {
@@ -8424,6 +8462,7 @@ export default function Board2Page() {
     if (!ytSelected) return;
     const ytSel = ytSelected;
     const start = ytStart, end = ytEnd;
+    const requestedStart = playheadRef.current;
     const title = (ytSel.title ?? "YouTube clip").slice(0, 40);
     // Set when this download originated from a Neural Search placeholder click — reuse its
     // board position instead of auto-placing, and remove it once the real clip lands.
@@ -8487,14 +8526,13 @@ export default function Board2Page() {
           const clipId = generateId();
           createVideoElement(clipId, blobUrl);
           setClips((prev) => {
-            const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-            const layer = freeLayerAtTime(prev, endTime, clipDuration, clipId, 1);
+            const placement = resolveManualTimelineInsertion(prev, requestedStart, clipDuration);
             const pos = (placeholderBoardX !== undefined && placeholderBoardY !== undefined)
               ? { boardX: placeholderBoardX, boardY: placeholderBoardY }
               : findBoardPosForNewMedia(prev, meta.w, meta.h);
             return [...prev, {
               id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
-              startTime: endTime, duration: clipDuration, layer,
+              startTime: placement.startTime, duration: clipDuration, layer: placement.layer,
               boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
               sourceDurationSec: meta.sourceDurationSec,
               sourceBlob: blob,
@@ -9456,6 +9494,7 @@ export default function Board2Page() {
   // (server-side, sidesteps browser CORS on arbitrary Google Images sources), turn it into a
   // real image Clip at the placeholder's board position, and drop the placeholder.
   async function commitImagePlaceholder(ph: ImagePlaceholder) {
+    const requestedStart = playheadRef.current;
     setImagePreviewWorking(true);
     setImagePreviewError("");
     const toastId = generateId();
@@ -9479,11 +9518,10 @@ export default function Board2Page() {
       const { w, h } = getMediaDimensions(blobUrl, "image");
       const clipId = generateId();
       setClips((prev) => {
-        const endTime = prev.reduce((acc, c) => Math.max(acc, c.startTime + c.duration), 0);
-        const layer = freeLayerAtTime(prev, endTime, 4, clipId, 1);
+        const placement = resolveManualTimelineInsertion(prev, requestedStart, 4);
         return [...prev, {
           id: clipId, type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
-          startTime: endTime, duration: 4, layer,
+          startTime: placement.startTime, duration: 4, layer: placement.layer,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
           sourceBlob: blob,
           source: "neuralSearch" as const,
