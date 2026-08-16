@@ -124,6 +124,8 @@ import {
   stableOrganicLayoutSeed,
 } from "@/lib/board2/organic-topic-layout";
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
+import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
+import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
@@ -1157,6 +1159,7 @@ const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
 const CLIP_FOCUS_RATIO = 0.7;
+const AUTO_IMAGE_FOCUS_RATIO = 0.78;
 const EXPORT_FPS = 60;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const AMBIENT_BUDGET = 4;
@@ -1170,7 +1173,6 @@ const PREVIEW_MAX_H_PX = 620;
 const PREVIEW_RENDER_LONG_EDGE_PX = 960;
 const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
 const PREVIEW_IMAGE_CACHE_LIMIT = 72;
-const EXPORT_IMAGE_CACHE_LIMIT = 16;
 const EDITOR_PLAYBACK_FPS = 30;
 const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
@@ -6196,14 +6198,17 @@ export default function Board2Page() {
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
       const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
+      if (!boardRectIntersectsCameraFrame(
+        { x: bx, y: by, width: bw, height: bh },
+        cam,
+        W,
+        H,
+        boardDimensionsRef.current.width,
+        quality === "preview" ? 0.35 : 0,
+      )) continue;
       const sx = (bx + bw / 2 - cam.cameraX) * sf + W / 2;
       const sy = (by + bh / 2 - cam.cameraY) * sf + H / 2;
       const sw = bw * sf, sh = bh * sf;
-      const cullMarginX = W * 0.35;
-      const cullMarginY = H * 0.35;
-      if (sx + sw / 2 < -cullMarginX || sx - sw / 2 > W + cullMarginX || sy + sh / 2 < -cullMarginY || sy - sh / 2 > H + cullMarginY) {
-        continue;
-      }
       ctx.globalAlpha = 1;
       if (clip.type === "image") {
         const renderUrl = clip.previewUrl ?? clip.sourceUrl;
@@ -7057,13 +7062,6 @@ export default function Board2Page() {
       const image = new Image();
       image.onload = () => {
         exportImgCacheRef.current.set(clip.sourceUrl, image);
-        while (exportImgCacheRef.current.size > EXPORT_IMAGE_CACHE_LIMIT) {
-          const oldestUrl = exportImgCacheRef.current.keys().next().value as string | undefined;
-          if (!oldestUrl || oldestUrl === clip.sourceUrl) break;
-          const oldest = exportImgCacheRef.current.get(oldestUrl);
-          if (oldest) oldest.src = "";
-          exportImgCacheRef.current.delete(oldestUrl);
-        }
         resolve();
       };
       image.onerror = () => resolve();
@@ -8089,11 +8087,17 @@ export default function Board2Page() {
       }));
       setAnnotations((prev) => [...prev, ...autoTopicAnnotations]);
       const nextClips = [...clipsRef.current];
+      const timingByMediaId = new Map(buildNarrationLockedImageWindows(
+        mediaItems.map(({ item, segment }) => ({ id: item.id, startTime: segment.start })),
+        narrationStart,
+        transcriptionDuration,
+      ).map((timing) => [timing.id, timing]));
       const autoClips: Clip[] = mediaItems.map(({ item, segment, image, sourceBlob, previewUrl }) => {
         const placement = placementByMediaId.get(item.id);
         if (!placement) throw new Error(`Organic placement missing for ${item.name}`);
-        const startTime = narrationStart + segment.start;
-        const duration = Math.max(0.1, segment.end - segment.start);
+        const timing = timingByMediaId.get(item.id);
+        if (!timing) throw new Error(`Narration timing missing for ${item.name}`);
+        const { startTime, duration } = timing;
         const id = generateId();
         const clip: Clip = {
           id,
@@ -8152,7 +8156,7 @@ export default function Board2Page() {
           canvasWidth: W,
           canvasHeight: H,
           boardWidth: layoutBoardDimensions.width,
-          imageFocusRatio: CLIP_FOCUS_RATIO,
+          imageFocusRatio: AUTO_IMAGE_FOCUS_RATIO,
         });
         cameraKeyframesRef.current = generatedCamera;
         setCameraKeyframes(generatedCamera);
@@ -11154,10 +11158,10 @@ export default function Board2Page() {
     drawableFailureCountRef.current = 0;
     exportImgCacheRef.current.clear();
     exportImgLoadRef.current.clear();
-    const exportImagesForWindow = (time: number) => currentClips.filter((clip) =>
-      clip.type === "image" && clip.startTime <= time + 12 && clip.startTime + clip.duration >= time - 2
-    );
-    await Promise.all(exportImagesForWindow(0).map((clip) => ensureExportImage(clip)));
+    // Export renders the whole board through the camera, not just the current timeline block.
+    // Decode every source image before capture starts so a wide frame can never outrun a small
+    // timeline-window/LRU cache and record blank media that only appears later.
+    await Promise.all(currentClips.filter((clip) => clip.type === "image").map((clip) => ensureExportImage(clip)));
     const canvasStream = exportCanvas.captureStream(EXPORT_FPS);
     const mimeType = MediaRecorder.isTypeSupported("video/mp4") ? "video/mp4" : "video/webm";
 
@@ -11260,7 +11264,6 @@ export default function Board2Page() {
         recorder.stop(); return;
       }
       setExportProgress(elapsed / totalDur);
-      for (const clip of exportImagesForWindow(elapsed)) void ensureExportImage(clip);
       evaluateVideoPlaybackStates(elapsed, currentClips, currentCameraKeyframes, W, H, { force: prevExportElapsed < 0, audioMode: "silent" });
       prevExportElapsed = elapsed;
       renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "export");

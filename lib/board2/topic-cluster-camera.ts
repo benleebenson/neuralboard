@@ -64,34 +64,38 @@ export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): T
     options.imageFocusRatio,
   ));
   const firstTopicClip = clips.map((clip, index) => !!clip.topicId && (index === 0 || clips[index - 1].topicId !== clip.topicId));
-  const startStops = clips.map((clip, index) => {
-    const topicBounds = clip.topicId ? boundsByTopic.get(clip.topicId) : undefined;
-    return firstTopicClip[index] && topicBounds
-      ? stopForRect(topicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.82)
-      : imageStops[index];
-  });
-
   const events: TopicCameraKeyframe[] = [];
   for (let index = 0; index < clips.length; index++) {
     const clip = clips[index];
     const imageStop = imageStops[index];
-    const startStop = startStops[index];
-    const nextStop = startStops[index + 1] ?? imageStop;
     const holdEnd = clip.startTime + clip.duration * (clip.holdFraction ?? 0.6);
     const clipEnd = clip.startTime + clip.duration;
-    events.push({ time: clip.startTime, ...startStop, easing: "ease-in-out" });
-
-    if (firstTopicClip[index] && clip.topicId && boundsByTopic.has(clip.topicId)) {
-      // Use at most the first 30% of the image's spoken interval: a short static cluster/title
-      // frame, followed by a smooth dive into the first image before its main hold completes.
-      const establishingDuration = Math.min(1.2, clip.duration * 0.3);
-      const establishingHoldEnd = clip.startTime + establishingDuration * 0.35;
-      const establishingEnd = clip.startTime + establishingDuration;
-      events.push({ time: establishingHoldEnd, ...startStop, easing: "ease-in-out" });
-      events.push({ time: establishingEnd, ...imageStop, easing: "ease-in-out" });
-    }
+    // The editorial timestamp is an arrival deadline, not the beginning of a camera move.
+    // Every image must therefore be the resolved camera stop at its exact narration start.
+    events.push({ time: clip.startTime, ...imageStop, easing: "ease-in-out" });
     if (holdEnd > clip.startTime) events.push({ time: holdEnd, ...imageStop, easing: "ease-in-out" });
-    events.push({ time: clipEnd, ...nextStop, easing: "ease-in-out" });
+
+    const nextClip = clips[index + 1];
+    const nextTopicBounds = nextClip && firstTopicClip[index + 1] && nextClip.topicId
+      ? boundsByTopic.get(nextClip.topicId)
+      : undefined;
+    if (nextClip && nextTopicBounds) {
+      // Preserve the cluster-wide establishing shot, but schedule it before the next image's
+      // narration timestamp so it can never make that image arrive late.
+      const availableTransition = Math.max(0, nextClip.startTime - holdEnd);
+      const establishingLead = Math.min(1.2, availableTransition * 0.45);
+      const establishingTime = nextClip.startTime - establishingLead;
+      if (establishingLead >= 0.1 && establishingTime > holdEnd) {
+        events.push({
+          time: establishingTime,
+          ...stopForRect(nextTopicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.82),
+          easing: "ease-in-out",
+        });
+      }
+    }
+    if (!nextClip || clipEnd < nextClip.startTime - 0.001) {
+      events.push({ time: clipEnd, ...imageStop, easing: "ease-in-out" });
+    }
   }
 
   const seenTimes = new Set<number>();
