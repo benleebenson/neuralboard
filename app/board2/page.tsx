@@ -322,7 +322,8 @@ type BrowserFoundImage = {
   source: "google" | "bing" | "openverse";
 };
 type SpeechBubbleCue = TranscriptSegment & { index: number };
-type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1 };
+type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1; radius?: number };
+type SpeechBubbleMediaTarget = { x: number; y: number; width: number; height: number };
 
 const AUTO_IMAGE_QUERY_STOP_WORDS = new Set([
   "about", "after", "again", "against", "also", "because", "before", "being", "between", "could", "does", "doing",
@@ -627,11 +628,177 @@ function actionSpeechVisemeAt(time: number, actions: readonly ResolvedCharAction
   return rhythmicViseme(localT, `${seedKey}:${active.id}:${active.type}`);
 }
 
-function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, clips: readonly Clip[], width: number, height: number, anchor?: SpeechBubbleAnchor | null) {
+function speechBubbleAnchorIsInFrame(anchor: SpeechBubbleAnchor | null | undefined, width: number, height: number): anchor is SpeechBubbleAnchor {
+  return !!anchor && anchor.x >= 0 && anchor.x <= width && anchor.y >= 0 && anchor.y <= height;
+}
+
+function speechBubbleTailTip(anchor: SpeechBubbleAnchor, bubbleCenterX: number, bubbleCenterY: number, fontSize: number) {
+  const dx = bubbleCenterX - anchor.x;
+  const dy = bubbleCenterY - anchor.y;
+  const distance = Math.max(0.001, Math.hypot(dx, dy));
+  const radius = Math.max(fontSize * 0.55, anchor.radius ?? fontSize * 0.8);
+  return {
+    x: anchor.x + dx / distance * radius,
+    y: anchor.y + dy / distance * radius,
+  };
+}
+
+function narrationMediaBubbleTarget(
+  time: number,
+  clips: readonly Clip[],
+  camera: { cameraX: number; cameraY: number; boardZoom: number },
+  scale: number,
+  width: number,
+  height: number,
+): SpeechBubbleMediaTarget | null {
+  const frameArea = width * height;
+  let best: { target: SpeechBubbleMediaTarget; score: number } | null = null;
+
+  for (const clip of clips) {
+    if (!isBoardMediaClip(clip) || clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+    const centerX = (clip.boardX + clip.boardW / 2 - camera.cameraX) * scale + width / 2;
+    const centerY = (clip.boardY + clip.boardH / 2 - camera.cameraY) * scale + height / 2;
+    const projectedWidth = clip.boardW * scale;
+    const projectedHeight = clip.boardH * scale;
+    const left = Math.max(0, centerX - projectedWidth / 2);
+    const top = Math.max(0, centerY - projectedHeight / 2);
+    const right = Math.min(width, centerX + projectedWidth / 2);
+    const bottom = Math.min(height, centerY + projectedHeight / 2);
+    const visibleWidth = right - left;
+    const visibleHeight = bottom - top;
+    if (visibleWidth < width * 0.12 || visibleHeight < height * 0.1) continue;
+
+    const active = isFeaturedTimelineClip(clip) && time >= clip.startTime && time < clip.startTime + clip.duration;
+    const coversFrameCenter = left <= width / 2 && right >= width / 2 && top <= height / 2 && bottom >= height / 2;
+    const distanceFromFrameCenter = Math.hypot(centerX - width / 2, centerY - height / 2);
+    const score = (active ? frameArea * 2 : 0)
+      + (coversFrameCenter ? frameArea : 0)
+      + visibleWidth * visibleHeight
+      - distanceFromFrameCenter * Math.min(width, height) * 0.2
+      + (clip.layer ?? 1) * 100;
+    if (!best || score > best.score) best = { target: { x: left, y: top, width: visibleWidth, height: visibleHeight }, score };
+  }
+
+  return best?.target ?? null;
+}
+
+function drawFloatingNarrationBubble(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  cue: SpeechBubbleCue,
+  clip: Clip,
+  width: number,
+  height: number,
+  mediaTarget?: SpeechBubbleMediaTarget | null,
+) {
+  const fontSize = clamp(Math.round(width * 0.022), 15, 27);
+  const maxWidth = clamp(width * 0.34, 180, 330);
+  ctx.save();
+  ctx.font = `${fontSize}px 'Patrick Hand', 'Comic Sans MS', cursive`;
+  const words = cue.text.toUpperCase().split(/\s+/);
+  const lines: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(next).width > maxWidth - fontSize * 2.1) { lines.push(line); line = word; }
+    else line = next;
+  }
+  if (line) lines.push(line);
+
+  const lineHeight = fontSize * 1.08;
+  const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 2.1)));
+  const boxH = Math.max(fontSize * 2.65, lines.length * lineHeight + fontSize * 1.5);
+  const fallbackTarget = {
+    x: width * 0.08,
+    y: height * 0.1,
+    width: width * 0.84,
+    height: height * 0.82,
+  };
+  const target = mediaTarget ?? fallbackTarget;
+  const placements = [
+    { x: 0.22, y: 0.22 },
+    { x: 0.79, y: 0.43 },
+    { x: 0.36, y: 0.78 },
+    { x: 0.73, y: 0.22 },
+    { x: 0.2, y: 0.55 },
+    { x: 0.72, y: 0.76 },
+  ];
+  let placementIndex = Math.floor(seededRandom(`${clip.id}:${cue.index}:floating-position`) * placements.length);
+  if (cue.index > 0) {
+    const previousIndex = Math.floor(seededRandom(`${clip.id}:${cue.index - 1}:floating-position`) * placements.length);
+    if (placementIndex === previousIndex) placementIndex = (placementIndex + 1 + cue.index % 2) % placements.length;
+  }
+  const placement = placements[placementIndex];
+  const safeLeft = Math.max(fontSize * 0.6, width * 0.025);
+  const safeRight = width - safeLeft;
+  // Keep floating captions below phone camera cutouts and social-video top chrome.
+  const safeTop = Math.max(fontSize * 1.8, height * 0.1);
+  const safeBottom = height - Math.max(fontSize * 0.8, height * 0.055);
+  const phase = seededRandom(`${clip.id}:${cue.index}:floating-phase`) * Math.PI * 2;
+  const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
+  const hoverY = Math.sin((sourceTime - cue.start) * Math.PI * 0.9 + phase) * fontSize * 0.09;
+  const centerX = clamp(target.x + target.width * placement.x, safeLeft + boxW / 2, safeRight - boxW / 2);
+  const centerY = clamp(target.y + target.height * placement.y + hoverY, safeTop + boxH / 2, safeBottom - boxH / 2);
+  const x = centerX - boxW / 2;
+  const y = centerY - boxH / 2;
+  const radius = boxH / 2;
+  const cueDuration = Math.max(0.001, cue.end - cue.start);
+  const cueT = clamp((sourceTime - cue.start) / cueDuration, 0, 1);
+  const enter = clamp(cueT / 0.14, 0, 1);
+  const exit = clamp((1 - cueT) / 0.12, 0, 1);
+  const visibility = Math.min(enter, exit);
+  const easedVisibility = visibility * visibility * (3 - 2 * visibility);
+  const pop = 0.84 + easedVisibility * 0.16;
+
+  ctx.globalAlpha *= easedVisibility;
+  ctx.translate(centerX, centerY);
+  ctx.scale(pop, pop);
+  ctx.translate(-centerX, -centerY);
+  ctx.shadowColor = "rgba(0,0,0,.14)";
+  ctx.shadowBlur = 3;
+  ctx.shadowOffsetX = 2;
+  ctx.shadowOffsetY = 2;
+  ctx.fillStyle = "rgba(255,255,252,.97)";
+  ctx.strokeStyle = "#171717";
+  ctx.lineWidth = Math.max(0.85, width * 0.00105);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + boxW - radius, y);
+  ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
+  ctx.lineTo(x + boxW, y + boxH - radius);
+  ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
+  ctx.lineTo(x + radius, y + boxH);
+  ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  ctx.stroke();
+  ctx.fillStyle = "#171717";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((item, index) => ctx.fillText(item, centerX, y + fontSize * 0.82 + lineHeight * (index + 0.5)));
+  ctx.restore();
+}
+
+function drawNarrationSpeechBubble(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  clips: readonly Clip[],
+  width: number,
+  height: number,
+  anchor?: SpeechBubbleAnchor | null,
+  mediaTarget?: SpeechBubbleMediaTarget | null,
+) {
   const active = activeNarrationBubble(time, clips);
-  if (!active || !anchor) return;
+  if (!active) return;
   const { cue, clip } = active;
-  const head = anchor ?? { x: width * 0.5, y: height * 0.42, facing: 1 as const };
+  if (!speechBubbleAnchorIsInFrame(anchor, width, height)) {
+    drawFloatingNarrationBubble(ctx, time, cue, clip, width, height, mediaTarget);
+    return;
+  }
+  const head = anchor;
   const sideSeed = seededRandom(`${clip.id}:${cue.index}:${cue.text}`);
   const side = sideSeed < 0.5 ? -head.facing : head.facing;
   const fontSize = clamp(Math.round(width * 0.022), 15, 27);
@@ -656,8 +823,7 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
   const tailBase = clamp(head.x, x + fontSize * 1.4, x + boxW - fontSize * 1.4);
-  const tailTipX = clamp(head.x + side * fontSize * 1.25, x + fontSize * 0.8, x + boxW - fontSize * 0.8);
-  const tailTipY = clamp(head.y - fontSize * 1.65, y + boxH + fontSize * 0.35, height - fontSize * 0.5);
+  const tailTip = speechBubbleTailTip(head, x + boxW / 2, y + boxH / 2, fontSize);
   const cueDuration = Math.max(0.001, cue.end - cue.start);
   const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
   const cueT = clamp((sourceTime - cue.start) / cueDuration, 0, 1);
@@ -677,7 +843,7 @@ function drawNarrationSpeechBubble(ctx: CanvasRenderingContext2D, time: number, 
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
   ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
   ctx.lineTo(tailBase + fontSize * 0.42, y + boxH);
-  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.85, tailTipX, tailTipY);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.85, tailTip.x, tailTip.y);
   ctx.quadraticCurveTo(tailBase - fontSize * 0.24, y + boxH + fontSize * 0.48, tailBase - fontSize * 0.45, y + boxH);
   ctx.lineTo(x + radius, y + boxH);
   ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
@@ -719,8 +885,7 @@ function drawLiveSpeechBubble(ctx: CanvasRenderingContext2D, text: string, width
   const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
   const radius = Math.min(boxH * 0.42, fontSize * 1.45);
   const tailBase = clamp(anchor.x, x + fontSize * 1.4, x + boxW - fontSize * 1.4);
-  const tailTipX = clamp(anchor.x + side * fontSize * 1.15, x + fontSize * 0.8, x + boxW - fontSize * 0.8);
-  const tailTipY = clamp(anchor.y - fontSize * 1.55, y + boxH + fontSize * 0.35, height - fontSize * 0.5);
+  const tailTip = speechBubbleTailTip(anchor, x + boxW / 2, y + boxH / 2, fontSize);
   ctx.shadowColor = "rgba(0,0,0,.12)";
   ctx.shadowBlur = 2;
   ctx.shadowOffsetX = 2;
@@ -733,7 +898,7 @@ function drawLiveSpeechBubble(ctx: CanvasRenderingContext2D, text: string, width
   ctx.quadraticCurveTo(x + boxW, y, x + boxW, y + radius);
   ctx.quadraticCurveTo(x + boxW, y + boxH, x + boxW - radius, y + boxH);
   ctx.lineTo(tailBase + fontSize * 0.42, y + boxH);
-  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.82, tailTipX, tailTipY);
+  ctx.quadraticCurveTo(tailBase + fontSize * 0.08, y + boxH + fontSize * 0.82, tailTip.x, tailTip.y);
   ctx.quadraticCurveTo(tailBase - fontSize * 0.24, y + boxH + fontSize * 0.46, tailBase - fontSize * 0.45, y + boxH);
   ctx.lineTo(x + radius, y + boxH);
   ctx.quadraticCurveTo(x, y + boxH, x, y + boxH - radius);
@@ -4132,6 +4297,7 @@ function characterHeadSpeechAnchor(
     x: sx + localX * pose.facing * (pose.momentumScaleX ?? 1),
     y: sy + pose.airY * s + localY * (pose.momentumScaleY ?? 1),
     facing: pose.facing,
+    radius: Math.max(headR, headRY),
   };
 }
 
@@ -6329,7 +6495,7 @@ export default function Board2Page() {
     } else if (showCharacterRef.current && !playModeRef.current) {
       const resolved = resolvedCharActionsRef.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c1", time, resolved, "timeline"));
-      if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+      if (time >= characterEntranceTimeRef.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true,
         cam, sf, W, H, charInitXRef.current, charInitYRef.current,
@@ -6350,7 +6516,7 @@ export default function Board2Page() {
     if (!liveMode && showCharacter2Ref.current && !playModeRef.current) {
       const resolved = resolvedCharActions2Ref.current;
       const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c2", time, resolved, "timeline"));
-      if (poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+      if (time >= characterEntranceTime2Ref.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, showCharacter2Ref.current,
         cam, sf, W, H, charInit2XRef.current, charInit2YRef.current,
@@ -6373,7 +6539,8 @@ export default function Board2Page() {
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
     ctx.restore();
-    drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
+    const mediaBubbleTarget = narrationMediaBubbleTarget(time, currentClips, cam, sf, W, H);
+    drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor, mediaBubbleTarget);
   }, [drawStreamGuestsToCtx, editorCameraAtTime]);
 
   const drawFrame = useCallback((time: number) => {
