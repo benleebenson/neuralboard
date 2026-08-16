@@ -243,7 +243,12 @@ export function isGestureTrack(value: unknown): value is GestureTrackPoint[] {
 }
 
 export function gestureAt(time: number, track: readonly GestureTrackPoint[]): Gesture {
-  if (!Number.isFinite(time) || !track.length || time < track[0].start) return "neutral";
+  const index = gestureTrackPointIndexAt(time, track);
+  return index >= 0 ? track[index].gesture : "neutral";
+}
+
+export function gestureTrackPointIndexAt(time: number, track: readonly GestureTrackPoint[]): number {
+  if (!Number.isFinite(time) || !track.length || time < track[0].start) return -1;
   let low = 0;
   let high = track.length - 1;
   while (low <= high) {
@@ -252,7 +257,12 @@ export function gestureAt(time: number, track: readonly GestureTrackPoint[]): Ge
     else high = mid - 1;
   }
   const point = high >= 0 ? track[high] : null;
-  return point && time < point.end ? point.gesture : "neutral";
+  return point && time < point.end ? high : -1;
+}
+
+/** Low-priority narration poses may replace idle/explanation arms, but never authored action poses. */
+export function actionAllowsNarrationGesture(actionType: string | undefined): boolean {
+  return actionType === undefined || actionType === "idle" || actionType === "explainGesture";
 }
 
 /** Gesture tracks are speech-bounded intervals, so silence and uncovered gaps resolve neutral. */

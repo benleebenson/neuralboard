@@ -73,13 +73,16 @@ import {
 } from "@/lib/character/lipsync";
 import {
   GESTURE_NAMES,
+  actionAllowsNarrationGesture,
   applyGestureDwellRules,
+  gestureTrackPointIndexAt,
   isGestureTrack,
   speechAwareGestureAt,
   tagNarrationGestures,
   type Gesture,
   type GestureTrackPoint,
 } from "@/lib/character/gestures";
+import { shouldResumeNarrationPlayback } from "@/lib/board2/narration-playback";
 import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
@@ -3016,15 +3019,17 @@ function evalCharPoseRaw(
   gesturePose: GesturePose = GESTURE_POSES[DEFAULT_TALK_GESTURE],
 ): CharPoseResult {
   // Standing/idle pose — angles measured from vertical-down, positive = outward from body midline.
-  // Relaxed arms stay visibly away from the torso; the idle bob below is head/breathing only.
+  // Narration gestures replace the idle upper-body pose while keeping the breathing bob.
   const idlePose = (rx: number, ry: number): CharPoseResult => {
     const t = time * 2;
     return {
       boardX: rx, boardY: ry, facing: 1,
-      headBob: Math.sin(t) * 2, bodyLean: 0,
+      headBob: Math.sin(t) * 2 + gesturePose.headBob,
+      bodyLean: gesturePose.bodyLean,
+      headTilt: gesturePose.headTilt,
       leftLegA: 0.12, rightLegA: -0.12,
-      leftArmA: CHAR_RELAX_ARM_A, rightArmA: -CHAR_RELAX_ARM_A,
-      leftForeA: CHAR_RELAX_FORE_A, rightForeA: -CHAR_RELAX_FORE_A,
+      leftArmA: gesturePose.leftArmA, rightArmA: gesturePose.rightArmA,
+      leftForeA: gesturePose.leftForeA, rightForeA: gesturePose.rightForeA,
       airY: 0,
     };
   };
@@ -4552,6 +4557,12 @@ export default function Board2Page() {
   const narrationVisemeTrackSourceRef = useRef<string | null>(null);
   const narrationGestureTrackRef = useRef<GestureTrackPoint[]>([]);
   const narrationGestureTrackSourceRef = useRef<string | null>(null);
+  const gesturePlaybackDebugRef = useRef<{
+    active: boolean;
+    generated: number;
+    seen: Set<number>;
+    executed: Set<number>;
+  }>({ active: false, generated: 0, seen: new Set(), executed: new Set() });
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
@@ -5433,13 +5444,20 @@ export default function Board2Page() {
     const forced = mode !== "auto" ? GESTURE_POSES[mode] : null;
     const sourceMatches = renderMode === "timeline"
       && narrationGestureTrackSourceRef.current === narrationGestureSourceSignature(clipsRef.current);
-    const trackedGesture = sourceMatches
-      ? speechAwareGestureAt(time, narrationGestureTrackRef.current)
-      : "neutral";
+    const track = narrationGestureTrackRef.current;
+    const pointIndex = sourceMatches ? gestureTrackPointIndexAt(time, track) : -1;
+    const point = pointIndex >= 0 ? track[pointIndex] : null;
+    const activeAction = actions.find((action) => time >= action.startTime && time < action.startTime + action.duration);
+    const canApplyTrackedGesture = !forced && actionAllowsNarrationGesture(activeAction?.type);
+    const trackedGesture = point && canApplyTrackedGesture ? point.gesture : "neutral";
+    const debug = gesturePlaybackDebugRef.current;
+    if (debug.active && point && point.gesture !== "neutral") {
+      debug.seen.add(pointIndex);
+      if (canApplyTrackedGesture) debug.executed.add(pointIndex);
+    }
     const automatic = GESTURE_POSES[trackedGesture];
     const target = forced ?? automatic;
     const transition = id === "c2" ? characterGestureTransition2Ref.current : characterGestureTransitionRef.current;
-    void actions;
     if (!transition) return target;
     const progress = (nowMs - transition.startMs) / (GESTURE_TRANSITION_SECONDS * 1000);
     return progress >= 1 ? target : interpolateGesturePose(transition.from, transition.to, progress);
@@ -6880,6 +6898,18 @@ export default function Board2Page() {
 
   // ─ RAF playback loop ──────────────────────────────────────────────────────
 
+  function finishGesturePlaybackDebug(reason: "paused" | "ended") {
+    const debug = gesturePlaybackDebugRef.current;
+    if (!debug.active) return;
+    console.info("[board2:gestures] playback summary", {
+      reason,
+      generated: debug.generated,
+      renderSaw: debug.seen.size,
+      executed: debug.executed.size,
+    });
+    debug.active = false;
+  }
+
   const rafLoop = useCallback(() => {
     if (!isPlayingRef.current) return;
     // eslint-disable-next-line react-hooks/purity
@@ -6904,6 +6934,7 @@ export default function Board2Page() {
           runtime.reason = "playback-ended";
         }
         stopAllNarrationAudio();
+        finishGesturePlaybackDebug("ended");
         prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
@@ -6925,7 +6956,7 @@ export default function Board2Page() {
       if (isActive && !wasActive && !activeNarrationRef.current.has(clip.id)) {
         startNarrationAudio(clip);
       } else if (isActive) {
-        syncNarrationAudio(clip, t);
+        syncNarrationAudio(clip);
       } else if (!isActive && wasActive) {
         stopNarrationAudio(clip.id);
       }
@@ -6944,6 +6975,17 @@ export default function Board2Page() {
       lastRafTimeRef.current = null;
       lastEditorFrameTimeRef.current = 0;
       lastPlayheadUiTimeRef.current = 0;
+      const currentGestureSource = narrationGestureSourceSignature(clipsRef.current);
+      const track = narrationGestureTrackSourceRef.current === currentGestureSource
+        ? narrationGestureTrackRef.current
+        : [];
+      const generated = track.filter((point) => point.gesture !== "neutral").length;
+      gesturePlaybackDebugRef.current = { active: true, generated, seen: new Set(), executed: new Set() };
+      console.info("[board2:gestures] playback start", {
+        generated,
+        renderTrackActions: generated,
+        sourceMatched: narrationGestureTrackSourceRef.current === currentGestureSource,
+      });
       rafIdRef.current = requestAnimationFrame(rafLoop);
       // Spawn narration audio for any clips already active at the current playhead
       const t = playheadRef.current;
@@ -6970,6 +7012,7 @@ export default function Board2Page() {
       ambientCandidateIdsRef.current = new Set();
       // Pause streamed narration elements without discarding their media state.
       stopAllNarrationAudio();
+      finishGesturePlaybackDebug("paused");
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
@@ -7627,16 +7670,14 @@ export default function Board2Page() {
     }
   }
 
-  function syncNarrationAudio(clip: Clip, timelineTime: number) {
+  function syncNarrationAudio(clip: Clip) {
     const element = activeNarrationRef.current.get(clip.id);
     if (!element) return;
     updateNarrationAudioSettings(clip, element);
-    if (element.readyState < 2 || element.seeking) return;
-    const expected = narrationSourceTime(clip, timelineTime, element);
-    if (Math.abs(element.currentTime - expected) > 0.35) {
-      try { element.currentTime = expected; } catch {}
-    }
-    if (element.paused && isPlayingRef.current) {
+    // Position once in startNarrationAudio, then let the media clock run continuously. Comparing
+    // it to RAF time here caused audible backward seeks; play() on an ended element also restarts
+    // that narration from zero while its timeline clip is still active.
+    if (isPlayingRef.current && shouldResumeNarrationPlayback(element)) {
       element.play().catch((err) => console.warn("[narration] preview resume failed", err));
     }
   }
@@ -8282,6 +8323,12 @@ export default function Board2Page() {
       drawFrameRef.current(playheadRef.current);
       const cueCount = analyzed.reduce((sum, item) => sum + item.cues.length, 0);
       const gestureCount = gestureTrack.filter((point) => point.gesture !== "neutral").length;
+      console.info("[board2:gestures] generated", {
+        generated: gestureCount,
+        trackPoints: gestureTrack.length,
+        sourceMatched: narrationGestureTrackSourceRef.current === narrationGestureSourceSignature(clipsRef.current),
+        smart: smartGestures && !smartGestureFallback,
+      });
       setToast(smartGestureFallback
         ? `Smart gestures failed · using rule-based track (${gestureCount} gestures)`
         : `Lip sync + gestures ready · ${cueCount} mouth cue${cueCount === 1 ? "" : "s"} · ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}`);
