@@ -1216,13 +1216,13 @@ const GESTURE_POSES: Record<Gesture, GesturePose> = {
     headTilt: 0, bodyLean: 0, headBob: 0,
   },
   pointUp: {
-    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-180),
-    leftForeA: gestureRadians(10), rightForeA: gestureRadians(-180),
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-110),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(-175),
     headTilt: gestureRadians(-3), bodyLean: gestureRadians(-2), headBob: 0,
   },
   thinking: {
-    leftArmA: gestureRadians(-40), rightArmA: gestureRadians(-100),
-    leftForeA: gestureRadians(-160), rightForeA: gestureRadians(120),
+    leftArmA: gestureRadians(10), rightArmA: gestureRadians(-88),
+    leftForeA: gestureRadians(10), rightForeA: gestureRadians(135),
     headTilt: gestureRadians(9), bodyLean: gestureRadians(2), headBob: 0,
   },
   self: {
