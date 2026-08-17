@@ -130,6 +130,8 @@ import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
+const BOARD_TOUCH_DRAG_THRESHOLD_PX = 8;
+const BOARD_TOUCH_TAP_MAX_MS = 350;
 
 type TranscriptionApiResponse = {
   error?: string;
@@ -1891,11 +1893,10 @@ function drawAnnotationsToCanvas(
       ctx.lineJoin = "round";
       for (let i = 1; i < ann.points.length; i++) {
         const a = ann.points[i - 1], b = ann.points[i];
-        const pressure = b.pressure ?? 0.5;
         ctx.beginPath();
         ctx.moveTo(toSX(a.x), toSY(a.y));
         ctx.quadraticCurveTo(toSX(a.x), toSY(a.y), toSX((a.x + b.x) / 2), toSY((a.y + b.y) / 2));
-        ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf * (0.35 + 0.9 * Math.pow(pressure, 0.7)));
+        ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf);
         ctx.stroke();
       }
       ctx.restore();
@@ -4389,6 +4390,7 @@ export default function Board2Page() {
   const [boardMode, setBoardMode] = useState(false);
   const boardModeInitializedRef = useRef(false);
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
+  const [mobileEditorMenuOpen, setMobileEditorMenuOpen] = useState(false);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
   // ── Save / Load ──
@@ -4717,17 +4719,24 @@ export default function Board2Page() {
   const mobileGestureRef = useRef<{
     type: "idle" | "deciding" | "pan" | "move" | "pinch";
     hitClipId: string | null;
+    hitAnnotationId: string | null;
     hitClipIsSelected: boolean;
-    startX: number; startY: number;
+    hitAnnotationIsSelected: boolean;
+    startX: number; startY: number; startTime: number;
     origPan: { x: number; y: number };
     clipOrigX: number; clipOrigY: number;
+    annotationOrigX: number; annotationOrigY: number;
+    annotationOrigArrowStartX?: number; annotationOrigArrowStartY?: number;
+    annotationOrigArrowEndX?: number; annotationOrigArrowEndY?: number;
+    annotationOrigPoints?: Array<{ x: number; y: number; pressure?: number }>;
     pinchStartDist: number; pinchStartZoom: number; pinchStartPan: { x: number; y: number };
     longPressTimer: ReturnType<typeof setTimeout> | null;
   }>({
-    type: "idle", hitClipId: null, hitClipIsSelected: false,
-    startX: 0, startY: 0,
+    type: "idle", hitClipId: null, hitAnnotationId: null, hitClipIsSelected: false, hitAnnotationIsSelected: false,
+    startX: 0, startY: 0, startTime: 0,
     origPan: { x: 0, y: 0 },
     clipOrigX: 0, clipOrigY: 0,
+    annotationOrigX: 0, annotationOrigY: 0,
     pinchStartDist: 1, pinchStartZoom: 0.18, pinchStartPan: { x: 0, y: 0 },
     longPressTimer: null,
   });
@@ -10195,6 +10204,11 @@ export default function Board2Page() {
     setEditingAnnotationId((prev) => (prev === id ? null : prev));
   }
 
+  function confirmDeleteAnnotation(id: string) {
+    if (!window.confirm("Delete this annotation from the board?")) return;
+    deleteAnnotation(id);
+  }
+
   function commitTextEdit(annId: string) {
     const text = editingAnnotationTextRef.current.trim();
     if (!text) {
@@ -10421,8 +10435,7 @@ export default function Board2Page() {
       e.preventDefault();
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       const baseWidth = penPresetRef.current === "marker" ? 14 : penPresetRef.current === "fine" ? 2.25 : 6;
-      const pressureOf = (ev: PointerEvent | React.PointerEvent) => ev.pointerType === "pen" && ev.pressure > 0 ? ev.pressure : 0.5;
-      const pts: Array<{ x: number; y: number; pressure?: number }> = [{ x: bx, y: by, pressure: pressureOf(e) }];
+      const pts: Array<{ x: number; y: number; pressure?: number }> = [{ x: bx, y: by }];
       const overlay = penOverlayRef.current;
       const overlayCtx = overlay?.getContext("2d");
       const containerRect = container.getBoundingClientRect();
@@ -10446,15 +10459,14 @@ export default function Board2Page() {
           const r = container.getBoundingClientRect();
           const px = (sample.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
           const py = (sample.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
-          const pressure = pressureOf(sample);
           activePenClientPointRef.current = { x: sample.clientX, y: sample.clientY };
-          pts.push({ x: px, y: py, pressure });
+          pts.push({ x: px, y: py });
           if (overlayCtx) {
             const next = { x: sample.clientX - r.left, y: sample.clientY - r.top };
             overlayCtx.beginPath();
             overlayCtx.moveTo(lastClient.x, lastClient.y);
             overlayCtx.lineTo((lastClient.x + next.x) / 2, (lastClient.y + next.y) / 2);
-            overlayCtx.lineWidth = baseWidth * boardZoomRef.current * (0.35 + 0.9 * Math.pow(pressure, 0.7));
+            overlayCtx.lineWidth = baseWidth * boardZoomRef.current;
             overlayCtx.stroke();
             lastClient = next;
           }
@@ -13371,19 +13383,36 @@ export default function Board2Page() {
 
     const target = e.target as HTMLElement;
     const clipEl = target.closest("[data-mbclipid]");
+    const annotationEl = target.closest("[data-mbannotationid]");
     const hitClipId = clipEl ? (clipEl as HTMLElement).dataset.mbclipid ?? null : null;
+    const hitAnnotationId = annotationEl ? (annotationEl as HTMLElement).dataset.mbannotationid ?? null : null;
     if (hitClipId) selectionSurfaceRef.current = "board";
 
     g.type = "deciding";
     g.hitClipId = hitClipId;
-    g.hitClipIsSelected = hitClipId !== null && hitClipId === selectedClipId;
+    g.hitAnnotationId = hitAnnotationId;
+    g.hitClipIsSelected = hitClipId !== null && selectedClipIdsRef.current.includes(hitClipId);
+    g.hitAnnotationIsSelected = hitAnnotationId !== null && selectedAnnotationIdsRef.current.includes(hitAnnotationId);
     g.startX = e.clientX;
     g.startY = e.clientY;
+    g.startTime = performance.now();
     g.origPan = { ...boardPanRef.current };
 
     if (hitClipId) {
       const clip = clipsRef.current.find((c) => c.id === hitClipId);
       if (clip?.boardX !== undefined) { g.clipOrigX = clip.boardX; g.clipOrigY = clip.boardY ?? 0; }
+    }
+    if (hitAnnotationId) {
+      const annotation = annotationsRef.current.find((candidate) => candidate.id === hitAnnotationId);
+      if (annotation) {
+        g.annotationOrigX = annotation.boardX;
+        g.annotationOrigY = annotation.boardY;
+        g.annotationOrigArrowStartX = annotation.arrowStartX;
+        g.annotationOrigArrowStartY = annotation.arrowStartY;
+        g.annotationOrigArrowEndX = annotation.arrowEndX;
+        g.annotationOrigArrowEndY = annotation.arrowEndY;
+        g.annotationOrigPoints = annotation.points?.map((point) => ({ ...point }));
+      }
     }
 
     g.longPressTimer = setTimeout(() => {
@@ -13423,9 +13452,9 @@ export default function Board2Page() {
     if (g.type === "deciding") {
       const dx = e.clientX - g.startX;
       const dy = e.clientY - g.startY;
-      if (Math.hypot(dx, dy) >= 8) {
+      if (Math.hypot(dx, dy) >= BOARD_TOUCH_DRAG_THRESHOLD_PX) {
         if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
-        g.type = g.hitClipIsSelected ? "move" : "pan";
+        g.type = g.hitClipIsSelected || g.hitAnnotationIsSelected ? "move" : "pan";
       }
     }
 
@@ -13440,6 +13469,22 @@ export default function Board2Page() {
       setClips((prev) => prev.map((c) => c.id !== g.hitClipId ? c : {
         ...c, boardX: Math.round(g.clipOrigX + dx), boardY: Math.round(g.clipOrigY + dy),
       }));
+    } else if (g.type === "move" && g.hitAnnotationId) {
+      const zoom = boardZoomRef.current;
+      const dx = (e.clientX - g.startX) / zoom;
+      const dy = (e.clientY - g.startY) / zoom;
+      setAnnotations((prev) => prev.map((annotation) => annotation.id !== g.hitAnnotationId ? annotation : {
+        ...annotation,
+        boardX: g.annotationOrigX + dx,
+        boardY: g.annotationOrigY + dy,
+        ...(g.annotationOrigArrowStartX !== undefined ? {
+          arrowStartX: g.annotationOrigArrowStartX + dx,
+          arrowStartY: g.annotationOrigArrowStartY! + dy,
+          arrowEndX: g.annotationOrigArrowEndX! + dx,
+          arrowEndY: g.annotationOrigArrowEndY! + dy,
+        } : {}),
+        ...(g.annotationOrigPoints ? { points: g.annotationOrigPoints.map((point) => ({ ...point, x: point.x + dx, y: point.y + dy })) } : {}),
+      }));
     }
   }
 
@@ -13449,12 +13494,14 @@ export default function Board2Page() {
     const g = mobileGestureRef.current;
     if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
 
-    if (g.type === "deciding") {
+    if (g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
       if (g.hitClipId) {
-        setSelectedClipId(g.hitClipId);
-        setMobileDrawer("props");
+        setClipSelection([g.hitClipId]);
+        if (!boardMode) setMobileDrawer("props");
+      } else if (g.hitAnnotationId) {
+        setAnnotationSelection([g.hitAnnotationId]);
       } else {
-        setSelectedClipId(null);
+        clearBoardSelection();
         setMobileDrawer(null);
       }
     }
@@ -15601,12 +15648,16 @@ export default function Board2Page() {
       <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
       {/* ── Header ── */}
-      <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+      <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
+          {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
-          <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>
+          {!isMobile && <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
+          {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
+          {isMobile && <button onClick={() => { setBoardMode(true); setAnnotationToolbarOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...miniButton, minWidth: isPortrait ? 70 : 58, height: isPortrait ? 36 : 28, padding: "0 6px", background: "#fffdf5", fontSize: isPortrait ? 9 : 8 }}>⛶ Board</button>}
+          {!isMobile && <>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               onClick={generateCameraKeyframes}
@@ -15648,8 +15699,22 @@ export default function Board2Page() {
               sign in →
             </button>
           )}
+          </>}
         </div>
       </header>
+
+      {isMobile && !boardMode && mobileEditorMenuOpen && (
+        <div style={{ position: "fixed", top: isPortrait ? "calc(max(44px, env(safe-area-inset-top) + 44px))" : "calc(max(34px, env(safe-area-inset-top) + 34px))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
+          <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
+          <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
+          <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
+          <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera ? 1 : .45 }}>⬡ Camera</button>
+          <button onClick={() => { if (isExporting) cancelExport(); else void startExport(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>{isExporting ? "✕ Export" : "⬇ Export"}</button>
+          <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>▶ YouTube</button>
+          <a href="/board2/library" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>▦ Library</a>
+          <button onClick={() => setMobileEditorMenuOpen(false)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>✕ Close</button>
+        </div>
+      )}
 
       {/* ── Main workspace ── */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, flexDirection: "column", overflow: "hidden" }}>
@@ -15658,7 +15723,7 @@ export default function Board2Page() {
         <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
-          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode || isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <label style={{ ...sketchButton, position: "relative", display: "block", textAlign: "center", boxSizing: "border-box", overflow: "hidden" }}>
               ↑ Upload media
@@ -15869,12 +15934,12 @@ export default function Board2Page() {
             {/* Board container — fills the whole center */}
             <div
               ref={boardContainerRef}
-              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode ? "none" : undefined }}
+              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode || isMobile ? "none" : undefined }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
-              onPointerDown={boardMode ? handleMobileBoardPointerDown : handleBoardPointerDown}
-              onPointerMove={boardMode ? handleMobileBoardPointerMove : undefined}
-              onPointerUp={boardMode ? handleMobileBoardPointerUp : undefined}
-              onPointerCancel={boardMode ? handleMobileBoardPointerUp : undefined}
+              onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
+              onPointerMove={boardMode || isMobile ? handleMobileBoardPointerMove : undefined}
+              onPointerUp={boardMode || isMobile ? handleMobileBoardPointerUp : undefined}
+              onPointerCancel={boardMode || isMobile ? handleMobileBoardPointerUp : undefined}
             >
               {boardMode && <button type="button" aria-label="Exit Board Mode" onClick={() => setBoardMode(false)} style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", right: "max(10px, env(safe-area-inset-right))", zIndex: 100, width: 48, height: 48, border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.94)", fontSize: 20, touchAction: "manipulation" }}>✕</button>}
               {boardMode && <canvas ref={penOverlayRef} aria-hidden="true" style={{ position: "absolute", inset: 0, zIndex: 95, pointerEvents: "none" }} />}
@@ -15904,7 +15969,7 @@ export default function Board2Page() {
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
-                onPointerDown={boardMode ? handleMobileBoardPointerDown : handleBoardSurfacePointerDown}
+                onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardSurfacePointerDown(e); }}
               >
                 {boardMarquee && (() => {
                   const x = Math.min(boardMarquee.startX, boardMarquee.currentX) * boardZoom;
@@ -15935,8 +16000,7 @@ export default function Board2Page() {
                         cursor: "grab",
                         overflow: "visible",
                       }}
-                      onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
-                      onPointerDown={(e) => { if (boardMode) handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
+                      onPointerDown={(e) => { if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
                         {clip.needsRedownload ? (
@@ -15990,6 +16054,16 @@ export default function Board2Page() {
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
                       ))}
+                      {isSel && (
+                        <button
+                          type="button"
+                          aria-label={`Delete ${clip.name} from board`}
+                          title="Delete from board"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); deleteBoardMedia(clip.id); }}
+                          style={{ position: "absolute", left: "50%", top: boardMode || isMobile ? -52 : -30, transform: "translateX(-50%)", width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: boardMode || isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                        >✕</button>
+                      )}
                     </div>
                   );
                 })}
@@ -16144,8 +16218,8 @@ export default function Board2Page() {
                       return <g key={ann.id}>{ann.points.slice(1).map((point, index) => {
                         const previous = ann.points![index];
                         const d = `M ${previous.x * boardZoom} ${previous.y * boardZoom} Q ${previous.x * boardZoom} ${previous.y * boardZoom} ${(previous.x + point.x) * boardZoom / 2} ${(previous.y + point.y) * boardZoom / 2}`;
-                        const pressureWidth = (ann.strokeWidth ?? 4) * boardZoom * (0.35 + 0.9 * Math.pow(point.pressure ?? 0.5, 0.7));
-                        return <path key={index} d={d} fill="none" stroke={ann.color} strokeWidth={pressureWidth} strokeLinecap="round" strokeLinejoin="round" />;
+                        const strokeWidth = (ann.strokeWidth ?? 4) * boardZoom;
+                        return <path key={index} d={d} fill="none" stroke={ann.color} strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />;
                       })}</g>;
                     } else if (ann.type === "emoji" && ann.emoji) {
                       return (
@@ -16171,6 +16245,7 @@ export default function Board2Page() {
                   return (
                     <div
                       key={ann.id}
+                      data-mbannotationid={ann.id}
                       style={{
                         position: "absolute",
                         left: ann.boardX * boardZoom,
@@ -16183,7 +16258,6 @@ export default function Board2Page() {
                         zIndex: 5,
                         pointerEvents: annotationTool === "pointer" || isEditing ? "auto" : "none",
                       }}
-                      onClick={(e) => { if (annotationTool === "pointer") { e.stopPropagation(); setAnnotationSelection([ann.id]); } }}
                       onDoubleClick={(e) => {
                         if (ann.type === "text" && annotationTool === "pointer") {
                           e.stopPropagation();
@@ -16191,7 +16265,11 @@ export default function Board2Page() {
                           setEditingAnnotationText(ann.text ?? "");
                         }
                       }}
-                      onPointerDown={(e) => { if (annotationTool === "pointer") handleAnnotationPointerDown(e, ann); }}
+                      onPointerDown={(e) => {
+                        if (annotationTool !== "pointer") return;
+                        if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>);
+                        else handleAnnotationPointerDown(e, ann);
+                      }}
                     >
                       {ann.type === "text" && !isEditing && (
                         <div style={{
@@ -16275,6 +16353,16 @@ export default function Board2Page() {
                           ))
                         )
                       )}
+                      {showHandles && (
+                        <button
+                          type="button"
+                          aria-label="Delete annotation"
+                          title="Delete annotation"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
+                          style={{ position: "absolute", left: "50%", top: boardMode || isMobile ? -52 : -30, transform: "translateX(-50%)", width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: boardMode || isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                        >✕</button>
+                      )}
                     </div>
                   );
                 })}
@@ -16320,7 +16408,7 @@ export default function Board2Page() {
               </div>
 
               {/* Annotation toolbar — collapsible, Pro gated */}
-              <div style={{ position: "absolute", top: boardMode ? "max(8px, env(safe-area-inset-top))" : 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: boardMode ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
+              <div style={{ position: "absolute", top: boardMode ? "max(8px, env(safe-area-inset-top))" : 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: boardMode || isMobile ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
                 <ProGated featureName="Annotation tools">
                   <>
                     <button
@@ -16334,7 +16422,7 @@ export default function Board2Page() {
                       }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
-                        padding: boardMode ? "10px 14px" : "5px 12px", minHeight: boardMode ? 44 : undefined, border: "1.5px solid #2a2a2a",
+                        padding: boardMode || isMobile ? "10px 14px" : "5px 12px", minHeight: boardMode || isMobile ? 44 : undefined, border: "1.5px solid #2a2a2a",
                         background: annotationToolbarOpen ? "#2a2a2a" : "#fffdf5",
                         color: annotationToolbarOpen ? "#c8f135" : "#2a2a2a",
                         cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
@@ -16349,11 +16437,11 @@ export default function Board2Page() {
                         background: "#fffdf5",
                         border: "1.5px solid #2a2a2a",
                         boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
-                        padding: boardMode ? "6px 8px" : "4px 8px",
+                        padding: boardMode || isMobile ? "6px 8px" : "4px 8px",
                         whiteSpace: "nowrap",
                         position: "relative",
-                        maxWidth: boardMode ? "100%" : undefined,
-                        overflowX: boardMode ? "auto" : undefined,
+                        maxWidth: boardMode || isMobile ? "100%" : undefined,
+                        overflowX: boardMode || isMobile ? "auto" : undefined,
                       }}>
                         {/* Tool buttons */}
                         {([
@@ -16377,7 +16465,7 @@ export default function Board2Page() {
                               else setEmojiPickerOpen(false);
                             }}
                             style={{
-                              width: boardMode ? 44 : 28, height: boardMode ? 44 : 28, minWidth: boardMode ? 44 : undefined, border: "none", padding: 0,
+                              width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, minWidth: boardMode || isMobile ? 44 : undefined, border: "none", padding: 0,
                               outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
                               background: annotationTool === id ? "#2a2a2a" : "transparent",
                               color: annotationTool === id ? "#fff" : "#2a2a2a",
@@ -16394,10 +16482,10 @@ export default function Board2Page() {
                           <>
                             <div style={{ width: 1, height: 28, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
                             {(["marker", "pen", "fine"] as const).map((preset) => (
-                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: boardMode ? 48 : 38, minHeight: boardMode ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
+                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 48 : 38, minHeight: boardMode || isMobile ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
                             ))}
-                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: boardMode ? 72 : 58, minHeight: boardMode ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
-                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: boardMode ? 48 : 34, minHeight: boardMode ? 44 : 28 }} title="Undo last stroke">↶</button>
+                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 72 : 58, minHeight: boardMode || isMobile ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
+                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 48 : 34, minHeight: boardMode || isMobile ? 44 : 28 }} title="Undo last stroke">↶</button>
                             <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: boardMode ? 58 : 42, minHeight: boardMode ? 44 : 28, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
                           </>
                         )}
@@ -16904,8 +16992,9 @@ export default function Board2Page() {
                 top: 8,
                 right: 8,
                 zIndex: 20,
-                pointerEvents: "auto",
+                pointerEvents: isMobile ? "none" : "auto",
                 touchAction: "none",
+                display: isMobile ? "none" : "block",
               }}
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
@@ -16983,7 +17072,7 @@ export default function Board2Page() {
           </div>
 
           {/* ── Right: properties panel (no keyframes) ── */}
-          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode || isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <div style={panelLabelStyle}>Properties</div>
               <button
@@ -17716,10 +17805,10 @@ export default function Board2Page() {
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ height: TIMELINE_H, flexShrink: 0, background: "rgba(255,253,245,0.85)", display: boardMode ? "none" : "flex", flexDirection: "column" }}>
+        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: boardMode ? "none" : "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 5 : 8, padding: isMobile ? "3px max(6px, env(safe-area-inset-left))" : "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap", overflowX: isMobile ? "auto" : "visible" }}>
             <button
               onClick={togglePlay}
               style={{ ...sketchButton, width: 34, height: 34, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isPlaying ? "#ff5e3a" : "#c8f135", color: isPlaying ? "#fff" : "#2a2a2a" }}
@@ -17736,8 +17825,8 @@ export default function Board2Page() {
               <button onClick={() => { const n = clamp(pxPerSec / 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>−</button>
               <button onClick={() => { const n = clamp(pxPerSec * 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>+</button>
             </div>
-            <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>space=play · ⌘C/V/D=copy/paste/dup · ⌫=delete · drag vertically=change layer</span>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 6 }}>
+            {!isMobile && <span style={{ fontSize: 9, fontFamily: "monospace", color: "#bbb" }}>space=play · ⌘C/V/D=copy/paste/dup · ⌫=delete · drag vertically=change layer</span>}
+            <div style={{ marginLeft: "auto", display: isMobile ? "none" : "flex", alignItems: "center", gap: 6 }}>
               {isExporting && (
                 <span style={{ fontSize: 10, fontFamily: "monospace", color: "#ff5e3a" }}>{Math.round(exportProgress * 100)}%</span>
               )}
@@ -17795,7 +17884,7 @@ export default function Board2Page() {
           {/* Track — 5 visual layers above, narration audio row below */}
           <div
             ref={scrollerRef}
-            style={{ flex: 1, minHeight: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 16, position: "relative", overflowX: "auto", overflowY: "hidden" }}
+            style={{ flex: 1, minHeight: isMobile ? 0 : TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 16, position: "relative", overflowX: "auto", overflowY: "hidden" }}
             onScroll={(e) => {
               const sl = (e.target as HTMLDivElement).scrollLeft;
               timelineScrollRef.current = sl;
