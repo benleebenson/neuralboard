@@ -967,7 +967,7 @@ type Annotation = {
   arrowEndX?: number;
   arrowEndY?: number;
   highlightStyle?: "rect" | "underline" | "curlyBrace";
-  points?: Array<{ x: number; y: number }>;  // pen
+  points?: Array<{ x: number; y: number; pressure?: number }>;  // pen, in board space
   emoji?: string;                              // emoji
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
@@ -1886,16 +1886,18 @@ function drawAnnotationsToCanvas(
       }
     } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
       ctx.save();
-      ctx.beginPath();
-      ctx.moveTo(toSX(ann.points[0].x), toSY(ann.points[0].y));
-      for (let i = 1; i < ann.points.length; i++) {
-        ctx.lineTo(toSX(ann.points[i].x), toSY(ann.points[i].y));
-      }
       ctx.strokeStyle = ann.color;
-      ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      ctx.stroke();
+      for (let i = 1; i < ann.points.length; i++) {
+        const a = ann.points[i - 1], b = ann.points[i];
+        const pressure = b.pressure ?? 0.5;
+        ctx.beginPath();
+        ctx.moveTo(toSX(a.x), toSY(a.y));
+        ctx.quadraticCurveTo(toSX(a.x), toSY(a.y), toSX((a.x + b.x) / 2), toSY((a.y + b.y) / 2));
+        ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf * (0.35 + 0.9 * Math.pow(pressure, 0.7)));
+        ctx.stroke();
+      }
       ctx.restore();
     } else if (ann.type === "emoji" && ann.emoji) {
       const fs = Math.max(8, (ann.fontSize ?? 120) * sf);
@@ -4384,6 +4386,8 @@ export default function Board2Page() {
   // ── Mobile ──
   const [isMobile, setIsMobile] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
+  const [boardMode, setBoardMode] = useState(false);
+  const boardModeInitializedRef = useRef(false);
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
@@ -4407,7 +4411,14 @@ export default function Board2Page() {
   const [annotationToolbarOpen, setAnnotationToolbarOpen] = useState(false);
   const [annotationEmoji, setAnnotationEmoji] = useState("🎯");
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
-  const [penPreviewPoints, setPenPreviewPoints] = useState<Array<{ x: number; y: number }> | null>(null);
+  const [penPreset, setPenPreset] = useState<"marker" | "pen" | "fine">("pen");
+  const [stylusOnly, setStylusOnly] = useState(false);
+  const penPresetRef = useRef<"marker" | "pen" | "fine">("pen");
+  const stylusOnlyRef = useRef(false);
+  const penOverlayRef = useRef<HTMLCanvasElement | null>(null);
+  const activePenPointerRef = useRef<number | null>(null);
+  const activePenClientPointRef = useRef<{ x: number; y: number } | null>(null);
+  const annotationUndoRef = useRef<Annotation[][]>([]);
 
   // ── Character ──
   const [showCharacter, setShowCharacter] = useState(false);
@@ -5477,6 +5488,8 @@ export default function Board2Page() {
   useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
   useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
   useEffect(() => { annotationEmojiRef.current = annotationEmoji; }, [annotationEmoji]);
+  useEffect(() => { penPresetRef.current = penPreset; }, [penPreset]);
+  useEffect(() => { stylusOnlyRef.current = stylusOnly; }, [stylusOnly]);
   useEffect(() => {
     if (editingAnnotationId) {
       requestAnimationFrame(() => editingTextareaRef.current?.focus());
@@ -5720,8 +5733,21 @@ export default function Board2Page() {
 
   useEffect(() => {
     const check = () => {
-      setIsMobile(window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches);
+      const mobile = window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches;
+      setIsMobile(mobile);
       setIsPortrait(window.innerHeight > window.innerWidth);
+      if (!boardModeInitializedRef.current) {
+        boardModeInitializedRef.current = true;
+        if (mobile) {
+          setMobileDesktopOverride(true);
+          setBoardMode(true);
+          setAnnotationToolbarOpen(true);
+          // iPadOS commonly identifies itself as Macintosh while exposing multi-touch.
+          const ipad = /iPad/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+          setStylusOnly(ipad);
+          stylusOnlyRef.current = ipad;
+        }
+      }
     };
     check();
     window.addEventListener("resize", check);
@@ -10339,6 +10365,19 @@ export default function Board2Page() {
   // ─ Annotation creation (glass pane) ──────────────────────────────────────
 
   function handleAnnotationGlassPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (annotationToolRef.current === "pen" && e.pointerType === "touch" && activePenPointerRef.current !== null && activePenPointerRef.current !== e.pointerId) {
+      const firstPoint = activePenClientPointRef.current;
+      if (firstPoint) mobileBoardPointersRef.current.set(activePenPointerRef.current, firstPoint);
+      activePenPointerRef.current = null;
+      const overlay = penOverlayRef.current;
+      overlay?.getContext("2d")?.clearRect(0, 0, overlay.width, overlay.height);
+      handleMobileBoardPointerDown(e);
+      return;
+    }
+    if (annotationToolRef.current === "pen" && stylusOnlyRef.current && e.pointerType === "touch") {
+      handleMobileBoardPointerDown(e);
+      return;
+    }
     e.stopPropagation();
     const container = boardContainerRef.current!;
     const rect = container.getBoundingClientRect();
@@ -10375,37 +10414,79 @@ export default function Board2Page() {
     }
 
     if (tool === "pen") {
+      if (stylusOnlyRef.current && e.pointerType !== "pen") return;
+      if (activePenPointerRef.current !== null) return;
+      activePenPointerRef.current = e.pointerId;
+      activePenClientPointRef.current = { x: e.clientX, y: e.clientY };
+      e.preventDefault();
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      const pts: Array<{ x: number; y: number }> = [{ x: bx, y: by }];
-      let lastSampleMs = performance.now();
+      const baseWidth = penPresetRef.current === "marker" ? 14 : penPresetRef.current === "fine" ? 2.25 : 6;
+      const pressureOf = (ev: PointerEvent | React.PointerEvent) => ev.pointerType === "pen" && ev.pressure > 0 ? ev.pressure : 0.5;
+      const pts: Array<{ x: number; y: number; pressure?: number }> = [{ x: bx, y: by, pressure: pressureOf(e) }];
+      const overlay = penOverlayRef.current;
+      const overlayCtx = overlay?.getContext("2d");
+      const containerRect = container.getBoundingClientRect();
+      if (overlay && overlayCtx) {
+        const dpr = window.devicePixelRatio || 1;
+        overlay.width = Math.max(1, Math.round(containerRect.width * dpr));
+        overlay.height = Math.max(1, Math.round(containerRect.height * dpr));
+        overlay.style.width = `${containerRect.width}px`;
+        overlay.style.height = `${containerRect.height}px`;
+        overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        overlayCtx.clearRect(0, 0, containerRect.width, containerRect.height);
+        overlayCtx.strokeStyle = annotationColorRef.current;
+        overlayCtx.lineCap = "round";
+        overlayCtx.lineJoin = "round";
+      }
+      let lastClient = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
       const onMove = (ev: PointerEvent) => {
-        const now = performance.now();
-        if (now - lastSampleMs < 10) return;
-        lastSampleMs = now;
-        const r = container.getBoundingClientRect();
-        const px = (ev.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
-        const py = (ev.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
-        pts.push({ x: px, y: py });
-        setPenPreviewPoints([...pts]);
+        if (ev.pointerId !== activePenPointerRef.current) return;
+        const samples = typeof ev.getCoalescedEvents === "function" ? ev.getCoalescedEvents() : [ev];
+        for (const sample of samples.length ? samples : [ev]) {
+          const r = container.getBoundingClientRect();
+          const px = (sample.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
+          const py = (sample.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
+          const pressure = pressureOf(sample);
+          activePenClientPointRef.current = { x: sample.clientX, y: sample.clientY };
+          pts.push({ x: px, y: py, pressure });
+          if (overlayCtx) {
+            const next = { x: sample.clientX - r.left, y: sample.clientY - r.top };
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(lastClient.x, lastClient.y);
+            overlayCtx.lineTo((lastClient.x + next.x) / 2, (lastClient.y + next.y) / 2);
+            overlayCtx.lineWidth = baseWidth * boardZoomRef.current * (0.35 + 0.9 * Math.pow(pressure, 0.7));
+            overlayCtx.stroke();
+            lastClient = next;
+          }
+        }
       };
-      const onUp = () => {
+      const onUp = (ev: PointerEvent) => {
+        if (activePenPointerRef.current !== null && ev.pointerId !== activePenPointerRef.current) return;
+        const cancelledForGesture = activePenPointerRef.current === null;
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
-        setPenPreviewPoints(null);
+        window.removeEventListener("pointercancel", onUp);
+        activePenPointerRef.current = null;
+        activePenClientPointRef.current = null;
+        overlayCtx?.clearRect(0, 0, containerRect.width, containerRect.height);
+        if (cancelledForGesture) return;
         if (pts.length < 2) return;
         const minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
         const minY = Math.min(...pts.map((p) => p.y)), maxY = Math.max(...pts.map((p) => p.y));
         const id = generateId();
-        setAnnotations((prev) => [...prev, {
-          id, type: "pen", color: annotationColorRef.current, strokeWidth: 4,
+        setAnnotations((prev) => {
+          annotationUndoRef.current.push(prev);
+          if (annotationUndoRef.current.length > 30) annotationUndoRef.current.shift();
+          return [...prev, {
+          id, type: "pen", color: annotationColorRef.current, strokeWidth: baseWidth,
           boardX: minX, boardY: minY, boardW: Math.max(1, maxX - minX), boardH: Math.max(1, maxY - minY),
           points: pts,
-        }]);
+        }]; });
         setAnnotationSelection([id]);
-        disarmAnnotationTool();
       };
       window.addEventListener("pointermove", onMove);
       window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
       return;
     }
 
@@ -13270,6 +13351,8 @@ export default function Board2Page() {
   // ─── Mobile gesture handlers ──────────────────────────────────────────────
 
   function handleMobileBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && mobileBoardPointersRef.current.size === 0)) return;
+    e.stopPropagation();
     const pointers = mobileBoardPointersRef.current;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -13312,6 +13395,7 @@ export default function Board2Page() {
   }
 
   function handleMobileBoardPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && mobileBoardPointersRef.current.size === 0)) return;
     const pointers = mobileBoardPointersRef.current;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const g = mobileGestureRef.current;
@@ -13360,6 +13444,7 @@ export default function Board2Page() {
   }
 
   function handleMobileBoardPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && !mobileBoardPointersRef.current.has(e.pointerId))) return;
     const pointers = mobileBoardPointersRef.current;
     const g = mobileGestureRef.current;
     if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
@@ -14042,7 +14127,7 @@ export default function Board2Page() {
   }
 
   // Below: existing mobile board (landscape) — only shown when mobileDesktopOverride is true
-  if (isMobile && isPortrait) {
+  if (isMobile && isPortrait && !mobileDesktopOverride) {
     return (
       <div style={{ position: "fixed", inset: 0, background: BOARD_SURFACE_COLOR, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace" }}>
         <div style={{ fontSize: 52, lineHeight: 1 }}>↻</div>
@@ -14052,7 +14137,7 @@ export default function Board2Page() {
     );
   }
 
-  if (isMobile) {
+  if (isMobile && !mobileDesktopOverride) {
     const MOBILE_LAYER_H = 30;
     const MOBILE_TRACK_H = N_LAYERS * MOBILE_LAYER_H;
     const MOBILE_NARRATION_H = 28;
@@ -15511,12 +15596,12 @@ export default function Board2Page() {
   // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div style={pageStyle}>
+    <div style={{ ...pageStyle, height: boardMode ? "100dvh" : pageStyle.height, minHeight: boardMode ? "100dvh" : pageStyle.minHeight }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
       {/* ── Header ── */}
-      <header style={headerStyle}>
+      <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
           <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>
@@ -15549,6 +15634,7 @@ export default function Board2Page() {
             </ProGated>
           )}
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
+          <button onClick={() => { setBoardMode(true); setAnnotationToolbarOpen(true); }} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Show only the editable board">⛶ Board Mode</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <a href="/board2/library" style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, color: "#2a2a2a", textDecoration: "none" }}>▦ Library</a>
           <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
@@ -15572,7 +15658,7 @@ export default function Board2Page() {
         <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
-          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <label style={{ ...sketchButton, position: "relative", display: "block", textAlign: "center", boxSizing: "border-box", overflow: "hidden" }}>
               ↑ Upload media
@@ -15783,10 +15869,23 @@ export default function Board2Page() {
             {/* Board container — fills the whole center */}
             <div
               ref={boardContainerRef}
-              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default" }}
+              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode ? "none" : undefined }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
-              onPointerDown={handleBoardPointerDown}
+              onPointerDown={boardMode ? handleMobileBoardPointerDown : handleBoardPointerDown}
+              onPointerMove={boardMode ? handleMobileBoardPointerMove : undefined}
+              onPointerUp={boardMode ? handleMobileBoardPointerUp : undefined}
+              onPointerCancel={boardMode ? handleMobileBoardPointerUp : undefined}
             >
+              {boardMode && <button type="button" aria-label="Exit Board Mode" onClick={() => setBoardMode(false)} style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", right: "max(10px, env(safe-area-inset-right))", zIndex: 100, width: 48, height: 48, border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.94)", fontSize: 20, touchAction: "manipulation" }}>✕</button>}
+              {boardMode && <canvas ref={penOverlayRef} aria-hidden="true" style={{ position: "absolute", inset: 0, zIndex: 95, pointerEvents: "none" }} />}
+              {boardMode && mobileLongPressClipId && (
+                <div onPointerDown={(e) => e.stopPropagation()} onClick={() => setMobileLongPressClipId(null)} style={{ position: "fixed", inset: 0, zIndex: 120, background: "rgba(0,0,0,.25)", display: "flex", alignItems: "flex-end", justifyContent: "center", padding: "16px max(16px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))" }}>
+                  <div onClick={(e) => e.stopPropagation()} style={{ width: "min(420px, 100%)", background: "#fffdf5", border: "2px solid #2a2a2a", borderRadius: 12, overflow: "hidden", boxShadow: "4px 4px 0 #2a2a2a" }}>
+                    <button type="button" onClick={() => { const id = mobileLongPressClipId; setClips((prev) => { const target = prev.find((clip) => clip.id === id); return target ? [...prev.filter((clip) => clip.id !== id), target] : prev; }); setMobileLongPressClipId(null); }} style={{ width: "100%", minHeight: 54, border: 0, borderBottom: "1px solid rgba(42,42,42,.15)", background: "transparent", fontFamily: "monospace", fontSize: 14 }}>Bring forward</button>
+                    <button type="button" onClick={() => { deleteBoardMedia(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ width: "100%", minHeight: 54, border: 0, background: "transparent", color: "#cc2200", fontFamily: "monospace", fontSize: 14 }}>Delete from board…</button>
+                  </div>
+                </div>
+              )}
               {pendingMediaPlacement && (
                 <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
                   <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
@@ -15805,7 +15904,7 @@ export default function Board2Page() {
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
-                onPointerDown={handleBoardSurfacePointerDown}
+                onPointerDown={boardMode ? handleMobileBoardPointerDown : handleBoardSurfacePointerDown}
               >
                 {boardMarquee && (() => {
                   const x = Math.min(boardMarquee.startX, boardMarquee.currentX) * boardZoom;
@@ -15822,6 +15921,7 @@ export default function Board2Page() {
                   return (
                     <div
                       key={clip.id}
+                      data-mbclipid={clip.id}
                       style={{
                         position: "absolute",
                         left: clip.boardX! * boardZoom,
@@ -15836,7 +15936,7 @@ export default function Board2Page() {
                         overflow: "visible",
                       }}
                       onClick={(e) => { e.stopPropagation(); setClipSelection([clip.id]); }}
-                      onPointerDown={(e) => { if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
+                      onPointerDown={(e) => { if (boardMode) handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
                         {clip.needsRedownload ? (
@@ -15876,16 +15976,16 @@ export default function Board2Page() {
                           key={corner}
                           style={{
                             position: "absolute",
-                            width: BOARD_RESIZE_PX,
-                            height: BOARD_RESIZE_PX,
+                            width: boardMode ? 44 : BOARD_RESIZE_PX,
+                            height: boardMode ? 44 : BOARD_RESIZE_PX,
                             background: "#ff5e3a",
                             border: "1.5px solid #fff",
                             cursor: (corner === "nw" || corner === "se") ? "nwse-resize" : "nesw-resize",
                             zIndex: 10,
-                            ...(corner === "nw" ? { left: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
-                                corner === "ne" ? { right: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
-                                corner === "sw" ? { left: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 } :
-                                                 { right: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 }),
+                            ...(corner === "nw" ? { left: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), top: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
+                                corner === "ne" ? { right: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), top: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
+                                corner === "sw" ? { left: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), bottom: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
+                                                 { right: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), bottom: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) }),
                           }}
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
@@ -16041,8 +16141,12 @@ export default function Board2Page() {
                       const cx = bx + bw, mid = by + bh / 2, q = Math.min(20, bh * 0.15);
                       return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
                     } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
-                      const d = ann.points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * boardZoom} ${p.y * boardZoom}`).join(" ");
-                      return <path key={ann.id} d={d} fill="none" stroke={ann.color} strokeWidth={(ann.strokeWidth ?? 4) * boardZoom} strokeLinecap="round" strokeLinejoin="round" />;
+                      return <g key={ann.id}>{ann.points.slice(1).map((point, index) => {
+                        const previous = ann.points![index];
+                        const d = `M ${previous.x * boardZoom} ${previous.y * boardZoom} Q ${previous.x * boardZoom} ${previous.y * boardZoom} ${(previous.x + point.x) * boardZoom / 2} ${(previous.y + point.y) * boardZoom / 2}`;
+                        const pressureWidth = (ann.strokeWidth ?? 4) * boardZoom * (0.35 + 0.9 * Math.pow(point.pressure ?? 0.5, 0.7));
+                        return <path key={index} d={d} fill="none" stroke={ann.color} strokeWidth={pressureWidth} strokeLinecap="round" strokeLinejoin="round" />;
+                      })}</g>;
                     } else if (ann.type === "emoji" && ann.emoji) {
                       return (
                         <text key={ann.id}
@@ -16056,14 +16160,6 @@ export default function Board2Page() {
                     }
                     return null;
                   })}
-                  {/* Live pen preview during drawing */}
-                  {penPreviewPoints && penPreviewPoints.length >= 2 && (
-                    <path
-                      d={penPreviewPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x * boardZoom} ${p.y * boardZoom}`).join(" ")}
-                      fill="none" stroke={annotationColor} strokeWidth={4 * boardZoom}
-                      strokeLinecap="round" strokeLinejoin="round" opacity={0.7}
-                    />
-                  )}
                 </svg>
 
                 {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
@@ -16186,7 +16282,7 @@ export default function Board2Page() {
                 {/* Glass pane — captures all pointer events for annotation drawing */}
                 {annotationTool !== "pointer" && !isSpaceDown && !editingAnnotationId && (
                   <div
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair" }}
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair", touchAction: boardMode ? "none" : undefined }}
                     onPointerDown={handleAnnotationGlassPointerDown}
                   />
                 )}
@@ -16224,7 +16320,7 @@ export default function Board2Page() {
               </div>
 
               {/* Annotation toolbar — collapsible, Pro gated */}
-              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+              <div style={{ position: "absolute", top: boardMode ? "max(8px, env(safe-area-inset-top))" : 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: boardMode ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
                 <ProGated featureName="Annotation tools">
                   <>
                     <button
@@ -16238,7 +16334,7 @@ export default function Board2Page() {
                       }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
-                        padding: "5px 12px", border: "1.5px solid #2a2a2a",
+                        padding: boardMode ? "10px 14px" : "5px 12px", minHeight: boardMode ? 44 : undefined, border: "1.5px solid #2a2a2a",
                         background: annotationToolbarOpen ? "#2a2a2a" : "#fffdf5",
                         color: annotationToolbarOpen ? "#c8f135" : "#2a2a2a",
                         cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
@@ -16253,9 +16349,11 @@ export default function Board2Page() {
                         background: "#fffdf5",
                         border: "1.5px solid #2a2a2a",
                         boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
-                        padding: "4px 8px",
+                        padding: boardMode ? "6px 8px" : "4px 8px",
                         whiteSpace: "nowrap",
                         position: "relative",
+                        maxWidth: boardMode ? "100%" : undefined,
+                        overflowX: boardMode ? "auto" : undefined,
                       }}>
                         {/* Tool buttons */}
                         {([
@@ -16279,7 +16377,7 @@ export default function Board2Page() {
                               else setEmojiPickerOpen(false);
                             }}
                             style={{
-                              width: 28, height: 28, border: "none", padding: 0,
+                              width: boardMode ? 44 : 28, height: boardMode ? 44 : 28, minWidth: boardMode ? 44 : undefined, border: "none", padding: 0,
                               outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
                               background: annotationTool === id ? "#2a2a2a" : "transparent",
                               color: annotationTool === id ? "#fff" : "#2a2a2a",
@@ -16291,6 +16389,18 @@ export default function Board2Page() {
                             {icon}
                           </button>
                         ))}
+
+                        {annotationTool === "pen" && (
+                          <>
+                            <div style={{ width: 1, height: 28, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
+                            {(["marker", "pen", "fine"] as const).map((preset) => (
+                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: boardMode ? 48 : 38, minHeight: boardMode ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
+                            ))}
+                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: boardMode ? 72 : 58, minHeight: boardMode ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
+                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: boardMode ? 48 : 34, minHeight: boardMode ? 44 : 28 }} title="Undo last stroke">↶</button>
+                            <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: boardMode ? 58 : 42, minHeight: boardMode ? 44 : 28, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
+                          </>
+                        )}
 
                         <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
 
@@ -16873,7 +16983,7 @@ export default function Board2Page() {
           </div>
 
           {/* ── Right: properties panel (no keyframes) ── */}
-          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <div style={panelLabelStyle}>Properties</div>
               <button
@@ -17606,7 +17716,7 @@ export default function Board2Page() {
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ height: TIMELINE_H, flexShrink: 0, background: "rgba(255,253,245,0.85)", display: "flex", flexDirection: "column" }}>
+        <div style={{ height: TIMELINE_H, flexShrink: 0, background: "rgba(255,253,245,0.85)", display: boardMode ? "none" : "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
           <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap" }}>
