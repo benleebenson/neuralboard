@@ -124,6 +124,7 @@ import {
   stableOrganicLayoutSeed,
 } from "@/lib/board2/organic-topic-layout";
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
+import { buildSerpentinePanPath } from "@/lib/board2/pan-camera";
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
@@ -10935,18 +10936,27 @@ export default function Board2Page() {
       return;
     }
 
-    const boardPlacedClips = clipsRef.current.filter((c) => c.boardX !== undefined);
+    const seenPanMediaIds = new Set<string>();
+    const boardPlacedClips = clipsRef.current.filter((clip) => {
+      if (!isBoardMediaClip(clip) || clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
+      const mediaId = clip.mediaId ?? clip.id;
+      if (seenPanMediaIds.has(mediaId)) return false;
+      seenPanMediaIds.add(mediaId);
+      return true;
+    });
     const hasBoardClips = boardPlacedClips.length > 0;
     const W = canvasWRef.current;
     const H = canvasHRef.current;
+    const boardWidth = boardDimensionsRef.current.width;
+    const boardHeight = boardDimensionsRef.current.height;
 
     type Stop = { camX: number; camY: number; zoom: number };
 
     // Bounding box of all board-placed clips
     const bboxMinX = hasBoardClips ? Math.min(...boardPlacedClips.map((c) => c.boardX!)) : 0;
-    const bboxMaxX = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardX! + c.boardW!)) : BOARD_W;
+    const bboxMaxX = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardX! + c.boardW!)) : boardWidth;
     const bboxMinY = hasBoardClips ? Math.min(...boardPlacedClips.map((c) => c.boardY!)) : 0;
-    const bboxMaxY = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardY! + c.boardH!)) : BOARD_H;
+    const bboxMaxY = hasBoardClips ? Math.max(...boardPlacedClips.map((c) => c.boardY! + c.boardH!)) : boardHeight;
     const bboxWidth = bboxMaxX - bboxMinX || 1;
     const bboxHeight = bboxMaxY - bboxMinY || 1;
     const bbW = bboxWidth;
@@ -10957,28 +10967,33 @@ export default function Board2Page() {
     const frameAllStop: Stop = {
       camX: (bboxMinX + bboxMaxX) / 2,
       camY: (bboxMinY + bboxMaxY) / 2,
-      zoom: faSf * BOARD_W / W,
+      zoom: faSf * boardWidth / W,
     };
 
-    // Pan sweep — horizontal math ported from /board's getPanSweepInfo;
-    // zoom uses actual canvas dims for correct 90% vertical fill
-    const margin = 100;
-    const bboxH = bboxMaxY - bboxMinY;
-    const panZoom = clamp(bboxH > 0 ? 0.9 * H * BOARD_W / (bboxH * W) : H * BOARD_W / (W * BOARD_H), 0.5, 5.0);
-    const halfVW = BOARD_W / (2 * panZoom);
-    const panCamY = (bboxMinY + bboxMaxY) / 2;
-    const panStartX = clamp(bboxMinX - margin, halfVW, BOARD_W - halfVW);
-    const panEndX = clamp(bboxMaxX + margin, halfVW, BOARD_W - halfVW);
+    const panPath = buildSerpentinePanPath({
+      media: boardPlacedClips.map((clip) => ({
+        id: clip.mediaId ?? clip.id,
+        x: clip.boardX!,
+        y: clip.boardY!,
+        width: clip.boardW!,
+        height: clip.boardH!,
+      })),
+      canvasWidth: W,
+      canvasHeight: H,
+      boardWidth,
+      boardHeight,
+      imageFocusRatio: CLIP_FOCUS_RATIO,
+    });
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const holdStartStops: Stop[] = allClipsSorted.map((c) => {
       if (c.type === "pan") {
-        return hasBoardClips
-          ? { camX: panStartX, camY: panCamY, zoom: panZoom }
+        return panPath.length > 0
+          ? { camX: panPath[0].cameraX, camY: panPath[0].cameraY, zoom: panPath[0].boardZoom }
           : frameAllStop;
       }
       const bw = c.boardW!, bh = c.boardH!;
       const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
-      return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * BOARD_W / W };
+      return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * boardWidth / W };
     });
     const allStartStops: Stop[] = [...holdStartStops, frameAllStop];
 
@@ -10998,9 +11013,22 @@ export default function Board2Page() {
           console.warn(`Pan clip skipped: no board-placed clips`);
           continue;
         }
-        // Two keyframes only — linear between them for constant-velocity sweep
-        events.push({ absTime: holdStart, stop: { camX: panStartX, camY: panCamY, zoom: panZoom }, easing: 'ease-in-out' });
-        events.push({ absTime: holdEnd,   stop: { camX: panEndX,   camY: panCamY, zoom: panZoom }, easing: 'linear' });
+        // Traverse every visual row during the hold phase. Distance-weighted waypoint times keep
+        // long hops from racing while ease-in-out arrivals make row turns and image visits smooth.
+        for (const waypoint of panPath) {
+          events.push({
+            absTime: holdStart + (holdEnd - holdStart) * waypoint.progress,
+            stop: { camX: waypoint.cameraX, camY: waypoint.cameraY, zoom: waypoint.boardZoom },
+            easing: 'ease-in-out',
+          });
+        }
+        if (panPath.length === 1) {
+          events.push({
+            absTime: holdEnd,
+            stop: { camX: panPath[0].cameraX, camY: panPath[0].cameraY, zoom: panPath[0].boardZoom },
+            easing: 'ease-in-out',
+          });
+        }
         events.push({ absTime: transEnd,  stop: nextStop,                                           easing: 'ease-in-out' });
       } else {
         events.push({ absTime: holdStart, stop: holdStartStops[i], easing: 'ease-in-out' });

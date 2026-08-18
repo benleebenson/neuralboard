@@ -64,11 +64,11 @@ export function timelineLayerOverlap(
 function snapTargets(
   blocks: readonly TimelineManipulationBlock[],
   excludeId: string,
-  playhead: number,
+  playhead?: number,
 ): number[] {
   return [
     0,
-    playhead,
+    ...(playhead === undefined ? [] : [playhead]),
     ...blocks.flatMap((block) => block.id === excludeId
       ? []
       : [block.startTime, block.startTime + block.duration]),
@@ -117,7 +117,14 @@ export function applyTimelineBlockDrag<T extends TimelineManipulationBlock>(
   const deltaSeconds = Number.isFinite(options.deltaSeconds) ? options.deltaSeconds : 0;
   const minimumDuration = Math.max(0.001, options.minimumDuration ?? MIN_TIMELINE_BLOCK_DURATION);
   const originalEnd = drag.originalStartTime + drag.originalDuration;
-  const targets = snapTargets(blocks, drag.blockId, options.playhead);
+  // Existing blocks may snap to other clip edges and t=0, but never to the playhead. The
+  // playhead is an insertion cursor; letting it participate in move snapping forces a newly
+  // inserted block back to its original start during the first pixels of a drag.
+  const targets = snapTargets(
+    blocks,
+    drag.blockId,
+    drag.kind === "move" ? undefined : options.playhead,
+  );
 
   return blocks.map((block) => {
     if (block.id !== drag.blockId) return block;
