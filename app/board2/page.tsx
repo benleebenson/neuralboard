@@ -129,6 +129,11 @@ import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
+import {
+  normalizeLoadedCharacterActionRecord,
+  normalizeLoadedSchemaVersion,
+  normalizeLoadedTimelineRecord,
+} from "@/lib/board2/loaded-board-normalization";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
@@ -15384,7 +15389,7 @@ export default function Board2Page() {
       // shape the app has always written. Normalizing here means the reconstruction logic below
       // (asset restore, legacy clip-type migration, character/lip-sync restore) never has to
       // branch on version itself — it only ever sees today's familiar flat field names.
-      const schemaVersion = typeof rawManifest?.schemaVersion === "number" ? rawManifest.schemaVersion : 0;
+      const schemaVersion = normalizeLoadedSchemaVersion(rawManifest?.schemaVersion);
       const normalizedRecipeClips = schemaVersion >= 2
         ? [
             ...(rawManifest.board?.media ?? []).map((media: Record<string, unknown>) => {
@@ -15470,9 +15475,18 @@ export default function Board2Page() {
         }
       }
 
-      const migratedClips = loadedClips.map((clip) => {
+      const migratedClips = loadedClips.map((rawClip, index) => {
+        const clip = normalizeLoadedTimelineRecord(
+          rawClip as unknown as Record<string, unknown>,
+          `loaded_clip_${index}`,
+          N_LAYERS - 1,
+        ) as unknown as Clip;
         if (isBoardMediaClip(clip)) {
-          return { ...clip, mediaId: clip.mediaId ?? clip.id, featured: clip.featured !== false };
+          // A visible loaded media block uses the same absence/default as a fresh clip. Only a
+          // board-only entity needs the explicit opt-out marker and stable media identity.
+          return clip.featured === false
+            ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: false as const }
+            : clip;
         }
         if (clip.type === "characterFocus") {
           return {
@@ -15511,8 +15525,16 @@ export default function Board2Page() {
       setAnnotations(manifest.annotations ?? []);
       setSpawnDoor(manifest.spawnDoor ?? null);
       if (manifest.canvasAspect) setCanvasAspect(manifest.canvasAspect);
-      if (manifest.pxPerSec) { pxPerSecRef.current = manifest.pxPerSec; setPxPerSec(manifest.pxPerSec); }
-      if (manifest.boardZoom) { boardZoomRef.current = manifest.boardZoom; setBoardZoom(manifest.boardZoom); }
+      const loadedPxPerSec = Number(manifest.pxPerSec);
+      if (Number.isFinite(loadedPxPerSec) && loadedPxPerSec > 0) {
+        pxPerSecRef.current = clamp(loadedPxPerSec, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+        setPxPerSec(pxPerSecRef.current);
+      }
+      const loadedBoardZoom = Number(manifest.boardZoom);
+      if (Number.isFinite(loadedBoardZoom) && loadedBoardZoom > 0) {
+        boardZoomRef.current = loadedBoardZoom;
+        setBoardZoom(loadedBoardZoom);
+      }
       if (manifest.boardPan) { boardPanRef.current = manifest.boardPan; setBoardPan(manifest.boardPan); }
       if (manifest.boardDimensions?.width >= BOARD_W && manifest.boardDimensions?.height >= BOARD_H) {
         const loadedDimensions = { width: Number(manifest.boardDimensions.width), height: Number(manifest.boardDimensions.height) };
@@ -15542,24 +15564,30 @@ export default function Board2Page() {
           ? { x: point.x, y: point.y }
           : null;
       };
+      const loadCharacterActions = (value: unknown, characterId: CharacterId): CharacterAction[] =>
+        (Array.isArray(value) ? value : []).map((action, index) =>
+          normalizeLoadedCharacterActionRecord(
+            action && typeof action === "object" ? action as Record<string, unknown> : {},
+            `loaded_${characterId}_action_${index}`,
+          ) as unknown as CharacterAction);
       if (Array.isArray(manifest.characters)) {
         type LoadedCharacter = Partial<CharacterInstance> & { id?: CharacterId; face?: ManifestFace | null };
         const c1 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c1");
         const c2 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c2");
-        setCharacterActions(c1?.actions ?? []);
+        setCharacterActions(loadCharacterActions(c1?.actions, "c1"));
         setShowCharacter(c1?.enabled ?? false);
         setCharacterMode(c1?.mode ?? "auto");
         setCharacterSkin(c1?.skin === "styled" ? "styled" : "stick");
         setCharacterFace(loadFace(c1?.face));
         setCharacterStart(loadStart(c1?.start));
-        setCharacterActions2(c2?.actions ?? []);
+        setCharacterActions2(loadCharacterActions(c2?.actions, "c2"));
         setShowCharacter2(c2?.enabled ?? false);
         setCharacterMode2(c2?.mode ?? "auto");
         setCharacterSkin2(c2?.skin === "styled" ? "styled" : "stick");
         setCharacterFace2(loadFace(c2?.face));
         setCharacterStart2(loadStart(c2?.start));
       } else {
-        if (manifest.characterActions) setCharacterActions(manifest.characterActions);
+        if (manifest.characterActions) setCharacterActions(loadCharacterActions(manifest.characterActions, "c1"));
         else setCharacterActions([]);
         if (manifest.showCharacter !== undefined) setShowCharacter(manifest.showCharacter);
         else setShowCharacter(false);

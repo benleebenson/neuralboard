@@ -7,6 +7,7 @@ export type TimelineManipulationBlock = {
   duration: number;
   layer?: number;
   sourceOffsetSec?: number;
+  featured?: boolean;
 };
 
 export type TimelineManipulationDrag = {
@@ -53,6 +54,7 @@ export function timelineLayerOverlap(
   layer: number,
 ): boolean {
   return blocks.some((block) =>
+    block.featured !== false &&
     block.id !== excludeId &&
     block.type !== "narration" &&
     (block.layer ?? 1) === layer &&
@@ -70,6 +72,7 @@ function snapTargets(
     0,
     ...(playhead === undefined ? [] : [playhead]),
     ...blocks.flatMap((block) => block.id === excludeId
+      || block.featured === false
       ? []
       : [block.startTime, block.startTime + block.duration]),
   ];
@@ -82,6 +85,7 @@ function nextResizeBoundary(
   const originalEnd = drag.originalStartTime + drag.originalDuration;
   return blocks
     .filter((block) =>
+      block.featured !== false &&
       block.id !== drag.blockId &&
       block.type !== "narration" &&
       (block.layer ?? 1) === drag.originalLayer &&
@@ -96,6 +100,7 @@ function previousResizeBoundary(
 ): number {
   return blocks
     .filter((block) =>
+      block.featured !== false &&
       block.id !== drag.blockId &&
       block.type !== "narration" &&
       (block.layer ?? 1) === drag.originalLayer &&
