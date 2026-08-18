@@ -127,6 +127,7 @@ import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-cam
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
+import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
@@ -1171,7 +1172,8 @@ type CharTimelineDrag = {
   actionId: string;
   origStartTime: number;
   origDuration: number;
-  cursorOffsetSec: number;
+  pointerStartClientX: number;
+  pixelsPerSecond: number;
 };
 
 type MediaItem = {
@@ -1199,7 +1201,10 @@ type TimelineDrag = {
   origStartTime: number;
   origDuration: number;
   origLayer: number;
-  cursorOffsetSec: number;
+  origSourceOffsetSec?: number;
+  pointerStartClientX: number;
+  pointerStartClientY: number;
+  pixelsPerSecond: number;
 };
 
 type BoardMarquee = {
@@ -1564,29 +1569,6 @@ function interpolateCameraKeyframes(
     time,
     { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 },
   );
-}
-
-function magneticSnap(
-  t: number,
-  candidates: number[],
-  threshold: number
-): { snapped: number; target: number | null } {
-  let best: number | null = null;
-  let bestDist = threshold;
-  for (const c of candidates) {
-    const d = Math.abs(t - c);
-    if (d < bestDist) { best = c; bestDist = d; }
-  }
-  return { snapped: best ?? t, target: best };
-}
-
-function allClipEdges(clips: Clip[], excludeId: string): number[] {
-  const edges: number[] = [];
-  for (const c of clips) {
-    if (c.id === excludeId) continue;
-    edges.push(c.startTime, c.startTime + c.duration);
-  }
-  return edges;
 }
 
 function layerOverlap(clips: Clip[], start: number, duration: number, excludeId: string, layer: number): boolean {
@@ -10584,91 +10566,51 @@ export default function Board2Page() {
   ) {
     selectionSurfaceRef.current = "timeline";
     e.stopPropagation();
+    e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     if (!selectedClipIdsRef.current.includes(clip.id)) setClipSelection([clip.id]);
-    const rect = scrollerRef.current!.getBoundingClientRect();
-    const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
-    const cursorOffsetSec = kind === "move" ? clickTimeSec - clip.startTime : 0;
     const origLayer = clip.layer ?? 1;
     timelineDragRef.current = {
       kind, clipId: clip.id,
       origStartTime: clip.startTime, origDuration: clip.duration,
       origLayer,
-      cursorOffsetSec,
+      origSourceOffsetSec: clip.sourceOffsetSec,
+      pointerStartClientX: e.clientX,
+      pointerStartClientY: e.clientY,
+      pixelsPerSecond: pxPerSecRef.current,
     };
     const onMove = (ev: PointerEvent) => {
       const drag = timelineDragRef.current;
       if (!drag) return;
-      const cursorSec = (ev.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
-      const threshold = MAGNETIC_SNAP_PX / pxPerSecRef.current;
-      const snapTargets = [0, playheadRef.current, ...allClipEdges(clipsRef.current, drag.clipId)];
-      setClips((prev) =>
-        prev.map((c) => {
-          if (c.id !== drag.clipId) return c;
-          if (drag.kind === "move") {
-            const rawStart = Math.max(0, cursorSec - drag.cursorOffsetSec);
-            const { snapped: snL, target: tL } = magneticSnap(rawStart, snapTargets, threshold);
-            const { snapped: snR, target: tR } = magneticSnap(rawStart + drag.origDuration, snapTargets, threshold);
-            const newStart = tL !== null ? Math.max(0, snL) : tR !== null ? Math.max(0, snR - drag.origDuration) : rawStart;
-            // For non-narration clips: compute target layer from vertical cursor position
-            if (c.type !== "narration") {
-              const newLayer = clamp(Math.floor((ev.clientY - rect.top) / LAYER_H), 0, N_LAYERS - 1);
-              if (!layerOverlap(prev, newStart, drag.origDuration, drag.clipId, newLayer)) {
-                return { ...c, startTime: newStart, layer: newLayer };
-              }
-              // Try same layer if target layer is blocked
-              const curLayer = c.layer ?? 1;
-              if (!layerOverlap(prev, newStart, drag.origDuration, drag.clipId, curLayer)) {
-                return { ...c, startTime: newStart };
-              }
-              return c; // reject — both positions overlap
-            }
-            return { ...c, startTime: newStart };
-          }
-          if (drag.kind === "resize-right") {
-            const rawEnd = Math.max(drag.origStartTime + 0.1, cursorSec);
-            const { snapped, target } = magneticSnap(rawEnd, snapTargets, threshold);
-            let newEnd = target !== null ? Math.max(drag.origStartTime + 0.1, snapped) : rawEnd;
-            // Clamp to not overlap next clip in same layer
-            if (c.type !== "narration") {
-              const layer = c.layer ?? 1;
-              const nextInLayer = clipsRef.current
-                .filter((cc) => cc.id !== drag.clipId && (cc.layer ?? 1) === layer && cc.type !== "narration" && cc.startTime >= drag.origStartTime)
-                .sort((a, b) => a.startTime - b.startTime)[0];
-              if (nextInLayer) newEnd = Math.min(newEnd, nextInLayer.startTime);
-            }
-            return { ...c, duration: Math.max(0.1, newEnd - drag.origStartTime) };
-          }
-          // resize-left
-          const rawStart = clamp(cursorSec, 0, drag.origStartTime + drag.origDuration - 0.1);
-          const { snapped, target } = magneticSnap(rawStart, snapTargets, threshold);
-          let newStart = target !== null
-            ? clamp(snapped, 0, drag.origStartTime + drag.origDuration - 0.1)
-            : rawStart;
-          // Clamp to not overlap previous clip in same layer
-          if (c.type !== "narration") {
-            const layer = c.layer ?? 1;
-            const prevInLayer = clipsRef.current
-              .filter((cc) => cc.id !== drag.clipId && (cc.layer ?? 1) === layer && cc.type !== "narration" && cc.startTime < drag.origStartTime + drag.origDuration)
-              .sort((a, b) => b.startTime - a.startTime)[0];
-            if (prevInLayer) newStart = Math.max(newStart, prevInLayer.startTime + prevInLayer.duration);
-          }
-          return {
-            ...c,
-            startTime: newStart,
-            duration: Math.max(0.1, drag.origStartTime + drag.origDuration - newStart),
-            ...(c.type === "narration" ? { sourceOffsetSec: (c.sourceOffsetSec ?? 0) + (newStart - drag.origStartTime) } : {}),
-          };
-        })
+      const deltaSeconds = (ev.clientX - drag.pointerStartClientX) / drag.pixelsPerSecond;
+      const targetLayer = clamp(
+        drag.origLayer + Math.round((ev.clientY - drag.pointerStartClientY) / LAYER_H),
+        0,
+        N_LAYERS - 1,
       );
+      setClips((prev) => applyTimelineBlockDrag(prev, {
+        kind: drag.kind,
+        blockId: drag.clipId,
+        originalStartTime: drag.origStartTime,
+        originalDuration: drag.origDuration,
+        originalLayer: drag.origLayer,
+        originalSourceOffsetSec: drag.origSourceOffsetSec,
+      }, {
+        deltaSeconds,
+        targetLayer,
+        playhead: playheadRef.current,
+        snapThresholdSeconds: MAGNETIC_SNAP_PX / drag.pixelsPerSecond,
+      }));
     };
-    const onUp = () => {
+    const onEnd = () => {
       timelineDragRef.current = null;
       window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
     };
     window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
   }
 
   // ─ Character action timeline drag ────────────────────────────────────────
@@ -10679,26 +10621,25 @@ export default function Board2Page() {
     kind: "move" | "resize-left" | "resize-right"
   ) {
     e.stopPropagation();
+    e.preventDefault();
     const owner: CharacterId = characterActions2Ref.current.some((a) => a.id === action.id) ? "c2" : "c1";
     selectCharAction(action.id);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const rect = scrollerRef.current!.getBoundingClientRect();
-    const clickTimeSec = (e.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
-    const cursorOffsetSec = kind === "move" ? clickTimeSec - action.startTime : 0;
     charActionDragRef.current = {
       kind, actionId: action.id,
       origStartTime: action.startTime, origDuration: action.duration,
-      cursorOffsetSec,
+      pointerStartClientX: e.clientX,
+      pixelsPerSecond: pxPerSecRef.current,
     };
     const onMove = (ev: PointerEvent) => {
       const drag = charActionDragRef.current;
       if (!drag) return;
-      const cursorSec = (ev.clientX - rect.left + timelineScrollRef.current) / pxPerSecRef.current;
+      const deltaSeconds = (ev.clientX - drag.pointerStartClientX) / drag.pixelsPerSecond;
       updateCharacterActionsFor(owner, (prev) =>
         prev.map((a) => {
           if (a.id !== drag.actionId) return a;
           if (drag.kind === "move") {
-            const rawStart = Math.max(0, cursorSec - drag.cursorOffsetSec);
+            const rawStart = Math.max(0, drag.origStartTime + deltaSeconds);
             // No-overlap: don't allow start time to produce overlap with other char actions
             const others = prev.filter((oa) => oa.id !== drag.actionId);
             const overlaps = others.some((oa) => rawStart < oa.startTime + oa.duration && rawStart + drag.origDuration > oa.startTime);
@@ -10706,11 +10647,11 @@ export default function Board2Page() {
             return { ...a, startTime: rawStart };
           }
           if (drag.kind === "resize-right") {
-            const newEnd = Math.max(drag.origStartTime + 0.1, cursorSec);
+            const newEnd = Math.max(drag.origStartTime + 0.1, drag.origStartTime + drag.origDuration + deltaSeconds);
             return { ...a, duration: Math.max(0.1, newEnd - drag.origStartTime) };
           }
           // resize-left
-          const newStart = clamp(cursorSec, 0, drag.origStartTime + drag.origDuration - 0.1);
+          const newStart = clamp(drag.origStartTime + deltaSeconds, 0, drag.origStartTime + drag.origDuration - 0.1);
           return {
             ...a,
             startTime: newStart,
@@ -10719,13 +10660,15 @@ export default function Board2Page() {
         })
       );
     };
-    const onUp = () => {
+    const onEnd = () => {
       charActionDragRef.current = null;
       window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
     };
     window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
   }
 
   // ─ Ruler scrub ────────────────────────────────────────────────────────────
