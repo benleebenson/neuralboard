@@ -139,6 +139,7 @@ import {
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
 import { buildSerpentinePanPath } from "@/lib/board2/pan-camera";
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
+import { fitMediaDimensions } from "@/lib/board2/media-sizing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import {
   BOARD_SNAPSHOT_LONG_EDGE,
@@ -4836,6 +4837,7 @@ export default function Board2Page() {
   const warmImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const previewCachePolicyRef = useRef(previewCachePolicy);
   const previewImagePendingRef = useRef<Set<string>>(new Set());
+  const placementImageDecodeRef = useRef<Map<string, Promise<HTMLImageElement>>>(new Map());
   const previewIdleLoadRef = useRef<Map<string, number>>(new Map());
   const previewDecodeStatsRef = useRef({ count: 0, wallMs: 0, longTaskMs: 0 });
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -5704,6 +5706,7 @@ export default function Board2Page() {
     }
     previewIdleLoadRef.current.clear();
     previewImagePendingRef.current.clear();
+    placementImageDecodeRef.current.clear();
   }, []);
   useEffect(() => {
     if (!document.fonts) return;
@@ -7588,6 +7591,39 @@ export default function Board2Page() {
     // Video: per-clip elements are created by createVideoElement instead
   }
 
+  // Placement needs a stronger contract than the preview loader: resolve only after decode has
+  // completed and intrinsic dimensions are available. Deduplicate concurrent paste/upload/drop
+  // requests for the same URL, then seed the normal preview cache with the decoded image.
+  function decodeImageForPlacement(url: string): Promise<HTMLImageElement> {
+    const cached = cachedPreviewImage(url);
+    if (cached?.complete && cached.naturalWidth > 0 && cached.naturalHeight > 0) {
+      return Promise.resolve(cached);
+    }
+    const pending = placementImageDecodeRef.current.get(url);
+    if (pending) return pending;
+    const promise = new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.decoding = "async";
+      image.onload = async () => {
+        try {
+          await image.decode();
+          if (image.naturalWidth <= 0 || image.naturalHeight <= 0) throw new Error("Image has no intrinsic dimensions");
+          imgCacheRef.current.set(url, image);
+          trimPreviewImageCaches();
+          drawFrame(playheadRef.current);
+          drawBoardImageOverlaysRef.current(playheadRef.current);
+          resolve(image);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      image.onerror = () => reject(new Error("Could not decode image"));
+      image.src = url;
+    }).finally(() => placementImageDecodeRef.current.delete(url));
+    placementImageDecodeRef.current.set(url, promise);
+    return promise;
+  }
+
   function ensureExportImage(clip: Clip): Promise<void> {
     if (clip.type !== "image" || !clip.sourceUrl) return Promise.resolve();
     const cached = exportImgCacheRef.current.get(clip.sourceUrl);
@@ -7715,9 +7751,8 @@ export default function Board2Page() {
   function getMediaDimensions(url: string, type: "image" | "video"): { w: number; h: number } {
     if (type === "image") {
       const img = imgCacheRef.current.get(url);
-      if (img && img.naturalWidth > 0) {
-        const scale = Math.min(1, 800 / img.naturalWidth, 600 / img.naturalHeight);
-        return { w: Math.round(img.naturalWidth * scale), h: Math.round(img.naturalHeight * scale) };
+      if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+        return fitMediaDimensions(img.naturalWidth, img.naturalHeight);
       }
     } else {
       const dims = videoDimsRef.current.get(url);
@@ -7745,15 +7780,9 @@ export default function Board2Page() {
     center?: { x: number; y: number },
     requestedStart = playheadRef.current,
   ) {
-    // Wait for image to load so we get natural dimensions
+    // Board geometry must never be committed until intrinsic image dimensions are known.
     if (item.type === "image") {
-      const img = imgCacheRef.current.get(item.url);
-      if (img && !img.complete) {
-        await new Promise<void>((resolve) => {
-          img.addEventListener("load", () => resolve(), { once: true });
-          img.addEventListener("error", () => resolve(), { once: true });
-        });
-      }
+      await decodeImageForPlacement(item.url);
     }
     const { w, h } = getMediaDimensions(item.url, item.type);
     const clipId = generateId();
@@ -9110,9 +9139,9 @@ export default function Board2Page() {
   async function ingestMediaFile(file: File | Blob, name: string) {
     const url = URL.createObjectURL(file);
     const type: "image" | "video" = file.type.startsWith("video") ? "video" : "image";
-    loadMedia(url, type);
     let duration: number | undefined;
     if (type === "video") {
+      loadMedia(url, type);
       const meta = await getVideoMeta(url);
       duration = meta.duration;
       if (meta.w > 0 && !videoDimsRef.current.has(url)) {
@@ -9120,17 +9149,11 @@ export default function Board2Page() {
         videoDimsRef.current.set(url, { w: Math.round(meta.w * scale), h: Math.round(meta.h * scale) });
       }
     }
+    if (type === "image") {
+      await decodeImageForPlacement(url);
+    }
     const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
     setMediaLibrary((prev) => [...prev, item]);
-    if (type === "image") {
-      const image = imgCacheRef.current.get(url);
-      if (image && !image.complete) {
-        await new Promise<void>((resolve) => {
-          image.addEventListener("load", () => resolve(), { once: true });
-          image.addEventListener("error", () => resolve(), { once: true });
-        });
-      }
-    }
     if (playModeRef.current) queueMediaPlacement(item);
     else await addClipAndPlaceOnBoard(item);
   }
@@ -10238,14 +10261,7 @@ export default function Board2Page() {
       }
       const blob = await res.blob();
       const blobUrl = URL.createObjectURL(blob);
-      loadMedia(blobUrl, "image");
-      const img = imgCacheRef.current.get(blobUrl);
-      if (img && !img.complete) {
-        await new Promise<void>((resolve) => {
-          img.addEventListener("load", () => resolve(), { once: true });
-          img.addEventListener("error", () => resolve(), { once: true });
-        });
-      }
+      await decodeImageForPlacement(blobUrl);
       const { w, h } = getMediaDimensions(blobUrl, "image");
       const clipId = generateId();
       setClips((prev) => {
@@ -11237,7 +11253,7 @@ export default function Board2Page() {
 
   // ─ Timeline drop ──────────────────────────────────────────────────────────
 
-  function handleTimelineDrop(e: React.DragEvent<HTMLDivElement>) {
+  async function handleTimelineDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
     const itemId = e.dataTransfer.getData("mediaItemId");
     const item = mediaLibrary.find((m) => m.id === itemId);
@@ -11248,6 +11264,7 @@ export default function Board2Page() {
     const duration = item.duration ?? (item.type === "video" ? 5 : 4);
     const clipId = generateId();
     loadMedia(item.url, item.type);
+    if (item.type === "image") await decodeImageForPlacement(item.url);
     if (item.type === "video") createVideoElement(clipId, item.url);
     const { w, h } = getMediaDimensions(item.url, item.type);
     const { camX, camY } = getVisibleBoardCenter();
