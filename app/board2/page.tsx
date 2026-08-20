@@ -88,7 +88,13 @@ import {
   type Gesture,
   type GestureTrackPoint,
 } from "@/lib/character/gestures";
-import { narrationResyncTarget, shouldResumeNarrationPlayback } from "@/lib/board2/narration-playback";
+import {
+  activeNarrationClipIdAtTime,
+  assertSingleActiveNarrationSource,
+  exclusiveNarrationSegments,
+  narrationResyncTarget,
+  shouldResumeNarrationPlayback,
+} from "@/lib/board2/narration-playback";
 import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
@@ -4866,7 +4872,6 @@ export default function Board2Page() {
   const thumbnailImagesRef = useRef<Map<string, HTMLImageElement | null>>(new Map()); // clip.id → pre-loaded thumbnail image (null = capture failed)
   const ytSliderTrackRef = useRef<HTMLDivElement>(null);
   const ytRangeRef = useRef({ start: 0, end: 30 });
-  const prevPlayheadRef = useRef(-1); // previous frame's playhead for entry detection
   const annotationsRef = useRef<Annotation[]>([]);
   const annotationToolRef = useRef<AnnotationTool>("pointer");
   const annotationColorRef = useRef("#cc2200");
@@ -7057,6 +7062,13 @@ export default function Board2Page() {
       sourceNode.connect(gainNode);
       gainNode.connect(ctx.destination);
       videoAudioNodesRef.current.set(clipId, { sourceNode, gainNode });
+      console.info("[board2:audio-source]", {
+        action: "connect",
+        kind: "MediaElementAudioSourceNode",
+        id: `board2-video-media-source-${clipId}`,
+        clipId,
+        currentTime: vid.currentTime,
+      });
     } catch {}
   }
 
@@ -7283,8 +7295,10 @@ export default function Board2Page() {
         activeCount++;
         vid.loop = false;
         const expected = isActive ? Math.max(0, time - activeWindows.get(clip.id)!.start) : 0;
+        let started = false;
         if (previousState !== "active" || vid.paused || vid.ended) {
           restartAndPlay(vid, expected);
+          started = true;
           runtime.lastRestartAt = now;
           console.log("[video] clip", clip.id, "entered — restart + play");
         } else if (isActive && Math.abs(vid.currentTime - expected) > 0.3) {
@@ -7294,6 +7308,17 @@ export default function Board2Page() {
           setClipAudioOff(clip.id, vid);
         } else {
           updateVideoVolume(clip, vid);
+        }
+        if (started && options.audioMode !== "silent" && effectiveClipVolume(clip) > 0) {
+          console.info("[board2:audio-source]", {
+            action: "play",
+            kind: videoAudioNodesRef.current.has(clip.id) ? "MediaElementAudioSourceNode" : "HTMLVideoElement",
+            id: `board2-video-${clip.id}`,
+            clipId: clip.id,
+            sourceUrl: clip.sourceUrl,
+            currentTime: vid.currentTime,
+            timelineTime: time,
+          });
         }
         videoRangeStateRef.current.set(clip.id, true);
       } else if (desired === "ambient") {
@@ -7366,7 +7391,6 @@ export default function Board2Page() {
     if (!isPlayingRef.current) return;
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
-    const prevT = prevPlayheadRef.current;
     if (lastRafTimeRef.current !== null) {
       const dt = (now - lastRafTimeRef.current) / 1000;
       const next = playheadRef.current + dt;
@@ -7387,7 +7411,6 @@ export default function Board2Page() {
         }
         stopAllNarrationAudio();
         finishGesturePlaybackDebug("ended");
-        prevPlayheadRef.current = maxEnd;
         drawFrame(maxEnd); return;
       }
       playheadRef.current = next;
@@ -7398,21 +7421,10 @@ export default function Board2Page() {
     }
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
-    prevPlayheadRef.current = t;
     evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
-    // Narration audio: spawn on entry, stop on exit
-    for (const clip of clipsRef.current) {
-      if (clip.type !== "narration") continue;
-      const isActive = t >= clip.startTime && t < clip.startTime + clip.duration;
-      const wasActive = prevT >= clip.startTime && prevT < clip.startTime + clip.duration;
-      if (isActive && !wasActive && !activeNarrationRef.current.has(clip.id)) {
-        startNarrationAudio(clip);
-      } else if (isActive) {
-        syncNarrationAudio(clip);
-      } else if (!isActive && wasActive) {
-        stopNarrationAudio(clip.id);
-      }
-    }
+    // Narration has one owner at every timeline instant, including when duplicate clips overlap.
+    // This shared ownership rule also drives the export schedule below.
+    syncNarrationAudioAtTime(t);
     if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
       lastEditorFrameTimeRef.current = now;
       drawFrame(t);
@@ -7439,14 +7451,7 @@ export default function Board2Page() {
         sourceMatched: narrationGestureTrackSourceRef.current === currentGestureSource,
       });
       rafIdRef.current = requestAnimationFrame(rafLoop);
-      // Spawn narration audio for any clips already active at the current playhead
-      const t = playheadRef.current;
-      for (const clip of clipsRef.current) {
-        if (clip.type !== "narration") continue;
-        if (t < clip.startTime || t >= clip.startTime + clip.duration) continue;
-        if (activeNarrationRef.current.has(clip.id)) continue;
-        startNarrationAudio(clip);
-      }
+      syncNarrationAudioAtTime(playheadRef.current);
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
       // Switch off every clip's video (paused clips render their frozen thumbnail)
@@ -8177,6 +8182,7 @@ export default function Board2Page() {
       cached.element.load();
     }
     const element = new Audio();
+    element.id = `board2-narration-${clip.id}`;
     element.preload = "metadata";
     element.src = clip.sourceUrl;
     narrationAudioElsRef.current.set(clip.id, { element, sourceUrl: clip.sourceUrl });
@@ -8202,7 +8208,45 @@ export default function Board2Page() {
     try { element.currentTime = target; } catch {}
   }
 
+  function playingNarrationSourceIds(): string[] {
+    return [...narrationAudioElsRef.current.entries()]
+      .filter(([, { element }]) => !element.paused && !element.ended)
+      .map(([clipId, { element }]) => `html:${clipId}@${element.currentTime.toFixed(3)}`);
+  }
+
+  function verifySinglePreviewNarrationSource(context: string) {
+    const sources = playingNarrationSourceIds();
+    try {
+      assertSingleActiveNarrationSource(sources, context);
+    } catch (error) {
+      console.error(error);
+      console.assert(false, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function stopNarrationAudioExcept(clipId: string | null) {
+    for (const [candidateId, { element }] of narrationAudioElsRef.current) {
+      if (candidateId === clipId) continue;
+      if (!activeNarrationRef.current.has(candidateId) && element.paused) continue;
+      narrationPlayRequestRef.current.set(candidateId, (narrationPlayRequestRef.current.get(candidateId) ?? 0) + 1);
+      if (!element.paused) {
+        console.info("[board2:audio-source]", {
+          action: "pause",
+          kind: "HTMLAudioElement",
+          id: element.id || candidateId,
+          clipId: candidateId,
+          currentTime: element.currentTime,
+          reason: "single-narration-owner",
+        });
+        element.pause();
+      }
+      activeNarrationRef.current.delete(candidateId);
+    }
+  }
+
   function startNarrationAudio(clip: Clip, timelineTime = playheadRef.current) {
+    if (isExportingRef.current) return;
+    stopNarrationAudioExcept(clip.id);
     const element = narrationAudioElement(clip);
     const requestId = (narrationPlayRequestRef.current.get(clip.id) ?? 0) + 1;
     narrationPlayRequestRef.current.set(clip.id, requestId);
@@ -8214,7 +8258,21 @@ export default function Board2Page() {
       // Every start/resume is a hard synchronization boundary. Never reuse the element's drifted
       // media clock after a pause, even when React batches a very fast pause→play pair.
       seekNarrationElement(clip, element, timelineTime, true);
-      element.play().catch((err) => console.warn("[narration] preview playback failed", err));
+      element.play().then(() => {
+        const activeSources = playingNarrationSourceIds();
+        console.info("[board2:audio-source]", {
+          action: "play",
+          kind: "HTMLAudioElement",
+          id: element.id,
+          clipId: clip.id,
+          sourceUrl: clip.sourceUrl,
+          currentTime: element.currentTime,
+          timelineTime,
+          activeNarrationSourceCount: activeSources.length,
+          activeNarrationSources: activeSources,
+        });
+        verifySinglePreviewNarrationSource("preview play");
+      }).catch((err) => console.warn("[narration] preview playback failed", err));
     };
 
     if (element.readyState >= 1) seekAndPlay();
@@ -8228,17 +8286,24 @@ export default function Board2Page() {
     const element = activeNarrationRef.current.get(clip.id);
     if (!element) return;
     updateNarrationAudioSettings(clip, element);
-    const expected = narrationSourceTime(clip, playheadRef.current, element);
     if (isPlayingRef.current && shouldResumeNarrationPlayback(element)) {
       seekNarrationElement(clip, element, playheadRef.current, true);
-      element.play().catch((err) => console.warn("[narration] preview resume failed", err));
-    } else if (isPlayingRef.current && !element.paused && !element.ended) {
-      // Correct only meaningful drift during an uninterrupted run; the tolerance avoids the old
-      // audible micro-seek loop while keeping the narration locked to the RAF playhead.
-      const correction = narrationResyncTarget(element.currentTime, expected);
-      if (correction !== null) {
-        try { element.currentTime = correction; } catch {}
-      }
+      element.play().then(() => {
+        const activeSources = playingNarrationSourceIds();
+        console.info("[board2:audio-source]", {
+          action: "play",
+          kind: "HTMLAudioElement",
+          id: element.id,
+          clipId: clip.id,
+          sourceUrl: clip.sourceUrl,
+          currentTime: element.currentTime,
+          timelineTime: playheadRef.current,
+          reason: "resume",
+          activeNarrationSourceCount: activeSources.length,
+          activeNarrationSources: activeSources,
+        });
+        verifySinglePreviewNarrationSource("preview resume");
+      }).catch((err) => console.warn("[narration] preview resume failed", err));
     }
   }
 
@@ -8250,14 +8315,30 @@ export default function Board2Page() {
   }
 
   function stopAllNarrationAudio() {
-    for (const clipId of [...activeNarrationRef.current.keys()]) stopNarrationAudio(clipId);
+    stopNarrationAudioExcept(null);
+    verifySinglePreviewNarrationSource("preview stopped");
+  }
+
+  function activeNarrationClipAtTime(timelineTime: number): Clip | null {
+    const narrationClips = clipsRef.current.filter((clip) => clip.type === "narration");
+    const clipId = activeNarrationClipIdAtTime(narrationClips, timelineTime);
+    return clipId ? narrationClips.find((clip) => clip.id === clipId) ?? null : null;
+  }
+
+  function syncNarrationAudioAtTime(timelineTime: number) {
+    const clip = activeNarrationClipAtTime(timelineTime);
+    if (!clip || isExportingRef.current) {
+      stopAllNarrationAudio();
+      return;
+    }
+    stopNarrationAudioExcept(clip.id);
+    if (activeNarrationRef.current.get(clip.id)) syncNarrationAudio(clip);
+    else startNarrationAudio(clip, timelineTime);
   }
 
   function resyncNarrationAudioAtTime(timelineTime: number, play: boolean) {
     stopAllNarrationAudio();
-    const clip = clipsRef.current.find((candidate) =>
-      candidate.type === "narration" && timelineTime >= candidate.startTime && timelineTime < candidate.startTime + candidate.duration
-    );
+    const clip = activeNarrationClipAtTime(timelineTime);
     if (!clip) return;
     if (play) {
       startNarrationAudio(clip, timelineTime);
@@ -11199,7 +11280,6 @@ export default function Board2Page() {
     const startPh = wrapped ? 0 : playheadRef.current;
     playheadRef.current = startPh;
     if (wrapped) setPlayhead(0);
-    prevPlayheadRef.current = startPh;
 
     // Ensure AudioContext exists and is running (user-gesture required for audio unlock)
     let ctx = audioCtxRef.current;
@@ -11899,7 +11979,7 @@ export default function Board2Page() {
     onProgress?: (current: number, total: number, clip: Clip) => void,
   ): Promise<OfflineAudioSource[]> {
     const context = new AudioContext();
-    const sources: OfflineAudioSource[] = [];
+    const decodedSources: Array<{ clip: Clip; source: OfflineAudioSource }> = [];
     const audioClips = currentClips.filter((clip) => {
       if (clip.type !== "narration" && clip.type !== "video") return false;
       if (clip.type === "video" && !isFeaturedTimelineClip(clip)) return false;
@@ -11919,12 +11999,15 @@ export default function Board2Page() {
                 return response.arrayBuffer();
               });
           const buffer = await context.decodeAudioData(bytes);
-          sources.push({
-            startTime: clip.startTime,
-            duration: Math.min(clip.duration, Math.max(0, buffer.duration - (clip.sourceOffsetSec ?? 0))),
-            sourceOffsetSec: Math.max(0, clip.sourceOffsetSec ?? 0),
-            volume,
-            buffer,
+          decodedSources.push({
+            clip,
+            source: {
+              startTime: clip.startTime,
+              duration: Math.min(clip.duration, Math.max(0, buffer.duration - (clip.sourceOffsetSec ?? 0))),
+              sourceOffsetSec: Math.max(0, clip.sourceOffsetSec ?? 0),
+              volume,
+              buffer,
+            },
           });
         } catch (error) {
           // A video container may legitimately have no audio track. Narration is required and a
@@ -11935,20 +12018,44 @@ export default function Board2Page() {
         onProgress?.(index + 1, audioClips.length, clip);
         await yieldForExportUi();
       }
-      return sources;
+      const videoSources = decodedSources
+        .filter(({ clip }) => clip.type === "video")
+        .map(({ source }) => source);
+      const narrationSources = decodedSources.filter(({ clip }) => clip.type === "narration");
+      const narrationById = new Map(narrationSources.map((item) => [item.clip.id, item]));
+      const exclusiveNarration = exclusiveNarrationSegments(narrationSources.map(({ clip }) => clip)).flatMap((segment) => {
+        const item = narrationById.get(segment.clipId);
+        if (!item) return [];
+        const duration = Math.min(segment.duration, Math.max(0, item.source.buffer.duration - segment.sourceOffsetSec));
+        return duration > 0 ? [{
+          ...item.source,
+          startTime: segment.startTime,
+          duration,
+          sourceOffsetSec: segment.sourceOffsetSec,
+        }] : [];
+      });
+      return [...videoSources, ...exclusiveNarration];
     } finally {
       await context.close().catch(() => {});
     }
   }
 
   async function startRealtimeExport() {
+    if (isExportingRef.current) return;
     if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
-    if (isPlayingRef.current) setIsPlaying(false);
     if (!("MediaRecorder" in window)) {
       setToast("Real-time video export is not available in this browser");
       return;
     }
+
+    // Export owns narration synchronously. Do not wait for React's state/effect cycle to pause the
+    // preview element: a rapid play→export transition can otherwise leave it alive through export.
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
+    rafIdRef.current = null;
+    stopAllNarrationAudio();
 
     setIsExporting(true);
     isExportingRef.current = true;
@@ -11989,9 +12096,11 @@ export default function Board2Page() {
     exportCtx.imageSmoothingQuality = "high";
 
     let exportAudioCtx: AudioContext | null = null;
+    let exportAudioDest: MediaStreamAudioDestinationNode | null = null;
     let exportMediaStream: MediaStream | null = null;
+    let exportRecorder: MediaRecorder | null = null;
     let wakeLock: WakeLockSentinel | null = null;
-    const scheduledAudio: AudioBufferSourceNode[] = [];
+    const scheduledAudio: Array<{ source: AudioBufferSourceNode; gain: GainNode; id: string }> = [];
     try {
       const uniqueImages = [...new Map(
         currentClips.filter((clip) => clip.type === "image").map((clip) => [clip.sourceUrl, clip]),
@@ -12041,7 +12150,6 @@ export default function Board2Page() {
         effectiveClipVolume(clip) > 0 && clip.duration > 0
       );
       let audioBuffers: AudioItem[] = [];
-      let exportAudioDest: MediaStreamAudioDestinationNode | null = null;
       if (audioClips.length > 0) {
         exportAudioCtx = new AudioContext();
         await exportAudioCtx.resume();
@@ -12096,6 +12204,7 @@ export default function Board2Page() {
         videoBitsPerSecond: exportBitrateMbps * 1_000_000,
         ...(exportAudioDest ? { audioBitsPerSecond: 192_000 } : {}),
       });
+      exportRecorder = recorder;
       const chunks: Blob[] = [];
       recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
       wakeLock = await navigator.wakeLock?.request("screen").catch(() => null) ?? null;
@@ -12108,18 +12217,74 @@ export default function Board2Page() {
 
         const exportAudioStart = exportAudioCtx?.currentTime ?? 0;
         if (exportAudioCtx && exportAudioDest) {
-          for (const { clip, buffer } of audioBuffers) {
-            const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
-            const playableDuration = Math.min(clip.duration, Math.max(0, buffer.duration - offset));
-            if (playableDuration <= 0) continue;
-            const gainNode = exportAudioCtx.createGain();
+          const audioContext = exportAudioCtx;
+          const audioDestination = exportAudioDest;
+          const scheduleSource = (
+            clip: Clip,
+            buffer: AudioBuffer,
+            startTime: number,
+            requestedOffset: number,
+            requestedDuration: number,
+            id: string,
+          ) => {
+            const offset = Math.min(Math.max(0, requestedOffset), Math.max(0, buffer.duration - 0.01));
+            const playableDuration = Math.min(requestedDuration, Math.max(0, buffer.duration - offset));
+            if (playableDuration <= 0) return;
+            const gainNode = audioContext.createGain();
             gainNode.gain.value = effectiveClipVolume(clip);
-            gainNode.connect(exportAudioDest);
-            const source = exportAudioCtx.createBufferSource();
+            gainNode.connect(audioDestination);
+            const source = audioContext.createBufferSource();
             source.buffer = buffer;
             source.connect(gainNode);
-            source.start(exportAudioStart + clip.startTime, offset, playableDuration);
-            scheduledAudio.push(source);
+            source.onended = () => { try { gainNode.disconnect(); } catch {} };
+            source.start(exportAudioStart + startTime, offset, playableDuration);
+            scheduledAudio.push({ source, gain: gainNode, id });
+            console.info("[board2:audio-source]", {
+              action: "start",
+              kind: "AudioBufferSourceNode",
+              id,
+              clipId: clip.id,
+              sourceUrl: clip.sourceUrl,
+              currentTime: audioContext.currentTime,
+              timelineTime: startTime,
+              sourceOffset: offset,
+              duration: playableDuration,
+              destination: "MediaStreamAudioDestinationNode",
+            });
+          };
+
+          const narrationItems = audioBuffers.filter((item) => item.clip.type === "narration");
+          const narrationById = new Map(narrationItems.map((item) => [item.clip.id, item]));
+          const narrationSegments = exclusiveNarrationSegments(narrationItems.map(({ clip }) => clip));
+          console.info("[board2:audio-source]", {
+            action: "schedule",
+            kind: "narration-export",
+            decodedClips: narrationItems.length,
+            exclusiveSegments: narrationSegments.length,
+            maxConcurrentNarrationSources: narrationSegments.length > 0 ? 1 : 0,
+          });
+          for (const segment of narrationSegments) {
+            const item = narrationById.get(segment.clipId);
+            if (!item) continue;
+            scheduleSource(
+              item.clip,
+              item.buffer,
+              segment.startTime,
+              segment.sourceOffsetSec,
+              segment.duration,
+              `export-narration-${segment.clipId}-${segment.startTime.toFixed(3)}`,
+            );
+          }
+          for (const { clip, buffer } of audioBuffers) {
+            if (clip.type === "narration") continue;
+            scheduleSource(
+              clip,
+              buffer,
+              clip.startTime,
+              clip.sourceOffsetSec ?? 0,
+              clip.duration,
+              `export-video-${clip.id}`,
+            );
           }
         }
 
@@ -12200,11 +12365,20 @@ export default function Board2Page() {
     } finally {
       if (exportRafRef.current !== null) cancelAnimationFrame(exportRafRef.current);
       exportRafRef.current = null;
-      for (const source of scheduledAudio) { try { source.stop(); } catch {} }
+      if (exportRecorder?.state !== "inactive") {
+        try { exportRecorder?.stop(); } catch {}
+      }
+      for (const { source, gain } of scheduledAudio) {
+        try { source.stop(); } catch {}
+        try { source.disconnect(); } catch {}
+        try { gain.disconnect(); } catch {}
+      }
+      try { exportAudioDest?.disconnect(); } catch {}
       exportMediaStream?.getTracks().forEach((track) => track.stop());
       await exportAudioCtx?.close().catch(() => {});
       await wakeLock?.release().catch(() => {});
       stopAllVideoPlayback("realtime-export-cleanup");
+      stopAllNarrationAudio();
       releaseOfflineRenderAssets();
       setIsExporting(false);
       isExportingRef.current = false;
@@ -12215,9 +12389,14 @@ export default function Board2Page() {
   }
 
   async function startDeterministicExport() {
+    if (isExportingRef.current) return;
     if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
-    if (isPlayingRef.current) setIsPlaying(false);
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
+    rafIdRef.current = null;
+    stopAllNarrationAudio();
     setIsExporting(true);
     isExportingRef.current = true;
     exportCancelRef.current = false;
