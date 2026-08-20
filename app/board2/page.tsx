@@ -115,6 +115,7 @@ import {
   DEFAULT_CHARACTER_FOCUS_LEAD_OUT_SECONDS,
   activeCharacterFocusBlock,
   applyCharacterFocusCamera,
+  bridgeCharacterFocusStops,
   normalizeCharacterFocusTransitionSeconds,
   type CharacterFocusId,
 } from "@/lib/character-focus-camera";
@@ -130,6 +131,11 @@ import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
 import { resolveTerrainFootIK } from "@/lib/board2/editor-character-physics";
+import {
+  ANNOTATION_LINE_HEIGHT,
+  annotationFontCss,
+  layoutAnnotationText,
+} from "@/lib/board2/annotation-text-layout";
 import {
   boardEntitiesForDisplay,
   boardEntityId,
@@ -1349,8 +1355,8 @@ const CHARACTER_FOCUS_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
-const CLIP_FOCUS_RATIO = 0.7;
 const AUTO_IMAGE_FOCUS_RATIO = 0.78;
+const CLIP_FOCUS_RATIO = AUTO_IMAGE_FOCUS_RATIO;
 const EXPORT_FPS = 60;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const AMBIENT_BUDGET = 4;
@@ -1802,6 +1808,47 @@ function normalizeYtSearchResponse(data: unknown): YtSearchResult[] {
 
 // ─── Annotation canvas helpers ────────────────────────────────────────────────
 
+let annotationMeasureContext: CanvasRenderingContext2D | null = null;
+
+function annotationLinesForContext(
+  annotation: Annotation,
+  context: CanvasRenderingContext2D,
+): string[] {
+  const fontSize = annotation.fontSize ?? 80;
+  const fontFamily = annotation.fontFamily ?? "Caveat";
+  const fontWeight = annotation.fontWeight ?? "normal";
+  context.font = annotationFontCss(fontSize, fontFamily, fontWeight);
+  return layoutAnnotationText(
+    annotation.text ?? "",
+    annotation.boardW,
+    (text) => context.measureText(text).width,
+  );
+}
+
+function annotationLinesForEditor(annotation: Annotation): string[] {
+  if (typeof document === "undefined") return (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  if (!annotationMeasureContext) {
+    annotationMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  return annotationMeasureContext
+    ? annotationLinesForContext(annotation, annotationMeasureContext)
+    : (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
+}
+
+async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return;
+  const fonts = new Set(
+    annotations
+      .filter((annotation) => annotation.type === "text")
+      .map((annotation) => annotationFontCss(
+        annotation.fontSize ?? 80,
+        annotation.fontFamily ?? "Caveat",
+        annotation.fontWeight ?? "normal",
+      )),
+  );
+  await Promise.all(Array.from(fonts, (font) => document.fonts.load(font).catch(() => [])));
+}
+
 function drawCurlyBrace(
   ctx: CanvasRenderingContext2D,
   x: number, y1: number, y2: number,
@@ -1846,9 +1893,11 @@ function drawAnnotationsToCanvas(
     const roughSeed = ann.id.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0) & 0xffff;
     const roughOpts = { stroke: ann.color, strokeWidth: sw, roughness: 1.4, bowing: 1.2, seed: roughSeed };
     if (ann.type === "text" && ann.text) {
-      const fs = Math.max(8, (ann.fontSize ?? 80) * sf);
+      const boardFontSize = ann.fontSize ?? 80;
+      const fs = boardFontSize * sf;
       ctx.save();
-      ctx.font = `${ann.fontWeight ?? "normal"} ${fs}px '${ann.fontFamily ?? "Caveat"}', cursive`;
+      const lines = annotationLinesForContext(ann, ctx);
+      ctx.font = annotationFontCss(fs, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
       ctx.fillStyle = ann.color;
       ctx.textBaseline = "top";
       ctx.textAlign = ann.textAlign ?? "left";
@@ -1857,7 +1906,10 @@ function drawAnnotationsToCanvas(
         : ann.textAlign === "right"
           ? ann.boardX + ann.boardW
           : ann.boardX;
-      ctx.fillText(ann.text, toSX(textX), toSY(ann.boardY));
+      const lineHeight = boardFontSize * ANNOTATION_LINE_HEIGHT * sf;
+      lines.forEach((line, index) => {
+        ctx.fillText(line, toSX(textX), toSY(ann.boardY) + index * lineHeight);
+      });
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
       const ax = toSX(ann.arrowStartX), ay = toSY(ann.arrowStartY!);
@@ -5527,6 +5579,22 @@ export default function Board2Page() {
   useEffect(() => { penPresetRef.current = penPreset; }, [penPreset]);
   useEffect(() => { stylusOnlyRef.current = stylusOnly; }, [stylusOnly]);
   useEffect(() => {
+    if (!document.fonts) return;
+    let cancelled = false;
+    const refreshAnnotationText = () => {
+      if (cancelled) return;
+      annotationMeasureContext = null;
+      setAnnotations((current) => [...current]);
+      drawFrameRef.current(playheadRef.current);
+    };
+    void ensureAnnotationFontsLoaded(annotationsRef.current).then(refreshAnnotationText);
+    document.fonts.addEventListener("loadingdone", refreshAnnotationText);
+    return () => {
+      cancelled = true;
+      document.fonts.removeEventListener("loadingdone", refreshAnnotationText);
+    };
+  }, []);
+  useEffect(() => {
     if (editingAnnotationId) {
       requestAnimationFrame(() => editingTextareaRef.current?.focus());
     }
@@ -7684,6 +7752,7 @@ export default function Board2Page() {
       return [...prev, clip];
     });
     setClipSelection([id]);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
   // A custom zoom clip carries no media of its own — boardX/Y/W/H mark a hand-drawn region of
@@ -10343,8 +10412,8 @@ export default function Board2Page() {
   }
 
   function commitTextEdit(annId: string) {
-    const text = editingAnnotationTextRef.current.trim();
-    if (!text) {
+    const text = editingAnnotationTextRef.current;
+    if (!text.trim()) {
       deleteAnnotation(annId);
     } else {
       const textarea = editingTextareaRef.current;
@@ -11034,7 +11103,8 @@ export default function Board2Page() {
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
     const hasTopicClusters = topicAwareClips.some((clip) => !!clip.autoTopicId);
     const hasPanBlocks = clipsRef.current.some((clip) => isFeaturedTimelineClip(clip) && clip.type === "pan");
-    if (hasTopicClusters && !hasPanBlocks) {
+    const hasCharacterFocusBlocks = clipsRef.current.some((clip) => isFeaturedTimelineClip(clip) && clip.type === "characterFocus");
+    if (hasTopicClusters && !hasPanBlocks && !hasCharacterFocusBlocks) {
       const topicIds = Array.from(new Set(topicAwareClips.flatMap((clip) => clip.autoTopicId ? [clip.autoTopicId] : [])));
       const topicBounds = topicIds.flatMap((topicId) => {
         const rects = [
@@ -11080,7 +11150,7 @@ export default function Board2Page() {
       }
     }
     const allClipsSorted = clipsRef.current
-      .filter((c) => isFeaturedTimelineClip(c) && (c.boardX !== undefined || c.type === "pan"))
+      .filter((c) => isFeaturedTimelineClip(c) && (c.boardX !== undefined || c.type === "pan" || c.type === "characterFocus"))
       .sort((a, b) => a.startTime - b.startTime);
 
     if (allClipsSorted.length === 0) {
@@ -11137,7 +11207,8 @@ export default function Board2Page() {
       imageFocusRatio: CLIP_FOCUS_RATIO,
     });
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
-    const holdStartStops: Stop[] = allClipsSorted.map((c) => {
+    const directHoldStartStops: Array<Stop | null> = allClipsSorted.map((c) => {
+      if (c.type === "characterFocus") return null;
       if (c.type === "pan") {
         return panPath.length > 0
           ? { camX: panPath[0].cameraX, camY: panPath[0].cameraY, zoom: panPath[0].boardZoom }
@@ -11147,7 +11218,7 @@ export default function Board2Page() {
       const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
       return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * boardWidth / W };
     });
-    const allStartStops: Stop[] = [...holdStartStops, frameAllStop];
+    const holdStartStops = bridgeCharacterFocusStops(directHoldStartStops, frameAllStop);
 
     type CamEvent = { absTime: number; stop: Stop; easing: 'linear' | 'ease-in-out' };
     const events: CamEvent[] = [];
@@ -11158,7 +11229,10 @@ export default function Board2Page() {
       const holdStart = c.startTime;
       const holdEnd = c.startTime + c.duration * hf;
       const transEnd = c.startTime + c.duration;
-      const nextStop = allStartStops[i + 1];
+      // Hold the final authored stop unless an explicit pan/establishing block says otherwise.
+      // Character placeholders bridge the surrounding stops and are replaced at runtime by the
+      // moving character camera, so adjacent image transitions cannot skip over them.
+      const nextStop = holdStartStops[i + 1] ?? holdStartStops[i];
 
       if (c.type === "pan") {
         if (!hasBoardClips) {
@@ -11541,6 +11615,7 @@ export default function Board2Page() {
     drawableFailureCountRef.current = 0;
     exportImgCacheRef.current.clear();
     exportImgLoadRef.current.clear();
+    await ensureAnnotationFontsLoaded(currentAnnotations);
     // Export renders the whole board through the camera, not just the current timeline block.
     // Decode every source image before capture starts so a wide frame can never outrun a small
     // timeline-window/LRU cache and record blank media that only appears later.
@@ -16436,6 +16511,9 @@ export default function Board2Page() {
                   const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
                   const showHandles = isSel && annotationTool === "pointer" && !isEditing;
+                  const textLines = ann.type === "text" && ann.text
+                    ? annotationLinesForEditor(ann)
+                    : [];
                   return (
                     <div
                       key={ann.id}
@@ -16477,10 +16555,16 @@ export default function Board2Page() {
                           overflow: "visible",
                           width: "100%",
                           height: "100%",
-                          lineHeight: 1.2,
+                          lineHeight: ANNOTATION_LINE_HEIGHT,
                           textAlign: ann.textAlign ?? "left",
                         }}>
-                          {ann.text || <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
+                          {ann.text
+                            ? textLines.map((line, index) => (
+                                <span key={index} style={{ display: "block", whiteSpace: "pre", height: `${ANNOTATION_LINE_HEIGHT}em` }}>
+                                  {line || "\u00a0"}
+                                </span>
+                              ))
+                            : <span style={{ opacity: 0.25, fontFamily: "monospace", fontSize: 11 }}>click to type…</span>}
                         </div>
                       )}
                       {ann.type === "text" && isEditing && (
@@ -16506,7 +16590,7 @@ export default function Board2Page() {
                             height: ann.boardH * boardZoom,
                             boxSizing: "border-box",
                             padding: 0,
-                            lineHeight: 1.2,
+                            lineHeight: ANNOTATION_LINE_HEIGHT,
                             textAlign: ann.textAlign ?? "left",
                             whiteSpace: "pre-wrap",
                           }}

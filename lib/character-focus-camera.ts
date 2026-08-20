@@ -21,8 +21,8 @@ export type CharacterFocusBlockLike = {
 export type CharacterFocusPosition = { x: number; y: number; speechBubble?: boolean };
 
 const CHARACTER_BOARD_HEIGHT = 170;
-const CHARACTER_FRAME_HEIGHT_RATIO = 0.55;
-const SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = 0.48;
+export const CHARACTER_FRAME_HEIGHT_RATIO = 0.78;
+const SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = 0.68;
 const CHARACTER_CAMERA_Y_OFFSET = 70;
 const SPEECH_BUBBLE_CAMERA_Y_OFFSET = 95;
 
@@ -99,7 +99,7 @@ export function activeCharacterFocusBlock(
     )[0];
 }
 
-function cameraForPosition(
+export function cameraForCharacterPosition(
   position: CharacterFocusPosition,
   canvasW: number,
   canvasH: number,
@@ -117,9 +117,31 @@ function cameraForPosition(
     boardZoom: clamp(
       frameHeightRatio * canvasH * boardW / (canvasW * CHARACTER_BOARD_HEIGHT),
       1.1,
-      8,
+      64,
     ),
   };
+}
+
+/**
+ * Character focus is a runtime camera override, but the authored base track
+ * still needs a placeholder at that point in the stop sequence. A character
+ * placeholder holds the preceding authored stop (or the following stop when
+ * first) so surrounding image transitions cannot skip across it.
+ */
+export function bridgeCharacterFocusStops<T>(
+  stops: readonly (T | null)[],
+  fallback: T,
+): T[] {
+  return stops.map((stop, index) => {
+    if (stop !== null) return stop;
+    for (let previous = index - 1; previous >= 0; previous--) {
+      if (stops[previous] !== null) return stops[previous] as T;
+    }
+    for (let next = index + 1; next < stops.length; next++) {
+      if (stops[next] !== null) return stops[next] as T;
+    }
+    return fallback;
+  });
 }
 
 /** Resolves the authored camera plus any active character-focus block as one camera track. */
@@ -156,9 +178,9 @@ export function applyCharacterFocusCamera(args: {
     const exitCamera = resolveAt(blockEnd, withoutBlock);
     const entryPosition = positionAt(characterId, block.startTime) ?? position;
     const exitPosition = positionAt(characterId, blockEnd) ?? position;
-    const entryFocusCamera = cameraForPosition(entryPosition, canvasW, canvasH, boardW);
-    const focusCamera = cameraForPosition(position, canvasW, canvasH, boardW);
-    const exitFocusCamera = cameraForPosition(exitPosition, canvasW, canvasH, boardW);
+    const entryFocusCamera = cameraForCharacterPosition(entryPosition, canvasW, canvasH, boardW);
+    const focusCamera = cameraForCharacterPosition(position, canvasW, canvasH, boardW);
+    const exitFocusCamera = cameraForCharacterPosition(exitPosition, canvasW, canvasH, boardW);
     const transitions = resolveCharacterFocusTransitionDurations(
       block,
       entryCamera,
