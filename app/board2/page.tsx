@@ -82,7 +82,7 @@ import {
   type Gesture,
   type GestureTrackPoint,
 } from "@/lib/character/gestures";
-import { shouldResumeNarrationPlayback } from "@/lib/board2/narration-playback";
+import { narrationResyncTarget, shouldResumeNarrationPlayback } from "@/lib/board2/narration-playback";
 import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
@@ -129,6 +129,15 @@ import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
+import { resolveTerrainFootIK } from "@/lib/board2/editor-character-physics";
+import {
+  boardEntitiesForDisplay,
+  boardEntityId,
+  boardEntityRepresentativesAtTime,
+  isBoardBackedClipType,
+  isCanonicalBoardEntity,
+  referencesBoardEntity,
+} from "@/lib/board2/board-entities";
 import {
   normalizeLoadedCharacterActionRecord,
   normalizeLoadedSchemaVersion,
@@ -308,8 +317,12 @@ function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" 
   return clip.type === "image" || clip.type === "video";
 }
 
+function isBoardBackedClip(clip: Clip): clip is Clip & { type: "image" | "video" | "customZoom" } {
+  return isBoardBackedClipType(clip.type);
+}
+
 function isFeaturedTimelineClip(clip: Clip): boolean {
-  return !isBoardMediaClip(clip) || clip.featured !== false;
+  return !isBoardBackedClip(clip) || clip.featured !== false;
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
@@ -1350,7 +1363,10 @@ const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
 const PREVIEW_RENDER_LONG_EDGE_PX = 960;
 const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
-const PREVIEW_IMAGE_CACHE_LIMIT = 72;
+// Two bounded LRU generations: the hot set covers the viewport plus a generous pan margin; the
+// warm set prevents a just-visible image from being discarded during a fast direction change.
+const PREVIEW_IMAGE_CACHE_LIMIT = 144;
+const PREVIEW_IMAGE_WARM_CACHE_LIMIT = 48;
 const EDITOR_PLAYBACK_FPS = 30;
 const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
@@ -2040,6 +2056,18 @@ function resolveCinematicGroundY(
   return desiredY;
 }
 
+function resolveActionGroundY(
+  action: Pick<ResolvedCharAction, "traversalMode">,
+  x: number,
+  desiredY: number,
+  clips: CharSurfaceClip[],
+  craters: readonly StreamCrater[] = [],
+): number {
+  // Editor actions already carry the surface-specific Y chosen during action resolution. Sampling
+  // every board image again here lets an unrelated overhead image replace that authored ground.
+  return action.traversalMode === "cinematic" ? desiredY : resolveGroundY(x, desiredY, clips, craters);
+}
+
 // Snap a board position to the top surface of the clip under x (for action placement).
 function snapToClipTop(
   tx: number, ty: number,
@@ -2304,7 +2332,7 @@ function buildSkateToPlan(active: ResolvedCharAction, clips: CharSurfaceClip[], 
     gapEndX = facing === 1 ? terrainGap.right : terrainGap.left;
     if (terrainGap.width > 120) finalX = gapEndX = edgeX + facing * 90;
     else finalX = gapEndX + facing * SKATE_LANDING_ROLLOUT_PX;
-    landingY = resolveGroundY(gapEndX, startY, clips, craters);
+    landingY = resolveActionGroundY(active, gapEndX, startY, clips, craters);
   } else if (source === target) {
     return null;
   }
@@ -2386,7 +2414,7 @@ function resolvedActionRestPosition(
   const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips, craters) : null;
   if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
   if (CHAR_STATIONARY_TARGET_TYPES.has(action.type) && action.targetX !== undefined) {
-    const targetY = resolveGroundY(action.targetX, action.targetY ?? action.fromY, clips, craters);
+    const targetY = resolveActionGroundY(action, action.targetX, action.targetY ?? action.fromY, clips, craters);
     const dist = Math.hypot(action.targetX - action.fromX, targetY - action.fromY);
     if (dist < CHAR_STATIONARY_NEAR_TARGET_PX) return { x: action.fromX, y: action.fromY };
     return {
@@ -2448,7 +2476,7 @@ function stationaryRuntimeForAction(
   }
 
   const targetX = active.targetX;
-  const targetY = resolveGroundY(targetX, active.targetY ?? active.fromY, clips, craters);
+  const targetY = resolveActionGroundY(active, targetX, active.targetY ?? active.fromY, clips, craters);
   const distance = Math.hypot(targetX - active.fromX, targetY - active.fromY);
   const elapsed = time - active.startTime;
   if (distance < CHAR_STATIONARY_NEAR_TARGET_PX) {
@@ -3131,16 +3159,17 @@ function travelPoseBetween(
   progress: number,
   clips: CharSurfaceClip[],
   running = false,
-  craters: readonly StreamCrater[] = []
+  craters: readonly StreamCrater[] = [],
+  traversalMode: CharacterTraversalMode = "solid",
 ): CharPoseResult {
   const distance = Math.hypot(targetX - fromX, targetY - fromY);
   const travelProgress = distanceTravelProgress(progress, distance);
   let bx = lerp(fromX, targetX, travelProgress);
   const rawBy = lerp(fromY, targetY, travelProgress);
   const terrain=clips.filter(isBoardSurface) as TerrainClip[];
-  let profile = groundProfileY(terrain, craters, bx);
+  let profile = traversalMode === "cinematic" ? null : groundProfileY(terrain, craters, bx);
   let autoJumpY=0;
-  if(!profile){let left:null|{x:number;y:number}=null,right:null|{x:number;y:number}=null;for(let d=6;d<=126&&!left;d+=6){const p=groundProfileY(terrain,craters,bx-d);if(p)left={x:bx-d,y:p.y};}for(let d=6;d<=126&&!right;d+=6){const p=groundProfileY(terrain,craters,bx+d);if(p)right={x:bx+d,y:p.y};}if(left&&right&&right.x-left.x<=120){const gapT=clamp((bx-left.x)/(right.x-left.x),0,1);profile={y:lerp(left.y,right.y,gapT),imageId:"terrain-gap",slope:0};autoJumpY=-70*4*gapT*(1-gapT);}else{const lip=targetX>=fromX?left:right;if(lip){bx=lip.x;profile=groundProfileY(terrain,craters,bx);}}}
+  if(traversalMode !== "cinematic"&&!profile){let left:null|{x:number;y:number}=null,right:null|{x:number;y:number}=null;for(let d=6;d<=126&&!left;d+=6){const p=groundProfileY(terrain,craters,bx-d);if(p)left={x:bx-d,y:p.y};}for(let d=6;d<=126&&!right;d+=6){const p=groundProfileY(terrain,craters,bx+d);if(p)right={x:bx+d,y:p.y};}if(left&&right&&right.x-left.x<=120){const gapT=clamp((bx-left.x)/(right.x-left.x),0,1);profile={y:lerp(left.y,right.y,gapT),imageId:"terrain-gap",slope:0};autoJumpY=-70*4*gapT*(1-gapT);}else{const lip=targetX>=fromX?left:right;if(lip){bx=lip.x;profile=groundProfileY(terrain,craters,bx);}}}
   if(profile&&Math.abs(profile.slope)>Math.tan(50*Math.PI/180)){const downhill=profile.slope>0?1:-1;for(let d=4;d<=60;d+=4){const candidate=groundProfileY(terrain,craters,bx+downhill*d);if(candidate&&Math.abs(candidate.slope)<=Math.tan(50*Math.PI/180)){bx+=downhill*d;profile=candidate;break;}}}
   const by = profile?.y ?? rawBy;
   const facing: 1 | -1 = targetX >= fromX ? 1 : -1;
@@ -3243,7 +3272,8 @@ function evalCharPoseRaw(
       clamp((time - active.startTime) / stationaryRuntime.travelDuration, 0, 1),
       clips,
       stationaryRuntime.running,
-      craters
+      craters,
+      active.traversalMode,
     );
   }
   const stationaryActive = stationaryRuntime.action;
@@ -3253,7 +3283,7 @@ function evalCharPoseRaw(
   if (active.type === "walkTo") {
     const tx = active.targetX ?? active.fromX, ty = active.targetY ?? active.fromY;
     const speed = Math.hypot(tx - active.fromX, ty - active.fromY) / Math.max(0.001, active.duration);
-    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips, speed > 520, craters), authoredPose);
+    return applyAuthoredPose(travelPoseBetween(time, active.fromX, active.fromY, tx, ty, progress, clips, speed > 520, craters, active.traversalMode), authoredPose);
   }
 
   if (active.type === "jumpTo") {
@@ -3311,7 +3341,7 @@ function evalCharPoseRaw(
     if (plan.tooHighTarget) {
       const tx = active.targetX ?? active.fromX;
       const ty = active.targetY ?? active.fromY;
-      const landingY = resolveGroundY(tx, ty, clips, craters);
+      const landingY = resolveActionGroundY(active, tx, ty, clips, craters);
       const bx = lerp(active.fromX, tx, progress);
       const by = lerp(active.fromY, landingY, progress);
       const facing: 1 | -1 = tx >= active.fromX ? 1 : -1;
@@ -3352,14 +3382,14 @@ function evalCharPoseRaw(
     } else if (elapsed < plan.airStart) {
       const rollElapsed = elapsed - plan.mountEnd;
       const baseRollT = plan.rollDur > 0 ? clamp(rollElapsed / plan.rollDur, 0, 1) : 1;
-      const probeX=lerp(plan.startX,plan.edgeX,baseRollT),probe=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,probeX);
+      const probeX=lerp(plan.startX,plan.edgeX,baseRollT),probe=active.traversalMode === "cinematic" ? null : groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,probeX);
       const slopeSpeed=1+clamp((probe?.slope??0)*plan.facing*.15,-.15,.15);
       const rollT=clamp(baseRollT*slopeSpeed,0,1);
       bx = lerp(plan.startX, plan.edgeX, rollT);
-      const rollGround=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx);
+      const rollGround=active.traversalMode === "cinematic" ? null : groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx);
       by = rollGround?.y??plan.startY;
-      const behind=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx-plan.facing*20)?.y??by;
-      const ahead=groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx+plan.facing*20)?.y??by;
+      const behind=active.traversalMode === "cinematic" ? by : groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx-plan.facing*20)?.y??by;
+      const ahead=active.traversalMode === "cinematic" ? by : groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,bx+plan.facing*20)?.y??by;
       skateboardTilt=Math.atan2(ahead-behind,40)*plan.facing;
       const prepStart = Math.max(plan.mountEnd, plan.airStart - plan.prepDur);
       if (plan.prepDur > 0 && elapsed >= prepStart) {
@@ -3401,7 +3431,7 @@ function evalCharPoseRaw(
       const t = plan.landDur > 0 ? clamp((elapsed - plan.airEnd) / plan.landDur, 0, 1) : 1;
       const rolloutT = clamp(t / 0.68, 0, 1);
       bx = plan.gapEndX + (plan.finalX - plan.gapEndX) * rolloutT;
-      by = resolveGroundY(bx,plan.landingY,clips,craters);
+      by = resolveActionGroundY(active, bx, plan.landingY, clips, craters);
       skateboardVisible = t < 0.72;
       pose = t < 0.68
         ? sampleAnimation(authoredAnimations["skate-olly"] ?? FALLBACK_SKATE_OLLY, lerp(0.84, 1, t / 0.68))
@@ -3638,7 +3668,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const groundY = resolveGroundY(a.fromX, a.targetY ?? a.fromY, clips, craters);
+    const groundY = resolveActionGroundY(a, a.fromX, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const STEP_END = 0.12;
     const LOWER_END = 0.3;
@@ -3814,7 +3844,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
+    const ty = resolveActionGroundY(a, tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const APPROACH_END = 0.1;
     const HANG_END = 0.15;
@@ -3917,7 +3947,7 @@ function evalCharPoseRaw(
     const a = stationaryActive;
     const p = stationaryProgress;
     const tx = a.targetX ?? a.fromX;
-    const ty = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
+    const ty = resolveActionGroundY(a, tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     let pose = standingCharPose(tx, ty, facing, time);
     let surpriseAlpha = 0;
@@ -4002,7 +4032,7 @@ function evalCharPoseRaw(
   if (active.type === "dance") {
     const a = stationaryActive;
     const tx = a.targetX ?? a.fromX;
-    const groundY = resolveGroundY(tx, a.targetY ?? a.fromY, clips, craters);
+    const groundY = resolveActionGroundY(a, tx, a.targetY ?? a.fromY, clips, craters);
     const facing: 1 | -1 = tx >= a.fromX ? 1 : -1;
     const elapsed = Math.max(0, stationaryElapsed);
     const edge = Math.min(1, elapsed / 0.22, (a.duration - elapsed) / 0.22);
@@ -4147,9 +4177,17 @@ function evalCharAtTime(
   };
   const intensity = momentumIntensityAt(time, resolved);
   const active = resolved.find((a) => time >= a.startTime && time < a.startTime + a.duration);
+  const traversalMode = active?.traversalMode ?? resolved[resolved.length - 1]?.traversalMode ?? "cinematic";
   const actionAge = active ? time - active.startTime : Infinity;
   const actionTail = active ? active.startTime + active.duration - time : Infinity;
   const terrainGrounded=active?.type!=="walkTo"&&isGrounded({actionType:active?.type??"idle",airY:base.airY,skateAirborne:base.skateFootMode==="air",grappleAirborne:active?.type==="grapple"&&actionAge>=active.duration*.32&&actionAge<active.duration*.93});
+  // Standard editor choreography is not a platformer. The old all-media foot IK sampled the
+  // highest image at each foot, so an unrelated overhead image pulled both feet upward and
+  // compressed the body. The sampler is never invoked in cinematic/editor mode.
+  const terrainFootIK = resolveTerrainFootIK(traversalMode, terrainGrounded, () => [
+    (groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX-14)?.y??base.boardY)-base.boardY,
+    (groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX+14)?.y??base.boardY)-base.boardY,
+  ]);
   const leanEase = Math.min(1, actionAge * LEAN_RESPONSE_HZ, actionTail * LEAN_RESPONSE_HZ);
   const leanExtra = clamp(velocity.x * LEAN_K, -LEAN_MAX, LEAN_MAX) * easeInOutCubic(clamp(leanEase, 0, 1)) * intensity;
 
@@ -4206,9 +4244,9 @@ function evalCharAtTime(
     momentumScaleX: scaleX,
     momentumScaleY: scaleY,
     actionType:active?.type??"idle",
-    terrainGrounded,
-    terrainLeftFootY:terrainGrounded?(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX-14)?.y??base.boardY)-base.boardY:0,
-    terrainRightFootY:terrainGrounded?(groundProfileY(clips.filter(isBoardSurface) as TerrainClip[],craters,base.boardX+14)?.y??base.boardY)-base.boardY:0,
+    terrainGrounded: terrainFootIK.terrainGrounded,
+    terrainLeftFootY: terrainFootIK.leftFootY,
+    terrainRightFootY: terrainFootIK.rightFootY,
   };
 }
 
@@ -4609,9 +4647,9 @@ export default function Board2Page() {
     const viewportTop = -boardPan.y / zoom;
     const viewportWidth = boardViewportSize.width / zoom;
     const viewportHeight = boardViewportSize.height / zoom;
-    const paddingX = Math.max(260, viewportWidth * 0.35);
-    const paddingY = Math.max(220, viewportHeight * 0.35);
-    return clips.filter((clip) => {
+    const paddingX = Math.max(520, viewportWidth * 1.25);
+    const paddingY = Math.max(440, viewportHeight * 1.25);
+    return boardEntitiesForDisplay(clips).filter((clip) => {
       if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
       return clip.boardX + clip.boardW >= viewportLeft - paddingX &&
         clip.boardX <= viewportLeft + viewportWidth + paddingX &&
@@ -4649,6 +4687,7 @@ export default function Board2Page() {
   const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const warmImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportCancelRef = useRef(false);
@@ -6383,7 +6422,7 @@ export default function Board2Page() {
     const authoredShake = bazookaShake(authoredBazooka.events, time * 1000);
     ctx.save();
     ctx.translate(authoredShake.x, authoredShake.y);
-    const sortedClips = [...currentClips].sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
+    const sortedClips = boardEntityRepresentativesAtTime(currentClips, time).sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
       const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
@@ -6402,8 +6441,8 @@ export default function Board2Page() {
       if (clip.type === "image") {
         const renderUrl = clip.previewUrl ?? clip.sourceUrl;
         const img = quality === "export"
-          ? exportImgCacheRef.current.get(clip.sourceUrl) ?? imgCacheRef.current.get(renderUrl)
-          : imgCacheRef.current.get(renderUrl);
+          ? exportImgCacheRef.current.get(clip.sourceUrl) ?? cachedPreviewImage(renderUrl)
+          : cachedPreviewImage(renderUrl);
         if (!img && quality === "preview") loadMedia(renderUrl, "image");
         if (img?.complete && img.naturalWidth > 0) {
           drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,renderCraters.filter(crater=>crater.clipId===clip.id));
@@ -6564,6 +6603,8 @@ export default function Board2Page() {
     ctx.restore();
     const mediaBubbleTarget = narrationMediaBubbleTarget(time, currentClips, cam, sf, W, H);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor, mediaBubbleTarget);
+  // Cache accessors are component-local and intentionally read the latest refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawStreamGuestsToCtx, editorCameraAtTime]);
 
   const drawFrame = useCallback((time: number) => {
@@ -6712,14 +6753,16 @@ export default function Board2Page() {
       const renderUrl = clip.previewUrl ?? clip.sourceUrl;
       const canvases = [boardImageCanvasRefs.current.get(clip.id), mobileBoardImageCanvasRefs.current.get(clip.id)].filter(Boolean) as HTMLCanvasElement[];
       if (!canvases.length) continue;
-      const image = imgCacheRef.current.get(renderUrl);
+      const image = cachedPreviewImage(renderUrl);
       if (!image) loadMedia(renderUrl, "image");
       for (const canvas of canvases) {
         const ctx = canvas.getContext("2d");
         if (!ctx) continue;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
         canvas.style.transform = `translate(${shake.x}px, ${shake.y}px)`;
         if (image?.complete && image.naturalWidth > 0) {
+          // Only replace pixels when the next frame is drawable. The CSS preview underneath and
+          // the previous canvas frame remain visible while a cache miss is decoding.
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
           drawCrateredImage(
             ctx, image, 0, 0, canvas.width, canvas.height, clip.boardW, clip.boardH,
             authoredBazooka.craters.filter((crater) => crater.clipId === clip.id),
@@ -6727,6 +6770,8 @@ export default function Board2Page() {
         }
       }
     }
+  // Cache accessors are component-local and intentionally read the latest refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => { drawBoardImageOverlaysRef.current = drawBoardImageOverlays; }, [drawBoardImageOverlays]);
@@ -7216,9 +7261,44 @@ export default function Board2Page() {
 
   // ─ Media loading ──────────────────────────────────────────────────────────
 
+  function trimPreviewImageCaches() {
+    while (imgCacheRef.current.size > PREVIEW_IMAGE_CACHE_LIMIT) {
+      const oldestUrl = imgCacheRef.current.keys().next().value as string | undefined;
+      if (!oldestUrl) break;
+      const oldest = imgCacheRef.current.get(oldestUrl);
+      imgCacheRef.current.delete(oldestUrl);
+      if (oldest) {
+        warmImgCacheRef.current.delete(oldestUrl);
+        warmImgCacheRef.current.set(oldestUrl, oldest);
+      }
+    }
+    while (warmImgCacheRef.current.size > PREVIEW_IMAGE_WARM_CACHE_LIMIT) {
+      const oldestUrl = warmImgCacheRef.current.keys().next().value as string | undefined;
+      if (!oldestUrl) break;
+      // Dropping the final JS reference lets the browser reclaim decoded pixels. Do not blank
+      // `src`: a mounted canvas/background keeps its last frame instead of flashing immediately.
+      warmImgCacheRef.current.delete(oldestUrl);
+    }
+  }
+
+  function cachedPreviewImage(url: string): HTMLImageElement | undefined {
+    const hot = imgCacheRef.current.get(url);
+    if (hot) {
+      imgCacheRef.current.delete(url);
+      imgCacheRef.current.set(url, hot);
+      return hot;
+    }
+    const warm = warmImgCacheRef.current.get(url);
+    if (!warm) return undefined;
+    warmImgCacheRef.current.delete(url);
+    imgCacheRef.current.set(url, warm);
+    trimPreviewImageCaches();
+    return warm;
+  }
+
   function loadMedia(url: string, type: "image" | "video") {
     if (type === "image") {
-      if (!imgCacheRef.current.has(url)) {
+      if (!cachedPreviewImage(url)) {
         const img = new Image();
         img.onload = () => {
           drawFrame(playheadRef.current);
@@ -7226,13 +7306,7 @@ export default function Board2Page() {
         };
         img.src = url;
         imgCacheRef.current.set(url, img);
-        while (imgCacheRef.current.size > PREVIEW_IMAGE_CACHE_LIMIT) {
-          const oldestUrl = imgCacheRef.current.keys().next().value as string | undefined;
-          if (!oldestUrl || oldestUrl === url) break;
-          const oldest = imgCacheRef.current.get(oldestUrl);
-          if (oldest) oldest.src = "";
-          imgCacheRef.current.delete(oldestUrl);
-        }
+        trimPreviewImageCaches();
       }
     }
     // Video: per-clip elements are created by createVideoElement instead
@@ -7473,8 +7547,9 @@ export default function Board2Page() {
 
   function deleteClip(clipId: string) {
     const clip = clipsRef.current.find((c) => c.id === clipId);
-    if (clip && isBoardMediaClip(clip)) {
-      // Timeline deletion removes only the appearance. The board entity/source/geometry remains.
+    if (clip && isBoardBackedClip(clip) && isCanonicalBoardEntity(clip)) {
+      // The canonical record owns the board object. Removing its timeline appearance keeps that
+      // record board-only; non-canonical appearances fall through and are removed outright.
       setClips((prev) => prev.map((candidate) => candidate.id === clipId
         ? { ...candidate, mediaId: candidate.mediaId ?? candidate.id, featured: false }
         : candidate));
@@ -7526,22 +7601,24 @@ export default function Board2Page() {
 
   function deleteBoardMedia(clipId: string) {
     const clip = clipsRef.current.find((candidate) => candidate.id === clipId);
-    if (!clip || !isBoardMediaClip(clip)) return;
-    const noun = clip.type === "image" ? "image" : "video";
-    if (!window.confirm(`Delete this ${noun} from the board? This removes it and any timeline blocks that feature it.`)) return;
+    if (!clip || !isBoardBackedClip(clip)) return;
+    const noun = clip.type === "customZoom" ? "drawn focus area" : clip.type === "image" ? "image" : "video";
+    if (!window.confirm(`Delete this ${noun} from the board? This removes it and any timeline blocks that reference it.`)) return;
 
-    const mediaId = clip.mediaId ?? clip.id;
+    const mediaId = boardEntityId(clip);
     // Remove all appearances referencing this entity, including future duplicate blocks.
-    setClips((prev) => prev.filter((candidate) =>
-      candidate.id !== clipId && (!isBoardMediaClip(candidate) || (candidate.mediaId ?? candidate.id) !== mediaId)));
-    const vid = videoElsRef.current.get(clipId);
-    if (vid) {
-      vid.pause();
-      vid.src = "";
-      videoHiddenContainerRef.current?.removeChild(vid);
-      videoElsRef.current.delete(clipId);
+    const entityClips = clipsRef.current.filter((candidate) => referencesBoardEntity(candidate, mediaId));
+    setClips((prev) => prev.filter((candidate) => !referencesBoardEntity(candidate, mediaId)));
+    for (const entityClip of entityClips) {
+      const vid = videoElsRef.current.get(entityClip.id);
+      if (vid) {
+        vid.pause();
+        vid.src = "";
+        videoHiddenContainerRef.current?.removeChild(vid);
+        videoElsRef.current.delete(entityClip.id);
+      }
+      thumbnailImagesRef.current.delete(entityClip.id);
     }
-    thumbnailImagesRef.current.delete(clipId);
     setSelectedClipIds([]);
     selectedClipIdsRef.current = [];
     setSelectedClipId(null);
@@ -7770,8 +7847,10 @@ export default function Board2Page() {
     const requestedStart = playheadRef.current;
     const newId = generateId();
     const cloned = src.type === "video" ? await cloneVideoSource(src) : null;
+    const referencesExistingBoardEntity = isBoardBackedClip(src);
     const clonedClip: Clip = {
       ...src, id: newId, startTime: requestedStart,
+      ...(referencesExistingBoardEntity ? { mediaId: boardEntityId(src), featured: true } : {}),
       ...(cloned ? { sourceUrl: cloned.sourceUrl, sourceBlob: cloned.sourceBlob } : {}),
     };
     if (src.type === "video") {
@@ -7797,6 +7876,7 @@ export default function Board2Page() {
     const layer = freeLayerAtTime(clipsRef.current, startTime, clip.duration, "", clip.layer ?? 1);
     const newClip: Clip = {
       ...clip, id: newId, startTime, layer,
+      ...(isBoardBackedClip(clip) ? { mediaId: boardEntityId(clip), featured: true } : {}),
       ...(cloned ? { sourceUrl: cloned.sourceUrl, sourceBlob: cloned.sourceBlob } : {}),
     };
     if (clip.type === "video") {
@@ -7838,7 +7918,14 @@ export default function Board2Page() {
     element.volume = clamp(clip.volume ?? 1, 0, 1);
   }
 
-  function startNarrationAudio(clip: Clip) {
+  function seekNarrationElement(clip: Clip, element: HTMLAudioElement, timelineTime: number, force: boolean) {
+    const expected = narrationSourceTime(clip, timelineTime, element);
+    const target = narrationResyncTarget(element.currentTime, expected, force);
+    if (target === null) return;
+    try { element.currentTime = target; } catch {}
+  }
+
+  function startNarrationAudio(clip: Clip, timelineTime = playheadRef.current) {
     const element = narrationAudioElement(clip);
     const requestId = (narrationPlayRequestRef.current.get(clip.id) ?? 0) + 1;
     narrationPlayRequestRef.current.set(clip.id, requestId);
@@ -7847,7 +7934,9 @@ export default function Board2Page() {
 
     const seekAndPlay = () => {
       if (!isPlayingRef.current || activeNarrationRef.current.get(clip.id) !== element || narrationPlayRequestRef.current.get(clip.id) !== requestId) return;
-      try { element.currentTime = narrationSourceTime(clip, playheadRef.current, element); } catch {}
+      // Every start/resume is a hard synchronization boundary. Never reuse the element's drifted
+      // media clock after a pause, even when React batches a very fast pause→play pair.
+      seekNarrationElement(clip, element, timelineTime, true);
       element.play().catch((err) => console.warn("[narration] preview playback failed", err));
     };
 
@@ -7862,11 +7951,17 @@ export default function Board2Page() {
     const element = activeNarrationRef.current.get(clip.id);
     if (!element) return;
     updateNarrationAudioSettings(clip, element);
-    // Position once in startNarrationAudio, then let the media clock run continuously. Comparing
-    // it to RAF time here caused audible backward seeks; play() on an ended element also restarts
-    // that narration from zero while its timeline clip is still active.
+    const expected = narrationSourceTime(clip, playheadRef.current, element);
     if (isPlayingRef.current && shouldResumeNarrationPlayback(element)) {
+      seekNarrationElement(clip, element, playheadRef.current, true);
       element.play().catch((err) => console.warn("[narration] preview resume failed", err));
+    } else if (isPlayingRef.current && !element.paused && !element.ended) {
+      // Correct only meaningful drift during an uninterrupted run; the tolerance avoids the old
+      // audible micro-seek loop while keeping the narration locked to the RAF playhead.
+      const correction = narrationResyncTarget(element.currentTime, expected);
+      if (correction !== null) {
+        try { element.currentTime = correction; } catch {}
+      }
     }
   }
 
@@ -7879,6 +7974,43 @@ export default function Board2Page() {
 
   function stopAllNarrationAudio() {
     for (const clipId of [...activeNarrationRef.current.keys()]) stopNarrationAudio(clipId);
+  }
+
+  function resyncNarrationAudioAtTime(timelineTime: number, play: boolean) {
+    stopAllNarrationAudio();
+    const clip = clipsRef.current.find((candidate) =>
+      candidate.type === "narration" && timelineTime >= candidate.startTime && timelineTime < candidate.startTime + candidate.duration
+    );
+    if (!clip) return;
+    if (play) {
+      startNarrationAudio(clip, timelineTime);
+      return;
+    }
+    const element = narrationAudioElement(clip);
+    const requestId = (narrationPlayRequestRef.current.get(clip.id) ?? 0) + 1;
+    narrationPlayRequestRef.current.set(clip.id, requestId);
+    element.pause();
+    updateNarrationAudioSettings(clip, element);
+    const seek = () => {
+      if (narrationPlayRequestRef.current.get(clip.id) !== requestId) return;
+      seekNarrationElement(clip, element, timelineTime, true);
+    };
+    if (element.readyState >= 1) seek();
+    else {
+      element.addEventListener("loadedmetadata", seek, { once: true });
+      element.load();
+    }
+  }
+
+  function seekEditorPlayback(timelineTime: number) {
+    const next = Math.max(0, timelineTime);
+    isPlayingRef.current = false;
+    if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+    rafIdRef.current = null;
+    playheadRef.current = next;
+    setPlayhead(next);
+    setIsPlaying(false);
+    resyncNarrationAudioAtTime(next, false);
   }
 
   function removeNarrationAudioElement(clipId: string) {
@@ -9915,8 +10047,7 @@ export default function Board2Page() {
     const y = Math.min(marquee.startY, marquee.currentY);
     const w = Math.abs(marquee.currentX - marquee.startX);
     const h = Math.abs(marquee.currentY - marquee.startY);
-    const clipIds = clipsRef.current
-      .filter((clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+    const clipIds = boardEntitiesForDisplay(clipsRef.current)
       .filter((clip) => rectsIntersect({ x, y, w, h }, { x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH! }))
       .map((clip) => clip.id);
     const annotationIds = annotationsRef.current
@@ -9988,6 +10119,18 @@ export default function Board2Page() {
   // ─ Board clip drag ────────────────────────────────────────────────────────
 
   function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
+    if (e.altKey && clip.type !== "customZoom") {
+      const point = clientToBoardPoint(e.clientX, e.clientY);
+      const focusArea = [...boardEntitiesForDisplay(clipsRef.current)].reverse().find((candidate) =>
+        candidate.type === "customZoom" &&
+        point.x >= candidate.boardX! && point.x <= candidate.boardX! + candidate.boardW! &&
+        point.y >= candidate.boardY! && point.y <= candidate.boardY! + candidate.boardH!
+      );
+      if (focusArea) {
+        handleBoardClipPointerDown(e, focusArea);
+        return;
+      }
+    }
     selectionSurfaceRef.current = "board";
     e.stopPropagation();
     e.preventDefault();
@@ -9997,9 +10140,9 @@ export default function Board2Page() {
     if (!selectedClipIdsRef.current.includes(clip.id)) setClipSelection([clip.id]);
     const startX = e.clientX, startY = e.clientY;
     const origClips = new Map(
-      clipsRef.current
-        .filter((c) => movingClipIds.includes(c.id) && c.boardX !== undefined && c.boardY !== undefined)
-        .map((c) => [c.id, { x: c.boardX!, y: c.boardY! }])
+      boardEntitiesForDisplay(clipsRef.current)
+        .filter((c) => movingClipIds.includes(c.id))
+        .map((c) => [boardEntityId(c), { x: c.boardX!, y: c.boardY! }])
     );
     const origAnnotations = new Map(
       annotationsRef.current
@@ -10021,13 +10164,14 @@ export default function Board2Page() {
       const dy = latestDy;
       hasMoved = false;
       setClips((prev) =>
-        prev.map((c) =>
-          !movingClipIds.includes(c.id) || !origClips.has(c.id) ? c : {
+        prev.map((c) => {
+          const orig = isBoardBackedClip(c) ? origClips.get(boardEntityId(c)) : undefined;
+          return !orig ? c : {
             ...c,
-            boardX: Math.round(origClips.get(c.id)!.x + dx),
-            boardY: Math.round(origClips.get(c.id)!.y + dy),
-          }
-        )
+            boardX: Math.round(orig.x + dx),
+            boardY: Math.round(orig.y + dy),
+          };
+        })
       );
       if (movingAnnotationIds.length > 0) {
         setAnnotations((prev) => prev.map((a) => {
@@ -10093,9 +10237,10 @@ export default function Board2Page() {
       else if (corner === "sw") { nw = Math.max(50, ow - dx); nh = nw / aspect; nx = ox + ow - nw; }
       else if (corner === "ne") { nw = Math.max(50, ow + dx); nh = nw / aspect; ny = oy + oh - nh; }
       else { nw = Math.max(50, ow - dx); nh = nw / aspect; nx = ox + ow - nw; ny = oy + oh - nh; }
+      const entityId = boardEntityId(clip);
       setClips((prev) =>
         prev.map((c) =>
-          c.id !== clip.id ? c : {
+          !referencesBoardEntity(c, entityId) ? c : {
             ...c, boardX: Math.round(nx), boardY: Math.round(ny), boardW: Math.round(nw), boardH: Math.round(nh),
           }
         )
@@ -10680,13 +10825,13 @@ export default function Board2Page() {
   // ─ Ruler scrub ────────────────────────────────────────────────────────────
 
   function handleRulerPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    setIsPlaying(false);
+    seekEditorPlayback(playheadRef.current);
     const el = e.currentTarget;
     el.setPointerCapture(e.pointerId);
     const rect = el.getBoundingClientRect();
     const scrub = (clientX: number) => {
       const x = clientX - rect.left + timelineScrollRef.current;
-      setPlayhead(Math.max(0, x / pxPerSecRef.current));
+      seekEditorPlayback(Math.max(0, x / pxPerSecRef.current));
     };
     scrub(e.clientX);
     const onMove = (ev: PointerEvent) => scrub(ev.clientX);
@@ -10718,8 +10863,7 @@ export default function Board2Page() {
       if (moved < 4) {
         clearBoardSelection();
         const point = timelinePointFromClient(ev.clientX, ev.clientY);
-        setPlayhead(Math.max(0, point.x / pxPerSecRef.current));
-        setIsPlaying(false);
+        seekEditorPlayback(Math.max(0, point.x / pxPerSecRef.current));
       } else if (timelineMarqueeRef.current) {
         setClipSelection(selectedClipIdsInTimelineMarquee(timelineMarqueeRef.current));
       }
@@ -10772,10 +10916,11 @@ export default function Board2Page() {
   // ─ Play / pause ───────────────────────────────────────────────────────────
 
   function togglePlay() {
-    if (isPlaying) { setPlayhead(playheadRef.current); setIsPlaying(false); return; }
+    if (isPlayingRef.current) { seekEditorPlayback(playheadRef.current); return; }
     const maxEnd = currentPlaybackDuration(clips);
     const wrapped = playheadRef.current >= maxEnd && maxEnd > 0;
     const startPh = wrapped ? 0 : playheadRef.current;
+    playheadRef.current = startPh;
     if (wrapped) setPlayhead(0);
     prevPlayheadRef.current = startPh;
 
@@ -10813,6 +10958,8 @@ export default function Board2Page() {
       }
     }
     evaluateVideoPlaybackStates(startPh, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { force: true });
+    isPlayingRef.current = true;
+    resyncNarrationAudioAtTime(startPh, true);
     setIsPlaying(true);
   }
 
@@ -14237,6 +14384,8 @@ export default function Board2Page() {
                     border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : "1.5px solid rgba(42,42,42,0.4)",
                     boxShadow: isSel ? "0 0 0 2px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : "1px 1px 4px rgba(42,42,42,0.2)",
                     touchAction: "none",
+                    pointerEvents: clip.type === "customZoom" ? "none" : undefined,
+                    zIndex: clip.type === "customZoom" ? 0 : 1,
                   }}
                 >
                   <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: clip.needsRedownload ? "auto" : "none" }}>
@@ -14257,11 +14406,11 @@ export default function Board2Page() {
                         width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                         height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                         aria-label={clip.name}
-                        style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center" }}
+                        style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center", backgroundImage: `url(${clip.previewUrl ?? clip.sourceUrl})`, backgroundSize: "100% 100%", backgroundRepeat: "no-repeat" }}
                       />
                     ) : clip.type === "customZoom" ? (
-                      <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.35)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                        <span style={{ color: "#1c6fc9", fontSize: Math.max(10, 16 * boardZoom), pointerEvents: "none" }}>🔍</span>
+                      <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <span style={{ color: "rgba(28,111,201,0.45)", fontSize: Math.max(10, 16 * boardZoom), pointerEvents: "none" }}>🔍</span>
                       </div>
                     ) : (
                       <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -14272,6 +14421,20 @@ export default function Board2Page() {
                       {clip.name}
                     </div>
                   </div>
+                  {clip.type === "customZoom" && (["top", "right", "bottom", "left"] as const).map((edge) => (
+                    <div
+                      key={edge}
+                      title="Focus area border — drag to move"
+                      data-focus-area-border
+                      style={{
+                        position: "absolute", pointerEvents: "auto", zIndex: 4, touchAction: "none", cursor: "move",
+                        ...(edge === "top" ? { left: 0, right: 0, top: -8, height: 16 } :
+                            edge === "right" ? { top: 0, bottom: 0, right: -8, width: 16 } :
+                            edge === "bottom" ? { left: 0, right: 0, bottom: -8, height: 16 } :
+                                                { top: 0, bottom: 0, left: -8, width: 16 }),
+                      }}
+                    />
+                  ))}
                   {isSel && (
                     <div
                       style={{ position: "absolute", right: -7, bottom: -7, width: 28, height: 28, background: "#ff5e3a", border: "2px solid #fff", borderRadius: 3, zIndex: 20, touchAction: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
@@ -14413,11 +14576,11 @@ export default function Board2Page() {
             onPointerDown={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const t = Math.max(0, (e.clientX - rect.left + (scrollerRef.current?.scrollLeft ?? 0)) / pxPerSecRef.current);
-              playheadRef.current = t; setPlayhead(t); setIsPlaying(false);
+              seekEditorPlayback(t);
               (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
               const onMove = (ev: PointerEvent) => {
                 const t2 = Math.max(0, (ev.clientX - rect.left + (scrollerRef.current?.scrollLeft ?? 0)) / pxPerSecRef.current);
-                playheadRef.current = t2; setPlayhead(t2);
+                seekEditorPlayback(t2);
               };
               const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
               window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
@@ -14752,12 +14915,12 @@ export default function Board2Page() {
                     </div>
                     <button
                       onClick={() => {
-                        if (selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip)) deleteBoardMedia(selectedClipId!);
+                        if (selectionSurfaceRef.current === "board" && isBoardBackedClip(selectedClip)) deleteBoardMedia(selectedClipId!);
                         else deleteClip(selectedClipId!);
                         setMobileDrawer(null);
                       }}
                       style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a", width: "100%", padding: "10px", fontSize: 13, textAlign: "center" }}
-                    >✕ {selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}</button>
+                    >✕ {selectionSurfaceRef.current === "board" && isBoardBackedClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}</button>
                   </div>
                 </>
               )}
@@ -15190,20 +15353,22 @@ export default function Board2Page() {
     }
     if (!recipeCreatedAtRef.current) recipeCreatedAtRef.current = new Date().toISOString();
 
-    const boardMedia = manifestClips
-      .filter((clip) => clip.type === "image" || clip.type === "video")
-      .map((clip) => {
-        const {
-          startTime: _startTime, duration: _duration, holdFraction: _holdFraction,
-          mediaId: _mediaId, featured: _featured,
-          ...media
-        } = clip;
-        return media;
+    const boardMediaById = new Map<string, ManifestClip>();
+    for (const clip of manifestClips.filter((candidate) => isBoardBackedClipType(candidate.type))) {
+      const entityId = clip.mediaId ?? clip.id;
+      const existing = boardMediaById.get(entityId);
+      if (!existing || clip.id === entityId) boardMediaById.set(entityId, clip);
+    }
+    const boardMedia = [...boardMediaById.entries()]
+      .map(([entityId, clip]) => {
+        const timelineOnlyFields = new Set(["id", "startTime", "duration", "holdFraction", "mediaId", "featured"]);
+        const media = Object.fromEntries(Object.entries(clip).filter(([key]) => !timelineOnlyFields.has(key)));
+        return { ...media, id: entityId };
       });
     const timelineBlocks = manifestClips
-      .filter((clip) => (clip.type !== "image" && clip.type !== "video") || clip.featured !== false)
+      .filter((clip) => !isBoardBackedClipType(clip.type) || clip.featured !== false)
       .map((clip) => {
-        if (clip.type !== "image" && clip.type !== "video") return clip;
+        if (!isBoardBackedClipType(clip.type)) return clip;
         return {
           id: clip.id,
           type: clip.type,
@@ -15392,16 +15557,28 @@ export default function Board2Page() {
       const schemaVersion = normalizeLoadedSchemaVersion(rawManifest?.schemaVersion);
       const normalizedRecipeClips = schemaVersion >= 2
         ? [
-            ...(rawManifest.board?.media ?? []).map((media: Record<string, unknown>) => {
+            ...(rawManifest.board?.media ?? []).flatMap((media: Record<string, unknown>) => {
               const mediaId = String(media.id ?? "");
-              const block = (rawManifest.timeline?.blocks ?? []).find((candidate: Record<string, unknown>) =>
+              const blocks = (rawManifest.timeline?.blocks ?? []).filter((candidate: Record<string, unknown>) =>
+                isBoardBackedClipType(String(candidate.type ?? "")) &&
                 String(candidate.mediaId ?? candidate.id ?? "") === mediaId);
-              return block
-                ? { ...media, ...block, id: mediaId, mediaId, featured: true }
+              const canonicalBlock = blocks.find((block: Record<string, unknown>) => String(block.id ?? "") === mediaId);
+              const canonical = canonicalBlock
+                ? { ...media, ...canonicalBlock, id: mediaId, mediaId, featured: true }
                 : { ...media, id: mediaId, mediaId, featured: false, startTime: 0, duration: 4 };
+              const appearances = blocks
+                .filter((block: Record<string, unknown>) => String(block.id ?? "") !== mediaId)
+                .map((block: Record<string, unknown>) => ({
+                  ...media,
+                  ...block,
+                  id: String(block.id ?? generateId()),
+                  mediaId,
+                  featured: true,
+                }));
+              return [canonical, ...appearances];
             }),
             ...(rawManifest.timeline?.blocks ?? []).filter((block: Record<string, unknown>) =>
-              block.type !== "image" && block.type !== "video"),
+              !isBoardBackedClipType(String(block.type ?? ""))),
           ]
         : rawManifest.board?.clips ?? [];
       const manifest = schemaVersion >= 1 ? {
@@ -15443,6 +15620,7 @@ export default function Board2Page() {
       for (const vid of videoElsRef.current.values()) { vid.pause(); vid.src = ""; }
       videoElsRef.current.clear();
       imgCacheRef.current.clear();
+      warmImgCacheRef.current.clear();
 
       const loadedClips: Clip[] = [];
       for (const mc of (manifest.clips ?? [])) {
@@ -15998,6 +16176,8 @@ export default function Board2Page() {
                           : "1px 1px 4px rgba(42,42,42,0.2)",
                         cursor: "grab",
                         overflow: "visible",
+                        pointerEvents: clip.type === "customZoom" ? "none" : undefined,
+                        zIndex: clip.type === "customZoom" ? 0 : 1,
                       }}
                       onPointerDown={(e) => { if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
@@ -16019,11 +16199,11 @@ export default function Board2Page() {
                             width={Math.max(1, Math.round(clip.boardW! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                             height={Math.max(1, Math.round(clip.boardH! * Math.min(1, BOARD_IMAGE_PREVIEW_LONG_EDGE_PX / Math.max(clip.boardW!, clip.boardH!))))}
                             aria-label={clip.name}
-                            style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center" }}
+                            style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center", backgroundImage: `url(${clip.previewUrl ?? clip.sourceUrl})`, backgroundSize: "100% 100%", backgroundRepeat: "no-repeat" }}
                           />
                         ) : clip.type === "customZoom" ? (
-                          <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.3)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                            <span style={{ color: "#1c6fc9", fontSize: 20, pointerEvents: "none" }}>🔍</span>
+                          <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.09)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <span style={{ color: "rgba(28,111,201,0.45)", fontSize: 20, pointerEvents: "none" }}>🔍</span>
                           </div>
                         ) : (
                           <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -16034,6 +16214,21 @@ export default function Board2Page() {
                           {clip.name}
                         </div>
                       </div>
+                      {clip.type === "customZoom" && (["top", "right", "bottom", "left"] as const).map((edge) => (
+                        <div
+                          key={edge}
+                          title="Focus area border — drag to move (or Option-click through media)"
+                          data-focus-area-border
+                          style={{
+                            position: "absolute", pointerEvents: "auto", zIndex: 4, touchAction: "none", cursor: "move",
+                            ...(edge === "top" ? { left: 0, right: 0, top: -6, height: 12 } :
+                                edge === "right" ? { top: 0, bottom: 0, right: -6, width: 12 } :
+                                edge === "bottom" ? { left: 0, right: 0, bottom: -6, height: 12 } :
+                                                    { top: 0, bottom: 0, left: -6, width: 12 }),
+                          }}
+                          onPointerDown={(e) => { if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
+                        />
+                      ))}
                       {isSel && (["nw", "ne", "sw", "se"] as const).map((corner) => (
                         <div
                           key={corner}
@@ -17783,19 +17978,19 @@ export default function Board2Page() {
                 )}
 
                 <div style={{ marginTop: "auto" }}>
-                  {isBoardMediaClip(selectedClip) && selectedClip.featured === false && (
+                  {isBoardBackedClip(selectedClip) && selectedClip.featured === false && (
                     <button
                       onClick={() => addBoardMediaToTimeline(selectedClip.id)}
                       style={{ ...miniButton, marginBottom: 8, background: "#c8f135" }}
                     >＋ Add to timeline</button>
                   )}
                   <button
-                    onClick={() => selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip)
+                    onClick={() => selectionSurfaceRef.current === "board" && isBoardBackedClip(selectedClip)
                       ? deleteBoardMedia(selectedClip.id)
                       : deleteClip(selectedClip.id)}
                     style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}
                   >
-                    ✕ {selectionSurfaceRef.current === "board" && isBoardMediaClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}
+                    ✕ {selectionSurfaceRef.current === "board" && isBoardBackedClip(selectedClip) ? "Delete from board…" : "Delete timeline block"}
                   </button>
                 </div>
               </>
@@ -17817,7 +18012,7 @@ export default function Board2Page() {
             <span style={{ fontFamily: "monospace", fontSize: 11, color: "#2a2a2a", border: "1.5px solid #2a2a2a", padding: "3px 8px", background: "#fffdf5", boxShadow: "2px 2px 0 #2a2a2a", minWidth: 72, textAlign: "center" }}>
               {formatTime(playhead)}
             </span>
-            <button onClick={() => { setPlayhead(0); setIsPlaying(false); }} style={miniButton}>↩ reset</button>
+            <button onClick={() => seekEditorPlayback(0)} style={miniButton}>↩ reset</button>
             <button onClick={fitTimeline} style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11 }}>Fit</button>
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>zoom</span>
