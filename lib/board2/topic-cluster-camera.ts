@@ -1,3 +1,5 @@
+import { cameraForFocusRect } from "./focus-camera.ts";
+
 export type TopicCameraClip = {
   id: string;
   startTime: number;
@@ -44,12 +46,7 @@ function stopForRect(
   boardWidth: number,
   fillRatio: number,
 ): CameraStop {
-  const scale = fillRatio * Math.min(canvasWidth / Math.max(1, rect.width), canvasHeight / Math.max(1, rect.height));
-  return {
-    cameraX: rect.x + rect.width / 2,
-    cameraY: rect.y + rect.height / 2,
-    boardZoom: scale * boardWidth / canvasWidth,
-  };
+  return cameraForFocusRect(rect, canvasWidth, canvasHeight, boardWidth, fillRatio);
 }
 
 export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): TopicCameraKeyframe[] {

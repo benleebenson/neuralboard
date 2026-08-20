@@ -138,6 +138,10 @@ import {
   stableOrganicLayoutSeed,
 } from "@/lib/board2/organic-topic-layout";
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
+import {
+  FOCUS_FILL_RATIO,
+  cameraForFocusRect,
+} from "@/lib/board2/focus-camera";
 import { buildSerpentinePanPath } from "@/lib/board2/pan-camera";
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
 import { fitMediaDimensions } from "@/lib/board2/media-sizing";
@@ -1441,8 +1445,9 @@ const CHARACTER_FOCUS_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
 const FRAME_ALL_PADDING = 0.1;
-const AUTO_IMAGE_FOCUS_RATIO = 0.78;
-const CLIP_FOCUS_RATIO = AUTO_IMAGE_FOCUS_RATIO;
+// Pan traversal intentionally retains its wider historical scale; focused stops use the shared
+// high-fill ratio above, while cluster-wide establishing beats keep their own wide framing.
+const PAN_TRAVERSAL_REFERENCE_FILL_RATIO = 0.78;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const AMBIENT_BUDGET = 4;
 const AMBIENT_STATE_EVAL_INTERVAL_MS = 100;
@@ -5252,14 +5257,14 @@ export default function Board2Page() {
       Math.abs(pose.boardY - c.boardY!) < Math.max(90, c.boardH! * 0.18)
     );
     if (!surface) return { camera: liveCharacterCameraTarget(pose, true), surfaceKey: null };
-    const sf = 0.70 * Math.min(canvasWRef.current / surface.boardW!, canvasHRef.current / surface.boardH!);
     return {
       surfaceKey: surface.id,
-      camera: {
-        cameraX: surface.boardX! + surface.boardW! / 2,
-        cameraY: surface.boardY! + surface.boardH! / 2,
-        boardZoom: clamp(sf * boardDimensionsRef.current.width / canvasWRef.current, 0.25, 5),
-      },
+      camera: cameraForFocusRect(
+        { x: surface.boardX!, y: surface.boardY!, width: surface.boardW!, height: surface.boardH! },
+        canvasWRef.current,
+        canvasHRef.current,
+        boardDimensionsRef.current.width,
+      ),
     };
   }, [liveCharacterCameraTarget]);
 
@@ -8915,7 +8920,7 @@ export default function Board2Page() {
           canvasWidth: W,
           canvasHeight: H,
           boardWidth: layoutBoardDimensions.width,
-          imageFocusRatio: AUTO_IMAGE_FOCUS_RATIO,
+          imageFocusRatio: FOCUS_FILL_RATIO,
         });
         cameraKeyframesRef.current = generatedCamera;
         setCameraKeyframes(generatedCamera);
@@ -11458,6 +11463,18 @@ export default function Board2Page() {
 
   // ─ Generate camera keyframes ──────────────────────────────────────────────
 
+  function handleCanvasAspectChange(aspect: "16:9" | "9:16") {
+    if (aspect === canvasAspect) return;
+    const nextWidth = aspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
+    const nextHeight = aspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
+    // Camera zoom is frame-aspect dependent. Update the refs synchronously so regeneration uses
+    // the newly selected output dimensions instead of the dimensions from the previous render.
+    canvasWRef.current = nextWidth;
+    canvasHRef.current = nextHeight;
+    setCanvasAspect(aspect);
+    if (cameraKeyframesRef.current.length > 0) generateCameraKeyframes();
+  }
+
   function generateCameraKeyframes() {
     const topicAwareClips = clipsRef.current
       .filter((clip) => isFeaturedTimelineClip(clip) && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
@@ -11499,7 +11516,7 @@ export default function Board2Page() {
         canvasWidth: canvasWRef.current,
         canvasHeight: canvasHRef.current,
         boardWidth: boardDimensionsRef.current.width,
-        imageFocusRatio: CLIP_FOCUS_RATIO,
+        imageFocusRatio: FOCUS_FILL_RATIO,
       });
       if (generated.length) {
         setCameraKeyframes(generated);
@@ -11565,7 +11582,7 @@ export default function Board2Page() {
       canvasHeight: H,
       boardWidth,
       boardHeight,
-      imageFocusRatio: CLIP_FOCUS_RATIO,
+      imageFocusRatio: PAN_TRAVERSAL_REFERENCE_FILL_RATIO,
     });
     // Hold-start stop for each clip (where camera is at the start of the hold phase)
     const directHoldStartStops: Array<Stop | null> = allClipsSorted.map((c) => {
@@ -11575,9 +11592,13 @@ export default function Board2Page() {
           ? { camX: panPath[0].cameraX, camY: panPath[0].cameraY, zoom: panPath[0].boardZoom }
           : frameAllStop;
       }
-      const bw = c.boardW!, bh = c.boardH!;
-      const sf = CLIP_FOCUS_RATIO * Math.min(W / bw, H / bh);
-      return { camX: c.boardX! + bw / 2, camY: c.boardY! + bh / 2, zoom: sf * boardWidth / W };
+      const camera = cameraForFocusRect(
+        { x: c.boardX!, y: c.boardY!, width: c.boardW!, height: c.boardH! },
+        W,
+        H,
+        boardWidth,
+      );
+      return { camX: camera.cameraX, camY: camera.cameraY, zoom: camera.boardZoom };
     });
     const holdStartStops = bridgeCharacterFocusStops(directHoldStartStops, frameAllStop);
 
@@ -14365,14 +14386,17 @@ export default function Board2Page() {
         playMediaFocusIdRef.current = null;
         setPlayMediaFocusId(null);
       }
-      const mediaTarget = focusedMedia ? {
-        cameraX: focusedMedia.boardX + focusedMedia.boardW / 2,
-        cameraY: focusedMedia.boardY + focusedMedia.boardH / 2,
-        boardZoom: clamp(Math.min(
-          BOARD_W * 0.82 / focusedMedia.boardW,
-          BOARD_W * canvas.height * 0.76 / (focusedMedia.boardH * canvas.width),
-        ), 0.35, 3),
-      } : null;
+      const mediaTarget = focusedMedia ? cameraForFocusRect(
+        {
+          x: focusedMedia.boardX,
+          y: focusedMedia.boardY,
+          width: focusedMedia.boardW,
+          height: focusedMedia.boardH,
+        },
+        canvas.width,
+        canvas.height,
+        boardDimensionsRef.current.width,
+      ) : null;
       const target = mediaTarget ?? (playSceneShot ? shot : { cameraX: playPose.boardX, cameraY: playPose.boardY - 120, boardZoom: playCameraRef.current.boardZoom });
       const follow = 1 - Math.exp(-dt * 5.5);
       playCameraRef.current = { cameraX: lerp(playCameraRef.current.cameraX, target.cameraX, follow), cameraY: lerp(playCameraRef.current.cameraY, target.cameraY, follow), boardZoom: lerp(playCameraRef.current.boardZoom, target.boardZoom, mediaTarget || playSceneShot ? follow : follow * 0.08) };
@@ -19336,7 +19360,7 @@ export default function Board2Page() {
                 {(["16:9", "9:16"] as const).map((a) => (
                   <button
                     key={a}
-                    onClick={() => setCanvasAspect(a)}
+                    onClick={() => handleCanvasAspectChange(a)}
                     style={{ ...miniButton, background: canvasAspect === a ? "#2a2a2a" : "transparent", color: canvasAspect === a ? "#fff" : "#2a2a2a" }}
                   >
                     {a}

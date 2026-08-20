@@ -2,6 +2,7 @@ import {
   interpolateCameraKeyframes,
   type CameraState,
 } from "./camera-keyframes.ts";
+import { FOCUS_FILL_RATIO } from "./board2/focus-camera.ts";
 
 export type CharacterFocusId = "c1" | "c2";
 
@@ -21,8 +22,12 @@ export type CharacterFocusBlockLike = {
 export type CharacterFocusPosition = { x: number; y: number; speechBubble?: boolean };
 
 const CHARACTER_BOARD_HEIGHT = 170;
-export const CHARACTER_FRAME_HEIGHT_RATIO = 0.78;
-const SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = 0.68;
+const PREVIOUS_CHARACTER_FRAME_HEIGHT_RATIO = 0.78;
+const PREVIOUS_SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = 0.68;
+export const CHARACTER_FRAME_HEIGHT_RATIO = FOCUS_FILL_RATIO;
+export const SPEECH_BUBBLE_FRAME_HEIGHT_RATIO = FOCUS_FILL_RATIO
+  * PREVIOUS_SPEECH_BUBBLE_FRAME_HEIGHT_RATIO
+  / PREVIOUS_CHARACTER_FRAME_HEIGHT_RATIO;
 const CHARACTER_CAMERA_Y_OFFSET = 70;
 const SPEECH_BUBBLE_CAMERA_Y_OFFSET = 95;
 
