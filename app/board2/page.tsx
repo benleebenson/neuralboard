@@ -8,6 +8,11 @@ import { ProGated } from "@/app/components/ProGated";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
+import {
+  ArrayBufferTarget as WebMArrayBufferTarget,
+  FileSystemWritableFileStreamTarget as WebMFileSystemWritableFileStreamTarget,
+  Muxer as WebMMuxer,
+} from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
@@ -143,6 +148,19 @@ import {
   snapshotDimensions,
   type OfflineAudioSource,
 } from "@/lib/board2/offline-export";
+import {
+  EXPORT_QUALITY_OPTIONS,
+  buildExportEncodingCandidates,
+  exportFallbackMessage,
+  exportOutputDimensions,
+  type ExportEncodingCandidate,
+  type ExportQuality,
+} from "@/lib/board2/export-encoding";
+import {
+  decodedImageBytes,
+  previewCachePolicy as calculatePreviewCachePolicy,
+  type PreviewCachePolicy,
+} from "@/lib/board2/image-cache-policy";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
 import { resolveTerrainFootIK } from "@/lib/board2/editor-character-physics";
@@ -992,11 +1010,36 @@ type VideoPlaybackRuntime = {
 };
 
 type OfflineExportStatus = {
-  stage: "preparing" | "frames" | "audio" | "finalizing";
+  stage: "choosing" | "preparing" | "frames" | "audio" | "finalizing";
   frame: number;
   totalFrames: number;
   etaSeconds: number;
+  detail?: string;
+  assetCurrent?: number;
+  assetTotal?: number;
+  fallbackNotice?: string | null;
 };
+
+type Board2PerformanceStats = {
+  cache: PreviewCachePolicy & {
+    hotCount: number;
+    warmCount: number;
+    decodedBytes: number;
+    decodedMiB: number;
+  };
+  decode: { count: number; wallMs: number; longTaskMs: number };
+};
+
+function exportStatusTitle(status: OfflineExportStatus | null): string {
+  if (!status) return "Preparing export…";
+  if (status.detail) return status.detail;
+  if (status.stage === "choosing") return "Checking encoder support…";
+  if (status.stage === "frames") return `Rendering frame ${status.frame.toLocaleString()} / ${status.totalFrames.toLocaleString()}`;
+  if (status.stage === "audio") return "Mixing and encoding audio…";
+  if (status.stage === "finalizing") return "Muxing final video…";
+  if (status.assetTotal) return `Preparing assets… ${status.assetCurrent ?? 0}/${status.assetTotal}`;
+  return "Preparing assets…";
+}
 
 type Annotation = {
   id: string;
@@ -1390,10 +1433,8 @@ const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
 const PREVIEW_RENDER_LONG_EDGE_PX = 960;
 const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
-// Two bounded LRU generations: the hot set covers the viewport plus a generous pan margin; the
-// warm set prevents a just-visible image from being discarded during a fast direction change.
-const PREVIEW_IMAGE_CACHE_LIMIT = 144;
-const PREVIEW_IMAGE_WARM_CACHE_LIMIT = 48;
+// Preview cache limits are computed from device memory and board image count. The hot/warm
+// generations remain, but large boards no longer decode a fixed 192-image working set.
 const EDITOR_PLAYBACK_FPS = 30;
 const EDITOR_FRAME_INTERVAL_MS = 1000 / EDITOR_PLAYBACK_FPS;
 const CHARACTER_TRACK_H = 36;
@@ -4448,6 +4489,7 @@ export default function Board2Page() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
   const [exportFps, setExportFps] = useState<(typeof SUPPORTED_EXPORT_FPS)[number]>(DEFAULT_EXPORT_FPS);
+  const [exportQuality, setExportQuality] = useState<ExportQuality>("1080p");
   const [exportStatus, setExportStatus] = useState<OfflineExportStatus | null>(null);
   const [isExportingBoardImage, setIsExportingBoardImage] = useState(false);
   const [snapshotIncludeCharacter, setSnapshotIncludeCharacter] = useState(true);
@@ -4718,14 +4760,25 @@ export default function Board2Page() {
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
   const canGenerateCamera = clips.some((clip) => isFeaturedTimelineClip(clip) && (clip.boardX !== undefined || clip.type === "pan"));
+  const boardImageCount = useMemo(
+    () => boardEntitiesForDisplay(clips).filter((clip) => clip.type === "image").length,
+    [clips],
+  );
+  const deviceMemoryGb = typeof navigator === "undefined"
+    ? 4
+    : (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
+  const previewCachePolicy = useMemo(
+    () => calculatePreviewCachePolicy({ deviceMemoryGb, boardImageCount }),
+    [boardImageCount, deviceMemoryGb],
+  );
   const visibleBoardClips = useMemo(() => {
     const zoom = Math.max(0.001, boardZoom);
     const viewportLeft = -boardPan.x / zoom;
     const viewportTop = -boardPan.y / zoom;
     const viewportWidth = boardViewportSize.width / zoom;
     const viewportHeight = boardViewportSize.height / zoom;
-    const paddingX = Math.max(520, viewportWidth * 1.25);
-    const paddingY = Math.max(440, viewportHeight * 1.25);
+    const paddingX = Math.max(180, viewportWidth * previewCachePolicy.preloadViewportMargin);
+    const paddingY = Math.max(160, viewportHeight * previewCachePolicy.preloadViewportMargin);
     return boardEntitiesForDisplay(clips).filter((clip) => {
       if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
       return clip.boardX + clip.boardW >= viewportLeft - paddingX &&
@@ -4733,7 +4786,7 @@ export default function Board2Page() {
         clip.boardY + clip.boardH >= viewportTop - paddingY &&
         clip.boardY <= viewportTop + viewportHeight + paddingY;
     });
-  }, [clips, boardPan, boardZoom, boardViewportSize]);
+  }, [clips, boardPan, boardZoom, boardViewportSize, previewCachePolicy.preloadViewportMargin]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -4765,6 +4818,10 @@ export default function Board2Page() {
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const warmImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const previewCachePolicyRef = useRef(previewCachePolicy);
+  const previewImagePendingRef = useRef<Set<string>>(new Set());
+  const previewIdleLoadRef = useRef<Map<string, number>>(new Map());
+  const previewDecodeStatsRef = useRef({ count: 0, wallMs: 0, longTaskMs: 0 });
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportVideoFramesRef = useRef<Map<string, ImageBitmap>>(new Map());
@@ -5590,6 +5647,13 @@ export default function Board2Page() {
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  useEffect(() => {
+    previewCachePolicyRef.current = previewCachePolicy;
+    trimPreviewImageCaches();
+    reportPreviewCacheStats("policy");
+  // Cache maintenance functions intentionally consume the latest refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewCachePolicy]);
   useEffect(() => { boardDimensionsRef.current = boardDimensions; }, [boardDimensions]);
   useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
@@ -5603,6 +5667,28 @@ export default function Board2Page() {
   useEffect(() => { annotationEmojiRef.current = annotationEmoji; }, [annotationEmoji]);
   useEffect(() => { penPresetRef.current = penPreset; }, [penPreset]);
   useEffect(() => { stylusOnlyRef.current = stylusOnly; }, [stylusOnly]);
+  useEffect(() => {
+    if (!("PerformanceObserver" in window)) return;
+    let observer: PerformanceObserver | null = null;
+    try {
+      observer = new PerformanceObserver((list) => {
+        previewDecodeStatsRef.current.longTaskMs += list.getEntries().reduce((sum, entry) => sum + entry.duration, 0);
+      });
+      observer.observe({ entryTypes: ["longtask"] });
+    } catch {
+      observer = null;
+    }
+    return () => observer?.disconnect();
+  }, []);
+  useEffect(() => () => {
+    for (const idleId of previewIdleLoadRef.current.values()) {
+      const cancelIdle = (window as unknown as { cancelIdleCallback?: (handle: number) => void }).cancelIdleCallback;
+      if (cancelIdle) cancelIdle.call(window, idleId);
+      else clearTimeout(idleId);
+    }
+    previewIdleLoadRef.current.clear();
+    previewImagePendingRef.current.clear();
+  }, []);
   useEffect(() => {
     if (!document.fonts) return;
     let cancelled = false;
@@ -6839,6 +6925,19 @@ export default function Board2Page() {
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
   }, []);
 
+  function boardClipInImmediateViewport(clip: Clip): boolean {
+    if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
+    const zoom = Math.max(0.001, boardZoomRef.current);
+    const pan = boardPanRef.current;
+    const rect = boardContainerRef.current?.getBoundingClientRect();
+    if (!rect) return true;
+    const left = -pan.x / zoom;
+    const top = -pan.y / zoom;
+    const right = left + rect.width / zoom;
+    const bottom = top + rect.height / zoom;
+    return clip.boardX + clip.boardW >= left && clip.boardX <= right && clip.boardY + clip.boardH >= top && clip.boardY <= bottom;
+  }
+
   const drawBoardImageOverlays = useCallback((time: number) => {
     const currentClips = clipsRef.current;
     const authoredBazooka = authoredBazookaTimeline(
@@ -6854,7 +6953,7 @@ export default function Board2Page() {
       const canvases = [boardImageCanvasRefs.current.get(clip.id), mobileBoardImageCanvasRefs.current.get(clip.id)].filter(Boolean) as HTMLCanvasElement[];
       if (!canvases.length) continue;
       const image = cachedPreviewImage(renderUrl);
-      if (!image) loadMedia(renderUrl, "image");
+      if (!image) loadMedia(renderUrl, "image", boardClipInImmediateViewport(clip) ? "visible" : "preload");
       for (const canvas of canvases) {
         const ctx = canvas.getContext("2d");
         if (!ctx) continue;
@@ -7361,8 +7460,29 @@ export default function Board2Page() {
 
   // ─ Media loading ──────────────────────────────────────────────────────────
 
+  function reportPreviewCacheStats(reason: string) {
+    const images = [...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()];
+    const bytes = decodedImageBytes(images);
+    const policy = previewCachePolicyRef.current;
+    const stats: Board2PerformanceStats = {
+      cache: {
+        ...policy,
+        hotCount: imgCacheRef.current.size,
+        warmCount: warmImgCacheRef.current.size,
+        decodedBytes: bytes,
+        decodedMiB: Number((bytes / 1024 / 1024).toFixed(1)),
+      },
+      decode: { ...previewDecodeStatsRef.current },
+    };
+    (window as Window & { __board2Performance?: Board2PerformanceStats }).__board2Performance = stats;
+    if (reason === "policy" || stats.decode.count % 12 === 0) {
+      console.info("[board2:image-cache]", reason, stats);
+    }
+  }
+
   function trimPreviewImageCaches() {
-    while (imgCacheRef.current.size > PREVIEW_IMAGE_CACHE_LIMIT) {
+    const policy = previewCachePolicyRef.current;
+    while (imgCacheRef.current.size > policy.hotEntries) {
       const oldestUrl = imgCacheRef.current.keys().next().value as string | undefined;
       if (!oldestUrl) break;
       const oldest = imgCacheRef.current.get(oldestUrl);
@@ -7372,13 +7492,17 @@ export default function Board2Page() {
         warmImgCacheRef.current.set(oldestUrl, oldest);
       }
     }
-    while (warmImgCacheRef.current.size > PREVIEW_IMAGE_WARM_CACHE_LIMIT) {
+    while (
+      warmImgCacheRef.current.size > policy.warmEntries ||
+      decodedImageBytes([...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()]) > policy.decodedBudgetBytes
+    ) {
       const oldestUrl = warmImgCacheRef.current.keys().next().value as string | undefined;
       if (!oldestUrl) break;
       // Dropping the final JS reference lets the browser reclaim decoded pixels. Do not blank
       // `src`: a mounted canvas/background keeps its last frame instead of flashing immediately.
       warmImgCacheRef.current.delete(oldestUrl);
     }
+    reportPreviewCacheStats("trim");
   }
 
   function cachedPreviewImage(url: string): HTMLImageElement | undefined {
@@ -7396,17 +7520,51 @@ export default function Board2Page() {
     return warm;
   }
 
-  function loadMedia(url: string, type: "image" | "video") {
+  function loadMedia(url: string, type: "image" | "video", priority: "visible" | "preload" = "visible") {
     if (type === "image") {
-      if (!cachedPreviewImage(url)) {
+      if (!cachedPreviewImage(url) && !previewImagePendingRef.current.has(url)) {
+        previewImagePendingRef.current.add(url);
+        const startDecode = () => {
+          previewIdleLoadRef.current.delete(url);
+          const startedAt = performance.now();
         const img = new Image();
-        img.onload = () => {
-          drawFrame(playheadRef.current);
-          drawBoardImageOverlaysRef.current(playheadRef.current);
+          img.decoding = "async";
+          img.onload = () => {
+            void img.decode().catch(() => {}).finally(() => {
+              previewImagePendingRef.current.delete(url);
+              previewDecodeStatsRef.current.count++;
+              previewDecodeStatsRef.current.wallMs += performance.now() - startedAt;
+              imgCacheRef.current.set(url, img);
+              trimPreviewImageCaches();
+              drawFrame(playheadRef.current);
+              drawBoardImageOverlaysRef.current(playheadRef.current);
+            });
+          };
+          img.onerror = () => previewImagePendingRef.current.delete(url);
+          img.src = url;
         };
-        img.src = url;
-        imgCacheRef.current.set(url, img);
-        trimPreviewImageCaches();
+        if (priority === "preload") {
+          const callback = () => startDecode();
+          const requestIdle = (window as unknown as {
+            requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
+          }).requestIdleCallback;
+          const idleId = requestIdle
+            ? requestIdle.call(window, callback, { timeout: 750 })
+            : setTimeout(callback, 80) as unknown as number;
+          previewIdleLoadRef.current.set(url, idleId);
+        } else {
+          startDecode();
+        }
+      } else if (priority === "visible") {
+        const idleId = previewIdleLoadRef.current.get(url);
+        if (idleId !== undefined) {
+          const cancelIdle = (window as unknown as { cancelIdleCallback?: (handle: number) => void }).cancelIdleCallback;
+          if (cancelIdle) cancelIdle.call(window, idleId);
+          else clearTimeout(idleId);
+          previewIdleLoadRef.current.delete(url);
+          previewImagePendingRef.current.delete(url);
+          loadMedia(url, type, "visible");
+        };
       }
     }
     // Video: per-clip elements are created by createVideoElement instead
@@ -11629,6 +11787,53 @@ export default function Board2Page() {
     exportImgLoadRef.current.clear();
   }
 
+  async function yieldForExportUi() {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  function trimExportImageCache(keepUrls: Set<string>) {
+    const maxEntries = 18;
+    const maxBytes = 256 * 1024 * 1024;
+    const cacheBytes = () => decodedImageBytes(exportImgCacheRef.current.values());
+    while (exportImgCacheRef.current.size > maxEntries || cacheBytes() > maxBytes) {
+      const evictable = [...exportImgCacheRef.current.keys()].find((url) => !keepUrls.has(url));
+      if (!evictable) break;
+      const image = exportImgCacheRef.current.get(evictable);
+      exportImgCacheRef.current.delete(evictable);
+      if (image) image.src = "";
+    }
+  }
+
+  async function prepareOfflineImagesForFrame(
+    time: number,
+    currentClips: Clip[],
+    camera: { cameraX: number; cameraY: number; boardZoom: number },
+    W: number,
+    H: number,
+    onPreparing: (clip: Clip) => void,
+  ) {
+    const visibleImages = boardEntityRepresentativesAtTime(currentClips, time)
+      .filter((clip) => clip.type === "image" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+      .filter((clip) => boardRectIntersectsCameraFrame(
+        { x: clip.boardX!, y: clip.boardY!, width: clip.boardW!, height: clip.boardH! },
+        camera,
+        W,
+        H,
+        boardDimensionsRef.current.width,
+        0.05,
+      ));
+    const keepUrls = new Set(visibleImages.map((clip) => clip.sourceUrl));
+    for (const clip of visibleImages) {
+      if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+      if (!exportImgCacheRef.current.has(clip.sourceUrl)) {
+        onPreparing(clip);
+        await yieldForExportUi();
+        await ensureExportImage(clip);
+      }
+    }
+    trimExportImageCache(keepUrls);
+  }
+
   async function prepareOfflineVideoFrames(
     time: number,
     currentClips: Clip[],
@@ -11676,15 +11881,22 @@ export default function Board2Page() {
     }
   }
 
-  async function decodeOfflineAudioSources(currentClips: Clip[]): Promise<OfflineAudioSource[]> {
+  async function decodeOfflineAudioSources(
+    currentClips: Clip[],
+    onProgress?: (current: number, total: number, clip: Clip) => void,
+  ): Promise<OfflineAudioSource[]> {
     const context = new AudioContext();
     const sources: OfflineAudioSource[] = [];
+    const audioClips = currentClips.filter((clip) => {
+      if (clip.type !== "narration" && clip.type !== "video") return false;
+      if (clip.type === "video" && !isFeaturedTimelineClip(clip)) return false;
+      return effectiveClipVolume(clip) > 0 && clip.duration > 0;
+    });
     try {
-      for (const clip of currentClips) {
-        if (clip.type !== "narration" && clip.type !== "video") continue;
-        if (clip.type === "video" && !isFeaturedTimelineClip(clip)) continue;
+      for (let index = 0; index < audioClips.length; index++) {
+        if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+        const clip = audioClips[index];
         const volume = effectiveClipVolume(clip);
-        if (volume <= 0 || clip.duration <= 0) continue;
         try {
           const blob = clip.type === "narration" ? clip.audioBlob ?? clip.sourceBlob : clip.sourceBlob;
           const bytes = blob
@@ -11707,6 +11919,8 @@ export default function Board2Page() {
           if (clip.type === "narration") throw new Error(`Could not decode narration “${clip.name}”`);
           console.info(`[offline-export] video “${clip.name}” has no decodable audio track`, error);
         }
+        onProgress?.(index + 1, audioClips.length, clip);
+        await yieldForExportUi();
       }
       return sources;
     } finally {
@@ -11717,32 +11931,6 @@ export default function Board2Page() {
   async function startExport() {
     if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
-    if (!("VideoEncoder" in window) || !("AudioEncoder" in window) || !("VideoFrame" in window)) {
-      setToast("Deterministic export requires a Chromium browser with WebCodecs");
-      return;
-    }
-
-    type SavePickerWindow = Window & {
-      showSaveFilePicker?: (options: {
-        suggestedName: string;
-        types: Array<{ description: string; accept: Record<string, string[]> }>;
-      }) => Promise<FileSystemFileHandle>;
-    };
-    let fileHandle: FileSystemFileHandle | null = null;
-    const savePicker = (window as SavePickerWindow).showSaveFilePicker;
-    if (savePicker) {
-      try {
-        fileHandle = await savePicker.call(window, {
-          suggestedName: "board2-export.mp4",
-          types: [{ description: "MP4 video", accept: { "video/mp4": [".mp4"] } }],
-        });
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        setToast(error instanceof Error ? error.message : "Could not choose an export file");
-        return;
-      }
-    }
-
     if (isPlayingRef.current) setIsPlaying(false);
     setIsExporting(true);
     isExportingRef.current = true;
@@ -11752,84 +11940,217 @@ export default function Board2Page() {
     const currentCameraKeyframes = cameraKeyframesRef.current;
     const currentAnnotations = annotationsRef.current;
     const totalDur = currentPlaybackDuration(currentClips);
-    const W = Math.max(2, canvasWRef.current - canvasWRef.current % 2);
-    const H = Math.max(2, canvasHRef.current - canvasHRef.current % 2);
-    const fps = exportFps;
-    const totalFrames = exportFrameCount(totalDur, fps);
-    setExportStatus({ stage: "preparing", frame: 0, totalFrames, etaSeconds: Number.NaN });
-    const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = W; exportCanvas.height = H;
-    const exportCtx = exportCanvas.getContext("2d", { alpha: false });
-    if (!exportCtx) {
-      setIsExporting(false);
-      isExportingRef.current = false;
-      setExportStatus(null);
-      setToast("Could not create export canvas");
-      return;
-    }
-    exportCtx.imageSmoothingEnabled = true;
-    exportCtx.imageSmoothingQuality = "high";
+    const requestedDimensions = exportOutputDimensions(exportQuality, canvasAspect);
+    const requestedTotalFrames = exportFrameCount(totalDur, exportFps);
+    setExportStatus({
+      stage: "choosing",
+      frame: 0,
+      totalFrames: requestedTotalFrames,
+      etaSeconds: Number.NaN,
+      detail: `Checking ${requestedDimensions.width}×${requestedDimensions.height} ${exportFps} fps encoder support…`,
+    });
     let writable: FileSystemWritableFileStream | null = null;
+    let fileHandle: FileSystemFileHandle | null = null;
     let videoEncoder: VideoEncoder | null = null;
     let audioEncoder: AudioEncoder | null = null;
     let wakeLock: WakeLockSentinel | null = null;
     try {
-      stopAllVideoPlayback("offline-export");
-      await Promise.all([
-        ensureAnnotationFontsLoaded(currentAnnotations),
-        ...currentClips.filter((clip) => clip.type === "image").map((clip) => ensureExportImage(clip)),
-      ]);
-      if (characterFaceImageRef.current) await characterFaceImageRef.current.decode();
-      if (characterFace2ImageRef.current) await characterFace2ImageRef.current.decode();
-      const audioSources = await decodeOfflineAudioSources(currentClips);
-
-      const videoConfig: VideoEncoderConfig = {
-        codec: "avc1.42001f",
-        width: W,
-        height: H,
-        bitrate: Math.max(6_000_000, Math.round(W * H * fps * 0.2)),
-        framerate: fps,
-        hardwareAcceleration: "prefer-hardware",
-        latencyMode: "quality",
-        avc: { format: "avc" },
-      };
-      const videoSupport = await VideoEncoder.isConfigSupported(videoConfig);
-      if (!videoSupport.supported) throw new Error("This browser cannot encode H.264 at the selected size and frame rate");
-      const audioConfig: AudioEncoderConfig = { codec: "mp4a.40.2", sampleRate: 48_000, numberOfChannels: 2, bitrate: 192_000 };
-      if (audioSources.length > 0) {
-        const audioSupport = await AudioEncoder.isConfigSupported(audioConfig);
-        if (!audioSupport.supported) throw new Error("This browser cannot encode the offline AAC audio mix");
+      // React needs an actual paint opportunity before capability probing, file picking, or asset
+      // decoding begins. This is what makes the progress/cancel surface visible immediately.
+      await yieldForExportUi();
+      if (!("VideoEncoder" in window) || !("AudioEncoder" in window) || !("VideoFrame" in window)) {
+        throw new Error("This browser does not provide the WebCodecs video/audio APIs required for deterministic export");
       }
 
-      writable = fileHandle ? await fileHandle.createWritable() : null;
-      const memoryTarget = writable ? null : new ArrayBufferTarget();
-      const target = writable
-        ? new FileSystemWritableFileStreamTarget(writable, { chunkSize: 16 * 1024 * 1024 })
-        : memoryTarget!;
-      const expectedAudioChunks = audioSources.length > 0 ? Math.ceil(totalDur * 48_000 / 1024) : 0;
-      const muxer = new Muxer({
-        target,
-        video: { codec: "avc", width: W, height: H, frameRate: fps },
-        ...(audioSources.length > 0 ? { audio: { codec: "aac" as const, sampleRate: 48_000, numberOfChannels: 2 } } : {}),
-        fastStart: {
-          expectedVideoChunks: totalFrames,
-          ...(expectedAudioChunks > 0 ? { expectedAudioChunks } : {}),
-        },
-        firstTimestampBehavior: "strict",
+      const audioIsExpected = currentClips.some((clip) =>
+        (clip.type === "narration" || (clip.type === "video" && isFeaturedTimelineClip(clip))) &&
+        effectiveClipVolume(clip) > 0 && clip.duration > 0
+      );
+      const candidates = buildExportEncodingCandidates({ quality: exportQuality, aspect: canvasAspect, fps: exportFps });
+      const preferredCandidate = candidates[0];
+      const audioSupportByCodec = new Map<string, boolean>();
+      let selectedCandidate: ExportEncodingCandidate | null = null;
+      for (let index = 0; index < candidates.length; index++) {
+        if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+        const candidate = candidates[index];
+        const input = {
+          codec: candidate.videoConfig.codec,
+          width: candidate.videoConfig.width,
+          height: candidate.videoConfig.height,
+          framerate: candidate.videoConfig.framerate,
+          bitrate: candidate.videoConfig.bitrate,
+          hardwareAcceleration: candidate.videoConfig.hardwareAcceleration,
+        };
+        setExportStatus({
+          stage: "choosing",
+          frame: 0,
+          totalFrames: exportFrameCount(totalDur, candidate.fps),
+          etaSeconds: Number.NaN,
+          detail: `Checking encoder ${index + 1}/${candidates.length}: ${candidate.label}…`,
+        });
+        await yieldForExportUi();
+        try {
+          const support = await VideoEncoder.isConfigSupported(candidate.videoConfig);
+          console.info("[board2:export] VideoEncoder.isConfigSupported", { input, result: support });
+          if (!support.supported) continue;
+          if (audioIsExpected) {
+            let audioSupported = audioSupportByCodec.get(candidate.audioConfig.codec);
+            if (audioSupported === undefined) {
+              const audioSupport = await AudioEncoder.isConfigSupported(candidate.audioConfig);
+              audioSupported = !!audioSupport.supported;
+              audioSupportByCodec.set(candidate.audioConfig.codec, audioSupported);
+              console.info("[board2:export] AudioEncoder.isConfigSupported", {
+                input: candidate.audioConfig,
+                result: audioSupport,
+              });
+            }
+            if (!audioSupported) continue;
+          }
+          selectedCandidate = candidate;
+          break;
+        } catch (error) {
+          console.info("[board2:export] VideoEncoder.isConfigSupported", { input, result: { supported: false, error } });
+        }
+      }
+      if (!selectedCandidate) {
+        const audioLimitation = audioIsExpected && [...audioSupportByCodec.values()].every((supported) => !supported)
+          ? " Compatible AAC and Opus audio encoders were also unavailable."
+          : "";
+        throw new Error(`No supported H.264/MP4 or VP9/WebM encoder was found, including software mode, 30 fps, and even 1280×720 output.${audioLimitation}`);
+      }
+
+      const fallbackNotice = exportFallbackMessage(preferredCandidate, selectedCandidate);
+      const W = selectedCandidate.width;
+      const H = selectedCandidate.height;
+      const fps = selectedCandidate.fps;
+      const totalFrames = exportFrameCount(totalDur, fps);
+      console.info("[board2:export] selected encoder", {
+        container: selectedCandidate.container,
+        videoConfig: selectedCandidate.videoConfig,
+        audioConfig: audioIsExpected ? selectedCandidate.audioConfig : null,
+        fallbackNotice,
+        boardDimensions: boardDimensionsRef.current,
+        outputDimensions: { width: W, height: H },
       });
+
+      type SavePickerWindow = Window & {
+        showSaveFilePicker?: (options: {
+          suggestedName: string;
+          types: Array<{ description: string; accept: Record<string, string[]> }>;
+        }) => Promise<FileSystemFileHandle>;
+      };
+      const extension = selectedCandidate.container === "mp4" ? "mp4" : "webm";
+      const mimeType = selectedCandidate.container === "mp4" ? "video/mp4" : "video/webm";
+      const savePicker = (window as SavePickerWindow).showSaveFilePicker;
+      if (savePicker) {
+        fileHandle = await savePicker.call(window, {
+          suggestedName: `board2-export.${extension}`,
+          types: [{ description: selectedCandidate.container === "mp4" ? "MP4 video" : "WebM video", accept: { [mimeType]: [`.${extension}`] } }],
+        });
+      }
+
+      const exportCanvas = document.createElement("canvas");
+      exportCanvas.width = W;
+      exportCanvas.height = H;
+      const exportCtx = exportCanvas.getContext("2d", { alpha: false });
+      if (!exportCtx) throw new Error("Could not create export canvas");
+      exportCtx.imageSmoothingEnabled = true;
+      exportCtx.imageSmoothingQuality = "high";
+
+      const uniqueImageCount = new Set(currentClips.filter((clip) => clip.type === "image").map((clip) => clip.sourceUrl)).size;
+      const audioClipCount = currentClips.filter((clip) =>
+        (clip.type === "narration" || (clip.type === "video" && isFeaturedTimelineClip(clip))) &&
+        effectiveClipVolume(clip) > 0 && clip.duration > 0
+      ).length;
+      const faceCount = Number(!!characterFaceImageRef.current) + Number(!!characterFace2ImageRef.current);
+      const assetTotal = uniqueImageCount + audioClipCount + faceCount + 1;
+      let preparedAssets = 0;
+      const preparedImageUrls = new Set<string>();
+      const updatePreparing = (detail: string) => {
+        setExportStatus({
+          stage: "preparing",
+          frame: 0,
+          totalFrames,
+          etaSeconds: Number.NaN,
+          assetCurrent: preparedAssets,
+          assetTotal,
+          detail,
+          fallbackNotice,
+        });
+        setExportProgress(assetTotal > 0 ? Math.min(0.05, preparedAssets / assetTotal * 0.05) : 0.05);
+      };
+
+      stopAllVideoPlayback("offline-export");
+      updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (fonts)`);
+      await yieldForExportUi();
+      await ensureAnnotationFontsLoaded(currentAnnotations);
+      preparedAssets++;
+      if (characterFaceImageRef.current) {
+        updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (character face)`);
+        await characterFaceImageRef.current.decode();
+        preparedAssets++;
+      }
+      if (characterFace2ImageRef.current) {
+        updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (second character face)`);
+        await characterFace2ImageRef.current.decode();
+        preparedAssets++;
+      }
+      const audioSources = await decodeOfflineAudioSources(currentClips, (current, total, clip) => {
+        preparedAssets++;
+        updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (audio ${current}/${total}: ${clip.name})`);
+      });
+
+      writable = fileHandle ? await fileHandle.createWritable() : null;
+      type ExportMuxer = {
+        addVideoChunk: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void;
+        addAudioChunk: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void;
+        finalize: () => void;
+      };
+      let muxer: ExportMuxer;
+      let outputBuffer: (() => ArrayBuffer) | null = null;
+      if (selectedCandidate.container === "mp4") {
+        const memoryTarget = writable ? null : new ArrayBufferTarget();
+        const target = writable
+          ? new FileSystemWritableFileStreamTarget(writable, { chunkSize: 16 * 1024 * 1024 })
+          : memoryTarget!;
+        const expectedAudioChunks = audioSources.length > 0 ? Math.ceil(totalDur * 48_000 / 1024) : 0;
+        muxer = new Muxer({
+          target,
+          video: { codec: "avc", width: W, height: H, frameRate: fps },
+          ...(audioSources.length > 0 ? { audio: { codec: "aac" as const, sampleRate: 48_000, numberOfChannels: 2 } } : {}),
+          fastStart: {
+            expectedVideoChunks: totalFrames,
+            ...(expectedAudioChunks > 0 ? { expectedAudioChunks } : {}),
+          },
+          firstTimestampBehavior: "strict",
+        });
+        if (memoryTarget) outputBuffer = () => memoryTarget.buffer;
+      } else {
+        const memoryTarget = writable ? null : new WebMArrayBufferTarget();
+        const target = writable
+          ? new WebMFileSystemWritableFileStreamTarget(writable, { chunkSize: 16 * 1024 * 1024 })
+          : memoryTarget!;
+        muxer = new WebMMuxer({
+          target,
+          video: { codec: "V_VP9", width: W, height: H, frameRate: fps },
+          ...(audioSources.length > 0 ? { audio: { codec: "A_OPUS", sampleRate: 48_000, numberOfChannels: 2 } } : {}),
+          firstTimestampBehavior: "strict",
+        });
+        if (memoryTarget) outputBuffer = () => memoryTarget.buffer;
+      }
 
       let codecError: Error | null = null;
       videoEncoder = new VideoEncoder({
         output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
         error: (error) => { codecError = error; },
       });
-      videoEncoder.configure(videoConfig);
+      videoEncoder.configure(selectedCandidate.videoConfig);
       if (audioSources.length > 0) {
         audioEncoder = new AudioEncoder({
           output: (chunk, metadata) => muxer.addAudioChunk(chunk, metadata),
           error: (error) => { codecError = error; },
         });
-        audioEncoder.configure(audioConfig);
+        audioEncoder.configure(selectedCandidate.audioConfig);
       }
       wakeLock = await navigator.wakeLock?.request("screen").catch(() => null) ?? null;
 
@@ -11840,6 +12161,13 @@ export default function Board2Page() {
         if (codecError) throw codecError;
         const frameTime = exportFrameTime(frameIndex, fps);
         const camera = editorCameraAtTime(frameTime, currentClips, currentCameraKeyframes, W, H);
+        await prepareOfflineImagesForFrame(frameTime, currentClips, camera, W, H, (clip) => {
+          if (!preparedImageUrls.has(clip.sourceUrl)) {
+            preparedImageUrls.add(clip.sourceUrl);
+            preparedAssets++;
+          }
+          updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (${clip.name})`);
+        });
         await prepareOfflineVideoFrames(frameTime, currentClips, camera, W, H);
         renderToCtx(exportCtx, frameTime, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "export");
         const timestamp = exportFrameTimestampUs(frameIndex, fps);
@@ -11854,8 +12182,8 @@ export default function Board2Page() {
           const rendered = frameIndex + 1;
           const elapsedSeconds = Math.max(0.001, (now - renderStartedAt) / 1000);
           const etaSeconds = elapsedSeconds / rendered * (totalFrames - rendered);
-          setExportStatus({ stage: "frames", frame: rendered, totalFrames, etaSeconds });
-          setExportProgress(rendered / totalFrames * 0.94);
+          setExportStatus({ stage: "frames", frame: rendered, totalFrames, etaSeconds, fallbackNotice });
+          setExportProgress(0.05 + rendered / totalFrames * 0.89);
         }
         if (frameIndex % 4 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
@@ -11863,7 +12191,7 @@ export default function Board2Page() {
       if (codecError) throw codecError;
 
       if (audioEncoder) {
-        setExportStatus({ stage: "audio", frame: totalFrames, totalFrames, etaSeconds: Number.NaN });
+        setExportStatus({ stage: "audio", frame: totalFrames, totalFrames, etaSeconds: Number.NaN, fallbackNotice });
         await encodeOfflineAudioTrack({
           encoder: audioEncoder,
           sources: audioSources,
@@ -11875,29 +12203,33 @@ export default function Board2Page() {
         if (codecError) throw codecError;
       }
 
-      setExportStatus({ stage: "finalizing", frame: totalFrames, totalFrames, etaSeconds: 0 });
+      setExportStatus({ stage: "finalizing", frame: totalFrames, totalFrames, etaSeconds: 0, fallbackNotice });
       setExportProgress(0.995);
       muxer.finalize();
       if (writable) {
         await writable.close();
         writable = null;
-      } else if (memoryTarget) {
-        const blob = new Blob([memoryTarget.buffer], { type: "video/mp4" });
+      } else if (outputBuffer) {
+        const blob = new Blob([outputBuffer()], { type: mimeType });
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
         anchor.href = url;
-        anchor.download = "board2-export.mp4";
+        anchor.download = `board2-export.${extension}`;
         document.body.appendChild(anchor);
         anchor.click();
         anchor.remove();
         setTimeout(() => URL.revokeObjectURL(url), 30_000);
       }
       setExportProgress(1);
-      setToast(`Exported ${totalFrames.toLocaleString()} deterministic frames at ${fps} fps`);
+      setToast(fallbackNotice
+        ? `Exported ${extension.toUpperCase()} at ${W}×${H}, ${fps} fps. ${fallbackNotice}`
+        : `Exported ${totalFrames.toLocaleString()} deterministic frames at ${W}×${H}, ${fps} fps`);
     } catch (error) {
       await writable?.abort().catch(() => {});
       writable = null;
-      if (error instanceof DOMException && error.name === "AbortError") setToast("Export cancelled");
+      if (error instanceof DOMException && error.name === "AbortError") {
+        if (exportCancelRef.current) setToast("Export cancelled");
+      }
       else setToast(error instanceof Error ? error.message : "Export failed");
     } finally {
       videoEncoder?.close();
@@ -14866,19 +15198,14 @@ export default function Board2Page() {
 
           {/* Export progress */}
           {isExporting && (
-            <div style={{ position: "absolute", inset: 0, background: "rgba(255,253,245,0.9)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 20 }}>
+            <div data-export-progress role="status" aria-live="polite" style={{ position: "absolute", inset: 0, background: "rgba(255,253,245,0.9)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 20 }}>
               <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 700, color: "#2a2a2a", marginBottom: 6 }}>
-                {exportStatus?.stage === "frames"
-                  ? `Rendering frame ${exportStatus.frame.toLocaleString()} / ${exportStatus.totalFrames.toLocaleString()}`
-                  : exportStatus?.stage === "audio"
-                    ? "Mixing and encoding audio…"
-                    : exportStatus?.stage === "finalizing"
-                      ? "Muxing final MP4…"
-                      : "Preparing full-resolution assets…"}
+                {exportStatusTitle(exportStatus)}
               </div>
               <div style={{ fontFamily: "monospace", fontSize: 10, color: "#6a6a6a", marginBottom: 12 }}>
                 {exportStatus?.stage === "frames" ? formatExportEta(exportStatus.etaSeconds) : "Keep this tab open; long renders are expected."}
               </div>
+              {exportStatus?.fallbackNotice && <div style={{ fontFamily: "monospace", fontSize: 9, color: "#9a6500", marginBottom: 8, textAlign: "center", maxWidth: 280 }}>{exportStatus.fallbackNotice}</div>}
               <div style={{ width: 160, height: 8, background: "rgba(42,42,42,0.15)", border: "1px solid #2a2a2a" }}>
                 <div style={{ height: "100%", width: `${exportProgress * 100}%`, background: "#c8f135", transition: "width 0.2s" }} />
               </div>
@@ -18357,6 +18684,18 @@ export default function Board2Page() {
                 </span>
               )}
               <select
+                aria-label="Export quality"
+                value={exportQuality}
+                disabled={isExporting}
+                onChange={(event) => setExportQuality(event.target.value as ExportQuality)}
+                style={{ ...miniButton, height: 28, background: "#fffdf5" }}
+              >
+                {EXPORT_QUALITY_OPTIONS.map((quality) => {
+                  const dimensions = exportOutputDimensions(quality, canvasAspect);
+                  return <option key={quality} value={quality}>{quality} · {dimensions.width}×{dimensions.height}</option>;
+                })}
+              </select>
+              <select
                 aria-label="Export frame rate"
                 value={exportFps}
                 disabled={isExporting}
@@ -19488,19 +19827,14 @@ export default function Board2Page() {
       )}
 
       {isExporting && (
-        <div style={{ position: "fixed", right: 24, bottom: 24, zIndex: 9997, width: 360, padding: "16px 18px", background: "rgba(255,253,245,.98)", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>
+        <div data-export-progress role="status" aria-live="polite" style={{ position: "fixed", right: 24, bottom: 24, zIndex: 9997, width: 360, padding: "16px 18px", background: "rgba(255,253,245,.98)", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>
           <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 800, color: "#2a2a2a" }}>
-            {exportStatus?.stage === "frames"
-              ? `Rendering frame ${exportStatus.frame.toLocaleString()} / ${exportStatus.totalFrames.toLocaleString()}`
-              : exportStatus?.stage === "audio"
-                ? "Mixing and encoding audio…"
-                : exportStatus?.stage === "finalizing"
-                  ? "Muxing final MP4…"
-                  : "Preparing full-resolution assets…"}
+            {exportStatusTitle(exportStatus)}
           </div>
           <div style={{ marginTop: 6, fontFamily: "monospace", fontSize: 10, color: "#6a6a6a" }}>
             {exportStatus?.stage === "frames" ? formatExportEta(exportStatus.etaSeconds) : "Keep this tab open; long renders are expected."}
           </div>
+          {exportStatus?.fallbackNotice && <div style={{ marginTop: 5, fontFamily: "monospace", fontSize: 9, color: "#9a6500" }}>{exportStatus.fallbackNotice}</div>}
           <div style={{ height: 8, marginTop: 12, border: "1px solid #2a2a2a", background: "rgba(42,42,42,.12)" }}>
             <div style={{ width: `${exportProgress * 100}%`, height: "100%", background: "#c8f135", transition: "width .2s" }} />
           </div>
