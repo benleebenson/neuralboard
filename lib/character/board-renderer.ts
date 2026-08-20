@@ -1,6 +1,7 @@
 import type { CharacterSkin, HeadLocalPoint, Viseme } from "../stream";
 import { BOARD_SURFACE_COLOR } from "../board-theme";
 import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
+import { drawExplainerCharacter, type Expression } from "./explainer-renderer";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
 const CHAR_TORSO_RAW = STREAM_CHARACTER_GEOMETRY.torsoRaw;
@@ -49,7 +50,7 @@ export const VISEME_MOUTH: Record<Viseme, {
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
-function drawCharacterMouth(
+export function drawCharacterMouth(
   ctx: CanvasRenderingContext2D,
   viseme: Viseme,
   anchor: HeadLocalPoint | undefined,
@@ -270,6 +271,8 @@ export function drawBoardCharacterToCanvas(
   authoredAnimations: Record<string, unknown> = {},
   characterFace: { image: HTMLImageElement | null; aspect: number; mouthAnchor?: HeadLocalPoint } | null = null,
   characterSkin: CharacterSkin = "stick",
+  characterType: "stickFigure" | "explainer" = "stickFigure",
+  expression: Expression = "neutral",
   poseOverride: BoardCharPoseResult | null = null,
   evaluators: BoardCharacterDrawEvaluators
 ) {
@@ -284,6 +287,17 @@ export function drawBoardCharacterToCanvas(
 
   const sx = (p.boardX - cam.cameraX) * sf + W / 2;
   const sy = (p.boardY - cam.cameraY) * sf + H / 2;
+  if (characterType === "explainer") {
+    drawExplainerCharacter(ctx, {
+      screenX: sx, screenY: sy, scale: sf, facing,
+      gesture: p.actionType === "pointAt" ? "pointUp" : (p.spriteGesture ?? "neutral"),
+      previousGesture: p.spritePreviousGesture,
+      transitionProgress: p.spriteTransitionProgress,
+      expression,
+      viseme: p.viseme ?? "rest",
+    });
+    return;
+  }
   const S = sf;
   const lw = Math.max(1, 3 * S);
   const jackedPulse = isJacked ? 1 + (p.physiquePulse ?? 0) * 0.16 : 1;

@@ -18,6 +18,7 @@ export type GestureTaggerInput = {
   visemeTrack?: readonly VisemeTrackPoint[];
   transcriptStart?: number;
   transcriptEnd?: number;
+  mapGesture?: (gesture: Gesture) => Gesture;
 };
 
 const gestureNames = new Set<string>(GESTURE_NAMES);
@@ -223,7 +224,12 @@ export function tagNarrationGestures(input: GestureTaggerInput): GestureTrackPoi
     if (!signal) fallbackOpen = !fallbackOpen;
     return { start: span.start, end: span.end, gesture };
   });
-  return applyGestureDwellRules(tagged, transcriptStart, transcriptEnd);
+  // Character-specific pose collapsing belongs at tag time: repetition and dwell rules must
+  // see the pose that will actually be rendered.
+  const mapped = input.mapGesture
+    ? tagged.map((point) => ({ ...point, gesture: input.mapGesture!(point.gesture) }))
+    : tagged;
+  return applyGestureDwellRules(mapped, transcriptStart, transcriptEnd);
 }
 
 export function isGesture(value: unknown): value is Gesture {

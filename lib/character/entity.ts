@@ -146,6 +146,8 @@ export class CharacterEntity {
       {},
       face ? { image: face, aspect: this.identity.faceAspect ?? 1, mouthAnchor: this.identity.mouthAnchor } : null,
       this.identity.skin,
+      "stickFigure",
+      "neutral",
       this.pose,
       {
         evalCharAtTime: () => this.pose ?? standingBoardPose(0, 0, 1, 0),

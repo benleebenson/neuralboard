@@ -62,6 +62,7 @@ import {
   tommyGunAimGeometry,
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
+import { EXPLAINER_POSE_CROSSFADE_SECONDS, type Expression } from "@/lib/character/explainer-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
@@ -533,7 +534,7 @@ function narrationGestureSourceSignature(clips: readonly Clip[]): string {
   return narrationVisemeSourceSignature(clips);
 }
 
-// ─── "Complete recipe" save schema (schemaVersion 4) ───────────────────────────
+// ─── "Complete recipe" save schema (schemaVersion 5) ───────────────────────────
 // See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
 // the flat manifest the app has always saved: it nests the same data plus lightweight provenance
 // tags and two "resolved" snapshots (camera + character position) baked at save time from the
@@ -999,6 +1000,7 @@ type CharacterFaceSettings = {
 
 type CharacterId = "c1" | "c2";
 type CharacterSkin = "stick" | "styled";
+type CharacterType = "stickFigure" | "explainer";
 
 type CharacterInstance = {
   id: CharacterId;
@@ -1007,6 +1009,8 @@ type CharacterInstance = {
   mode: "auto" | "manual";
   actions: CharacterAction[];
   skin: CharacterSkin;
+  characterType: CharacterType;
+  expression: Expression;
   faceBlobUrl?: string;
   faceAspect?: number;
   mouthAnchor?: HeadLocalPoint;
@@ -1113,6 +1117,7 @@ type CharacterAction = {
 };
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch" | "explainGesture";
+const EXPLAINER_ACTION_TYPES = new Set<CharacterAction["type"]>(["idle", "explainGesture", "pointAt"]);
 
 function nextAvailableCharacterActionStart(
   actions: readonly CharacterAction[],
@@ -1468,6 +1473,9 @@ type GesturePose = {
   headTilt: number;
   bodyLean: number;
   headBob: number;
+  spriteGesture?: Gesture;
+  spritePreviousGesture?: Gesture;
+  spriteTransitionProgress?: number;
 };
 
 type GestureTestTransition = {
@@ -1532,6 +1540,9 @@ function interpolateGesturePose(from: GesturePose, to: GesturePose, progress: nu
     headTilt: lerp(from.headTilt, to.headTilt, t),
     bodyLean: lerp(from.bodyLean, to.bodyLean, t),
     headBob: lerp(from.headBob, to.headBob, t),
+    spriteGesture: to.spriteGesture,
+    spritePreviousGesture: to.spritePreviousGesture,
+    spriteTransitionProgress: to.spriteTransitionProgress,
   };
 }
 
@@ -3003,6 +3014,9 @@ type CharPoseResult = {
   physiquePulse?: number;
   momentumScaleX?: number;
   momentumScaleY?: number;
+  spriteGesture?: Gesture;
+  spritePreviousGesture?: Gesture;
+  spriteTransitionProgress?: number;
 };
 
 function playPointingPoseToward(
@@ -3348,6 +3362,9 @@ function evalCharPoseRaw(
       leftArmA: gesturePose.leftArmA, rightArmA: gesturePose.rightArmA,
       leftForeA: gesturePose.leftForeA, rightForeA: gesturePose.rightForeA,
       airY: 0,
+      spriteGesture: gesturePose.spriteGesture,
+      spritePreviousGesture: gesturePose.spritePreviousGesture,
+      spriteTransitionProgress: gesturePose.spriteTransitionProgress,
     };
   };
 
@@ -3942,6 +3959,9 @@ function evalCharPoseRaw(
       leftForeA: heldPose.leftForeA,
       rightForeA: heldPose.rightForeA,
       airY: 0,
+      spriteGesture: heldPose.spriteGesture,
+      spritePreviousGesture: heldPose.spritePreviousGesture,
+      spriteTransitionProgress: heldPose.spriteTransitionProgress,
     };
   }
 
@@ -4589,10 +4609,14 @@ export default function Board2Page() {
   const [characterActions, setCharacterActions] = useState<CharacterAction[]>([]);
   const [characterMode, setCharacterMode] = useState<"auto" | "manual">("auto");
   const [characterSkin, setCharacterSkin] = useState<CharacterSkin>("stick");
+  const [characterType, setCharacterType] = useState<CharacterType>("stickFigure");
+  const [characterExpression, setCharacterExpression] = useState<Expression>("neutral");
   const [showCharacter2, setShowCharacter2] = useState(false);
   const [characterActions2, setCharacterActions2] = useState<CharacterAction[]>([]);
   const [characterMode2, setCharacterMode2] = useState<"auto" | "manual">("auto");
   const [characterSkin2, setCharacterSkin2] = useState<CharacterSkin>("stick");
+  const [characterType2, setCharacterType2] = useState<CharacterType>("stickFigure");
+  const [characterExpression2, setCharacterExpression2] = useState<Expression>("neutral");
   const [characterViseme, setCharacterViseme] = useState<Viseme | "auto">("auto");
   const [characterViseme2, setCharacterViseme2] = useState<Viseme | "auto">("auto");
   const [characterGesture, setCharacterGesture] = useState<GestureTestMode>("auto");
@@ -4759,8 +4783,8 @@ export default function Board2Page() {
       ? characterActions2.find((a) => a.id === selectedCharActionId) ?? null
       : null;
   const activeCharacter: CharacterInstance = activeCharacterId === "c2"
-    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor, start: characterStart2 ?? undefined }
-    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
+    ? { id: "c2", enabled: showCharacter2, accentColor: "#3a3a5a", mode: characterMode2, actions: characterActions2, skin: characterSkin2, characterType: characterType2, expression: characterExpression2, faceBlobUrl: characterFace2?.faceBlobUrl, faceAspect: characterFace2?.faceAspect, mouthAnchor: characterFace2?.mouthAnchor, start: characterStart2 ?? undefined }
+    : { id: "c1", enabled: showCharacter, accentColor: "#2a2a2a", mode: characterMode, actions: characterActions, skin: characterSkin, characterType, expression: characterExpression, faceBlobUrl: characterFace?.faceBlobUrl, faceAspect: characterFace?.faceAspect, mouthAnchor: characterFace?.mouthAnchor, start: characterStart ?? undefined };
   const currentNarrationVisemeSource = useMemo(() => narrationVisemeSourceSignature(clips), [clips]);
   const narrationVisemeTrackIsCurrent = narrationVisemeTrack.length > 0 && narrationVisemeTrackSource === currentNarrationVisemeSource;
   const currentNarrationGestureSource = useMemo(() => narrationGestureSourceSignature(clips), [clips]);
@@ -4957,6 +4981,10 @@ export default function Board2Page() {
   const characterMode2Ref = useRef<"auto" | "manual">("auto");
   const characterSkinRef = useRef<CharacterSkin>("stick");
   const characterSkin2Ref = useRef<CharacterSkin>("stick");
+  const characterTypeRef = useRef<CharacterType>("stickFigure");
+  const characterType2Ref = useRef<CharacterType>("stickFigure");
+  const characterExpressionRef = useRef<Expression>("neutral");
+  const characterExpression2Ref = useRef<Expression>("neutral");
   const characterVisemeModeRef = useRef<Viseme | "auto">("auto");
   const characterVisemeMode2Ref = useRef<Viseme | "auto">("auto");
   const characterVisemeRef = useRef<Viseme>("rest");
@@ -5809,6 +5837,15 @@ export default function Board2Page() {
   useEffect(() => { characterMode2Ref.current = characterMode2; }, [characterMode2]);
   useEffect(() => { characterSkinRef.current = characterSkin; }, [characterSkin]);
   useEffect(() => { characterSkin2Ref.current = characterSkin2; }, [characterSkin2]);
+  useEffect(() => { characterTypeRef.current = characterType; }, [characterType]);
+  useEffect(() => { characterType2Ref.current = characterType2; }, [characterType2]);
+  useEffect(() => { characterExpressionRef.current = characterExpression; }, [characterExpression]);
+  useEffect(() => { characterExpression2Ref.current = characterExpression2; }, [characterExpression2]);
+  useEffect(() => {
+    const redraw = () => drawFrameRef.current(playheadRef.current);
+    window.addEventListener("explainer-assets-loaded", redraw);
+    return () => window.removeEventListener("explainer-assets-loaded", redraw);
+  }, []);
   useEffect(() => {
     characterVisemeModeRef.current = characterViseme;
     characterVisemeRef.current = characterViseme === "auto" ? "rest" : characterViseme;
@@ -5871,7 +5908,12 @@ export default function Board2Page() {
       if (canApplyTrackedGesture) debug.executed.add(pointIndex);
     }
     const automatic = GESTURE_POSES[trackedGesture];
-    const target = forced ?? automatic;
+    const renderedGesture = (forced ? mode : trackedGesture) as Gesture;
+    const previousGesture = pointIndex > 0 ? track[pointIndex - 1].gesture : "neutral";
+    const spriteProgress = forced
+      ? 1
+      : point ? clamp((time - point.start) / EXPLAINER_POSE_CROSSFADE_SECONDS, 0, 1) : 1;
+    const target = { ...(forced ?? automatic), spriteGesture: renderedGesture, spritePreviousGesture: previousGesture, spriteTransitionProgress: spriteProgress };
     const transition = id === "c2" ? characterGestureTransition2Ref.current : characterGestureTransitionRef.current;
     if (!transition) return target;
     const progress = (nowMs - transition.startMs) / (GESTURE_TRANSITION_SECONDS * 1000);
@@ -5919,8 +5961,9 @@ export default function Board2Page() {
     const merged = characterMode === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit.x, charInit.y, cameraKeyframes, canvasW, canvasH), characterActions)
       : characterActions;
-    return resolveEditorCharActions(merged, charInit.x, charInit.y, clips);
-  }, [clips, characterActions, characterMode, charInit, cameraKeyframes, canvasW, canvasH]);
+    const gated = characterType === "explainer" ? merged.filter((action) => EXPLAINER_ACTION_TYPES.has(action.type)) : merged;
+    return resolveEditorCharActions(gated, charInit.x, charInit.y, clips);
+  }, [clips, characterActions, characterMode, characterType, charInit, cameraKeyframes, canvasW, canvasH]);
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
     const focusClips = clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
@@ -5932,15 +5975,16 @@ export default function Board2Page() {
     const merged = characterMode2 === "auto"
       ? mergeCharActions(deriveAutoCharActions(clips, charInit2.x, charInit2.y, cameraKeyframes, canvasW, canvasH), characterActions2)
       : characterActions2;
+    const gated = characterType2 === "explainer" ? merged.filter((action) => EXPLAINER_ACTION_TYPES.has(action.type)) : merged;
     return resolveEditorCharActions(
-      merged,
+      gated,
       charInit2.x,
       charInit2.y,
       clips,
       showCharacter ? [{ resolved: resolvedCharActions, initX: charInit.x, initY: charInit.y, entranceTime: characterEntranceTime }] : [],
       characterMode2 === "auto" ? 60 : 0
     );
-  }, [clips, characterActions2, characterMode2, charInit, charInit2, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
+  }, [clips, characterActions2, characterMode2, characterType2, charInit, charInit2, cameraKeyframes, canvasW, canvasH, showCharacter, resolvedCharActions, characterEntranceTime]);
 
   // Before the auto-derived entrance flip lands, the character isn't on the board at all (see
   // deriveAutoCharActions) — this is when that flip starts, or +Infinity if the timeline is
@@ -6736,6 +6780,7 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
             : null,
           characterSkinRef.current,
+          characterTypeRef.current, characterExpressionRef.current,
           { ...pose, viseme: resolvedCharacterViseme("c1", liveRuntimeSeconds(live.c1, wallMs), currentClips, liveResolvedActions(live.c1, clipsRef.current, streamCratersRef.current), "live") },
           boardCharacterDrawEvaluators()
         );
@@ -6756,6 +6801,7 @@ export default function Board2Page() {
             ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
             : null,
           characterSkin2Ref.current,
+          characterType2Ref.current, characterExpression2Ref.current,
           { ...pose, viseme: resolvedCharacterViseme("c2", liveRuntimeSeconds(live.c2, wallMs), currentClips, liveResolvedActions(live.c2, clipsRef.current, streamCratersRef.current), "live") },
           boardCharacterDrawEvaluators()
         );
@@ -6773,6 +6819,7 @@ export default function Board2Page() {
           ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
           : null,
         characterSkinRef.current,
+        characterTypeRef.current, characterExpressionRef.current,
         { ...pose, viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
@@ -6794,6 +6841,7 @@ export default function Board2Page() {
           ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
           : null,
         characterSkin2Ref.current,
+        characterType2Ref.current, characterExpression2Ref.current,
         { ...pose, viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
@@ -6899,6 +6947,8 @@ export default function Board2Page() {
       faceSettings: CharacterFaceSettings | null,
       faceImage: HTMLImageElement | null,
       skin: CharacterSkin,
+      characterType: CharacterType,
+      expression: Expression,
       viseme: Viseme,
     ) => {
       if (!enabled) return;
@@ -6912,7 +6962,7 @@ export default function Board2Page() {
         ctx, time, resolved, true, cam, sf, W, H, initX, initY,
         currentClips, -Infinity, authoredAnimationsRef.current,
         faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect, mouthAnchor: faceSettings.mouthAnchor } : null,
-        skin, { ...pose, viseme },
+        skin, characterType, expression, { ...pose, viseme },
         boardCharacterDrawEvaluators(),
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -6935,12 +6985,12 @@ export default function Board2Page() {
     drawEditorCharacter(
       "c1",
       resolvedCharActionsRef.current, showCharacterRef.current, charInitXRef.current, charInitYRef.current,
-      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, resolvedCharacterViseme("c1", time, currentClips, resolvedCharActionsRef.current),
+      characterFaceRef.current, characterFaceImageRef.current, characterSkinRef.current, characterTypeRef.current, characterExpressionRef.current, resolvedCharacterViseme("c1", time, currentClips, resolvedCharActionsRef.current),
     );
     drawEditorCharacter(
       "c2",
       resolvedCharActions2Ref.current, showCharacter2Ref.current, charInit2XRef.current, charInit2YRef.current,
-      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, resolvedCharacterViseme("c2", time, currentClips, resolvedCharActions2Ref.current),
+      characterFace2Ref.current, characterFace2ImageRef.current, characterSkin2Ref.current, characterType2Ref.current, characterExpression2Ref.current, resolvedCharacterViseme("c2", time, currentClips, resolvedCharActions2Ref.current),
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
@@ -8993,6 +9043,9 @@ export default function Board2Page() {
         visemeTrack: track,
         transcriptStart,
         transcriptEnd,
+        mapGesture: activeCharacter.characterType === "explainer" && activeCharacterIdRef.current === activeCharacter.id
+          ? (gesture) => gesture === "open" ? "shrug" : gesture
+          : undefined,
       });
       let gestureTrack = ruleBasedTrack;
       let smartGestureFallback = false;
@@ -9014,7 +9067,10 @@ export default function Board2Page() {
               : "Smart gestures returned an invalid track";
             throw new Error(message);
           }
-          gestureTrack = applyGestureDwellRules(candidate, transcriptStart, transcriptEnd);
+          const displayTrack = activeCharacter.characterType === "explainer"
+            ? candidate.map((point) => ({ ...point, gesture: point.gesture === "open" ? "shrug" as const : point.gesture }))
+            : candidate;
+          gestureTrack = applyGestureDwellRules(displayTrack, transcriptStart, transcriptEnd);
         } catch (error) {
           console.warn("[board2:gestures] Smart gesture generation failed; using rules", error);
           smartGestureFallback = true;
@@ -14352,6 +14408,7 @@ export default function Board2Page() {
             ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current!.faceAspect, mouthAnchor: characterFaceRef.current!.mouthAnchor }
             : null,
           characterSkinRef.current,
+          characterTypeRef.current, characterExpressionRef.current,
           { ...playPose, viseme: playViseme },
           boardCharacterDrawEvaluators()
         );
@@ -16304,7 +16361,7 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  // Builds the full "complete recipe" manifest (schemaVersion 4) — the shared core of both
+  // Builds the full "complete recipe" manifest (schemaVersion 5) — the shared core of both
   // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
@@ -16537,7 +16594,7 @@ export default function Board2Page() {
     }));
 
     const manifest = {
-      schemaVersion: 4 as const,
+      schemaVersion: 5 as const,
       meta: {
         id: recipeProjectIdRef.current,
         projectId: recipeProjectIdRef.current,
@@ -16587,12 +16644,12 @@ export default function Board2Page() {
       characters: {
         c1: {
           id: "c1" as const, enabled: showCharacterRef.current, accentColor: "#2a2a2a",
-          mode: characterModeRef.current, skin: characterSkinRef.current, actions: characterActionsRef.current.map(normalizeRecipeAction),
+          mode: characterModeRef.current, skin: characterSkinRef.current, characterType: characterTypeRef.current, expression: characterExpressionRef.current, actions: characterActionsRef.current.map(normalizeRecipeAction),
           start: characterStart ?? undefined, face: manifestFace, resolvedPositionTrack: resolvedPositionTrackC1,
         } satisfies ManifestCharacter,
         c2: {
           id: "c2" as const, enabled: showCharacter2Ref.current, accentColor: "#3a3a5a",
-          mode: characterMode2Ref.current, skin: characterSkin2Ref.current, actions: characterActions2Ref.current.map(normalizeRecipeAction),
+          mode: characterMode2Ref.current, skin: characterSkin2Ref.current, characterType: characterType2Ref.current, expression: characterExpression2Ref.current, actions: characterActions2Ref.current.map(normalizeRecipeAction),
           start: characterStart2 ?? undefined, face: manifestFace2, resolvedPositionTrack: resolvedPositionTrackC2,
         } satisfies ManifestCharacter,
       },
@@ -16888,16 +16945,22 @@ export default function Board2Page() {
         type LoadedCharacter = Partial<CharacterInstance> & { id?: CharacterId; face?: ManifestFace | null };
         const c1 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c1");
         const c2 = (manifest.characters as LoadedCharacter[]).find((c) => c.id === "c2");
-        setCharacterActions(loadCharacterActions(c1?.actions, "c1"));
+        const c1Type: CharacterType = c1?.characterType === "explainer" ? "explainer" : "stickFigure";
+        const c2Type: CharacterType = c2?.characterType === "explainer" ? "explainer" : "stickFigure";
+        setCharacterActions(loadCharacterActions(c1?.actions, "c1").filter((action) => c1Type !== "explainer" || EXPLAINER_ACTION_TYPES.has(action.type)));
         setShowCharacter(c1?.enabled ?? false);
         setCharacterMode(c1?.mode ?? "auto");
         setCharacterSkin(c1?.skin === "styled" ? "styled" : "stick");
+        setCharacterType(c1Type);
+        setCharacterExpression(c1?.expression === "disgruntled" ? "disgruntled" : "neutral");
         setCharacterFace(loadFace(c1?.face));
         setCharacterStart(loadStart(c1?.start));
-        setCharacterActions2(loadCharacterActions(c2?.actions, "c2"));
+        setCharacterActions2(loadCharacterActions(c2?.actions, "c2").filter((action) => c2Type !== "explainer" || EXPLAINER_ACTION_TYPES.has(action.type)));
         setShowCharacter2(c2?.enabled ?? false);
         setCharacterMode2(c2?.mode ?? "auto");
         setCharacterSkin2(c2?.skin === "styled" ? "styled" : "stick");
+        setCharacterType2(c2Type);
+        setCharacterExpression2(c2?.expression === "disgruntled" ? "disgruntled" : "neutral");
         setCharacterFace2(loadFace(c2?.face));
         setCharacterStart2(loadStart(c2?.start));
       } else {
@@ -16908,12 +16971,16 @@ export default function Board2Page() {
         if (manifest.characterMode) setCharacterMode(manifest.characterMode);
         else setCharacterMode("auto");
         setCharacterSkin(manifest.characterSkin === "styled" ? "styled" : "stick");
+        setCharacterType("stickFigure");
+        setCharacterExpression("neutral");
         setCharacterFace(loadFace(manifest.characterFace));
         setCharacterStart(loadStart(manifest.characterStart));
         setCharacterActions2([]);
         setShowCharacter2(false);
         setCharacterMode2("auto");
         setCharacterSkin2("stick");
+        setCharacterType2("stickFigure");
+        setCharacterExpression2("neutral");
         setCharacterFace2(null);
         setCharacterStart2(null);
       }
@@ -18051,12 +18118,13 @@ export default function Board2Page() {
                                 { mode: "skateTo" as const, label: "Skate", title: "Click board to skate to position (3.0s)" },
                                 { mode: "grapple" as const, label: "Grapple", title: "Click board to grapple-hook to position (1.8s)" },
                                 { mode: "pointAt" as const, label: "Point", title: "Click board to point at position (2.0s)" },
+                                { mode: "explainGesture" as const, label: "Talk", title: "Click board to place talking hand motions (2.4s)" },
                                 { mode: "dance" as const, label: "Dance", title: "Click board to place a hip-shake dance action (2.5s)" },
                                 { mode: "pullUps" as const, label: "Pull-ups", title: "Click board to place a grounded pull-up bar action (4.0s)" },
                                 { mode: "bazooka" as const, label: "Bazooka", title: "Click an image to fire one terrain-damaging rocket (2.4s)" },
                                 { mode: "mirrorCheck" as const, label: "Mirror", title: "Click board to place a mirror-check transformation action (5.0s)" },
                                 { mode: "emote" as const, label: "Emote", title: "Choose emoji then place at playhead (2.0s)" },
-                            ]).map(({ mode, label, title }) => (
+                            ]).filter(({ mode }) => characterType !== "explainer" || mode === "pointAt").map(({ mode, label, title }) => (
                               <button
                                 key={mode}
                                 title={title}
@@ -18127,7 +18195,7 @@ export default function Board2Page() {
                             )}
 
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
-                            <ProGated featureName="Pose Lab">
+                            {characterType !== "explainer" && <ProGated featureName="Pose Lab">
                               <button
                                 title="Open the visual keyframe animation editor"
                                 onClick={(e) => {
@@ -18144,7 +18212,7 @@ export default function Board2Page() {
                               >
                                 🎭 Pose Lab
                               </button>
-                            </ProGated>
+                            </ProGated>}
                             <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)" }} />
                             {/* AI choreography — describe moves in plain language, optionally synced to narration */}
                             <button
@@ -18745,6 +18813,25 @@ export default function Board2Page() {
                           </button>
                         ))}
                       </div>
+                      <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 10 }}>
+                        <span>Character type</span>
+                        <select value={activeCharacter.characterType} onChange={(event) => {
+                          const next: CharacterType = event.target.value === "explainer" ? "explainer" : "stickFigure";
+                          if (activeCharacterId === "c2") {
+                            characterType2Ref.current = next;
+                            setCharacterType2(next);
+                            if (next === "explainer") setCharacterActions2((actions) => actions.filter((action) => EXPLAINER_ACTION_TYPES.has(action.type)));
+                          } else {
+                            characterTypeRef.current = next;
+                            setCharacterType(next);
+                            if (next === "explainer") setCharacterActions((actions) => actions.filter((action) => EXPLAINER_ACTION_TYPES.has(action.type)));
+                          }
+                          setCharacterAddMode(null);
+                        }} style={{ flex: 1, fontFamily: "monospace", fontSize: 10, border: "1px solid #2a2a2a", background: "#fffdf4", padding: "3px 5px" }}>
+                          <option value="stickFigure">Stick figure</option>
+                          <option value="explainer">Explainer</option>
+                        </select>
+                      </label>
                       <div style={{ display: "flex", border: "1px solid rgba(42,42,42,0.35)", overflow: "hidden" }}>
                         {(["auto", "manual"] as const).map((m) => (
                           <button
@@ -18787,6 +18874,20 @@ export default function Board2Page() {
                       )}
                       {DEV_MOUTH_TEST && (
                         <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 10 }}>
+                          <span>Expression test</span>
+                          <select value={activeCharacter.expression} onChange={(event) => {
+                            const next: Expression = event.target.value === "disgruntled" ? "disgruntled" : "neutral";
+                            if (activeCharacterId === "c2") { characterExpression2Ref.current = next; setCharacterExpression2(next); }
+                            else { characterExpressionRef.current = next; setCharacterExpression(next); }
+                            drawFrameRef.current(playheadRef.current);
+                          }} style={{ flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 10, border: "1px solid #2a2a2a", background: "#fffdf4", padding: "3px 5px" }}>
+                            <option value="neutral">neutral</option>
+                            <option value="disgruntled">disgruntled</option>
+                          </select>
+                        </label>
+                      )}
+                      {DEV_MOUTH_TEST && (
+                        <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 10 }}>
                           <span>Gesture test</span>
                           <select
                             value={activeCharacterId === "c2" ? characterGesture2 : characterGesture}
@@ -18801,7 +18902,7 @@ export default function Board2Page() {
                         </label>
                       )}
                       <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                        {addButtons.map(({ mode, label, title }) => (
+                        {addButtons.filter(({ mode }) => activeCharacter.characterType !== "explainer" || mode === "explainGesture" || mode === "pointAt").map(({ mode, label, title }) => (
                           <button
                             key={mode}
                             type="button"
