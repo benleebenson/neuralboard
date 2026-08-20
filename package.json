@@ -13,6 +13,7 @@
     "@supabase/supabase-js": "^2.105.4",
     "@types/recordrtc": "^5.6.15",
     "fflate": "^0.8.3",
+    "mp4-muxer": "^5.2.2",
     "next": "16.2.4",
     "next-auth": "^4.24.14",
     "react": "19.2.4",
