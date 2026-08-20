@@ -188,6 +188,15 @@ type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | 
 const BOARD_TOUCH_DRAG_THRESHOLD_PX = 8;
 const BOARD_TOUCH_TAP_MAX_MS = 350;
 
+// Experimental only. The MediaRecorder path remains the production default until all three
+// deterministic-export regressions are fixed and verified end to end:
+// 1. the camera track is not sampled correctly per frame, producing a static camera;
+// 2. the encoded audio track is missing from the final mux;
+// 3. the save-picker writable-stream target can close with a 0-byte file.
+const DETERMINISTIC_EXPORT_ENABLED = process.env.NEXT_PUBLIC_DETERMINISTIC_EXPORT === "1";
+const EXPORT_BITRATE_OPTIONS_MBPS = [8, 12, 20, 32] as const;
+const DEFAULT_EXPORT_BITRATE_MBPS = 20;
+
 type TranscriptionApiResponse = {
   error?: string;
   transcript?: string;
@@ -4490,6 +4499,7 @@ export default function Board2Page() {
   const [exportProgress, setExportProgress] = useState(0);
   const [exportFps, setExportFps] = useState<(typeof SUPPORTED_EXPORT_FPS)[number]>(DEFAULT_EXPORT_FPS);
   const [exportQuality, setExportQuality] = useState<ExportQuality>("1080p");
+  const [exportBitrateMbps, setExportBitrateMbps] = useState(DEFAULT_EXPORT_BITRATE_MBPS);
   const [exportStatus, setExportStatus] = useState<OfflineExportStatus | null>(null);
   const [isExportingBoardImage, setIsExportingBoardImage] = useState(false);
   const [snapshotIncludeCharacter, setSnapshotIncludeCharacter] = useState(true);
@@ -4826,6 +4836,7 @@ export default function Board2Page() {
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportVideoFramesRef = useRef<Map<string, ImageBitmap>>(new Map());
   const exportCancelRef = useRef(false);
+  const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraKeyframesRef = useRef<CameraKeyframe[]>([]);
@@ -6587,17 +6598,19 @@ export default function Board2Page() {
     currentAnnotations: Annotation[],
     overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null,
     liveWallMs?: number,
-    quality: "preview" | "export" | "snapshot" = "preview",
+    quality: "preview" | "realtime-export" | "export" | "snapshot" = "preview",
     renderOptions: { includeCharacter?: boolean } = {},
   ) => {
     ctx.fillStyle = BOARD_SURFACE_COLOR;
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
     const sf = cam.boardZoom * W / boardDimensionsRef.current.width;
-    const offlineRendering = quality !== "preview";
+    const preparedImageRendering = quality !== "preview";
+    const offlineVideoRendering = quality === "export" || quality === "snapshot";
+    const timelineRendering = quality !== "preview";
     const includeCharacter = renderOptions.includeCharacter ?? true;
-    const liveMode = !offlineRendering && liveControlEnabledRef.current;
-    const authoredBazooka = !liveMode && (offlineRendering || !playModeRef.current)
+    const liveMode = !timelineRendering && liveControlEnabledRef.current;
+    const authoredBazooka = !liveMode && (timelineRendering || !playModeRef.current)
       ? authoredBazookaTimeline(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current], currentClips, streamCratersRef.current)
       : { craters: [...streamCratersRef.current], events: [] as BazookaVisualEvent[] };
     const renderCraters = authoredBazooka.craters;
@@ -6608,13 +6621,13 @@ export default function Board2Page() {
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
       const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
-      if (quality === "preview" && !boardRectIntersectsCameraFrame(
+      if ((quality === "preview" || quality === "realtime-export") && !boardRectIntersectsCameraFrame(
         { x: bx, y: by, width: bw, height: bh },
         cam,
         W,
         H,
         boardDimensionsRef.current.width,
-        0.35,
+        quality === "preview" ? 0.35 : 0,
       )) continue;
       const sx = (bx + bw / 2 - cam.cameraX) * sf + W / 2;
       const sy = (by + bh / 2 - cam.cameraY) * sf + H / 2;
@@ -6622,7 +6635,7 @@ export default function Board2Page() {
       ctx.globalAlpha = 1;
       if (clip.type === "image") {
         const renderUrl = clip.previewUrl ?? clip.sourceUrl;
-        const img = offlineRendering
+        const img = preparedImageRendering
           ? exportImgCacheRef.current.get(clip.sourceUrl)
           : cachedPreviewImage(renderUrl);
         if (!img && quality === "preview") loadMedia(renderUrl, "image");
@@ -6638,15 +6651,15 @@ export default function Board2Page() {
         let drewLive = false;
         const playbackRuntime = videoPlaybackStateRef.current.get(clip.id);
         const playbackMode = playbackRuntime?.state ?? "dormant";
-        const justRestartedActive = !offlineRendering && playbackMode === "active" && playbackRuntime ? performance.now() - playbackRuntime.lastRestartAt < 250 : false;
+        const justRestartedActive = !offlineVideoRendering && playbackMode === "active" && playbackRuntime ? performance.now() - playbackRuntime.lastRestartAt < 250 : false;
         // Ambient clips can wrap through currentTime=0 while looping, so drawable state is based
         // primarily on decoded future data + actually playing. The currentTime guard only applies
         // immediately after an active-range restart to avoid the first-play thumbnail/audio race.
-        const offlineFrame = offlineRendering ? exportVideoFramesRef.current.get(clip.id) : undefined;
+        const offlineFrame = offlineVideoRendering ? exportVideoFramesRef.current.get(clip.id) : undefined;
         if (offlineFrame) {
           drawCrateredImage(ctx, offlineFrame, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
           drewLive = true;
-        } else if (!offlineRendering && vid && vid.readyState >= 3 && !vid.paused && !vid.ended && (!justRestartedActive || vid.currentTime > 0.05)) {
+        } else if (!offlineVideoRendering && vid && vid.readyState >= 3 && !vid.paused && !vid.ended && (!justRestartedActive || vid.currentTime > 0.05)) {
           try {
             drawCrateredImage(ctx, vid, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
             drewLive = true;
@@ -6654,10 +6667,10 @@ export default function Board2Page() {
         }
         if (drewLive) {
           videoStuckFrameCountRef.current.set(clip.id, 0);
-        } else if (!offlineRendering && (playbackMode === "active" || playbackMode === "ambient")) {
+        } else if (!offlineVideoRendering && (playbackMode === "active" || playbackMode === "ambient")) {
           drawableFailureCountRef.current++;
         }
-        if (!offlineRendering && !drewLive && playbackMode === "active" && vid && !vid.paused && !justRestartedActive && vid.readyState >= 2) {
+        if (!offlineVideoRendering && !drewLive && playbackMode === "active" && vid && !vid.paused && !justRestartedActive && vid.readyState >= 2) {
           // Clip should be actively playing but produced no drawable frame this render — track
           // consecutive misses and gently nudge forward if it stays stuck. Never jump back to
           // the beginning: repeated backward seeks produce a loud, stuttering audio loop.
@@ -6740,7 +6753,7 @@ export default function Board2Page() {
         );
       }
       drawStreamGuestsToCtx(ctx, cam, sf, W, H);
-    } else if (includeCharacter && showCharacterRef.current && (offlineRendering || !playModeRef.current)) {
+    } else if (includeCharacter && showCharacterRef.current && (timelineRendering || !playModeRef.current)) {
       const resolved = resolvedCharActionsRef.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c1", time, resolved, "timeline"));
       if (time >= characterEntranceTimeRef.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
@@ -6761,7 +6774,7 @@ export default function Board2Page() {
         drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
       }
     }
-    if (includeCharacter && !liveMode && showCharacter2Ref.current && (offlineRendering || !playModeRef.current)) {
+    if (includeCharacter && !liveMode && showCharacter2Ref.current && (timelineRendering || !playModeRef.current)) {
       const resolved = resolvedCharActions2Ref.current;
       const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c2", time, resolved, "timeline"));
       if (time >= characterEntranceTime2Ref.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
@@ -11928,7 +11941,280 @@ export default function Board2Page() {
     }
   }
 
-  async function startExport() {
+  async function startRealtimeExport() {
+    if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
+    if (clips.length === 0) { alert("No clips to export"); return; }
+    if (isPlayingRef.current) setIsPlaying(false);
+    if (!("MediaRecorder" in window)) {
+      setToast("Real-time video export is not available in this browser");
+      return;
+    }
+
+    setIsExporting(true);
+    isExportingRef.current = true;
+    exportCancelRef.current = false;
+    setExportProgress(0);
+    const currentClips = clipsRef.current;
+    const currentCameraKeyframes = cameraKeyframesRef.current;
+    const currentAnnotations = annotationsRef.current;
+    const totalDur = currentPlaybackDuration(currentClips);
+    if (totalDur <= 0) {
+      setToast("Add at least one timeline clip before exporting");
+      setIsExporting(false);
+      isExportingRef.current = false;
+      return;
+    }
+    const { width: W, height: H } = exportOutputDimensions(exportQuality, canvasAspect);
+    const totalFrames = exportFrameCount(totalDur, exportFps);
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = W;
+    exportCanvas.height = H;
+    const exportCtx = exportCanvas.getContext("2d", { alpha: false });
+    if (!exportCtx) {
+      setToast("Could not create export canvas");
+      setIsExporting(false);
+      isExportingRef.current = false;
+      return;
+    }
+    const captureStream = (exportCanvas as HTMLCanvasElement & {
+      captureStream?: (fps: number) => MediaStream;
+    }).captureStream;
+    if (!captureStream) {
+      setToast("Real-time export requires canvas.captureStream (use desktop Chrome or Safari 17.2+)");
+      setIsExporting(false);
+      isExportingRef.current = false;
+      return;
+    }
+    exportCtx.imageSmoothingEnabled = true;
+    exportCtx.imageSmoothingQuality = "high";
+
+    let exportAudioCtx: AudioContext | null = null;
+    let exportMediaStream: MediaStream | null = null;
+    let wakeLock: WakeLockSentinel | null = null;
+    const scheduledAudio: AudioBufferSourceNode[] = [];
+    try {
+      const uniqueImages = [...new Map(
+        currentClips.filter((clip) => clip.type === "image").map((clip) => [clip.sourceUrl, clip]),
+      ).values()];
+      const videoClips = currentClips.filter((clip) => clip.type === "video");
+      const imageAssetTotal = uniqueImages.length + Number(!!characterFaceImageRef.current) + Number(!!characterFace2ImageRef.current) + thumbnailImagesRef.current.size;
+      setExportStatus({
+        stage: "preparing",
+        frame: 0,
+        totalFrames,
+        etaSeconds: Number.NaN,
+        assetCurrent: 0,
+        assetTotal: imageAssetTotal,
+        detail: `Preparing ${W}×${H} real-time export assets…`,
+      });
+      await yieldForExportUi();
+
+      stopAllVideoPlayback("realtime-export-preparing");
+      exportImgCacheRef.current.clear();
+      exportImgLoadRef.current.clear();
+      await Promise.all([
+        ensureAnnotationFontsLoaded(currentAnnotations),
+        ...uniqueImages.map((clip) => ensureExportImage(clip)),
+        characterFaceImageRef.current?.decode().catch(() => {}),
+        characterFace2ImageRef.current?.decode().catch(() => {}),
+        ...[...thumbnailImagesRef.current.values()].flatMap((image) => image ? [image.decode().catch(() => {})] : []),
+      ]);
+
+      // Prime every video element before the clock starts. Video decoding remains real-time, but
+      // metadata/first-frame work no longer lands on the first expensive pan frame.
+      await Promise.all(videoClips.map(async (clip) => {
+        const video = videoElsRef.current.get(clip.id) ?? createVideoElement(clip.id, clip.sourceUrl);
+        video.preload = "auto";
+        video.load();
+        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return;
+        await new Promise<void>((resolve) => {
+          const finish = () => { window.clearTimeout(timer); resolve(); };
+          const timer = window.setTimeout(finish, 8_000);
+          video.addEventListener("loadeddata", finish, { once: true });
+          video.addEventListener("error", finish, { once: true });
+        });
+      }));
+
+      type AudioItem = { clip: Clip; buffer: AudioBuffer };
+      const audioClips = currentClips.filter((clip) =>
+        (clip.type === "narration" || (clip.type === "video" && isFeaturedTimelineClip(clip))) &&
+        effectiveClipVolume(clip) > 0 && clip.duration > 0
+      );
+      let audioBuffers: AudioItem[] = [];
+      let exportAudioDest: MediaStreamAudioDestinationNode | null = null;
+      if (audioClips.length > 0) {
+        exportAudioCtx = new AudioContext();
+        await exportAudioCtx.resume();
+        exportAudioDest = exportAudioCtx.createMediaStreamDestination();
+        const results = await Promise.all(audioClips.map(async (clip) => {
+          try {
+            const blob = clip.type === "narration" ? clip.audioBlob ?? clip.sourceBlob : clip.sourceBlob;
+            const bytes = blob
+              ? await blob.arrayBuffer()
+              : await fetch(clip.sourceUrl).then((response) => {
+                  if (!response.ok) throw new Error(`Audio source failed (${response.status})`);
+                  return response.arrayBuffer();
+                });
+            return { clip, buffer: await exportAudioCtx!.decodeAudioData(bytes) } satisfies AudioItem;
+          } catch (error) {
+            if (clip.type === "narration") throw new Error(`Could not decode narration “${clip.name}”`);
+            console.info(`[realtime-export] video “${clip.name}” has no decodable audio track`, error);
+            return null;
+          }
+        }));
+        audioBuffers = results.filter((item): item is AudioItem => item !== null);
+      }
+
+      for (const nodes of videoAudioNodesRef.current.values()) {
+        try { nodes.gainNode.gain.value = 0; } catch {}
+      }
+      for (const clip of videoClips) {
+        const video = videoElsRef.current.get(clip.id);
+        if (!video) continue;
+        video.loop = false;
+        video.pause();
+        video.currentTime = 0;
+      }
+      ambientCandidateIdsRef.current = new Set();
+      lastAmbientEvalAtRef.current = 0;
+      drawableFailureCountRef.current = 0;
+
+      const canvasStream = captureStream.call(exportCanvas, exportFps);
+      exportMediaStream = exportAudioDest
+        ? new MediaStream([...canvasStream.getVideoTracks(), ...exportAudioDest.stream.getAudioTracks()])
+        : canvasStream;
+      const mimeCandidates = [
+        "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+        "video/mp4",
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm",
+      ];
+      const mimeType = mimeCandidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? "";
+      const recorder = new MediaRecorder(exportMediaStream, {
+        ...(mimeType ? { mimeType } : {}),
+        videoBitsPerSecond: exportBitrateMbps * 1_000_000,
+        ...(exportAudioDest ? { audioBitsPerSecond: 192_000 } : {}),
+      });
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (event) => { if (event.data.size > 0) chunks.push(event.data); };
+      wakeLock = await navigator.wakeLock?.request("screen").catch(() => null) ?? null;
+
+      let renderedFrames = 0;
+      await new Promise<void>((resolve, reject) => {
+        recorder.onerror = (event) => reject((event as Event & { error?: DOMException }).error ?? new Error("MediaRecorder failed"));
+        recorder.onstop = () => resolve();
+        recorder.start(250);
+
+        const exportAudioStart = exportAudioCtx?.currentTime ?? 0;
+        if (exportAudioCtx && exportAudioDest) {
+          for (const { clip, buffer } of audioBuffers) {
+            const offset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, buffer.duration - 0.01));
+            const playableDuration = Math.min(clip.duration, Math.max(0, buffer.duration - offset));
+            if (playableDuration <= 0) continue;
+            const gainNode = exportAudioCtx.createGain();
+            gainNode.gain.value = effectiveClipVolume(clip);
+            gainNode.connect(exportAudioDest);
+            const source = exportAudioCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(gainNode);
+            source.start(exportAudioStart + clip.startTime, offset, playableDuration);
+            scheduledAudio.push(source);
+          }
+        }
+
+        const exportWallStart = performance.now();
+        let lastUiUpdate = 0;
+        let nextFrameTime = 0;
+        const exportFrame = (wallNow: number) => {
+          if (exportCancelRef.current) {
+            if (recorder.state !== "inactive") recorder.stop();
+            return;
+          }
+          const elapsed = (wallNow - exportWallStart) / 1000;
+          if (elapsed >= totalDur) {
+            if (recorder.state !== "inactive") recorder.stop();
+            return;
+          }
+
+          // requestAnimationFrame is commonly 60–120 Hz. Rendering only when the selected export
+          // cadence is due avoids doing 2–4× redundant canvas work at 30 fps.
+          if (elapsed + 0.001 >= nextFrameTime) {
+            evaluateVideoPlaybackStates(elapsed, currentClips, currentCameraKeyframes, W, H, {
+              force: renderedFrames === 0,
+              audioMode: "silent",
+            });
+            renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "realtime-export");
+            renderedFrames++;
+            nextFrameTime += 1 / exportFps;
+            if (nextFrameTime < elapsed) nextFrameTime = elapsed + 1 / exportFps;
+          }
+
+          if (wallNow - lastUiUpdate >= 250) {
+            lastUiUpdate = wallNow;
+            const expectedSoFar = Math.min(totalFrames, Math.floor(elapsed * exportFps) + 1);
+            setExportStatus({
+              stage: "frames",
+              frame: renderedFrames,
+              totalFrames,
+              etaSeconds: Math.max(0, totalDur - elapsed),
+              detail: `Recording real-time video… ${renderedFrames.toLocaleString()} / ${totalFrames.toLocaleString()} frames (${Math.max(0, expectedSoFar - renderedFrames)} late)`,
+            });
+            setExportProgress(Math.min(0.995, elapsed / totalDur));
+          }
+          exportRafRef.current = requestAnimationFrame(exportFrame);
+        };
+        exportRafRef.current = requestAnimationFrame(exportFrame);
+      });
+
+      if (exportRafRef.current !== null) cancelAnimationFrame(exportRafRef.current);
+      exportRafRef.current = null;
+      stopAllVideoPlayback("realtime-export-ended");
+      const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
+      if (!exportCancelRef.current) {
+        if (blob.size === 0) throw new Error("MediaRecorder produced an empty export");
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = blob.type.includes("mp4") ? "board2-export.mp4" : "board2-export.webm";
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        console.info("[board2:realtime-export] complete", {
+          expectedFrames: totalFrames,
+          renderedFrames,
+          dimensions: { width: W, height: H },
+          fps: exportFps,
+          requestedVideoBitrate: exportBitrateMbps * 1_000_000,
+          bytes: blob.size,
+          mimeType: blob.type,
+        });
+        setToast(`Exported ${W}×${H} real-time video with audio at ${exportBitrateMbps} Mbps`);
+      } else {
+        setToast("Export cancelled");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") setToast("Export cancelled");
+      else setToast(error instanceof Error ? error.message : "Export failed");
+    } finally {
+      if (exportRafRef.current !== null) cancelAnimationFrame(exportRafRef.current);
+      exportRafRef.current = null;
+      for (const source of scheduledAudio) { try { source.stop(); } catch {} }
+      exportMediaStream?.getTracks().forEach((track) => track.stop());
+      await exportAudioCtx?.close().catch(() => {});
+      await wakeLock?.release().catch(() => {});
+      stopAllVideoPlayback("realtime-export-cleanup");
+      releaseOfflineRenderAssets();
+      setIsExporting(false);
+      isExportingRef.current = false;
+      setExportProgress(0);
+      setExportStatus(null);
+      drawFrameRef.current(playheadRef.current);
+    }
+  }
+
+  async function startDeterministicExport() {
     if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
     if (isPlayingRef.current) setIsPlaying(false);
@@ -12243,6 +12529,14 @@ export default function Board2Page() {
       setExportStatus(null);
       drawFrameRef.current(playheadRef.current);
     }
+  }
+
+  async function startExport() {
+    if (DETERMINISTIC_EXPORT_ENABLED) {
+      await startDeterministicExport();
+      return;
+    }
+    await startRealtimeExport();
   }
 
   async function exportBoardImage() {
@@ -16466,9 +16760,12 @@ export default function Board2Page() {
   // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div style={{ ...pageStyle, height: boardMode ? "100dvh" : pageStyle.height, minHeight: boardMode ? "100dvh" : pageStyle.minHeight }}>
+    <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: boardMode ? "100dvh" : pageStyle.height, minHeight: boardMode ? "100dvh" : pageStyle.minHeight }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-      <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
+      <style>{`
+        @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        [data-board2-exporting] > :not(style):not([aria-hidden="true"]):not([data-export-progress]) { visibility: hidden !important; }
+      `}</style>
 
       {/* ── Header ── */}
       <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
@@ -18703,6 +19000,15 @@ export default function Board2Page() {
                 style={{ ...miniButton, height: 28, background: "#fffdf5" }}
               >
                 {SUPPORTED_EXPORT_FPS.map((fps) => <option key={fps} value={fps}>{fps} fps</option>)}
+              </select>
+              <select
+                aria-label="Export bitrate"
+                value={exportBitrateMbps}
+                disabled={isExporting}
+                onChange={(event) => setExportBitrateMbps(Number(event.target.value))}
+                style={{ ...miniButton, height: 28, background: "#fffdf5" }}
+              >
+                {EXPORT_BITRATE_OPTIONS_MBPS.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} Mbps</option>)}
               </select>
               <button
                 onClick={isExporting ? cancelExport : startExport}
