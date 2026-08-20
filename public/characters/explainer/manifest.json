@@ -1,0 +1,107 @@
+{
+  "canvas": {
+    "w": 1536,
+    "h": 2048
+  },
+  "neckY": 812,
+  "bodies": {
+    "neutral_arms_down": {
+      "file": "bodies/neutral_arms_down.png",
+      "box": [
+        590,
+        812,
+        876,
+        1422
+      ]
+    },
+    "self_hand_chest": {
+      "file": "bodies/self_hand_chest.png",
+      "box": [
+        590,
+        812,
+        876,
+        1422
+      ]
+    },
+    "shrug": {
+      "file": "bodies/shrug.png",
+      "box": [
+        417,
+        812,
+        1020,
+        1422
+      ]
+    },
+    "point_up": {
+      "file": "bodies/point_up.png",
+      "box": [
+        590,
+        775,
+        959,
+        1422
+      ]
+    },
+    "arms_crossed": {
+      "file": "bodies/arms_crossed.png",
+      "box": [
+        582,
+        812,
+        876,
+        1422
+      ]
+    },
+    "thinking": {
+      "file": "bodies/thinking.png",
+      "box": [
+        625,
+        812,
+        937,
+        1422
+      ]
+    }
+  },
+  "faces": {
+    "neutral": {
+      "file": "faces/neutral.png",
+      "box": [
+        577,
+        549,
+        865,
+        812
+      ]
+    },
+    "disgruntled": {
+      "file": "faces/disgruntled.png",
+      "box": [
+        577,
+        549,
+        865,
+        812
+      ]
+    }
+  },
+  "mouthAnchor": {
+    "faceLocal": {
+      "x": 143,
+      "y": 208
+    },
+    "canvas": {
+      "x": 720,
+      "y": 757
+    },
+    "headRadiusPx": 144,
+    "note": "starting estimate - tune in the anchor editor"
+  },
+  "expressions": [
+    "neutral",
+    "disgruntled"
+  ],
+  "poses": [
+    "neutral_arms_down",
+    "self_hand_chest",
+    "shrug",
+    "point_up",
+    "arms_crossed",
+    "thinking"
+  ]
+}
