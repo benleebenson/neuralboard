@@ -291,8 +291,6 @@ export function drawBoardCharacterToCanvas(
     drawExplainerCharacter(ctx, {
       screenX: sx, screenY: sy, scale: sf, facing,
       gesture: p.actionType === "pointAt" ? "pointUp" : (p.spriteGesture ?? "neutral"),
-      previousGesture: p.spritePreviousGesture,
-      transitionProgress: p.spriteTransitionProgress,
       expression,
       viseme: p.viseme ?? "rest",
     });

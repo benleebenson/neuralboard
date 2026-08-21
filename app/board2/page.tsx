@@ -62,7 +62,7 @@ import {
   tommyGunAimGeometry,
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
-import { EXPLAINER_POSE_CROSSFADE_SECONDS, type Expression } from "@/lib/character/explainer-renderer";
+import type { Expression } from "@/lib/character/explainer-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
@@ -1459,6 +1459,7 @@ const PREVIEW_MIN_H_PX = 96;
 const PREVIEW_MAX_H_PX = 620;
 const PREVIEW_RENDER_LONG_EDGE_PX = 960;
 const BOARD_IMAGE_PREVIEW_LONG_EDGE_PX = 720;
+const EDITOR_CANVAS_DPR_CAP = 2;
 // Preview cache limits are computed from device memory and board image count. The hot/warm
 // generations remain, but large boards no longer decode a fixed 192-image working set.
 const EDITOR_PLAYBACK_FPS = 30;
@@ -1479,8 +1480,6 @@ type GesturePose = {
   bodyLean: number;
   headBob: number;
   spriteGesture?: Gesture;
-  spritePreviousGesture?: Gesture;
-  spriteTransitionProgress?: number;
 };
 
 type GestureTestTransition = {
@@ -1546,8 +1545,6 @@ function interpolateGesturePose(from: GesturePose, to: GesturePose, progress: nu
     bodyLean: lerp(from.bodyLean, to.bodyLean, t),
     headBob: lerp(from.headBob, to.headBob, t),
     spriteGesture: to.spriteGesture,
-    spritePreviousGesture: to.spritePreviousGesture,
-    spriteTransitionProgress: to.spriteTransitionProgress,
   };
 }
 
@@ -3020,8 +3017,6 @@ type CharPoseResult = {
   momentumScaleX?: number;
   momentumScaleY?: number;
   spriteGesture?: Gesture;
-  spritePreviousGesture?: Gesture;
-  spriteTransitionProgress?: number;
 };
 
 function playPointingPoseToward(
@@ -3368,8 +3363,6 @@ function evalCharPoseRaw(
       leftForeA: gesturePose.leftForeA, rightForeA: gesturePose.rightForeA,
       airY: 0,
       spriteGesture: gesturePose.spriteGesture,
-      spritePreviousGesture: gesturePose.spritePreviousGesture,
-      spriteTransitionProgress: gesturePose.spriteTransitionProgress,
     };
   };
 
@@ -3965,8 +3958,6 @@ function evalCharPoseRaw(
       rightForeA: heldPose.rightForeA,
       airY: 0,
       spriteGesture: heldPose.spriteGesture,
-      spritePreviousGesture: heldPose.spritePreviousGesture,
-      spriteTransitionProgress: heldPose.spriteTransitionProgress,
     };
   }
 
@@ -4678,6 +4669,7 @@ export default function Board2Page() {
   const [playLiveSpeechStatus, setPlayLiveSpeechStatus] = useState<"idle" | "listening" | "transcribing" | "error">("idle");
   const [playLiveSpeechText, setPlayLiveSpeechText] = useState("");
   const [playViewport, setPlayViewport] = useState({ width: 1280, height: 720 });
+  const [editorCanvasDpr, setEditorCanvasDpr] = useState(1);
   const [pendingMediaPlacement, setPendingMediaPlacement] = useState<PendingMediaPlacement | null>(null);
 
   // ── AI character choreography ──
@@ -5914,11 +5906,7 @@ export default function Board2Page() {
     }
     const automatic = GESTURE_POSES[trackedGesture];
     const renderedGesture = (forced ? mode : trackedGesture) as Gesture;
-    const previousGesture = pointIndex > 0 ? track[pointIndex - 1].gesture : "neutral";
-    const spriteProgress = forced
-      ? 1
-      : point ? clamp((time - point.start) / EXPLAINER_POSE_CROSSFADE_SECONDS, 0, 1) : 1;
-    const target = { ...(forced ?? automatic), spriteGesture: renderedGesture, spritePreviousGesture: previousGesture, spriteTransitionProgress: spriteProgress };
+    const target = { ...(forced ?? automatic), spriteGesture: renderedGesture };
     const transition = id === "c2" ? characterGestureTransition2Ref.current : characterGestureTransitionRef.current;
     if (!transition) return target;
     const progress = (nowMs - transition.startMs) / (GESTURE_TRANSITION_SECONDS * 1000);
@@ -6389,6 +6377,15 @@ export default function Board2Page() {
       clearNarrationAudioElements();
       audioCtxRef.current?.close().catch(() => {});
     };
+  }, []);
+
+  useEffect(() => {
+    const updateEditorCanvasDpr = () => {
+      setEditorCanvasDpr(Math.min(EDITOR_CANVAS_DPR_CAP, window.devicePixelRatio || 1));
+    };
+    updateEditorCanvasDpr();
+    window.addEventListener("resize", updateEditorCanvasDpr);
+    return () => window.removeEventListener("resize", updateEditorCanvasDpr);
   }, []);
 
   // Apply pending scroll after pxPerSec changes
@@ -6873,6 +6870,9 @@ export default function Board2Page() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    const logicalWidth = canvas.width / editorCanvasDpr;
+    const logicalHeight = canvas.height / editorCanvasDpr;
+    ctx.setTransform(editorCanvasDpr, 0, 0, editorCanvasDpr, 0, 0);
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
     let liveCam: { cameraX: number; cameraY: number; boardZoom: number } | null = null;
@@ -6915,20 +6915,23 @@ export default function Board2Page() {
       }
       liveCameraRef.current = liveCam;
     }
-    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, canvas.width, canvas.height, annotationsRef.current, liveCam);
-  }, [renderToCtx]);
+    renderToCtx(ctx, time, clipsRef.current, cameraKeyframesRef.current, logicalWidth, logicalHeight, annotationsRef.current, liveCam);
+  }, [editorCanvasDpr, renderToCtx]);
 
   useEffect(() => { drawFrameRef.current = drawFrame; }, [drawFrame]);
 
   const drawCharacterBoardOverlay = useCallback((canvas: HTMLCanvasElement, time: number) => {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const logicalWidth = canvas.width / editorCanvasDpr;
+    const logicalHeight = canvas.height / editorCanvasDpr;
+    ctx.setTransform(editorCanvasDpr, 0, 0, editorCanvasDpr, 0, 0);
+    ctx.clearRect(0, 0, logicalWidth, logicalHeight);
     if (!showCharacterRef.current && !showCharacter2Ref.current) return;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    const W = canvas.width;
-    const H = canvas.height;
+    const W = logicalWidth;
+    const H = logicalHeight;
     const sf = W / boardDimensionsRef.current.width;
     const cam = { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
     const currentClips = clipsRef.current;
@@ -6999,7 +7002,7 @@ export default function Board2Page() {
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
-  }, []);
+  }, [editorCanvasDpr]);
 
   function boardClipInImmediateViewport(clip: Clip): boolean {
     if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return false;
@@ -15660,8 +15663,8 @@ export default function Board2Page() {
 
             <canvas
               ref={mobileBoardCharacterCanvasRef}
-              width={BOARD_W}
-              height={BOARD_H}
+              width={Math.round(BOARD_W * editorCanvasDpr)}
+              height={Math.round(BOARD_H * editorCanvasDpr)}
               aria-label="Characters on board"
               style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}
             />
@@ -15760,8 +15763,8 @@ export default function Board2Page() {
             {previewVisible && (
               <canvas
                 ref={canvasRef}
-                width={previewRenderW}
-                height={previewRenderH}
+                width={Math.round(previewRenderW * editorCanvasDpr)}
+                height={Math.round(previewRenderH * editorCanvasDpr)}
                 style={{ display: "block", width: mobilePreviewW, height: mobilePreviewH, border: "1.5px solid #2a2a2a", background: "#111", boxShadow: "2px 2px 0 rgba(42,42,42,0.4)" }}
               />
             )}
@@ -17496,8 +17499,8 @@ export default function Board2Page() {
 
                 <canvas
                   ref={boardCharacterCanvasRef}
-                  width={BOARD_W}
-                  height={BOARD_H}
+                  width={Math.round(BOARD_W * editorCanvasDpr)}
+                  height={Math.round(BOARD_H * editorCanvasDpr)}
                   aria-label="Characters on board"
                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 6 }}
                 />
@@ -18476,8 +18479,8 @@ export default function Board2Page() {
                 <div style={{ position: "relative", width: previewW, height: previewHeight }}>
                   <canvas
                     ref={canvasRef}
-                    width={previewRenderW}
-                    height={previewRenderH}
+                    width={Math.round(previewRenderW * editorCanvasDpr)}
+                    height={Math.round(previewRenderH * editorCanvasDpr)}
                     style={{
                       display: "block",
                       width: previewW,

@@ -82,15 +82,15 @@
   },
   "mouthAnchor": {
     "faceLocal": {
-      "x": 143,
-      "y": 208
+      "x": 161,
+      "y": 232
     },
     "canvas": {
-      "x": 720,
-      "y": 757
+      "x": 738,
+      "y": 781
     },
     "headRadiusPx": 144,
-    "note": "starting estimate - tune in the anchor editor"
+    "note": "measured face-local mouth position"
   },
   "expressions": [
     "neutral",
