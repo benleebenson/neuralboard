@@ -7859,9 +7859,14 @@ export default function Board2Page() {
     const { w, h } = getMediaDimensions(item.url, item.type);
     const clipId = generateId();
     const clipDuration = item.duration ?? (item.type === "video" ? 5 : 4);
+    // Manual images are scenery until the editor explicitly features them. Videos retain the
+    // historical timed-content behavior and are inserted at the playhead immediately.
+    const shouldFeatureOnTimeline = item.type === "video";
     if (item.type === "video") createVideoElement(clipId, item.url);
     setClips((prev) => {
-      const placement = resolveManualTimelineInsertion(prev, requestedStart, clipDuration);
+      const placement = shouldFeatureOnTimeline
+        ? resolveManualTimelineInsertion(prev, requestedStart, clipDuration)
+        : null;
       const pos = center
         ? {
             boardX: clamp(center.x - w / 2, 0, BOARD_W - w),
@@ -7872,7 +7877,7 @@ export default function Board2Page() {
         ...prev,
         {
           id: clipId, type: item.type, name: item.name, sourceUrl: item.url,
-          startTime: placement.startTime, duration: clipDuration, layer: placement.layer,
+          startTime: placement?.startTime ?? 0, duration: clipDuration, layer: placement?.layer ?? 1,
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
           sourceBlob: item.blob,
@@ -7880,10 +7885,15 @@ export default function Board2Page() {
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
           source: item.source ?? "manual",
+          ...(!shouldFeatureOnTimeline ? { mediaId: clipId, featured: false as const } : {}),
         },
       ];
     });
+    selectionSurfaceRef.current = "board";
     setClipSelection([clipId]);
+    setToast(shouldFeatureOnTimeline
+      ? "Video added to the board and timeline"
+      : "Image added to the board — select it to add to the timeline");
   }
 
   function queueMediaPlacement(item: MediaItem) {
@@ -9239,7 +9249,7 @@ export default function Board2Page() {
 
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
   // in the media library, and places it on the board via addClipAndPlaceOnBoard.
-  async function ingestMediaFile(file: File | Blob, name: string) {
+  async function ingestMediaFile(file: File | Blob, name: string, center?: { x: number; y: number }) {
     const url = URL.createObjectURL(file);
     const type: "image" | "video" = file.type.startsWith("video") ? "video" : "image";
     let duration: number | undefined;
@@ -9258,7 +9268,7 @@ export default function Board2Page() {
     const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
     setMediaLibrary((prev) => [...prev, item]);
     if (playModeRef.current) queueMediaPlacement(item);
-    else await addClipAndPlaceOnBoard(item);
+    else await addClipAndPlaceOnBoard(item, center);
   }
 
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -9266,6 +9276,28 @@ export default function Board2Page() {
     e.target.value = "";
     for (const file of files) {
       await ingestMediaFile(file, file.name);
+    }
+  }
+
+  function handleBoardFileDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+
+  async function handleBoardFileDrop(e: React.DragEvent<HTMLDivElement>) {
+    const files = Array.from(e.dataTransfer.files).filter((file) =>
+      file.type.startsWith("image/") || file.type.startsWith("video/"),
+    );
+    if (files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const point = clientToBoardPoint(e.clientX, e.clientY);
+    for (const [index, file] of files.entries()) {
+      await ingestMediaFile(file, file.name, {
+        x: point.x + index * 28,
+        y: point.y + index * 28,
+      });
     }
   }
 
@@ -10351,7 +10383,6 @@ export default function Board2Page() {
   // (server-side, sidesteps browser CORS on arbitrary Google Images sources), turn it into a
   // real image Clip at the placeholder's board position, and drop the placeholder.
   async function commitImagePlaceholder(ph: ImagePlaceholder) {
-    const requestedStart = playheadRef.current;
     setImagePreviewWorking(true);
     setImagePreviewError("");
     const toastId = generateId();
@@ -10367,19 +10398,22 @@ export default function Board2Page() {
       await decodeImageForPlacement(blobUrl);
       const { w, h } = getMediaDimensions(blobUrl, "image");
       const clipId = generateId();
-      setClips((prev) => {
-        const placement = resolveManualTimelineInsertion(prev, requestedStart, 4);
-        return [...prev, {
-          id: clipId, type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
-          startTime: placement.startTime, duration: 4, layer: placement.layer,
+      setClips((prev) => [
+        ...prev,
+        {
+          id: clipId, mediaId: clipId, featured: false as const,
+          type: "image" as const, name: ph.title.slice(0, 40), sourceUrl: blobUrl,
+          startTime: 0, duration: 4, layer: 1,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
           sourceBlob: blob,
           source: "neuralSearch" as const,
-        }];
-      });
-      setSelectedClipId(clipId);
+        },
+      ]);
+      selectionSurfaceRef.current = "board";
+      setClipSelection([clipId]);
       removeImagePlaceholder(ph.id);
       setImagePreviewTarget(null);
+      setToast("Image added to the board — select it to add to the timeline");
 
       setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 2000);
@@ -14698,7 +14732,7 @@ export default function Board2Page() {
             await ingestMediaFile(file, `Pasted image ${Date.now()}.${ext}`);
             pastedCount++;
           }
-          if (pastedCount > 0) setToast("Image pasted");
+          if (pastedCount > 0) setToast("Image pasted to the board — select it to add to the timeline");
         })();
         return;
       }
@@ -15615,6 +15649,8 @@ export default function Board2Page() {
         <div
           ref={boardContainerRef}
           style={{ flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0 }}
+          onDragOver={handleBoardFileDragOver}
+          onDrop={(e) => { void handleBoardFileDrop(e); }}
           onPointerDown={handleMobileBoardPointerDown}
           onPointerMove={handleMobileBoardPointerMove}
           onPointerUp={handleMobileBoardPointerUp}
@@ -16167,6 +16203,16 @@ export default function Board2Page() {
                           style={{ width: "100%", accentColor: "#c8f135" }}
                         />
                       </div>
+                    )}
+                    {isBoardBackedClip(selectedClip) && selectedClip.featured === false && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          addBoardMediaToTimeline(selectedClip.id);
+                          setMobileDrawer(null);
+                        }}
+                        style={{ ...sketchButton, width: "100%", padding: "10px", fontSize: 13, background: "#c8f135" }}
+                      >＋ Add to timeline at playhead</button>
                     )}
                     <div style={{ display: "flex", gap: 8 }}>
                       <button onClick={() => copyClip(selectedClipId!)} style={{ ...miniButton, flex: 1, padding: "8px", fontSize: 12 }}>⌘ Copy</button>
@@ -17457,7 +17503,7 @@ export default function Board2Page() {
               onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }}
             />
             <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: "4px 0 0" }}>
-              Upload images or videos — they automatically appear on the board and timeline.
+              Images land on the board as scenery. Select one and choose “Add to timeline” when it belongs in the edit. Videos are timed automatically.
             </p>
           </div>
 
@@ -17468,6 +17514,8 @@ export default function Board2Page() {
             <div
               ref={boardContainerRef}
               style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode || isMobile ? "none" : undefined }}
+              onDragOver={handleBoardFileDragOver}
+              onDrop={(e) => { void handleBoardFileDrop(e); }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
               onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
               onPointerMove={boardMode || isMobile ? handleMobileBoardPointerMove : undefined}
@@ -19384,9 +19432,11 @@ export default function Board2Page() {
                 <div style={{ marginTop: "auto" }}>
                   {isBoardBackedClip(selectedClip) && selectedClip.featured === false && (
                     <button
+                      type="button"
                       onClick={() => addBoardMediaToTimeline(selectedClip.id)}
-                      style={{ ...miniButton, marginBottom: 8, background: "#c8f135" }}
-                    >＋ Add to timeline</button>
+                      title="Create a timeline block at the current playhead"
+                      style={{ ...miniButton, width: "100%", marginBottom: 8, background: "#c8f135" }}
+                    >＋ Add to timeline at playhead</button>
                   )}
                   <button
                     onClick={() => selectionSurfaceRef.current === "board" && isBoardBackedClip(selectedClip)
