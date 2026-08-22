@@ -2,6 +2,8 @@ export type TimelineLayerInterval = {
   startTime: number;
   duration: number;
   layer?: number;
+  type?: string;
+  featured?: boolean;
 };
 
 export type TimelineInsertionPlacement = {
@@ -72,4 +74,37 @@ export function resolveTimelineInsertion(
         ? "requested-layer"
         : "alternate-layer",
   };
+}
+
+/**
+ * Continues the custom-zoom sequence from the timeline appearance whose end is latest.
+ * Its layer becomes the preferred layer for the next block. Board-only custom zoom
+ * entities do not establish or extend the sequence.
+ */
+export function resolveCustomZoomInsertion(
+  intervals: readonly TimelineLayerInterval[],
+  playhead: number,
+  duration: number,
+  preferredLayer: number,
+  layerCount: number,
+): TimelineInsertionPlacement {
+  const lastCustomZoom = intervals.reduce<TimelineLayerInterval | undefined>((latest, interval) => {
+    if (interval.type !== "customZoom" || interval.featured === false) return latest;
+    if (!latest) return interval;
+    const latestEnd = latest.startTime + latest.duration;
+    const intervalEnd = interval.startTime + interval.duration;
+    return intervalEnd >= latestEnd ? interval : latest;
+  }, undefined);
+  const requestedStart = lastCustomZoom
+    ? Math.round((lastCustomZoom.startTime + lastCustomZoom.duration) * 1_000_000) / 1_000_000
+    : playhead;
+  const chainLayer = lastCustomZoom?.layer ?? preferredLayer;
+
+  return resolveTimelineInsertion(
+    intervals.filter((interval) => interval.featured !== false),
+    requestedStart,
+    duration,
+    chainLayer,
+    layerCount,
+  );
 }

@@ -173,7 +173,11 @@ import {
   previewCachePolicy as calculatePreviewCachePolicy,
   type PreviewCachePolicy,
 } from "@/lib/board2/image-cache-policy";
-import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
+import {
+  resolveCustomZoomInsertion,
+  resolveTimelineInsertion,
+  type TimelineInsertionPlacement,
+} from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
 import {
   CUSTOM_ZOOM_DURATION_STEP,
@@ -8071,18 +8075,30 @@ export default function Board2Page() {
   // aspect ratio without any special-casing there.
   function addCustomZoomClip(boardX: number, boardY: number, boardW: number, boardH: number, atTime?: number) {
     const id = generateId();
-    const requestedStart = atTime ?? playheadRef.current;
     const duration = customZoomDurationRef.current;
-    setClips((prev) => {
-      const placement = resolveManualTimelineInsertion(prev, requestedStart, duration);
-      const clip: Clip = {
-        id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
-        startTime: placement.startTime, duration, holdFraction: 0.65, layer: placement.layer,
-        boardX: Math.round(boardX), boardY: Math.round(boardY),
-        boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
-      };
-      return [...prev, clip];
-    });
+    const existingClips = clipsRef.current;
+    const placement = resolveCustomZoomInsertion(
+      existingClips.filter((clip) => clip.type !== "narration"),
+      atTime ?? playheadRef.current,
+      duration,
+      1,
+      N_LAYERS,
+    );
+    const clip: Clip = {
+      id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
+      startTime: placement.startTime, duration, holdFraction: 0.65, layer: placement.layer,
+      boardX: Math.round(boardX), boardY: Math.round(boardY),
+      boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
+    };
+    // Keep the ref current immediately so consecutive draw gestures chain even before React's
+    // effect has synchronized the committed state.
+    clipsRef.current = [...existingClips, clip];
+    setClips((prev) => [...prev, clip]);
+    if (placement.resolution === "alternate-layer") {
+      setToast(`Custom zoom chained at ${placement.startTime.toFixed(1)}s on free layer ${placement.layer + 1}`);
+    } else if (placement.resolution === "shifted") {
+      setToast(`Custom zoom chained at nearest free time ${placement.startTime.toFixed(1)}s on layer ${placement.layer + 1}`);
+    }
     setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
