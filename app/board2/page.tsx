@@ -175,6 +175,13 @@ import {
 } from "@/lib/board2/image-cache-policy";
 import { resolveTimelineInsertion, type TimelineInsertionPlacement } from "@/lib/board2/timeline-placement";
 import { applyTimelineBlockDrag } from "@/lib/board2/timeline-manipulation";
+import {
+  CUSTOM_ZOOM_DURATION_STEP,
+  DEFAULT_CUSTOM_ZOOM_DURATION,
+  MAX_CUSTOM_ZOOM_DURATION,
+  MIN_CUSTOM_ZOOM_DURATION,
+  normalizeCustomZoomDuration,
+} from "@/lib/board2/custom-zoom-duration";
 import { resolveTerrainFootIK } from "@/lib/board2/editor-character-physics";
 import {
   ANNOTATION_LINE_HEIGHT,
@@ -538,7 +545,7 @@ function narrationGestureSourceSignature(clips: readonly Clip[]): string {
   return narrationVisemeSourceSignature(clips);
 }
 
-// ─── "Complete recipe" save schema (schemaVersion 5) ───────────────────────────
+// ─── "Complete recipe" save schema (schemaVersion 6) ───────────────────────────
 // See app/board2/page.tsx saveBoard/loadBoard/exportBoardData. This is a versioned superset of
 // the flat manifest the app has always saved: it nests the same data plus lightweight provenance
 // tags and two "resolved" snapshots (camera + character position) baked at save time from the
@@ -4754,6 +4761,7 @@ export default function Board2Page() {
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
   const [customZoomDrawMode, setCustomZoomDrawMode] = useState(false);
   const [customZoomDrawPreview, setCustomZoomDrawPreview] = useState<BoardMarquee>(null);
+  const [customZoomDuration, setCustomZoomDuration] = useState(DEFAULT_CUSTOM_ZOOM_DURATION);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -4878,6 +4886,7 @@ export default function Board2Page() {
   const boardMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
   const timelineMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
   const customZoomDrawModeRef = useRef(false);
+  const customZoomDurationRef = useRef(DEFAULT_CUSTOM_ZOOM_DURATION);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
   const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
   const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
@@ -5699,6 +5708,7 @@ export default function Board2Page() {
   }, [previewCachePolicy]);
   useEffect(() => { boardDimensionsRef.current = boardDimensions; }, [boardDimensions]);
   useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
+  useEffect(() => { customZoomDurationRef.current = customZoomDuration; }, [customZoomDuration]);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
   useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
@@ -8062,7 +8072,7 @@ export default function Board2Page() {
   function addCustomZoomClip(boardX: number, boardY: number, boardW: number, boardH: number, atTime?: number) {
     const id = generateId();
     const requestedStart = atTime ?? playheadRef.current;
-    const duration = 3;
+    const duration = customZoomDurationRef.current;
     setClips((prev) => {
       const placement = resolveManualTimelineInsertion(prev, requestedStart, duration);
       const clip: Clip = {
@@ -8075,6 +8085,19 @@ export default function Board2Page() {
     });
     setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function adjustCustomZoomDuration(delta: number) {
+    const next = normalizeCustomZoomDuration(customZoomDurationRef.current + delta);
+    customZoomDurationRef.current = next;
+    setCustomZoomDuration(next);
+  }
+
+  function toggleCustomZoomDrawMode() {
+    const next = !customZoomDrawModeRef.current;
+    customZoomDrawModeRef.current = next;
+    setCustomZoomDrawMode(next);
+    if (next) disarmAnnotationTool();
   }
 
   function openFaceCropFromSource(url: string, name: string) {
@@ -16388,7 +16411,7 @@ export default function Board2Page() {
 
   // ─── Save / Load ──────────────────────────────────────────────────────────
 
-  // Builds the full "complete recipe" manifest (schemaVersion 5) — the shared core of both
+  // Builds the full "complete recipe" manifest (schemaVersion 6) — the shared core of both
   // Save Board (.nbp: media zipped alongside manifest.json) and Export Board Data (a single
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
@@ -16621,7 +16644,7 @@ export default function Board2Page() {
     }));
 
     const manifest = {
-      schemaVersion: 5 as const,
+      schemaVersion: 6 as const,
       meta: {
         id: recipeProjectIdRef.current,
         projectId: recipeProjectIdRef.current,
@@ -16647,6 +16670,7 @@ export default function Board2Page() {
       },
       timeline: {
         blocks: timelineBlocks,
+        customZoomDurationSeconds: customZoomDurationRef.current,
       },
       annotations: normalizedAnnotations,
       narration: {
@@ -16820,6 +16844,7 @@ export default function Board2Page() {
         narrationGestureTrack: rawManifest.narration?.gestureTrack ?? [],
         narrationGestureTrackSource: rawManifest.narration?.gestureTrackFingerprint ?? null,
         smartGestures: rawManifest.narration?.smartGestures === true,
+        customZoomDurationSeconds: rawManifest.timeline?.customZoomDurationSeconds,
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
       } : rawManifest;
       if (schemaVersion >= 1) {
@@ -16915,6 +16940,9 @@ export default function Board2Page() {
       narrationGestureTrackRef.current = loadedGestureTrack;
       narrationGestureTrackSourceRef.current = loadedGestureSource;
       setSmartGestures(manifest.smartGestures === true);
+      const loadedCustomZoomDuration = normalizeCustomZoomDuration(manifest.customZoomDurationSeconds);
+      customZoomDurationRef.current = loadedCustomZoomDuration;
+      setCustomZoomDuration(loadedCustomZoomDuration);
       const hadLegacyGeneratedCameraMode = manifest.cameraKeyframeMode === "character" || manifest.cameraKeyframeMode === "follow";
       const loadedCameraKeyframes = hadLegacyGeneratedCameraMode ? [] : manifest.cameraKeyframes ?? [];
       setCameraKeyframes(loadedCameraKeyframes);
@@ -17049,12 +17077,98 @@ export default function Board2Page() {
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
+  function renderCustomZoomControls(boardOverlay = false) {
+    return (
+      <div
+        className="nb-custom-zoom-controls"
+        aria-label="Custom zoom controls"
+        onPointerDown={(event) => event.stopPropagation()}
+        style={{ display: "flex", alignItems: "stretch", gap: 4, width: boardOverlay ? "auto" : "100%", touchAction: "manipulation" }}
+      >
+        <button
+          type="button"
+          className="nb-custom-zoom-trigger"
+          onClick={toggleCustomZoomDrawMode}
+          style={{
+            ...sketchButton,
+            flex: "1 1 auto",
+            minWidth: 0,
+            background: CUSTOM_ZOOM_CLIP_COLOR,
+            fontSize: 11,
+            padding: "6px 7px",
+            fontWeight: 700,
+            whiteSpace: "nowrap",
+            outline: customZoomDrawMode ? "2px solid #2e8fff" : "none",
+            outlineOffset: -2,
+          }}
+          title="Click, then drag a box on the board to zoom into that exact region"
+        >
+          {customZoomDrawMode ? "🔍 Drag a box…" : "🔍 Custom Zoom"}
+        </button>
+        <div
+          role="group"
+          aria-label="Default duration for new custom zoom blocks"
+          style={{ display: "flex", alignItems: "stretch", flex: "0 0 auto" }}
+        >
+          <output
+            className="nb-custom-zoom-duration"
+            aria-label={`Custom zoom duration ${customZoomDuration.toFixed(1)} seconds`}
+            aria-live="polite"
+            style={{
+              width: 38,
+              height: 28,
+              boxSizing: "border-box",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              border: "1px solid #2a2a2a",
+              borderRight: 0,
+              background: "rgba(255,253,245,0.86)",
+              fontFamily: "monospace",
+              fontSize: 10,
+              fontWeight: 700,
+            }}
+          >
+            {customZoomDuration.toFixed(1)}s
+          </output>
+          <button
+            type="button"
+            className="nb-custom-zoom-step"
+            aria-label="Decrease custom zoom duration by 0.1 seconds"
+            title="Decrease new custom zoom duration"
+            disabled={customZoomDuration <= MIN_CUSTOM_ZOOM_DURATION}
+            onClick={() => adjustCustomZoomDuration(-CUSTOM_ZOOM_DURATION_STEP)}
+            style={{ ...miniButton, width: 26, height: 28, padding: 0, opacity: customZoomDuration <= MIN_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
+          >
+            −
+          </button>
+          <button
+            type="button"
+            className="nb-custom-zoom-step"
+            aria-label="Increase custom zoom duration by 0.1 seconds"
+            title="Increase new custom zoom duration"
+            disabled={customZoomDuration >= MAX_CUSTOM_ZOOM_DURATION}
+            onClick={() => adjustCustomZoomDuration(CUSTOM_ZOOM_DURATION_STEP)}
+            style={{ ...miniButton, width: 26, height: 28, padding: 0, borderLeft: 0, opacity: customZoomDuration >= MAX_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
+          >
+            +
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: boardMode ? "100dvh" : pageStyle.height, minHeight: boardMode ? "100dvh" : pageStyle.minHeight }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
         [data-board2-exporting] > :not(style):not([aria-hidden="true"]):not([data-export-progress]) { visibility: hidden !important; }
+        @media (pointer: coarse) {
+          .nb-custom-zoom-trigger { min-height: 44px !important; }
+          .nb-custom-zoom-duration { height: 44px !important; }
+          .nb-custom-zoom-step { width: 44px !important; min-width: 44px !important; height: 44px !important; }
+        }
       `}</style>
 
       {/* ── Header ── */}
@@ -17163,16 +17277,7 @@ export default function Board2Page() {
             >
               ◎ Zoom on character
             </button>
-            <button
-              onClick={() => setCustomZoomDrawMode((v) => !v)}
-              style={{
-                ...sketchButton, background: CUSTOM_ZOOM_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700,
-                outline: customZoomDrawMode ? "2px solid #2e8fff" : "none", outlineOffset: -2,
-              }}
-              title="Click, then drag a box on the board to zoom into that exact region"
-            >
-              {customZoomDrawMode ? "🔍 Drag a box on the board…" : "🔍 Draw custom zoom"}
-            </button>
+            {renderCustomZoomControls()}
             <button
               onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); }}
               style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
@@ -17354,6 +17459,11 @@ export default function Board2Page() {
               onPointerCancel={boardMode || isMobile ? handleMobileBoardPointerUp : undefined}
             >
               {boardMode && <button type="button" aria-label="Exit Board Mode" onClick={() => setBoardMode(false)} style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", right: "max(10px, env(safe-area-inset-right))", zIndex: 100, width: 48, height: 48, border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.94)", fontSize: 20, touchAction: "manipulation" }}>✕</button>}
+              {boardMode && (
+                <div style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", left: "max(10px, env(safe-area-inset-left))", zIndex: 100 }}>
+                  {renderCustomZoomControls(true)}
+                </div>
+              )}
               {boardMode && <canvas ref={penOverlayRef} aria-hidden="true" style={{ position: "absolute", inset: 0, zIndex: 95, pointerEvents: "none" }} />}
               {boardMode && mobileLongPressClipId && (
                 <div onPointerDown={(e) => e.stopPropagation()} onClick={() => setMobileLongPressClipId(null)} style={{ position: "fixed", inset: 0, zIndex: 120, background: "rgba(0,0,0,.25)", display: "flex", alignItems: "flex-end", justifyContent: "center", padding: "16px max(16px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))" }}>
