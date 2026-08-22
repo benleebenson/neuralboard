@@ -1460,6 +1460,7 @@ const FRAME_ALL_PADDING = 0.1;
 // high-fill ratio above, while cluster-wide establishing beats keep their own wide framing.
 const PAN_TRAVERSAL_REFERENCE_FILL_RATIO = 0.78;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
+const CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY = "nb_board2_custom_zoom_continuous";
 const AMBIENT_BUDGET = 4;
 const AMBIENT_STATE_EVAL_INTERVAL_MS = 100;
 const AMBIENT_VIEWPORT_EXPAND = 0.25;
@@ -4766,6 +4767,7 @@ export default function Board2Page() {
   const [customZoomDrawMode, setCustomZoomDrawMode] = useState(false);
   const [customZoomDrawPreview, setCustomZoomDrawPreview] = useState<BoardMarquee>(null);
   const [customZoomDuration, setCustomZoomDuration] = useState(DEFAULT_CUSTOM_ZOOM_DURATION);
+  const [customZoomContinuous, setCustomZoomContinuous] = useState(false);
 
   const canvasW = canvasAspect === "16:9" ? CANVAS_W_LAND : CANVAS_H_LAND;
   const canvasH = canvasAspect === "16:9" ? CANVAS_H_LAND : CANVAS_W_LAND;
@@ -4891,6 +4893,21 @@ export default function Board2Page() {
   const timelineMarqueeStartClientRef = useRef<{ x: number; y: number } | null>(null);
   const customZoomDrawModeRef = useRef(false);
   const customZoomDurationRef = useRef(DEFAULT_CUSTOM_ZOOM_DURATION);
+  const customZoomContinuousRef = useRef(false);
+  const customZoomTouchPointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const customZoomGestureRef = useRef<
+    | { type: "draw"; pointerId: number; startX: number; startY: number }
+    | { type: "pan"; pointerId: number; startClientX: number; startClientY: number; startPan: { x: number; y: number } }
+    | {
+        type: "touch-navigation";
+        startDistance: number;
+        startCenterX: number;
+        startCenterY: number;
+        startZoom: number;
+        startPan: { x: number; y: number };
+      }
+    | null
+  >(null);
   const rafCallbackRef = useRef<FrameRequestCallback>(() => {});
   const dividerDragRef = useRef<{ clipId: string; innerStartPx: number; innerWidthPx: number } | null>(null);
   const videoHiddenContainerRef = useRef<HTMLDivElement>(null);
@@ -5713,6 +5730,16 @@ export default function Board2Page() {
   useEffect(() => { boardDimensionsRef.current = boardDimensions; }, [boardDimensions]);
   useEffect(() => { customZoomDrawModeRef.current = customZoomDrawMode; }, [customZoomDrawMode]);
   useEffect(() => { customZoomDurationRef.current = customZoomDuration; }, [customZoomDuration]);
+  useEffect(() => {
+    const restoreTimer = window.setTimeout(() => {
+      try {
+        const restored = window.sessionStorage.getItem(CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY) === "1";
+        customZoomContinuousRef.current = restored;
+        setCustomZoomContinuous(restored);
+      } catch {}
+    }, 0);
+    return () => window.clearTimeout(restoreTimer);
+  }, []);
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
   useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
@@ -8119,11 +8146,32 @@ export default function Board2Page() {
     setCustomZoomDuration(next);
   }
 
+  function disarmCustomZoomDrawMode() {
+    customZoomDrawModeRef.current = false;
+    customZoomGestureRef.current = null;
+    customZoomTouchPointersRef.current.clear();
+    if (boardContainerRef.current) {
+      boardContainerRef.current.style.cursor = pendingMediaPlacementsRef.current.length > 0 ? "crosshair" : "default";
+    }
+    setCustomZoomDrawPreview(null);
+    setCustomZoomDrawMode(false);
+  }
+
   function toggleCustomZoomDrawMode() {
-    const next = !customZoomDrawModeRef.current;
-    customZoomDrawModeRef.current = next;
-    setCustomZoomDrawMode(next);
-    if (next) disarmAnnotationTool();
+    if (customZoomDrawModeRef.current) {
+      disarmCustomZoomDrawMode();
+      return;
+    }
+    customZoomDrawModeRef.current = true;
+    setCustomZoomDrawMode(true);
+    disarmAnnotationTool();
+  }
+
+  function toggleCustomZoomContinuous() {
+    const next = !customZoomContinuousRef.current;
+    customZoomContinuousRef.current = next;
+    setCustomZoomContinuous(next);
+    try { window.sessionStorage.setItem(CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY, next ? "1" : "0"); } catch {}
   }
 
   function openFaceCropFromSource(url: string, name: string) {
@@ -11187,36 +11235,132 @@ export default function Board2Page() {
 
   // ─ Custom zoom box creation (glass pane) ──────────────────────────────────
   // Same click-drag-release rectangle mechanic as the annotation tools above, but produces a
-  // Clip (type "customZoom") instead of an Annotation, and auto-disarms draw mode after one box.
+  // Clip (type "customZoom") instead of an Annotation. Continuous mode leaves the glass pane
+  // armed after a completed box. Space/middle-drag pans, and a two-finger touch gesture pans and
+  // pinches without accidentally creating a focus region.
 
   function handleCustomZoomGlassPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0 && e.button !== 1) return;
     e.stopPropagation();
-    const container = boardContainerRef.current!;
-    const rect = container.getBoundingClientRect();
-    const startBX = (e.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
-    const startBY = (e.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
+    e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    setCustomZoomDrawPreview({ startX: startBX, startY: startBY, currentX: startBX, currentY: startBY });
-    const onMove = (ev: PointerEvent) => {
-      const bx = (ev.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
-      const by = (ev.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
-      setCustomZoomDrawPreview({ startX: startBX, startY: startBY, currentX: bx, currentY: by });
+
+    if (e.pointerType === "touch") {
+      const pointers = customZoomTouchPointersRef.current;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size >= 2) {
+        const [first, second] = [...pointers.values()];
+        const rect = boardContainerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        setCustomZoomDrawPreview(null);
+        customZoomGestureRef.current = {
+          type: "touch-navigation",
+          startDistance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
+          startCenterX: (first.x + second.x) / 2 - rect.left,
+          startCenterY: (first.y + second.y) / 2 - rect.top,
+          startZoom: boardZoomRef.current,
+          startPan: { ...boardPanRef.current },
+        };
+        return;
+      }
+    } else if (customZoomGestureRef.current) {
+      return;
+    }
+
+    if (isSpaceDownRef.current || e.button === 1) {
+      customZoomGestureRef.current = {
+        type: "pan",
+        pointerId: e.pointerId,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startPan: { ...boardPanRef.current },
+      };
+      return;
+    }
+
+    const start = clientToBoardPoint(e.clientX, e.clientY);
+    customZoomGestureRef.current = {
+      type: "draw",
+      pointerId: e.pointerId,
+      startX: start.x,
+      startY: start.y,
     };
-    const onUp = (ev: PointerEvent) => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      setCustomZoomDrawPreview(null);
-      setCustomZoomDrawMode(false);
-      const ex = (ev.clientX - rect.left - boardPanRef.current.x) / boardZoomRef.current;
-      const ey = (ev.clientY - rect.top - boardPanRef.current.y) / boardZoomRef.current;
-      const minBX = Math.min(startBX, ex), maxBX = Math.max(startBX, ex);
-      const minBY = Math.min(startBY, ey), maxBY = Math.max(startBY, ey);
-      const bw = maxBX - minBX, bh = maxBY - minBY;
-      if (bw < 10 || bh < 10) return;
-      addCustomZoomClip(minBX, minBY, bw, bh);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
+    setCustomZoomDrawPreview({ startX: start.x, startY: start.y, currentX: start.x, currentY: start.y });
+  }
+
+  function handleCustomZoomGlassPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const pointers = customZoomTouchPointersRef.current;
+    if (e.pointerType === "touch" && pointers.has(e.pointerId)) {
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+    const gesture = customZoomGestureRef.current;
+    if (!gesture) return;
+
+    if (gesture.type === "touch-navigation") {
+      if (pointers.size < 2) return;
+      const [first, second] = [...pointers.values()];
+      const rect = boardContainerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
+      const centerX = (first.x + second.x) / 2 - rect.left;
+      const centerY = (first.y + second.y) / 2 - rect.top;
+      const nextZoom = clamp(gesture.startZoom * distance / gesture.startDistance, 0.05, 3);
+      const anchorBoardX = (gesture.startCenterX - gesture.startPan.x) / gesture.startZoom;
+      const anchorBoardY = (gesture.startCenterY - gesture.startPan.y) / gesture.startZoom;
+      const nextPan = {
+        x: centerX - anchorBoardX * nextZoom,
+        y: centerY - anchorBoardY * nextZoom,
+      };
+      boardZoomRef.current = nextZoom;
+      boardPanRef.current = nextPan;
+      setBoardZoom(nextZoom);
+      setBoardPan(nextPan);
+      return;
+    }
+
+    if (gesture.pointerId !== e.pointerId) return;
+    if (gesture.type === "pan") {
+      const nextPan = {
+        x: gesture.startPan.x + e.clientX - gesture.startClientX,
+        y: gesture.startPan.y + e.clientY - gesture.startClientY,
+      };
+      boardPanRef.current = nextPan;
+      setBoardPan(nextPan);
+      return;
+    }
+
+    const point = clientToBoardPoint(e.clientX, e.clientY);
+    setCustomZoomDrawPreview({
+      startX: gesture.startX,
+      startY: gesture.startY,
+      currentX: point.x,
+      currentY: point.y,
+    });
+  }
+
+  function finishCustomZoomGlassPointer(e: React.PointerEvent<HTMLDivElement>, cancelled = false) {
+    const pointers = customZoomTouchPointersRef.current;
+    if (e.pointerType === "touch") pointers.delete(e.pointerId);
+    const gesture = customZoomGestureRef.current;
+    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch {}
+    if (!gesture) return;
+    if (gesture.type === "touch-navigation") {
+      if (pointers.size === 0) customZoomGestureRef.current = null;
+      return;
+    }
+    if (gesture.pointerId !== e.pointerId) return;
+    customZoomGestureRef.current = null;
+    if (gesture.type === "pan") return;
+
+    setCustomZoomDrawPreview(null);
+    if (!customZoomContinuousRef.current) disarmCustomZoomDrawMode();
+    if (cancelled) return;
+    const end = clientToBoardPoint(e.clientX, e.clientY);
+    const minBX = Math.min(gesture.startX, end.x), maxBX = Math.max(gesture.startX, end.x);
+    const minBY = Math.min(gesture.startY, end.y), maxBY = Math.max(gesture.startY, end.y);
+    const bw = maxBX - minBX, bh = maxBY - minBY;
+    if (bw < 10 || bh < 10) return;
+    addCustomZoomClip(minBX, minBY, bw, bh);
   }
 
   // ─ Timeline drag with cursor-anchored magnetic snap ───────────────────────
@@ -14633,6 +14777,11 @@ export default function Board2Page() {
         cancelPendingMediaPlacement();
         return;
       }
+      if (!inInput && e.code === "Escape" && customZoomDrawModeRef.current) {
+        e.preventDefault();
+        disarmCustomZoomDrawMode();
+        return;
+      }
       if (!inInput && e.code === "Escape" && annotationToolRef.current !== "pointer") {
         e.preventDefault();
         disarmAnnotationTool();
@@ -14644,7 +14793,7 @@ export default function Board2Page() {
         if (boardContainerRef.current) boardContainerRef.current.style.cursor = "grab";
         if (!inInput) {
           e.preventDefault();
-          if (!e.repeat) togglePlay();
+          if (!customZoomDrawModeRef.current && !e.repeat) togglePlay();
         }
         return;
       }
@@ -14686,7 +14835,7 @@ export default function Board2Page() {
       if (e.code === "Space") {
         isSpaceDownRef.current = false;
         setIsSpaceDown(false);
-        if (boardContainerRef.current) boardContainerRef.current.style.cursor = "default";
+        if (boardContainerRef.current) boardContainerRef.current.style.cursor = customZoomDrawModeRef.current ? "crosshair" : "default";
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -17145,27 +17294,42 @@ export default function Board2Page() {
         className="nb-custom-zoom-controls"
         aria-label="Custom zoom controls"
         onPointerDown={(event) => event.stopPropagation()}
-        style={{ display: "flex", alignItems: "stretch", gap: 4, width: boardOverlay ? "auto" : "100%", touchAction: "manipulation" }}
+        style={{
+          display: "grid",
+          gridTemplateColumns: boardOverlay ? "minmax(112px, auto) auto auto" : "minmax(0, 1fr) auto",
+          alignItems: "stretch",
+          gap: 4,
+          width: boardOverlay ? "auto" : "100%",
+          touchAction: "manipulation",
+        }}
       >
         <button
           type="button"
           className="nb-custom-zoom-trigger"
           onClick={toggleCustomZoomDrawMode}
+          aria-pressed={customZoomDrawMode}
+          aria-label={customZoomDrawMode ? "Exit Custom Zoom drawing mode" : "Arm Custom Zoom drawing mode"}
           style={{
             ...sketchButton,
-            flex: "1 1 auto",
             minWidth: 0,
-            background: CUSTOM_ZOOM_CLIP_COLOR,
+            minHeight: boardOverlay ? 44 : 28,
+            background: customZoomDrawMode ? "#2e8fff" : CUSTOM_ZOOM_CLIP_COLOR,
+            color: customZoomDrawMode ? "#fff" : "#2a2a2a",
             fontSize: 11,
             padding: "6px 7px",
             fontWeight: 700,
             whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
             outline: customZoomDrawMode ? "2px solid #2e8fff" : "none",
             outlineOffset: -2,
+            boxShadow: customZoomDrawMode ? "0 0 0 2px #fff, 3px 3px 0 #2a2a2a" : sketchButton.boxShadow,
           }}
-          title="Click, then drag a box on the board to zoom into that exact region"
+          title={customZoomDrawMode
+            ? "Custom Zoom is armed. Drag a region; press Esc or click again to exit. Space-drag or middle-drag pans."
+            : "Arm Custom Zoom, then drag a box on the board to zoom into that exact region"}
         >
-          {customZoomDrawMode ? "🔍 Drag a box…" : "🔍 Custom Zoom"}
+          {customZoomDrawMode ? (boardOverlay ? "✚ Draw region · Esc" : "✚ Armed · Esc") : "🔍 Custom Zoom"}
         </button>
         <div
           role="group"
@@ -17177,8 +17341,8 @@ export default function Board2Page() {
             aria-label={`Custom zoom duration ${customZoomDuration.toFixed(1)} seconds`}
             aria-live="polite"
             style={{
-              width: 38,
-              height: 28,
+              width: boardOverlay ? 44 : 38,
+              height: boardOverlay ? 44 : 28,
               boxSizing: "border-box",
               display: "flex",
               alignItems: "center",
@@ -17200,7 +17364,7 @@ export default function Board2Page() {
             title="Decrease new custom zoom duration"
             disabled={customZoomDuration <= MIN_CUSTOM_ZOOM_DURATION}
             onClick={() => adjustCustomZoomDuration(-CUSTOM_ZOOM_DURATION_STEP)}
-            style={{ ...miniButton, width: 26, height: 28, padding: 0, opacity: customZoomDuration <= MIN_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
+            style={{ ...miniButton, width: boardOverlay ? 44 : 26, height: boardOverlay ? 44 : 28, padding: 0, opacity: customZoomDuration <= MIN_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
           >
             −
           </button>
@@ -17211,11 +17375,34 @@ export default function Board2Page() {
             title="Increase new custom zoom duration"
             disabled={customZoomDuration >= MAX_CUSTOM_ZOOM_DURATION}
             onClick={() => adjustCustomZoomDuration(CUSTOM_ZOOM_DURATION_STEP)}
-            style={{ ...miniButton, width: 26, height: 28, padding: 0, borderLeft: 0, opacity: customZoomDuration >= MAX_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
+            style={{ ...miniButton, width: boardOverlay ? 44 : 26, height: boardOverlay ? 44 : 28, padding: 0, borderLeft: 0, opacity: customZoomDuration >= MAX_CUSTOM_ZOOM_DURATION ? 0.4 : 1 }}
           >
             +
           </button>
         </div>
+        <button
+          type="button"
+          className="nb-custom-zoom-continuous"
+          aria-pressed={customZoomContinuous}
+          aria-label={customZoomContinuous ? "Turn off continuous Custom Zoom" : "Keep Custom Zoom armed after each region"}
+          title={customZoomContinuous
+            ? "Continuous Custom Zoom is on for this browser session"
+            : "Keep Custom Zoom armed after each region (saved for this browser session)"}
+          onClick={toggleCustomZoomContinuous}
+          style={{
+            ...miniButton,
+            gridColumn: boardOverlay ? undefined : "1 / -1",
+            minWidth: boardOverlay ? 44 : 0,
+            minHeight: boardOverlay ? 44 : 28,
+            padding: boardOverlay ? 0 : "4px 8px",
+            background: customZoomContinuous ? "#2a2a2a" : "#fffdf5",
+            color: customZoomContinuous ? "#c8f135" : "#2a2a2a",
+            fontSize: boardOverlay ? 17 : 10,
+            fontWeight: 700,
+          }}
+        >
+          {boardOverlay ? "📌" : `📌 Keep on ${customZoomContinuous ? "✓" : ""}`}
+        </button>
       </div>
     );
   }
@@ -17230,6 +17417,7 @@ export default function Board2Page() {
           .nb-custom-zoom-trigger { min-height: 44px !important; }
           .nb-custom-zoom-duration { height: 44px !important; }
           .nb-custom-zoom-step { width: 44px !important; min-width: 44px !important; height: 44px !important; }
+          .nb-custom-zoom-continuous { min-width: 44px !important; min-height: 44px !important; }
         }
       `}</style>
 
@@ -17988,10 +18176,15 @@ export default function Board2Page() {
                 )}
 
                 {/* Glass pane — drag a rectangle to create a Custom Zoom clip */}
-                {customZoomDrawMode && !isSpaceDown && (
+                {customZoomDrawMode && (
                   <div
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: "crosshair" }}
+                    aria-label="Custom Zoom drawing surface"
+                    title="Drag to draw a zoom region · Space-drag or middle-drag to pan · Two fingers pan and pinch · Esc exits"
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: isSpaceDown ? "grab" : "crosshair", touchAction: "none" }}
                     onPointerDown={handleCustomZoomGlassPointerDown}
+                    onPointerMove={handleCustomZoomGlassPointerMove}
+                    onPointerUp={(event) => finishCustomZoomGlassPointer(event)}
+                    onPointerCancel={(event) => finishCustomZoomGlassPointer(event, true)}
                   />
                 )}
                 {customZoomDrawPreview && (() => {
