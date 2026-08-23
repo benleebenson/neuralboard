@@ -105,6 +105,17 @@ import {
   type TranscriptionChunk,
 } from "@/lib/audio/transcription";
 import {
+  BOARD_DROP_STRING_TYPES,
+  boardDropMayContainMedia,
+  centeredBoardDropPosition,
+  droppedImageUrl,
+  extensionForImageType,
+  imageBlobFromTransferItem,
+  isBoardMediaFile,
+  stringFromTransferItem,
+  type DroppedBlob,
+} from "@/lib/board2/image-drop";
+import {
   BAZOOKA_RAGDOLL_GROUND_DRAG,
   BAZOOKA_RAGDOLL_RECOVERY_MS,
   GUEST_BAZOOKA_MAX_HEALTH,
@@ -4573,6 +4584,7 @@ export default function Board2Page() {
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number; clipId?: string } | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
+  const [isBoardDropActive, setIsBoardDropActive] = useState(false);
 
   // ── Mobile ──
   const [isMobile, setIsMobile] = useState(false);
@@ -4849,6 +4861,7 @@ export default function Board2Page() {
   const playCanvasRef = useRef<HTMLCanvasElement>(null);
   const playContainerRef = useRef<HTMLDivElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
+  const boardDropDepthRef = useRef(0);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const clipsRef = useRef<Clip[]>(clips);
   const selectedClipIdsRef = useRef<string[]>([]);
@@ -7895,10 +7908,14 @@ export default function Board2Page() {
         ? resolveManualTimelineInsertion(prev, requestedStart, clipDuration)
         : null;
       const pos = center
-        ? {
-            boardX: clamp(center.x - w / 2, 0, BOARD_W - w),
-            boardY: clamp(center.y - h / 2, 0, BOARD_H - h),
-          }
+        ? centeredBoardDropPosition({
+            dropX: center.x,
+            dropY: center.y,
+            imageWidth: w,
+            imageHeight: h,
+            boardWidth: boardDimensionsRef.current.width,
+            boardHeight: boardDimensionsRef.current.height,
+          })
         : findBoardPosForNewMedia(prev, w, h);
       return [
         ...prev,
@@ -9315,7 +9332,7 @@ export default function Board2Page() {
     }
     const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
     setMediaLibrary((prev) => [...prev, item]);
-    if (playModeRef.current) queueMediaPlacement(item);
+    if (playModeRef.current && !center) queueMediaPlacement(item);
     else await addClipAndPlaceOnBoard(item, center);
   }
 
@@ -9327,25 +9344,147 @@ export default function Board2Page() {
     }
   }
 
+  function handleBoardFileDragEnter(e: React.DragEvent<HTMLDivElement>) {
+    if (!boardDropMayContainMedia(e.dataTransfer)) return;
+    e.preventDefault();
+    boardDropDepthRef.current += 1;
+    setIsBoardDropActive(true);
+  }
+
   function handleBoardFileDragOver(e: React.DragEvent<HTMLDivElement>) {
-    if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+    if (!boardDropMayContainMedia(e.dataTransfer)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "copy";
+    setIsBoardDropActive(true);
+  }
+
+  function handleBoardFileDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    boardDropDepthRef.current = Math.max(0, boardDropDepthRef.current - 1);
+    if (boardDropDepthRef.current === 0) setIsBoardDropActive(false);
+  }
+
+  function resetBoardDropIndicator() {
+    boardDropDepthRef.current = 0;
+    setIsBoardDropActive(false);
+  }
+
+  function droppedBlobName(blob: Blob, declaredType: string, index: number): string {
+    if (blob instanceof File && blob.name) return blob.name;
+    return `Dropped image ${Date.now()}${index ? `-${index + 1}` : ""}.${extensionForImageType(blob.type || declaredType)}`;
+  }
+
+  async function fetchDroppedImage(url: string): Promise<Blob> {
+    let directError = "Could not fetch the dropped image";
+    try {
+      const response = await fetch(url, { credentials: "omit", referrerPolicy: "no-referrer" });
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.type && !blob.type.startsWith("image/")) throw new Error("The dropped URL did not return an image");
+        if (blob.size > MAX_PASTED_IMAGE_BYTES) throw new Error("Dropped image is too large (max 15MB)");
+        return blob;
+      }
+      directError = `Image fetch failed (${response.status})`;
+    } catch (error) {
+      directError = error instanceof Error ? error.message : directError;
+    }
+
+    if (/^https?:\/\//i.test(url)) {
+      const response = await fetch(`/api/proxy-image?url=${encodeURIComponent(url)}`);
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob.type && !blob.type.startsWith("image/")) throw new Error("The dropped URL did not return an image");
+        if (blob.size > MAX_PASTED_IMAGE_BYTES) throw new Error("Dropped image is too large (max 15MB)");
+        return blob;
+      }
+    }
+    throw new Error(directError);
+  }
+
+  function droppedUrlName(url: string, blob: Blob): string {
+    try {
+      const pathname = new URL(url).pathname;
+      const basename = decodeURIComponent(pathname.split("/").filter(Boolean).at(-1) ?? "");
+      if (basename && /\.[a-z0-9]{2,8}$/i.test(basename)) return basename.slice(0, 120);
+    } catch {
+      // Data and blob URLs use the generated fallback name.
+    }
+    return `Dropped image.${extensionForImageType(blob.type)}`;
   }
 
   async function handleBoardFileDrop(e: React.DragEvent<HTMLDivElement>) {
-    const files = Array.from(e.dataTransfer.files).filter((file) =>
-      file.type.startsWith("image/") || file.type.startsWith("video/"),
-    );
-    if (files.length === 0) return;
+    const dataTransfer = e.dataTransfer;
+    const mayContainMedia = boardDropMayContainMedia(dataTransfer);
+    resetBoardDropIndicator();
+    if (!mayContainMedia) return;
     e.preventDefault();
     e.stopPropagation();
     const point = clientToBoardPoint(e.clientX, e.clientY);
-    for (const [index, file] of files.entries()) {
-      await ingestMediaFile(file, file.name, {
-        x: point.x + index * 28,
-        y: point.y + index * 28,
-      });
+
+    // Snapshot/call all protected data-store accessors synchronously. Their Blob/string values
+    // may resolve later, after the native drop event has returned.
+    const directFiles: DroppedBlob[] = Array.from(dataTransfer.files ?? [])
+      .filter(isBoardMediaFile)
+      .map((blob) => ({ blob, declaredType: blob.type }));
+    const items = Array.from(dataTransfer.items ?? []);
+    const itemBlobPromises = items
+      .map(imageBlobFromTransferItem)
+      .filter((promise): promise is Promise<DroppedBlob | null> => promise !== null);
+    const itemStringPromises = items
+      .map(stringFromTransferItem)
+      .filter((promise): promise is Promise<{ type: string; value: string }> => promise !== null);
+    const immediateStrings: Record<string, string> = {};
+    for (const type of BOARD_DROP_STRING_TYPES) {
+      try { immediateStrings[type] = dataTransfer.getData(type); } catch { /* Item callback may still resolve. */ }
+    }
+
+    const itemBlobs = (await Promise.all(itemBlobPromises)).filter((value): value is DroppedBlob => value !== null);
+    const droppedBlobs: DroppedBlob[] = [];
+    const seenObjects = new Set<Blob>();
+    const seenFiles = new Set<string>();
+    for (const candidate of [...directFiles, ...itemBlobs]) {
+      if (!isBoardMediaFile(candidate.blob) && !candidate.declaredType.startsWith("image/")) continue;
+      const fileKey = candidate.blob instanceof File
+        ? `${candidate.blob.name}\u0000${candidate.blob.size}\u0000${candidate.blob.type}\u0000${candidate.blob.lastModified}`
+        : "";
+      if (seenObjects.has(candidate.blob) || (fileKey && seenFiles.has(fileKey))) continue;
+      seenObjects.add(candidate.blob);
+      if (fileKey) seenFiles.add(fileKey);
+      droppedBlobs.push(candidate);
+    }
+
+    if (droppedBlobs.length > 0) {
+      for (const [index, candidate] of droppedBlobs.entries()) {
+        try {
+          await ingestMediaFile(candidate.blob, droppedBlobName(candidate.blob, candidate.declaredType, index), {
+            x: point.x + index * 28,
+            y: point.y + index * 28,
+          });
+        } catch (error) {
+          setToast(error instanceof Error ? error.message : "Could not add the dropped image");
+        }
+      }
+      return;
+    }
+
+    const itemStrings = await Promise.all(itemStringPromises);
+    for (const { type, value } of itemStrings) {
+      if (value && !immediateStrings[type]) immediateStrings[type] = value;
+    }
+    const imageUrl = droppedImageUrl({
+      uriList: immediateStrings["text/uri-list"],
+      html: immediateStrings["text/html"],
+      plainText: immediateStrings["text/plain"],
+    }, window.location.href);
+    if (!imageUrl) {
+      setToast("That drop did not contain a usable image");
+      return;
+    }
+    try {
+      const blob = await fetchDroppedImage(imageUrl);
+      await ingestMediaFile(blob, droppedUrlName(imageUrl, blob), point);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not fetch the dropped image");
     }
   }
 
@@ -15797,8 +15936,18 @@ export default function Board2Page() {
         {/* ── Board ── */}
         <div
           ref={boardContainerRef}
-          style={{ flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0 }}
+          data-board-drop-target
+          data-board-drop-active={isBoardDropActive ? "true" : undefined}
+          style={{
+            flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0,
+            boxShadow: isBoardDropActive
+              ? "inset 0 0 0 3px rgba(46,143,255,.8), inset 0 0 0 9999px rgba(46,143,255,.06)"
+              : undefined,
+          }}
+          onDragEnter={handleBoardFileDragEnter}
           onDragOver={handleBoardFileDragOver}
+          onDragLeave={handleBoardFileDragLeave}
+          onDragEnd={resetBoardDropIndicator}
           onDrop={(e) => { void handleBoardFileDrop(e); }}
           onPointerDown={handleMobileBoardPointerDown}
           onPointerMove={handleMobileBoardPointerMove}
@@ -17701,8 +17850,19 @@ export default function Board2Page() {
             {/* Board container — fills the whole center */}
             <div
               ref={boardContainerRef}
-              style={{ position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode || isMobile ? "none" : undefined }}
+              data-board-drop-target
+              data-board-drop-active={isBoardDropActive ? "true" : undefined}
+              style={{
+                position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode || isMobile ? "none" : undefined,
+                boxShadow: isBoardDropActive
+                  ? "inset 0 0 0 3px rgba(46,143,255,.8), inset 0 0 0 9999px rgba(46,143,255,.06)"
+                  : undefined,
+                transition: "box-shadow 100ms ease",
+              }}
+              onDragEnter={handleBoardFileDragEnter}
               onDragOver={handleBoardFileDragOver}
+              onDragLeave={handleBoardFileDragLeave}
+              onDragEnd={resetBoardDropIndicator}
               onDrop={(e) => { void handleBoardFileDrop(e); }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
               onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
