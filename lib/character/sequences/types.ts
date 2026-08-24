@@ -1,6 +1,8 @@
 import type { Pose } from "../../characterAnimations.ts";
 
-export type SequenceRole = "attacker" | "victim";
+export type PairedSequenceRole = "attacker" | "victim";
+export type SingleSequenceRole = "performer";
+export type SequenceRole = PairedSequenceRole | SingleSequenceRole;
 
 export type SequenceEasing =
   | "linear"
@@ -11,11 +13,11 @@ export type SequenceEasing =
 
 export type SequencePosition =
   | { mode: "absolute"; x: number; y: number }
-  | { mode: "relative"; to: SequenceRole; x: number; y: number };
+  | { mode: "relative"; to: PairedSequenceRole; x: number; y: number };
 
 export type SequenceEffect = {
   type: "impactStars" | "motionLines" | "dustPuff" | "screenShake";
-  anchor?: SequenceRole | "between";
+  anchor?: PairedSequenceRole | "between";
   x?: number;
   y?: number;
   intensity?: number;
@@ -36,17 +38,30 @@ export type SequenceKeyframe = {
   effects?: SequenceEffect[];
 };
 
-export type CharacterSequence = {
+type CharacterSequenceBase = {
   id: string;
   name: string;
   description: string;
   durationSeconds: number;
+};
+
+export type PairedCharacterSequence = CharacterSequenceBase & {
+  kind: "paired-pose";
+  roles: readonly ["attacker", "victim"];
   setup: {
     distance: number;
     facing: "toward" | "same" | "away";
   };
   keyframes: SequenceKeyframe[];
 };
+
+export type SingleCharacterSequence = CharacterSequenceBase & {
+  kind: "single-canvas";
+  roles: readonly ["performer"];
+  renderer: "trenchCoatReveal";
+};
+
+export type CharacterSequence = PairedCharacterSequence | SingleCharacterSequence;
 
 export type SequenceWorldSetup = {
   centerX: number;
@@ -71,7 +86,7 @@ export type SampledSequenceEffect = SequenceEffect & {
 
 export type SampledSequence = {
   progress: number;
-  characters: Record<SequenceRole, SampledSequenceCharacter>;
+  characters: Record<PairedSequenceRole, SampledSequenceCharacter>;
   effects: SampledSequenceEffect[];
   shake: { x: number; y: number };
 };

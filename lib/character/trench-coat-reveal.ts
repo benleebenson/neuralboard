@@ -19,6 +19,9 @@ export type TrenchCoatRevealSample = {
 };
 
 type Point = { x: number; y: number };
+export type RevealRect = { x: number; y: number; width: number; height: number };
+
+const REVEAL_RECT: RevealRect = { x: -38, y: -154, width: 76, height: 82 };
 
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -149,8 +152,8 @@ function drawCoatBack(ctx: CanvasRenderingContext2D) {
 }
 
 function drawCoatPanel(ctx: CanvasRenderingContext2D, side: -1 | 1, open: number, hand: Point) {
-  const innerTopX = side * lerp(2, 10, open);
-  const innerHemX = side * lerp(4, 31, open);
+  const innerTopX = side * lerp(2, 27, open);
+  const innerHemX = side * lerp(4, 44, open);
   const outerHemX = side * lerp(39, 92, open);
   const shoulderX = side * 27;
   const lapelX = side * lerp(19, 31, open);
@@ -183,9 +186,79 @@ function drawCoatPanel(ctx: CanvasRenderingContext2D, side: -1 | 1, open: number
   ctx.stroke();
 }
 
+/** Object-fit contain geometry used for both preview and export canvas rendering. */
+export function fitRevealImage(sourceWidth: number, sourceHeight: number, bounds: RevealRect = REVEAL_RECT): RevealRect {
+  const width = Math.max(1, sourceWidth);
+  const height = Math.max(1, sourceHeight);
+  const scale = Math.min(bounds.width / width, bounds.height / height);
+  const fittedWidth = width * scale;
+  const fittedHeight = height * scale;
+  return {
+    x: bounds.x + (bounds.width - fittedWidth) / 2,
+    y: bounds.y + (bounds.height - fittedHeight) / 2,
+    width: fittedWidth,
+    height: fittedHeight,
+  };
+}
+
+function revealSourceDimensions(source: CanvasImageSource): { width: number; height: number } {
+  const candidate = source as CanvasImageSource & {
+    naturalWidth?: number;
+    naturalHeight?: number;
+    videoWidth?: number;
+    videoHeight?: number;
+    width?: number;
+    height?: number;
+  };
+  return {
+    width: candidate.naturalWidth || candidate.videoWidth || candidate.width || 1,
+    height: candidate.naturalHeight || candidate.videoHeight || candidate.height || 1,
+  };
+}
+
+function clipRevealOpening(ctx: CanvasRenderingContext2D, open: number) {
+  const top = lerp(1, 27, open);
+  const bottom = lerp(2, 44, open);
+  ctx.beginPath();
+  ctx.moveTo(-top, REVEAL_RECT.y);
+  ctx.lineTo(top, REVEAL_RECT.y);
+  ctx.lineTo(bottom, REVEAL_RECT.y + REVEAL_RECT.height);
+  ctx.lineTo(-bottom, REVEAL_RECT.y + REVEAL_RECT.height);
+  ctx.closePath();
+  ctx.clip();
+}
+
+function drawRevealContent(ctx: CanvasRenderingContext2D, image: CanvasImageSource | null | undefined, open: number, alpha: number, ink: string) {
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  clipRevealOpening(ctx, open);
+  if (image) {
+    const source = revealSourceDimensions(image);
+    const fitted = fitRevealImage(source.width, source.height);
+    ctx.fillStyle = "#fffdf7";
+    ctx.fillRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height);
+    ctx.drawImage(image, fitted.x, fitted.y, fitted.width, fitted.height);
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = 2.2;
+    ctx.strokeRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height);
+  } else {
+    ctx.fillStyle = "#c8f135";
+    ctx.beginPath();
+    ctx.roundRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height, 6);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = ink;
+    ctx.font = "800 13px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("REVEAL", 0, REVEAL_RECT.y + REVEAL_RECT.height / 2);
+  }
+  ctx.restore();
+}
+
 export function drawTrenchCoatRevealToCanvas(
   ctx: CanvasRenderingContext2D,
-  args: { x: number; groundY: number; scale?: number; progress: number },
+  args: { x: number; groundY: number; scale?: number; progress: number; revealImage?: CanvasImageSource | null },
 ) {
   const sample = sampleTrenchCoatReveal(args.progress);
   const { open, reach } = sample;
@@ -221,20 +294,9 @@ export function drawTrenchCoatRevealToCanvas(
   ctx.lineTo(0, -76);
   ctx.stroke();
 
-  // A small board-colored card stands in for whatever the final reveal will become.
-  ctx.save();
-  ctx.globalAlpha *= sample.revealAlpha;
-  ctx.fillStyle = "#c8f135";
-  ctx.beginPath();
-  ctx.roundRect(-25, -139, 50, 55, 6);
-  ctx.fill();
-  ctx.stroke();
-  ctx.fillStyle = ink;
-  ctx.font = "800 13px monospace";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("REVEAL", 0, -111);
-  ctx.restore();
+  // The reveal lives behind the moving front flaps and is clipped to the widening opening.
+  // A built-in card remains as a safe fallback when an action has no image reference.
+  drawRevealContent(ctx, args.revealImage, open, sample.revealAlpha, ink);
 
   const lapelHandX = 15;
   const downHand: Point = { x: 47, y: -78 };

@@ -2,6 +2,7 @@ import type { CharacterSkin, HeadLocalPoint, Viseme } from "../stream";
 import { BOARD_SURFACE_COLOR } from "../board-theme";
 import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { drawExplainerCharacter, type Expression } from "./explainer-renderer";
+import { drawTrenchCoatRevealToCanvas } from "./trench-coat-reveal";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
 const CHAR_TORSO_RAW = STREAM_CHARACTER_GEOMETRY.torsoRaw;
@@ -441,6 +442,18 @@ export function drawBoardCharacterToCanvas(
   const sy = (p.boardY - cam.cameraY) * sf + H / 2 + (p.sequenceShakeY ?? 0) * sf;
   if (Array.isArray(p.sequenceEffects)) {
     drawCharacterSequenceEffectsToCanvas(ctx, p.sequenceEffects, cam, sf, W, H);
+  }
+  if (p.sequenceRenderer === "trenchCoatReveal") {
+    drawTrenchCoatRevealToCanvas(ctx, {
+      x: sx,
+      groundY: sy,
+      progress: p.sequenceProgress ?? 0,
+      revealImage: p.sequenceRevealImage ?? null,
+      // The coat study is intentionally a touch larger than the standard rig so an inserted
+      // reveal stays readable at ordinary generated-camera framing.
+      scale: sf * 1.16,
+    });
+    return;
   }
   if (characterType === "explainer") {
     drawExplainerCharacter(ctx, {

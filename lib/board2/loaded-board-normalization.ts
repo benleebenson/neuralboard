@@ -95,5 +95,6 @@ export function normalizeLoadedCharacterActionRecord(
   }
   if (raw.targetClipId !== undefined) normalized.targetClipId = String(raw.targetClipId);
   if (raw.narrationGestureClipId !== undefined) normalized.narrationGestureClipId = String(raw.narrationGestureClipId);
+  if (raw.revealMediaId !== undefined) normalized.revealMediaId = String(raw.revealMediaId);
   return normalized;
 }

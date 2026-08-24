@@ -1,4 +1,4 @@
-import type { CharacterSequence } from "./types.ts";
+import type { PairedCharacterSequence } from "./types.ts";
 
 const stand = {
   leftLegA: 0.12, rightLegA: -0.12,
@@ -7,7 +7,9 @@ const stand = {
   bodyLean: 0, headTilt: 0, headBob: 0, poseRotation: 0, airborneY: 0,
 };
 
-export const kneeToFaceSequence: CharacterSequence = {
+export const kneeToFaceSequence: PairedCharacterSequence = {
+  kind: "paired-pose",
+  roles: ["attacker", "victim"],
   id: "knee-to-face",
   name: "Knee to face",
   description: "Grab, comedy beat, knee strike, impact hold, and a theatrical throw.",

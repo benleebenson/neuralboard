@@ -128,7 +128,7 @@ import {
   nextBazookaHealth,
 } from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
-import { characterSequenceById, kneeToFaceSequence, sampleSequence, sequenceSetupMarks, type SequenceRole } from "@/lib/character/sequences";
+import { characterSequenceById, kneeToFaceSequence, sampleSequence, sequenceSetupMarks, trenchCoatRevealSequence, type SequenceRole } from "@/lib/character/sequences";
 import {
   easeInOutCubic,
   interpolateCameraKeyframes as interpolateCameraTrack,
@@ -400,6 +400,9 @@ type Clip = {
   // `mediaId` is persisted by timeline blocks so multiple blocks can reference one asset.
   mediaId?: string;
   featured?: boolean;
+  // Image asset used only by one or more reveal actions. It is saved with board media but has no
+  // board geometry, so it never becomes scenery or a camera target.
+  revealOnly?: boolean;
   // automated narration draft provenance:
   provenance?: "browserFound";
   sourceAttributionUrl?: string;
@@ -1175,6 +1178,7 @@ type CharacterAction = {
   sequenceCenterX?: number;
   sequenceCenterY?: number;
   sequenceDirection?: 1 | -1;
+  revealMediaId?: string;
   source?: ClipSource; // provenance: "auto" mirrors aiGenerated, else "manual". Narrower in practice
                         // (never neuralSearch/top5) but shares the ClipSource union for one schema.
 };
@@ -2616,7 +2620,10 @@ function resolvedActionRestPosition(
 ): { x: number; y: number } {
   if (action.type === "sequence" && action.sequenceId && action.sequenceRole && action.sequenceCenterX !== undefined && action.sequenceCenterY !== undefined) {
     const sequence = characterSequenceById[action.sequenceId];
-    if (sequence) {
+    if (sequence?.kind === "single-canvas") {
+      return { x: action.targetX ?? action.sequenceCenterX, y: action.targetY ?? action.sequenceCenterY };
+    }
+    if (sequence?.kind === "paired-pose" && action.sequenceRole !== "performer") {
       const sampled = sampleSequence(sequence, 1, {
         centerX: action.sequenceCenterX,
         groundY: action.sequenceCenterY,
@@ -3090,6 +3097,10 @@ type CharPoseResult = {
   sequenceShakeX?: number;
   sequenceShakeY?: number;
   sequenceEffects?: Array<{ type: "impactStars" | "motionLines" | "dustPuff" | "screenShake"; x: number; y: number; alpha: number; intensity?: number }>;
+  sequenceRenderer?: "trenchCoatReveal";
+  sequenceProgress?: number;
+  sequenceRevealMediaId?: string;
+  sequenceRevealImage?: CanvasImageSource | null;
   spriteGesture?: Gesture;
 };
 
@@ -3492,6 +3503,17 @@ function evalCharPoseRaw(
       return travelPoseBetween(time, active.fromX, active.fromY, targetX, targetY, elapsed / Math.max(0.001, setupDuration), clips, distance / Math.max(0.001, setupDuration) > 520, craters, active.traversalMode);
     }
     const sequenceProgress = clamp((elapsed - setupDuration) / Math.max(0.001, active.duration - setupDuration), 0, 1);
+    if (sequence.kind === "single-canvas") {
+      return {
+        ...idlePose(active.targetX ?? active.sequenceCenterX, active.targetY ?? active.sequenceCenterY),
+        facing: active.sequenceDirection ?? 1,
+        actionType: "sequence",
+        sequenceRenderer: sequence.renderer,
+        sequenceProgress,
+        sequenceRevealMediaId: active.revealMediaId,
+      };
+    }
+    if (active.sequenceRole === "performer") return idlePose(active.targetX ?? active.fromX, active.targetY ?? active.fromY);
     const sampled = sampleSequence(sequence, sequenceProgress, {
       centerX: active.sequenceCenterX,
       groundY: active.sequenceCenterY,
@@ -4921,7 +4943,12 @@ export default function Board2Page() {
   const narrationGestureTrackIsCurrent = narrationGestureTrack.length > 0 && narrationGestureTrackSource === currentNarrationGestureSource;
   const narrationSpeechTracksAreCurrent = narrationVisemeTrackIsCurrent && narrationGestureTrackIsCurrent;
   const currentGeneratedBoardSource = useMemo(() => generatedBoardSourceSignature(clips), [clips]);
-  const generatedDuration = Math.max(0, ...clips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
+  const generatedDuration = Math.max(
+    0,
+    ...clips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration),
+    ...characterActions.map((action) => action.startTime + action.duration),
+    ...characterActions2.map((action) => action.startTime + action.duration),
+  );
   const timelineDuration = Math.max(10, generatedDuration + 2);
   const timelineWidth = timelineDuration * pxPerSec;
   const previewAspect = canvasW / canvasH;
@@ -6993,7 +7020,7 @@ export default function Board2Page() {
           : null,
         characterSkinRef.current,
         characterTypeRef.current, characterExpressionRef.current,
-        { ...pose, viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
+        { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -7015,7 +7042,7 @@ export default function Board2Page() {
           : null,
         characterSkin2Ref.current,
         characterType2Ref.current, characterExpression2Ref.current,
-        { ...pose, viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
+        { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
         boardCharacterDrawEvaluators()
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -7141,7 +7168,7 @@ export default function Board2Page() {
         ctx, time, resolved, true, cam, sf, W, H, initX, initY,
         currentClips, -Infinity, authoredAnimationsRef.current,
         faceSettings && faceImage ? { image: faceImage, aspect: faceSettings.faceAspect, mouthAnchor: faceSettings.mouthAnchor } : null,
-        skin, characterType, expression, { ...pose, viseme },
+        skin, characterType, expression, { ...withSequenceRevealImage(pose, currentClips), viseme },
         boardCharacterDrawEvaluators(),
       );
       const active = authoredBazookaDisplayAction(time, resolved);
@@ -7173,6 +7200,8 @@ export default function Board2Page() {
     );
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx, event, cam, sf, W, H, time * 1000);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor);
+  // The reveal-image cache accessor intentionally reads the latest media/cache refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editorCanvasDpr]);
 
   function boardClipInImmediateViewport(clip: Clip): boolean {
@@ -7314,7 +7343,12 @@ export default function Board2Page() {
   }
 
   function currentPlaybackDuration(currentClips: Clip[]): number {
-    return currentClips.filter(isFeaturedTimelineClip).reduce((acc, clip) => Math.max(acc, clip.startTime + clip.duration), 0);
+    return Math.max(
+      0,
+      ...currentClips.filter(isFeaturedTimelineClip).map((clip) => clip.startTime + clip.duration),
+      ...characterActionsRef.current.map((action) => action.startTime + action.duration),
+      ...characterActions2Ref.current.map((action) => action.startTime + action.duration),
+    );
   }
 
   function activeVideoWindow(clip: Clip, time: number): { start: number; end: number } | undefined {
@@ -9550,6 +9584,43 @@ export default function Board2Page() {
     else await addClipAndPlaceOnBoard(item, center);
   }
 
+  async function ingestRevealImageFile(file: File | Blob, name: string, actionId: string) {
+    if (!file.type.startsWith("image/")) {
+      setToast("The trench-coat reveal needs an image");
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    await decodeImageForPlacement(url);
+    loadMedia(url, "image");
+    const mediaId = generateId();
+    const item: MediaItem = { id: mediaId, name, type: "image", url, blob: file };
+    setMediaLibrary((previous) => [...previous, item]);
+    setClips((previous) => [...previous, {
+      id: mediaId,
+      mediaId,
+      featured: false,
+      revealOnly: true,
+      type: "image",
+      name,
+      sourceUrl: url,
+      sourceBlob: file,
+      startTime: 0,
+      duration: 4,
+      layer: 1,
+    }]);
+    setActionRevealMedia(actionId, mediaId);
+    selectedCharActionIdRef.current = actionId;
+    setSelectedCharActionId(actionId);
+    setCharacterPanelOpen(true);
+    setToast("Reveal image attached to the trench-coat action");
+  }
+
+  async function handleRevealImageUpload(event: React.ChangeEvent<HTMLInputElement>, actionId: string) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (file) await ingestRevealImageFile(file, file.name, actionId);
+  }
+
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
@@ -10997,8 +11068,20 @@ export default function Board2Page() {
   function deleteCharacterAction(id: string) {
     const action = [...characterActionsRef.current, ...characterActions2Ref.current].find((candidate) => candidate.id === id);
     const pairId = action?.sequencePairId;
+    const deletedIds = new Set(
+      [...characterActionsRef.current, ...characterActions2Ref.current]
+        .filter((candidate) => candidate.id === id || (!!pairId && candidate.sequencePairId === pairId))
+        .map((candidate) => candidate.id),
+    );
+    const orphanedRevealMediaId = action?.revealMediaId && ![...characterActionsRef.current, ...characterActions2Ref.current]
+      .some((candidate) => !deletedIds.has(candidate.id) && candidate.revealMediaId === action.revealMediaId)
+      ? action.revealMediaId
+      : undefined;
     setCharacterActions((prev) => prev.filter((candidate) => candidate.id !== id && (!pairId || candidate.sequencePairId !== pairId)));
     setCharacterActions2((prev) => prev.filter((candidate) => candidate.id !== id && (!pairId || candidate.sequencePairId !== pairId)));
+    if (orphanedRevealMediaId) {
+      setClips((prev) => prev.filter((clip) => !(boardEntityId(clip) === orphanedRevealMediaId && clip.revealOnly)));
+    }
     if (selectedCharActionIdRef.current === id) {
       selectedCharActionIdRef.current = null;
       setSelectedCharActionId(null);
@@ -11010,6 +11093,18 @@ export default function Board2Page() {
   function updateCharacterActionsFor(id: CharacterId, updater: (prev: CharacterAction[]) => CharacterAction[]) {
     if (id === "c2") setCharacterActions2(updater);
     else setCharacterActions(updater);
+  }
+
+  function setActionRevealMedia(actionId: string, mediaId: string | undefined) {
+    const allActions = [...characterActionsRef.current, ...characterActions2Ref.current];
+    const existing = allActions.find((action) => action.id === actionId);
+    const owner: CharacterId = characterActions2Ref.current.some((action) => action.id === actionId) ? "c2" : "c1";
+    updateCharacterActionsFor(owner, (previous) => previous.map((action) => action.id === actionId
+      ? { ...action, revealMediaId: mediaId }
+      : action));
+    if (existing?.revealMediaId && existing.revealMediaId !== mediaId && !allActions.some((action) => action.id !== actionId && action.revealMediaId === existing.revealMediaId)) {
+      setClips((previous) => previous.filter((clip) => !(clip.revealOnly && boardEntityId(clip) === existing.revealMediaId)));
+    }
   }
 
   function addKneeToFaceSequence() {
@@ -11039,7 +11134,7 @@ export default function Board2Page() {
     startTime = nextAvailableCharacterActionStart(victimActions, startTime, duration);
     startTime = nextAvailableCharacterActionStart(attackerActions, startTime, duration);
     const pairId = `sequence_${generateId()}`;
-    const makeAction = (role: SequenceRole): CharacterAction => ({
+    const makeAction = (role: "attacker" | "victim"): CharacterAction => ({
       id: generateId(),
       type: "sequence",
       startTime,
@@ -11063,6 +11158,53 @@ export default function Board2Page() {
     setPlayhead(startTime);
     playheadRef.current = startTime;
     setToast("Knee to face queued: both characters walk to their marks, then fight");
+  }
+
+  function addTrenchCoatRevealSequence() {
+    const characterId = activeCharacterIdRef.current;
+    const actions = characterId === "c2" ? characterActions2Ref.current : characterActionsRef.current;
+    const resolved = characterId === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+    const initX = characterId === "c2" ? charInit2XRef.current : charInitXRef.current;
+    const initY = characterId === "c2" ? charInit2YRef.current : charInitYRef.current;
+    const longestDuration = trenchCoatRevealSequence.durationSeconds + 1.2;
+    const startTime = nextAvailableCharacterActionStart(actions, playheadRef.current, longestDuration);
+    const currentPose = evalCharAtTime(startTime, resolved, initX, initY, clipsRef.current, authoredAnimationsRef.current);
+    const camera = editorCameraAtTime(startTime, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+    const targetX = clamp(camera.cameraX, 120, boardDimensionsRef.current.width - 120);
+    const targetY = resolveGroundY(targetX, currentPose.boardY, clipsRef.current, streamCratersRef.current);
+    const distance = Math.hypot(targetX - currentPose.boardX, targetY - currentPose.boardY);
+    const setupDuration = distance < CHAR_STATIONARY_NEAR_TARGET_PX ? 0 : clamp(distance / CHAR_STATIONARY_WALK_SPEED, 0.25, 1.2);
+    const id = generateId();
+    const action: CharacterAction = {
+      id,
+      type: "sequence",
+      startTime,
+      duration: setupDuration + trenchCoatRevealSequence.durationSeconds,
+      targetX: Math.round(targetX),
+      targetY: Math.round(targetY),
+      sequenceId: trenchCoatRevealSequence.id,
+      sequenceRole: "performer",
+      sequenceSetupDuration: setupDuration,
+      sequenceCenterX: targetX,
+      sequenceCenterY: targetY,
+      sequenceDirection: currentPose.facing,
+    };
+    updateCharacterActionsFor(characterId, (previous) => [...previous, action]);
+    if (characterId === "c2") {
+      setShowCharacter2(true);
+      setCharacterMode2("manual");
+    } else {
+      setShowCharacter(true);
+      setCharacterMode("manual");
+    }
+    selectedCharActionIdRef.current = id;
+    setSelectedCharActionId(id);
+    setCharacterPanelOpen(true);
+    setPlayhead(startTime);
+    playheadRef.current = startTime;
+    setToast(setupDuration > 0
+      ? "Trench coat reveal queued: the character walks into frame, then opens the coat"
+      : "Trench coat reveal queued — choose an image in Action properties");
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {
@@ -12849,8 +12991,16 @@ export default function Board2Page() {
         boardDimensionsRef.current.width,
         0.05,
       ));
-    const keepUrls = new Set(visibleImages.map((clip) => clip.sourceUrl));
-    for (const clip of visibleImages) {
+    const activeRevealMediaIds = [...characterActionsRef.current, ...characterActions2Ref.current]
+      .filter((action) => action.sequenceId === trenchCoatRevealSequence.id && action.revealMediaId && time >= action.startTime && time < action.startTime + action.duration)
+      .map((action) => action.revealMediaId!);
+    const revealImages = activeRevealMediaIds.flatMap((mediaId) => {
+      const clip = revealImageClip(mediaId, currentClips);
+      return clip ? [clip] : [];
+    });
+    const neededImages = [...new Map([...visibleImages, ...revealImages].map((clip) => [clip.sourceUrl, clip])).values()];
+    const keepUrls = new Set(neededImages.map((clip) => clip.sourceUrl));
+    for (const clip of neededImages) {
       if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
       if (!exportImgCacheRef.current.has(clip.sourceUrl)) {
         onPreparing(clip);
@@ -15490,6 +15640,18 @@ export default function Board2Page() {
 
       if (imageFiles.length > 0) {
         e.preventDefault();
+        const selectedAction = [...characterActionsRef.current, ...characterActions2Ref.current]
+          .find((action) => action.id === selectedCharActionIdRef.current);
+        if (selectedAction?.sequenceId === trenchCoatRevealSequence.id) {
+          const file = imageFiles[0];
+          if (file.size > MAX_PASTED_IMAGE_BYTES) {
+            setToast("Image too large to paste (max 15MB)");
+            return;
+          }
+          const ext = file.type.split("/")[1] || "png";
+          void ingestRevealImageFile(file, `Pasted reveal ${Date.now()}.${ext}`, selectedAction.id);
+          return;
+        }
         void (async () => {
           let pastedCount = 0;
           for (const file of imageFiles) {
@@ -17391,7 +17553,7 @@ export default function Board2Page() {
       ? narrationGestureTrackRef.current
       : [];
 
-    const totalDurationSec = Math.max(0, ...clipsRef.current.map((c) => c.startTime + c.duration), 0);
+    const totalDurationSec = currentPlaybackDuration(clipsRef.current);
     const cameraMode: "clips" | "character" | "follow" = clipsRef.current.some((c) => c.type === "characterFocus")
       ? "follow"
       : (showCharacterRef.current && characterModeRef.current === "auto" ? "character" : "clips");
@@ -17932,6 +18094,28 @@ export default function Board2Page() {
   }
 
   // ─── Render ───────────────────────────────────────────────────────────────
+
+  function revealImageClip(mediaId: string | undefined, currentClips: Clip[]): Clip | undefined {
+    if (!mediaId) return undefined;
+    return currentClips.find((clip) => clip.type === "image" && clip.id === mediaId)
+      ?? currentClips.find((clip) => clip.type === "image" && boardEntityId(clip) === mediaId);
+  }
+
+  function withSequenceRevealImage(
+    pose: CharPoseResult,
+    currentClips: Clip[],
+    quality: "preview" | "realtime-export" | "export" | "snapshot" = "preview",
+  ): CharPoseResult {
+    if (pose.sequenceRenderer !== "trenchCoatReveal") return pose;
+    const clip = revealImageClip(pose.sequenceRevealMediaId, currentClips);
+    if (!clip) return { ...pose, sequenceRevealImage: null };
+    const renderUrl = clip.previewUrl ?? clip.sourceUrl;
+    const image = quality === "preview"
+      ? cachedPreviewImage(renderUrl)
+      : exportImgCacheRef.current.get(clip.sourceUrl);
+    if (!image && quality === "preview") loadMedia(renderUrl, "image");
+    return { ...pose, sequenceRevealImage: image ?? null };
+  }
 
   function renderCustomZoomControls(boardOverlay = false) {
     return (
@@ -19556,8 +19740,12 @@ export default function Board2Page() {
             </div>
 
             {(selectedCharAction || characterPanelOpen) && (() => {
+              const selectedSequence = selectedCharAction?.sequenceId ? characterSequenceById[selectedCharAction.sequenceId] : undefined;
+              const selectedIsTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
+              const selectedRevealClip = selectedIsTrenchReveal ? revealImageClip(selectedCharAction?.revealMediaId, clips) : undefined;
+              const boardRevealChoices = boardEntitiesForDisplay(clips).filter((clip) => clip.type === "image");
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: selectedCharAction?.emoji ?? "🤔",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: selectedIsTrenchReveal ? "🧥" : "💥", emote: selectedCharAction?.emoji ?? "🤔",
                 flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", idle: "⏸",
               };
               const targetableAction = selectedCharAction && !["emote", "idle", "sequence"].includes(selectedCharAction.type);
@@ -19584,7 +19772,7 @@ export default function Board2Page() {
                     <div style={{ border: "1.5px solid rgba(42,42,42,0.28)", background: "#fffdf5", padding: 9, display: "flex", flexDirection: "column", gap: 8 }}>
                       <div style={{ ...panelLabelStyle, marginBottom: -2 }}>Action</div>
                       <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700 }}>
-                        {actionIcons[selectedCharAction.type] ?? "•"} {selectedCharAction.type}{selectedCharAction.aiGenerated ? " ✨" : ""}
+                        {actionIcons[selectedCharAction.type] ?? "•"} {selectedSequence?.name ?? selectedCharAction.type}{selectedCharAction.aiGenerated ? " ✨" : ""}
                       </div>
                       <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "monospace", fontSize: 9, color: "#6a6a6a" }}>
                         Start time
@@ -19647,6 +19835,64 @@ export default function Board2Page() {
                               </button>
                             ))}
                           </div>
+                        </div>
+                      )}
+                      {selectedIsTrenchReveal && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <div style={{ ...panelLabelStyle, marginBottom: 0 }}>Reveal image</div>
+                          {selectedRevealClip ? (
+                            <div style={{ display: "flex", gap: 7, alignItems: "center", minWidth: 0 }}>
+                              <img
+                                src={selectedRevealClip.previewUrl ?? selectedRevealClip.sourceUrl}
+                                alt="Selected trench-coat reveal"
+                                style={{ width: 58, height: 58, objectFit: "contain", border: "1px solid rgba(42,42,42,.35)", background: "#fff" }}
+                              />
+                              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", fontFamily: "monospace", fontSize: 9 }}>{selectedRevealClip.name}</span>
+                            </div>
+                          ) : (
+                            <div style={{ padding: 7, border: "1px dashed rgba(42,42,42,.35)", background: "#c8f135", fontFamily: "monospace", fontSize: 9 }}>No image — using the REVEAL placeholder</div>
+                          )}
+                          <div style={{ display: "flex", gap: 5 }}>
+                            <label style={{ ...miniButton, position: "relative", overflow: "hidden", flex: 1, textAlign: "center", padding: "5px 6px" }}>
+                              ↑ Upload image
+                              <input
+                                type="file"
+                                accept="image/*"
+                                aria-label="Upload trench-coat reveal image"
+                                onClick={(event) => { event.currentTarget.value = ""; }}
+                                onChange={(event) => void handleRevealImageUpload(event, selectedCharAction.id)}
+                                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
+                              />
+                            </label>
+                            {selectedCharAction.revealMediaId && (
+                              <button type="button" onClick={() => setActionRevealMedia(selectedCharAction.id, undefined)} style={{ ...miniButton, padding: "5px 6px" }}>Clear</button>
+                            )}
+                          </div>
+                          <div style={{ fontFamily: "monospace", fontSize: 8, color: "#6a6a6a" }}>Paste an image with ⌘/Ctrl+V while this action is selected.</div>
+                          {boardRevealChoices.length > 0 && (
+                            <div>
+                              <div style={{ fontFamily: "monospace", fontSize: 8, color: "#6a6a6a", marginBottom: 4 }}>Or pick board media</div>
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4, maxHeight: 118, overflowY: "auto" }}>
+                                {boardRevealChoices.map((clip) => {
+                                  const mediaId = boardEntityId(clip);
+                                  const chosen = selectedCharAction.revealMediaId === mediaId;
+                                  return (
+                                    <button
+                                      key={mediaId}
+                                      type="button"
+                                      title={clip.name}
+                                      aria-label={`Use ${clip.name} as reveal image`}
+                                      aria-pressed={chosen}
+                                      onClick={() => setActionRevealMedia(selectedCharAction.id, mediaId)}
+                                      style={{ padding: 2, height: 48, border: chosen ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,.3)", background: chosen ? "#c8f135" : "#fff", cursor: "pointer" }}
+                                    >
+                                      <img src={clip.previewUrl ?? clip.sourceUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                       <button
@@ -20004,7 +20250,7 @@ export default function Board2Page() {
                         ))}
                       </div>
                       {activeCharacter.characterType !== "explainer" && (
-                        <div style={{ display: "flex", gap: 5 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
                           <button
                             type="button"
                             title="Move both characters to the required spacing, then play Knee to face"
@@ -20015,9 +20261,17 @@ export default function Board2Page() {
                           </button>
                           <button
                             type="button"
+                            title="Walk the active character into frame, then reveal an image inside the coat"
+                            onClick={addTrenchCoatRevealSequence}
+                            style={{ ...miniButton, padding: "5px 6px", background: "#e7ddff", fontWeight: 700 }}
+                          >
+                            🧥 Trench coat reveal
+                          </button>
+                          <button
+                            type="button"
                             title="Open the isolated animation test harness"
                             onClick={() => { window.location.href = "/board2/anim"; }}
-                            style={{ ...miniButton, flex: 1, padding: "5px 6px" }}
+                            style={{ ...miniButton, gridColumn: "1 / -1", padding: "5px 6px" }}
                           >
                             ▶ Anim harness
                           </button>
@@ -20692,8 +20946,9 @@ export default function Board2Page() {
                     const isAuto = characterMode === "auto" && !characterActions.find((m) => m.id === action.id);
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
+                    const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? "🧥" : "💥", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
@@ -20735,7 +20990,7 @@ export default function Board2Page() {
                           />
                         )}
                         <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#2a4a2a", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
-                          {icons[action.type]} {action.type}
+                          {icons[action.type]} {sequence?.name ?? action.type}
                         </span>
                         {/* AI-choreographed badge — drag/resize/delete work the same as any manual action */}
                         {action.aiGenerated && (
@@ -20790,8 +21045,9 @@ export default function Board2Page() {
                     const isAuto = characterMode2 === "auto" && !characterActions2.find((m) => m.id === action.id);
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
+                    const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? "🧥" : "💥", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
@@ -20832,7 +21088,7 @@ export default function Board2Page() {
                           />
                         )}
                         <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, fontSize: 8, fontFamily: "monospace", color: "#303052", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none", zIndex: 4 }}>
-                          {icons[action.type]} {action.type}
+                          {icons[action.type]} {sequence?.name ?? action.type}
                         </span>
                         {action.aiGenerated && (
                           <span title="AI-choreographed" style={{ position: "absolute", top: -1, right: 1, fontSize: 8, zIndex: 5, pointerEvents: "none" }}>✨</span>

@@ -8,8 +8,8 @@ import {
   drawTrenchCoatRevealToCanvas,
   sampleTrenchCoatReveal,
   TRENCH_COAT_REVEAL_BEATS,
-  TRENCH_COAT_REVEAL_DURATION,
 } from "@/lib/character/trench-coat-reveal";
+import { characterSequences, sampleSequence } from "@/lib/character/sequences";
 import { STREAM_ACTION_TYPES, type CharacterSkin } from "@/lib/stream";
 import { DEFAULT_POSE, sampleAnimation, starterAnimations, type Pose } from "@/lib/characterAnimations";
 import styles from "./anim.module.css";
@@ -36,18 +36,18 @@ type CharacterControls = {
 type MoveOption = {
   id: string;
   label: string;
-  group: "Featured sequence" | "Character moves" | "Authored clips";
+  group: "Sequences" | "Character moves" | "Authored clips";
   duration: number;
-  kind: "trench" | "action" | "authored";
+  kind: "sequence" | "action" | "authored";
   key: string;
 };
 
 const authoredAnimations = starterAnimations("harness");
 const moveOptions: MoveOption[] = [
-  {
-    id: "featured:trench-coat-reveal", label: "Trench coat reveal", group: "Featured sequence",
-    duration: TRENCH_COAT_REVEAL_DURATION, kind: "trench", key: "trenchCoatReveal",
-  },
+  ...characterSequences.map((sequence) => ({
+    id: `sequence:${sequence.id}`, label: sequence.name, group: "Sequences" as const,
+    duration: sequence.durationSeconds, kind: "sequence" as const, key: sequence.id,
+  })),
   ...STREAM_ACTION_TYPES.map((name) => ({
     id: `action:${name}`, label: name, group: "Character moves" as const,
     duration: SINGLE_MOVE_SECONDS[name] ?? 2, kind: "action" as const, key: name,
@@ -121,7 +121,7 @@ function CharacterControlRow({
 export default function AnimationHarnessPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const currentTimeRef = useRef(0);
-  const [selectedId, setSelectedId] = useState("featured:trench-coat-reveal");
+  const [selectedId, setSelectedId] = useState("sequence:trench-coat-reveal");
   const [playing, setPlaying] = useState(true);
   const [loop, setLoop] = useState(true);
   const [speed, setSpeed] = useState(1);
@@ -133,7 +133,22 @@ export default function AnimationHarnessPage() {
 
   const poses = useMemo(() => {
     const idleB = poseResult(DEFAULT_POSE, characterB.x, characterB.facing);
-    if (selected.kind === "trench") return { a: poseResult(DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
+    if (selected.kind === "sequence") {
+      const sequence = characterSequences.find((item) => item.id === selected.key);
+      if (!sequence || sequence.kind === "single-canvas") {
+        return { a: poseResult(DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
+      }
+      const direction: 1 | -1 = characterB.x >= characterA.x ? 1 : -1;
+      const sampled = sampleSequence(sequence, progress, {
+        centerX: (characterA.x + characterB.x) / 2,
+        groundY: GROUND_Y,
+        direction,
+        distance: Math.max(1, Math.abs(characterB.x - characterA.x)),
+      });
+      const a = sampled.characters.attacker;
+      const b = sampled.characters.victim;
+      return { a: poseResult(a.pose, a.position.x, a.facing), b: poseResult(b.pose, b.position.x, b.facing) };
+    }
     if (selected.kind === "authored") {
       const animation = authoredAnimations.find((item) => item.name === selected.key);
       return { a: poseResult(sampleAnimation(animation, progress) ?? DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
@@ -199,7 +214,8 @@ export default function AnimationHarnessPage() {
       ctx.lineWidth = 1.5;
       const groundScreenY = GROUND_Y + rect.height / 2;
       ctx.beginPath(); ctx.moveTo(32, groundScreenY); ctx.lineTo(rect.width - 32, groundScreenY); ctx.stroke();
-      if (selected.kind === "trench") {
+      const selectedSequence = selected.kind === "sequence" ? characterSequences.find((item) => item.id === selected.key) : null;
+      if (selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal") {
         drawTrenchCoatRevealToCanvas(ctx, {
           x: characterA.x + rect.width / 2,
           groundY: groundScreenY,
@@ -225,7 +241,7 @@ export default function AnimationHarnessPage() {
     return () => observer.disconnect();
   }, [characterA, characterB, currentTime, poses, progress, selected.key, selected.kind]);
 
-  const grouped = ["Featured sequence", "Character moves", "Authored clips"] as const;
+  const grouped = ["Sequences", "Character moves", "Authored clips"] as const;
   const selectMove = (id: string) => { setSelectedId(id); currentTimeRef.current = 0; setCurrentTime(0); setPlaying(true); };
   const togglePlaying = () => {
     if (playing) { setPlaying(false); return; }
@@ -242,13 +258,15 @@ export default function AnimationHarnessPage() {
     setCurrentTime(value);
     setPlaying(false);
   };
-  const poseKeys: Array<"a" | "b"> = selected.kind === "trench" ? ["a"] : ["a", "b"];
+  const selectedSequence = selected.kind === "sequence" ? characterSequences.find((item) => item.id === selected.key) : null;
+  const isTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
+  const poseKeys: Array<"a" | "b"> = isTrenchReveal ? ["a"] : ["a", "b"];
   return (
     <main className={styles.page}>
       <section className={styles.stage} aria-label="Animation preview stage">
         <div className={styles.stageMeta} aria-live="polite">
           <span className={styles.stageEyebrow}>7-frame study</span>
-          <strong>{selected.kind === "trench" ? trenchSample.beatLabel : selected.label}</strong>
+          <strong>{isTrenchReveal ? trenchSample.beatLabel : selected.label}</strong>
         </div>
         <canvas ref={canvasRef} className={styles.canvas} />
       </section>
@@ -269,7 +287,7 @@ export default function AnimationHarnessPage() {
           </label>
           <div className={styles.time}>{currentTime.toFixed(3)} / {selected.duration.toFixed(2)}s</div>
         </div>
-        {selected.kind === "trench" && (
+        {isTrenchReveal && (
           <div className={styles.beatStrip} aria-label="Trench coat keyframes">
             {TRENCH_COAT_REVEAL_BEATS.map((beat, index) => (
               <button
@@ -285,7 +303,7 @@ export default function AnimationHarnessPage() {
           </div>
         )}
         <CharacterControlRow name="A" value={characterA} onChange={setCharacterA} />
-        {selected.kind !== "trench" && <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />}
+        {!isTrenchReveal && <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />}
         <div className={styles.readouts}>
           {poseKeys.map((key) => <div className={styles.posePanel} key={key}><div className={styles.poseTitle}>Character {key.toUpperCase()} pose</div><div className={styles.poseGrid}>{poseReadout(poses[key]).map(([name, value]) => <span key={name}>{name} {Number(value).toFixed(3)}</span>)}</div></div>)}
         </div>

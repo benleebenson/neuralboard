@@ -1,6 +1,5 @@
 import { clamp, lerp, normalizePose, type Pose } from "../../characterAnimations.ts";
 import type {
-  CharacterSequence,
   SampledSequence,
   SampledSequenceCharacter,
   SampledSequenceEffect,
@@ -8,11 +7,12 @@ import type {
   SequenceEasing,
   SequenceEffect,
   SequenceKeyframe,
-  SequenceRole,
+  PairedCharacterSequence,
+  PairedSequenceRole,
   SequenceWorldSetup,
 } from "./types.ts";
 
-const ROLES: readonly SequenceRole[] = ["attacker", "victim"];
+const ROLES: readonly PairedSequenceRole[] = ["attacker", "victim"];
 
 function ease(value: number, easing: SequenceEasing = "easeInOut"): number {
   const t = clamp(value, 0, 1);
@@ -41,7 +41,7 @@ function lerpPose(a: Pose, b: Pose, t: number): Pose {
   };
 }
 
-function facingFor(sequence: CharacterSequence, role: SequenceRole, direction: 1 | -1): 1 | -1 {
+function facingFor(sequence: PairedCharacterSequence, role: PairedSequenceRole, direction: 1 | -1): 1 | -1 {
   if (sequence.setup.facing === "same") return direction;
   if (sequence.setup.facing === "away") return (role === "attacker" ? -direction : direction) as 1 | -1;
   return (role === "attacker" ? direction : -direction) as 1 | -1;
@@ -49,10 +49,10 @@ function facingFor(sequence: CharacterSequence, role: SequenceRole, direction: 1
 
 function resolveFramePositions(
   frame: SequenceKeyframe,
-  sequence: CharacterSequence,
+  sequence: PairedCharacterSequence,
   setup: SequenceWorldSetup,
-): Record<SequenceRole, { x: number; y: number }> {
-  const result = {} as Record<SequenceRole, { x: number; y: number }>;
+): Record<PairedSequenceRole, { x: number; y: number }> {
+  const result = {} as Record<PairedSequenceRole, { x: number; y: number }>;
   const spacingScale = (setup.distance ?? sequence.setup.distance) / Math.max(1, sequence.setup.distance);
   const resolveAbsolute = (character: SequenceCharacterKeyframe) => ({
     x: setup.centerX + character.position.x * spacingScale * setup.direction,
@@ -81,7 +81,7 @@ function resolveFramePositions(
 
 function effectPoint(
   effect: SequenceEffect,
-  characters: Record<SequenceRole, SampledSequenceCharacter>,
+  characters: Record<PairedSequenceRole, SampledSequenceCharacter>,
   direction: 1 | -1,
 ) {
   const anchor = effect.anchor ?? "between";
@@ -94,16 +94,16 @@ function effectPoint(
   return { x: base.x + (effect.x ?? 0) * direction, y: base.y + (effect.y ?? 0) };
 }
 
-export function sequenceSetupMarks(sequence: CharacterSequence, setup: SequenceWorldSetup) {
+export function sequenceSetupMarks(sequence: PairedCharacterSequence, setup: SequenceWorldSetup) {
   const half = (setup.distance ?? sequence.setup.distance) / 2;
   return {
     attacker: { x: setup.centerX - half * setup.direction, y: setup.groundY },
     victim: { x: setup.centerX + half * setup.direction, y: setup.groundY },
-  } satisfies Record<SequenceRole, { x: number; y: number }>;
+  } satisfies Record<PairedSequenceRole, { x: number; y: number }>;
 }
 
 export function sampleSequence(
-  sequence: CharacterSequence,
+  sequence: PairedCharacterSequence,
   progress: number,
   setup: SequenceWorldSetup,
 ): SampledSequence {
@@ -117,7 +117,7 @@ export function sampleSequence(
   const intervalT = ease((t - left.t) / span, left.easing);
   const leftPositions = resolveFramePositions(left, sequence, setup);
   const rightPositions = resolveFramePositions(right, sequence, setup);
-  const characters = {} as Record<SequenceRole, SampledSequenceCharacter>;
+  const characters = {} as Record<PairedSequenceRole, SampledSequenceCharacter>;
 
   for (const role of ROLES) {
     characters[role] = {
@@ -147,7 +147,7 @@ export function sampleSequence(
 
 /** Deterministic preview version of the board's momentum response for sequence root motion. */
 export function sampleSequenceWithMomentum(
-  sequence: CharacterSequence,
+  sequence: PairedCharacterSequence,
   progress: number,
   setup: SequenceWorldSetup,
 ): SampledSequence {
