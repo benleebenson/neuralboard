@@ -534,6 +534,25 @@ function streamPoseFallback(args: {
   return pose;
 }
 
+/** Shared action adapter used by isolated previews and the live character entity. */
+export function previewEntityActionPose(args: {
+  x: number;
+  y: number;
+  facing: 1 | -1;
+  actionType: string;
+  progress: number;
+  physique?: "slim" | "jacked";
+  emoji?: string;
+  actionParams?: Record<string, number | string | boolean | null | undefined>;
+}): BoardCharPoseResult {
+  return streamPoseFallback({
+    ...args,
+    vx: 0,
+    vy: 0,
+    physique: args.physique ?? "slim",
+  });
+}
+
 function standingBoardPose(boardX: number, boardY: number, facing: 1 | -1, time: number): BoardCharPoseResult {
   return {
     boardX,

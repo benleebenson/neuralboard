@@ -52,7 +52,8 @@ export type StreamCharacterDebugRow = {
   construction?: Record<string, number | string | boolean>;
 };
 
-export type StreamBoardPose = Record<string, number | string | boolean | null | undefined>;
+export type StreamBoardPoseEffect = Record<string, number | string | boolean | null | undefined>;
+export type StreamBoardPose = Record<string, number | string | boolean | null | undefined | StreamBoardPoseEffect[]>;
 
 export function isCharacterSkin(value: unknown): value is CharacterSkin {
   return value === "stick" || value === "styled";

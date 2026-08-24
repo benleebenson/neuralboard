@@ -255,6 +255,158 @@ export type BoardCharacterDrawEvaluators = {
   physiqueAt: (time: number, actions: BoardResolvedCharAction[]) => "slim" | "jacked";
 };
 
+export type CharacterDebugEffect = {
+  type: "impactStars" | "motionLines" | "dustPuff" | "screenShake";
+  x: number;
+  y: number;
+  alpha: number;
+  intensity?: number;
+};
+
+export function drawCharacterSequenceEffectsToCanvas(
+  ctx: CanvasRenderingContext2D,
+  effects: readonly CharacterDebugEffect[],
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number,
+) {
+  for (const effect of effects) {
+    if (effect.type === "screenShake" || effect.alpha <= 0.001) continue;
+    const x = (effect.x - cam.cameraX) * sf + W / 2;
+    const y = (effect.y - cam.cameraY) * sf + H / 2;
+    const strength = (effect.intensity ?? 1) * effect.alpha;
+    ctx.save();
+    ctx.globalAlpha *= clamp(effect.alpha, 0, 1);
+    ctx.strokeStyle = "#2a2a2a";
+    ctx.fillStyle = "#ffd34e";
+    ctx.lineWidth = Math.max(1.5, 2.4 * sf);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    if (effect.type === "impactStars") {
+      for (let i = 0; i < 5; i++) {
+        const angle = (Math.PI * 2 * i) / 5 - Math.PI / 2;
+        const cx = x + Math.cos(angle) * 30 * sf * strength;
+        const cy = y + Math.sin(angle) * 24 * sf * strength;
+        const outer = 9 * sf * strength;
+        const inner = outer * 0.42;
+        ctx.beginPath();
+        for (let point = 0; point < 10; point++) {
+          const a = -Math.PI / 2 + point * Math.PI / 5;
+          const radius = point % 2 === 0 ? outer : inner;
+          const px = cx + Math.cos(a) * radius;
+          const py = cy + Math.sin(a) * radius;
+          if (point === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      }
+    } else if (effect.type === "motionLines") {
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.moveTo(x - 38 * sf * strength, y + i * 13 * sf);
+        ctx.quadraticCurveTo(x - 10 * sf, y + i * 10 * sf, x + 18 * sf * strength, y + i * 5 * sf);
+        ctx.stroke();
+      }
+    } else if (effect.type === "dustPuff") {
+      ctx.fillStyle = BOARD_SURFACE_COLOR;
+      for (const [dx, dy, radius] of [[-22, -3, 13], [-8, -12, 17], [11, -9, 15], [25, -1, 11]] as const) {
+        ctx.beginPath();
+        ctx.arc(x + dx * sf * strength, y + dy * sf, radius * sf * strength, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+}
+
+export function drawCharacterSkeletonOverlayToCanvas(
+  ctx: CanvasRenderingContext2D,
+  pose: BoardCharPoseResult,
+  cam: { cameraX: number; cameraY: number; boardZoom: number },
+  sf: number,
+  W: number,
+  H: number,
+) {
+  const S = sf;
+  const leg = STREAM_CHARACTER_GEOMETRY.legRaw * S;
+  const arm = STREAM_CHARACTER_GEOMETRY.armRaw * S;
+  const torso = CHAR_TORSO_RAW * S;
+  const neck = CHAR_NECK_RAW * S;
+  const head = CHAR_HEAD_R_RAW * S;
+  const hipY = -CHAR_HIP_RAW * S + (pose.headBob ?? 0) * S * 0.25;
+  type Point = { x: number; y: number };
+  const rotateAround = (point: Point, origin: Point, angle: number): Point => {
+    const dx = point.x - origin.x;
+    const dy = point.y - origin.y;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    return { x: origin.x + dx * cos - dy * sin, y: origin.y + dx * sin + dy * cos };
+  };
+  const hip = { x: 0, y: hipY };
+  const legChain = (thighA: number, shinA: number) => {
+    const knee = { x: -Math.sin(thighA) * leg, y: hipY + Math.cos(thighA) * leg };
+    return { knee, foot: { x: knee.x - Math.sin(shinA) * leg, y: knee.y + Math.cos(shinA) * leg } };
+  };
+  const leftLeg = legChain(pose.leftLegA, pose.leftShinA ?? pose.leftLegA + pose.leftForeA * 0.5);
+  const rightLeg = legChain(pose.rightLegA, pose.rightShinA ?? pose.rightLegA + pose.rightForeA * 0.5);
+  const shoulderCenter = rotateAround({ x: 0, y: hipY - torso * 0.85 }, hip, pose.bodyLean ?? 0);
+  const torsoTop = rotateAround({ x: 0, y: hipY - torso }, hip, pose.bodyLean ?? 0);
+  const headTilt = pose.headTilt ?? 0;
+  const neckTop = rotateAround({ x: -Math.sin(headTilt) * neck, y: hipY - torso - Math.cos(headTilt) * neck }, hip, pose.bodyLean ?? 0);
+  const headCenter = rotateAround({ x: -Math.sin(headTilt) * (neck + head * 0.35), y: hipY - torso - Math.cos(headTilt) * (neck + head) }, hip, pose.bodyLean ?? 0);
+  const armChain = (upperA: number, foreA: number) => {
+    const rawElbow = { x: -Math.sin(upperA) * arm, y: hipY - torso * 0.85 + Math.cos(upperA) * arm };
+    const rawHand = { x: rawElbow.x - Math.sin(foreA) * arm, y: rawElbow.y + Math.cos(foreA) * arm };
+    return { elbow: rotateAround(rawElbow, hip, pose.bodyLean ?? 0), hand: rotateAround(rawHand, hip, pose.bodyLean ?? 0) };
+  };
+  const leftArm = armChain(pose.leftArmA, pose.leftForeA);
+  const rightArm = armChain(pose.rightArmA, pose.rightForeA);
+  let points = {
+    hip, shoulderCenter, torsoTop, neckTop, headCenter,
+    leftKnee: leftLeg.knee, leftFoot: leftLeg.foot,
+    rightKnee: rightLeg.knee, rightFoot: rightLeg.foot,
+    leftElbow: leftArm.elbow, leftHand: leftArm.hand,
+    rightElbow: rightArm.elbow, rightHand: rightArm.hand,
+  };
+  if (pose.spinAngle) {
+    const center = { x: 0, y: hipY - torso / 2 };
+    points = Object.fromEntries(Object.entries(points).map(([key, value]) => [key, rotateAround(value, center, pose.spinAngle)])) as typeof points;
+  }
+  const rootX = (pose.boardX - cam.cameraX) * sf + W / 2 + (pose.sequenceShakeX ?? 0) * sf;
+  const rootY = (pose.boardY - cam.cameraY) * sf + H / 2 + (pose.airY ?? 0) * sf + (pose.sequenceShakeY ?? 0) * sf;
+  const screen = (point: Point) => ({
+    x: rootX + point.x * pose.facing * (pose.momentumScaleX ?? 1),
+    y: rootY + point.y * (pose.momentumScaleY ?? 1),
+  });
+  // Explicit chains keep left/right limbs readable despite the renderer sharing a shoulder origin.
+  const chains: Array<[Point, Point, Point]> = [
+    [points.hip, points.leftKnee, points.leftFoot], [points.hip, points.rightKnee, points.rightFoot],
+    [points.shoulderCenter, points.leftElbow, points.leftHand], [points.shoulderCenter, points.rightElbow, points.rightHand],
+  ];
+  ctx.save();
+  ctx.strokeStyle = "rgba(31, 111, 235, 0.9)";
+  ctx.fillStyle = "#ff4d7a";
+  ctx.lineWidth = Math.max(1, 1.25 * sf);
+  for (const chain of chains) {
+    ctx.beginPath();
+    chain.map(screen).forEach((point, index) => index === 0 ? ctx.moveTo(point.x, point.y) : ctx.lineTo(point.x, point.y));
+    ctx.stroke();
+  }
+  for (const [a, b] of [[points.hip, points.shoulderCenter], [points.shoulderCenter, points.torsoTop], [points.torsoTop, points.neckTop], [points.neckTop, points.headCenter]] as Array<[Point, Point]>) {
+    const from = screen(a); const to = screen(b);
+    ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+  }
+  const dots = [points.hip, points.shoulderCenter, points.torsoTop, points.neckTop, points.headCenter, points.leftKnee, points.leftFoot, points.rightKnee, points.rightFoot, points.leftElbow, points.leftHand, points.rightElbow, points.rightHand];
+  for (const dot of dots) {
+    const point = screen(dot);
+    ctx.beginPath(); ctx.arc(point.x, point.y, Math.max(2.5, 3.4 * sf), 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+
 export function drawBoardCharacterToCanvas(
   ctx: CanvasRenderingContext2D,
   time: number,
@@ -285,8 +437,11 @@ export function drawBoardCharacterToCanvas(
   const isJacked = physique === "jacked";
   const effectiveSkin: CharacterSkin = isJacked ? "stick" : characterSkin;
 
-  const sx = (p.boardX - cam.cameraX) * sf + W / 2;
-  const sy = (p.boardY - cam.cameraY) * sf + H / 2;
+  const sx = (p.boardX - cam.cameraX) * sf + W / 2 + (p.sequenceShakeX ?? 0) * sf;
+  const sy = (p.boardY - cam.cameraY) * sf + H / 2 + (p.sequenceShakeY ?? 0) * sf;
+  if (Array.isArray(p.sequenceEffects)) {
+    drawCharacterSequenceEffectsToCanvas(ctx, p.sequenceEffects, cam, sf, W, H);
+  }
   if (characterType === "explainer") {
     drawExplainerCharacter(ctx, {
       screenX: sx, screenY: sy, scale: sf, facing,

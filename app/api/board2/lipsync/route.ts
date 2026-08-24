@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions, isUserPro } from "@/lib/auth";
+import { lipSyncBridgeHttpError, lipSyncBridgeRequestError } from "@/lib/board2/generation-feedback";
 
 export const runtime = "nodejs";
 export const maxDuration = 180;
@@ -42,17 +43,17 @@ export async function POST(req: NextRequest) {
     });
     const data: unknown = await bridgeResponse.json().catch(() => null);
     if (!bridgeResponse.ok) {
-      const error = data && typeof data === "object" && "error" in data
-        ? String((data as { error: unknown }).error)
-        : `Bridge lip sync failed (${bridgeResponse.status})`;
-      return NextResponse.json({ error }, { status: bridgeResponse.status });
+      return NextResponse.json(
+        { error: lipSyncBridgeHttpError(bridgeResponse.status, bridgeResponse.statusText, data) },
+        { status: bridgeResponse.status },
+      );
     }
     if (!Array.isArray(data)) {
       return NextResponse.json({ error: "Bridge returned an invalid lip sync response" }, { status: 502 });
     }
     return NextResponse.json(data);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Lip sync request failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const failure = lipSyncBridgeRequestError(error);
+    return NextResponse.json({ error: failure.message }, { status: failure.status });
   }
 }

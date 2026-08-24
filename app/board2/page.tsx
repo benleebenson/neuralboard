@@ -128,6 +128,7 @@ import {
   nextBazookaHealth,
 } from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
+import { characterSequenceById, kneeToFaceSequence, sampleSequence, sequenceSetupMarks, type SequenceRole } from "@/lib/character/sequences";
 import {
   easeInOutCubic,
   interpolateCameraKeyframes as interpolateCameraTrack,
@@ -238,10 +239,24 @@ type TranscriptionApiResponse = {
   segments?: Array<{ start?: number; end?: number; text?: string }>;
 };
 
-async function postTranscriptionAudio(audio: Blob, filename: string): Promise<TranscriptionApiResponse> {
+type OperationMessage = {
+  kind: "success" | "error" | "warning" | "cancelled";
+  text: string;
+};
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError"
+    || error instanceof Error && error.name === "AbortError";
+}
+
+async function waitForUiPaint(): Promise<void> {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+async function postTranscriptionAudio(audio: Blob, filename: string, signal?: AbortSignal): Promise<TranscriptionApiResponse> {
   const form = new FormData();
   form.append("audio", audio, filename);
-  const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form });
+  const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form, signal });
   const data = await response.json().catch(() => null) as TranscriptionApiResponse | null;
   if (!response.ok) {
     throw new Error(
@@ -257,13 +272,15 @@ async function transcribeAudioBlob(
   audio: Blob,
   filename: string,
   onChunk?: (current: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<MergedTranscription> {
+  signal?.throwIfAborted();
   // Preserve the existing direct path for already-small recordings (including short live WebM
   // chunks that some browsers cannot decodeAudioData reliably). Multipart overhead still leaves
   // ample room below Vercel's 4.5 MB limit.
   if (audio.size <= 3 * 1024 * 1024) {
     onChunk?.(1, 1);
-    const data = await postTranscriptionAudio(audio, filename);
+    const data = await postTranscriptionAudio(audio, filename, signal);
     const segments = (Array.isArray(data.segments) ? data.segments : []).flatMap((segment) => {
       const start = Number(segment.start);
       const end = Number(segment.end);
@@ -296,6 +313,7 @@ async function transcribeAudioBlob(
 
   const chunks: TranscriptionChunk[] = [];
   for (let index = 0; index < windows.length; index++) {
+    signal?.throwIfAborted();
     const window = windows[index];
     onChunk?.(index + 1, windows.length);
     // Mono 16 kHz PCM keeps every ~60 second multipart request around 1.9 MB, safely below
@@ -308,6 +326,7 @@ async function transcribeAudioBlob(
     const data = await postTranscriptionAudio(
       chunkAudio,
       `${filename.replace(/\.[^.]+$/, "")}-part-${index + 1}.wav`,
+      signal,
     );
     chunks.push({
       window,
@@ -558,6 +577,17 @@ function narrationVisemeSourceSignature(clips: readonly Clip[]): string {
 
 function narrationGestureSourceSignature(clips: readonly Clip[]): string {
   return narrationVisemeSourceSignature(clips);
+}
+
+function generatedBoardSourceSignature(clips: readonly Clip[]): string {
+  return JSON.stringify(clips
+    .filter((clip) => clip.type === "narration" || isFeaturedTimelineClip(clip) && clip.boardX !== undefined)
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((clip) => [
+      clip.id, clip.type, clip.startTime, clip.duration, clip.holdFraction ?? null,
+      clip.boardX ?? null, clip.boardY ?? null, clip.boardW ?? null, clip.boardH ?? null,
+      clip.muted ?? false, clip.volume ?? 1, clip.sourceOffsetSec ?? 0,
+    ]));
 }
 
 // ─── "Complete recipe" save schema (schemaVersion 6) ───────────────────────────
@@ -1118,7 +1148,7 @@ type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "p
 type CharacterAction = {
   id: string;
   type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
-      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "idle";
+      | "pointAt" | "sitAndWatch" | "explainGesture" | "emote" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "sequence" | "idle";
   startTime: number;
   duration: number;
   targetX?: number;
@@ -1138,6 +1168,13 @@ type CharacterAction = {
                            // removable in bulk via "Clear AI choreography", otherwise a normal manual action
   narrationGestureClipId?: string;
   narrationGestureCueIndex?: number;
+  sequenceId?: string;
+  sequenceRole?: SequenceRole;
+  sequencePairId?: string;
+  sequenceSetupDuration?: number;
+  sequenceCenterX?: number;
+  sequenceCenterY?: number;
+  sequenceDirection?: 1 | -1;
   source?: ClipSource; // provenance: "auto" mirrors aiGenerated, else "manual". Narrower in practice
                         // (never neuralSearch/top5) but shares the ClipSource union for one schema.
 };
@@ -2125,7 +2162,7 @@ const CHAR_POINT_BEAT = 1.5;  // seconds of pointing per clip hold
 const CHAR_TRAVEL_TYPES = new Set<CharacterAction["type"]>(["walkTo", "jumpTo", "skateTo", "flip", "zipline", "wallClimb", "grapple"]);
 // Stationary actions whose target is a place to perform the action. Runtime may spend the first
 // part of the same block walking in, but the timeline still stores one action.
-const CHAR_STATIONARY_TARGET_TYPES = new Set<CharacterAction["type"]>(["dance", "emote", "pullUps", "mirrorCheck", "sitAndWatch", "explainGesture"]);
+const CHAR_STATIONARY_TARGET_TYPES = new Set<CharacterAction["type"]>(["dance", "emote", "pullUps", "mirrorCheck", "sitAndWatch", "explainGesture", "sequence"]);
 const CHAR_STATIONARY_NEAR_TARGET_PX = 60;
 const CHAR_STATIONARY_RUN_DIST_PX = 600;
 const CHAR_STATIONARY_WALK_SPEED = 360;
@@ -2577,6 +2614,17 @@ function resolvedActionRestPosition(
   clips: CharSurfaceClip[],
   craters: readonly StreamCrater[] = []
 ): { x: number; y: number } {
+  if (action.type === "sequence" && action.sequenceId && action.sequenceRole && action.sequenceCenterX !== undefined && action.sequenceCenterY !== undefined) {
+    const sequence = characterSequenceById[action.sequenceId];
+    if (sequence) {
+      const sampled = sampleSequence(sequence, 1, {
+        centerX: action.sequenceCenterX,
+        groundY: action.sequenceCenterY,
+        direction: action.sequenceDirection ?? 1,
+      });
+      return sampled.characters[action.sequenceRole].position;
+    }
+  }
   const skatePlan = action.type === "skateTo" ? buildSkateToPlan(action, clips, craters) : null;
   if (skatePlan) return { x: skatePlan.finalX, y: skatePlan.landingY };
   if (CHAR_STATIONARY_TARGET_TYPES.has(action.type) && action.targetX !== undefined) {
@@ -2737,7 +2785,7 @@ function resolveCharActions(
     const resolvedTarget = resolveClipTarget(a, clips);
     let targetX = a.type === "bazooka" ? resolvedTarget?.x ?? a.targetX : a.targetX ?? resolvedTarget?.x;
     let targetY = a.type === "bazooka" ? resolvedTarget?.y ?? a.targetY : a.targetY ?? resolvedTarget?.y;
-    if (actionCanChangeRestPosition(a.type) && targetX !== undefined) {
+    if (actionCanChangeRestPosition(a.type) && a.type !== "sequence" && targetX !== undefined) {
       const slot = resolveStandingSlot(targetX, targetY ?? y, a.startTime, a.startTime + a.duration, a.targetClipId, clips, blockers, resolvedTarget ? laneBias : 0, craters, traversalMode);
       targetX = slot.x;
       targetY = slot.y;
@@ -3039,6 +3087,9 @@ type CharPoseResult = {
   physiquePulse?: number;
   momentumScaleX?: number;
   momentumScaleY?: number;
+  sequenceShakeX?: number;
+  sequenceShakeY?: number;
+  sequenceEffects?: Array<{ type: "impactStars" | "motionLines" | "dustPuff" | "screenShake"; x: number; y: number; alpha: number; intensity?: number }>;
   spriteGesture?: Gesture;
 };
 
@@ -3429,6 +3480,46 @@ function evalCharPoseRaw(
   const authoredPose = slotName
     ? sampleAnimation(authoredAnimations[slotName], authoredProgressForAction(active, progress))
     : null;
+  if (active.type === "sequence" && active.sequenceId && active.sequenceRole && active.sequenceCenterX !== undefined && active.sequenceCenterY !== undefined) {
+    const sequence = characterSequenceById[active.sequenceId];
+    if (!sequence) return idlePose(active.fromX, active.fromY);
+    const setupDuration = clamp(active.sequenceSetupDuration ?? 0, 0, Math.max(0, active.duration - 0.05));
+    const elapsed = time - active.startTime;
+    const targetX = active.targetX ?? active.fromX;
+    const targetY = active.targetY ?? active.fromY;
+    if (elapsed < setupDuration) {
+      const distance = Math.hypot(targetX - active.fromX, targetY - active.fromY);
+      return travelPoseBetween(time, active.fromX, active.fromY, targetX, targetY, elapsed / Math.max(0.001, setupDuration), clips, distance / Math.max(0.001, setupDuration) > 520, craters, active.traversalMode);
+    }
+    const sequenceProgress = clamp((elapsed - setupDuration) / Math.max(0.001, active.duration - setupDuration), 0, 1);
+    const sampled = sampleSequence(sequence, sequenceProgress, {
+      centerX: active.sequenceCenterX,
+      groundY: active.sequenceCenterY,
+      direction: active.sequenceDirection ?? 1,
+    });
+    const character = sampled.characters[active.sequenceRole];
+    return {
+      boardX: character.position.x,
+      boardY: character.position.y,
+      facing: character.facing,
+      headBob: character.pose.headBob,
+      bodyLean: character.pose.bodyLean,
+      headTilt: character.pose.headTilt,
+      spinAngle: character.pose.poseRotation * character.facing,
+      leftLegA: character.pose.leftLegA,
+      rightLegA: character.pose.rightLegA,
+      leftShinA: character.pose.leftShinA,
+      rightShinA: character.pose.rightShinA,
+      leftArmA: character.pose.leftArmA,
+      rightArmA: character.pose.rightArmA,
+      leftForeA: character.pose.leftForeA,
+      rightForeA: character.pose.rightForeA,
+      airY: character.pose.airborneY,
+      sequenceShakeX: sampled.shake.x,
+      sequenceShakeY: sampled.shake.y,
+      ...(active.sequenceRole === "attacker" ? { sequenceEffects: sampled.effects } : {}),
+    };
+  }
   const stationaryRuntime = stationaryRuntimeForAction(active, clips, time, craters);
   if (stationaryRuntime.hasTarget && stationaryRuntime.phase === "travel") {
     return travelPoseBetween(
@@ -4563,22 +4654,31 @@ export default function Board2Page() {
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
+  const [narrationTranscriptionPhase, setNarrationTranscriptionPhase] = useState<string | null>(null);
+  const [narrationTranscriptionMessage, setNarrationTranscriptionMessage] = useState<OperationMessage | null>(null);
   const [narrationVisemeTrack, setNarrationVisemeTrack] = useState<VisemeTrackPoint[]>([]);
   const [narrationVisemeTrackSource, setNarrationVisemeTrackSource] = useState<string | null>(null);
   const [narrationGestureTrack, setNarrationGestureTrack] = useState<GestureTrackPoint[]>([]);
   const [narrationGestureTrackSource, setNarrationGestureTrackSource] = useState<string | null>(null);
   const [smartGestures, setSmartGestures] = useState(false);
   const [lipSyncStatus, setLipSyncStatus] = useState<"idle" | "analyzing">("idle");
+  const [lipSyncPhase, setLipSyncPhase] = useState<string | null>(null);
+  const [lipSyncMessage, setLipSyncMessage] = useState<OperationMessage | null>(null);
+  const [gestureGenerationMessage, setGestureGenerationMessage] = useState<OperationMessage | null>(null);
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
+  const [autoBuildCancelled, setAutoBuildCancelled] = useState(false);
+  const [autoBuildSource, setAutoBuildSource] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [boardDimensions, setBoardDimensions] = useState({ width: BOARD_W, height: BOARD_H });
   const [boardViewportSize, setBoardViewportSize] = useState({ width: VIEWPORT_W, height: VIEWPORT_H });
   const [toast, setToast] = useState<string | null>(null);
   const [cameraKeyframes, setCameraKeyframes] = useState<CameraKeyframe[]>([]);
+  const [cameraGenerationPhase, setCameraGenerationPhase] = useState<string | null>(null);
+  const [cameraGenerationMessage, setCameraGenerationMessage] = useState<OperationMessage | null>(null);
   const [isSpaceDown, setIsSpaceDown] = useState(false);
   const [dividerTooltip, setDividerTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
   const [keyframesOutOfDate, setKeyframesOutOfDate] = useState(false);
@@ -4702,6 +4802,8 @@ export default function Board2Page() {
   const [syncEmotesToNarration, setSyncEmotesToNarration] = useState(true);
   const [choreoPhase, setChoreoPhase] = useState<string | null>(null);
   const [choreoError, setChoreoError] = useState<string | null>(null);
+  const [choreoMessage, setChoreoMessage] = useState<OperationMessage | null>(null);
+  const [choreoSource, setChoreoSource] = useState<string | null>(null);
 
   // ── AI annotation generation ──
   const [aiModalOpen, setAiModalOpen] = useState(false);
@@ -4710,6 +4812,8 @@ export default function Board2Page() {
   const [aiScriptText, setAiScriptText] = useState("");
   const [aiPhase, setAiPhase] = useState<string | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiMessage, setAiMessage] = useState<OperationMessage | null>(null);
+  const [aiSource, setAiSource] = useState<string | null>(null);
 
   // ── YouTube modal ──
   const [ytModalOpen, setYtModalOpen] = useState(false);
@@ -4733,6 +4837,7 @@ export default function Board2Page() {
   const [neuralConcept, setNeuralConcept] = useState("");
   const [neuralPhase, setNeuralPhase] = useState<string | null>(null);
   const [neuralError, setNeuralError] = useState("");
+  const [neuralMessage, setNeuralMessage] = useState<OperationMessage | null>(null);
   const [neuralPlaceholders, setNeuralPlaceholders] = useState<NeuralPlaceholder[]>([]);
   const [imagePlaceholders, setImagePlaceholders] = useState<ImagePlaceholder[]>([]);
   const [hoveredPlaceholderId, setHoveredPlaceholderId] = useState<string | null>(null);
@@ -4745,6 +4850,7 @@ export default function Board2Page() {
   const [top5Concept, setTop5Concept] = useState("");
   const [top5Phase, setTop5Phase] = useState<string | null>(null);
   const [top5Error, setTop5Error] = useState("");
+  const [top5Message, setTop5Message] = useState<OperationMessage | null>(null);
 
   // ── Mobile Top 5 Tinder flow ──
   type MobileVideoCandidate = { videoId: string; title: string; channel: string; thumbnailUrl: string; viewCount: number; durationSec: number; };
@@ -4766,6 +4872,7 @@ export default function Board2Page() {
   const [mobileTop5LoadingRank, setMobileTop5LoadingRank] = useState<number | null>(null);
   const [mobileTop5BuildPhase, setMobileTop5BuildPhase] = useState<string | null>(null);
   const [mobileTop5Error, setMobileTop5Error] = useState("");
+  const [mobileTop5BuildMessage, setMobileTop5BuildMessage] = useState<OperationMessage | null>(null);
   const [mobileTop5TrimStartInput, setMobileTop5TrimStartInput] = useState("0:00");
   const [mobileTop5TrimEndInput, setMobileTop5TrimEndInput] = useState("0:30");
   const [mobileTop5TrimError, setMobileTop5TrimError] = useState("");
@@ -4813,6 +4920,7 @@ export default function Board2Page() {
   const currentNarrationGestureSource = useMemo(() => narrationGestureSourceSignature(clips), [clips]);
   const narrationGestureTrackIsCurrent = narrationGestureTrack.length > 0 && narrationGestureTrackSource === currentNarrationGestureSource;
   const narrationSpeechTracksAreCurrent = narrationVisemeTrackIsCurrent && narrationGestureTrackIsCurrent;
+  const currentGeneratedBoardSource = useMemo(() => generatedBoardSourceSignature(clips), [clips]);
   const generatedDuration = Math.max(0, ...clips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
   const timelineDuration = Math.max(10, generatedDuration + 2);
   const timelineWidth = timelineDuration * pxPerSec;
@@ -4894,6 +5002,15 @@ export default function Board2Page() {
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
+  const autoBuildAbortRef = useRef<AbortController | null>(null);
+  const lipSyncAbortRef = useRef<AbortController | null>(null);
+  const narrationTranscriptionAbortRef = useRef<AbortController | null>(null);
+  const cameraGenerationRunRef = useRef(0);
+  const annotationAbortRef = useRef<AbortController | null>(null);
+  const choreographyAbortRef = useRef<AbortController | null>(null);
+  const neuralSearchAbortRef = useRef<AbortController | null>(null);
+  const top5AbortRef = useRef<AbortController | null>(null);
+  const mobileTop5AbortRef = useRef<AbortController | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraKeyframesRef = useRef<CameraKeyframe[]>([]);
   const pxPerSecRef = useRef(DEFAULT_PX_PER_SEC);
@@ -5609,7 +5726,7 @@ export default function Board2Page() {
                 }
               : undefined,
             velocity: { x: state?.vx ?? 0, y: state?.vy ?? 0 },
-            boardPose: pose ? { ...pose, viseme } : undefined,
+            boardPose: pose ? ({ ...pose, viseme } as StreamCharacterFrame["boardPose"]) : undefined,
             emoji: pose?.emojiText,
             emojiAlpha: pose?.emojiAlpha,
             viseme,
@@ -5639,7 +5756,7 @@ export default function Board2Page() {
             actionStartTime: sentAt - progress * duration * 1000,
             actionDuration: duration,
             velocity: { x: 0, y: 0 },
-            boardPose: { ...pose, viseme },
+            boardPose: { ...pose, viseme } as StreamCharacterFrame["boardPose"],
             emoji: pose.emojiText,
             emojiAlpha: pose.emojiAlpha,
             viseme,
@@ -8726,18 +8843,25 @@ export default function Board2Page() {
     const toastId = generateId();
     const createdBlobUrls: string[] = [];
     let placed = false;
+    const controller = new AbortController();
+    autoBuildAbortRef.current?.abort();
+    autoBuildAbortRef.current = controller;
     setAutoBuildError(null);
     setAutoBuildSummary(null);
-    setAutoBuildPhase("Transcribing…");
+    setAutoBuildCancelled(false);
+    setAutoBuildPhase("Compiling narration…");
     setDownloadToasts((prev) => [...prev, { id: toastId, title: "Auto-build narration images", status: "downloading" }]);
     try {
+      await waitForUiPaint();
       const narrationStart = narrationClips[0].startTime;
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
       const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
       const audio = await compileNarrationToBlob(narrationClips);
+      controller.signal.throwIfAborted();
+      setAutoBuildPhase("Transcribing narration…");
       const transcriptData = await transcribeAudioBlob(audio, "narration.wav", (current, total) => {
         if (total > 1) setAutoBuildPhase(`Transcribing (${current}/${total})…`);
-      });
+      }, controller.signal);
       const transcript = transcriptData.transcript.trim();
       if (!transcript) throw new Error("No spoken narration was detected");
       let transcriptSegments: TranscriptSegment[] = Array.isArray(transcriptData.segments)
@@ -8756,6 +8880,7 @@ export default function Board2Page() {
         const planResponse = await fetch("/api/board2/plan-images", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
           body: JSON.stringify({
             transcript,
             segments: transcriptSegments,
@@ -8840,6 +8965,7 @@ export default function Board2Page() {
           };
         });
       } catch (plannerError) {
+        if (isAbortError(plannerError)) throw plannerError;
         // The previous deterministic planner remains the safety net for malformed model output,
         // missing configuration, timeouts, and transient OpenAI failures.
         console.warn("[board2:auto-build] Editorial image planning failed; using keyword fallback", plannerError);
@@ -8860,6 +8986,7 @@ export default function Board2Page() {
           const imageResponse = await fetch("/api/board2/find-images", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
             body: JSON.stringify({ query: segment.query, count: 1 }),
           });
           const imageData = await imageResponse.json().catch(() => null) as {
@@ -8885,6 +9012,7 @@ export default function Board2Page() {
           };
           found.push({ segment, image: imageMetadata, sourceBlob, previewBlob });
         } catch (error) {
+          if (isAbortError(error)) throw error;
           const reason = error instanceof Error ? error.message : "Image search failed";
           skipped.push({ index, query: segment.query, reason });
           console.warn(`[board2:auto-build] Skipping image slot ${index + 1}/${segments.length} for “${segment.query}”: ${reason}`);
@@ -9014,6 +9142,7 @@ export default function Board2Page() {
       });
       clipsRef.current = nextClips;
       setClips(nextClips);
+      setAutoBuildSource(generatedBoardSourceSignature(nextClips));
       setClipSelection(autoClips.map((clip) => clip.id));
       placed = true;
 
@@ -9058,14 +9187,28 @@ export default function Board2Page() {
       setToast(summary);
     } catch (error) {
       if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
+      if (isAbortError(error)) {
+        const message = "Auto-build cancelled";
+        setAutoBuildSummary(null);
+        setAutoBuildError(null);
+        setAutoBuildCancelled(true);
+        setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
+        setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2500);
+        return;
+      }
       const message = error instanceof Error ? error.message : "Could not auto-build the narration draft";
       setAutoBuildSummary(null);
       setAutoBuildError(message);
       setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 6000);
     } finally {
+      if (autoBuildAbortRef.current === controller) autoBuildAbortRef.current = null;
       setAutoBuildPhase(null);
     }
+  }
+
+  function cancelAutoBuild() {
+    autoBuildAbortRef.current?.abort();
   }
 
   async function generateNarrationLipSync() {
@@ -9079,13 +9222,22 @@ export default function Board2Page() {
     }
 
     const sourceSignature = narrationVisemeSourceSignature(clipsRef.current);
+    const controller = new AbortController();
+    lipSyncAbortRef.current?.abort();
+    lipSyncAbortRef.current = controller;
     setLipSyncStatus("analyzing");
-    setToast("Analyzing narration…");
+    setLipSyncMessage(null);
+    setGestureGenerationMessage(null);
+    setLipSyncPhase("Compiling narration…");
+    setToast("Compiling narration…");
     try {
+      await waitForUiPaint();
       const analyzed: Array<{ clipId: string; startTime: number; duration: number; cues: RhubarbCue[] }> = [];
       const timedTranscript: TranscriptSegment[] = [];
       for (let clipIndex = 0; clipIndex < sourceClips.length; clipIndex++) {
+        controller.signal.throwIfAborted();
         const clip = sourceClips[clipIndex];
+        setLipSyncPhase(`Compiling narration ${clipIndex + 1}/${sourceClips.length}…`);
         const decoded = await decodeNarrationClip(clip);
         const sourceOffset = Math.min(Math.max(0, clip.sourceOffsetSec ?? 0), Math.max(0, decoded.duration - 0.01));
         const analysisDuration = Math.min(clip.duration, Math.max(0, decoded.duration - sourceOffset));
@@ -9093,12 +9245,20 @@ export default function Board2Page() {
         if (!windows.length) throw new Error(`No audio found in ${clip.name || "narration"}`);
         const clipCues: RhubarbCue[] = [];
         for (let chunkIndex = 0; chunkIndex < windows.length; chunkIndex++) {
+          controller.signal.throwIfAborted();
           const window = windows[chunkIndex];
-          setToast(`Analyzing narration ${clipIndex + 1}/${sourceClips.length} · part ${chunkIndex + 1}/${windows.length}…`);
+          const chunkLabel = `chunk ${chunkIndex + 1}/${windows.length} · narration ${clipIndex + 1}/${sourceClips.length}`;
+          setLipSyncPhase(`Uploading to bridge — ${chunkLabel}…`);
+          setToast(`Uploading lip sync — ${chunkLabel}…`);
           const audio = audioBufferSegmentToMonoWav(decoded, sourceOffset + window.audioStart, window.audioEnd - window.audioStart);
           const form = new FormData();
           form.append("audio", audio, `${clip.name || "narration"}-${chunkIndex + 1}.wav`);
-          const response = await fetch("/api/board2/lipsync", { method: "POST", body: form });
+          const analysisTimer = setTimeout(() => {
+            setLipSyncPhase(`Analyzing (Rhubarb) — ${chunkLabel}…`);
+            setToast(`Analyzing (Rhubarb) — ${chunkLabel}…`);
+          }, 600);
+          const response = await fetch("/api/board2/lipsync", { method: "POST", body: form, signal: controller.signal })
+            .finally(() => clearTimeout(analysisTimer));
           const data: unknown = await response.json().catch(() => null);
           if (!response.ok) {
             const message = data && typeof data === "object" && "error" in data
@@ -9124,9 +9284,15 @@ export default function Board2Page() {
         if (storedSegments.length) {
           timedTranscript.push(...storedSegments);
         } else {
+          setLipSyncPhase(`Transcribing gestures ${clipIndex + 1}/${sourceClips.length}…`);
           setToast(`Transcribing gestures ${clipIndex + 1}/${sourceClips.length}…`);
           const speechAudio = audioBufferSegmentToMonoWav(decoded, sourceOffset, analysisDuration);
-          const transcription = await transcribeAudioBlob(speechAudio, `${clip.name || "narration"}-gestures.wav`);
+          const transcription = await transcribeAudioBlob(
+            speechAudio,
+            `${clip.name || "narration"}-gestures.wav`,
+            undefined,
+            controller.signal,
+          );
           const generatedSegments = transcription.segments.flatMap((segment): TranscriptSegment[] => {
             const start = Math.max(0, segment.start);
             const end = Math.min(analysisDuration, segment.end);
@@ -9171,12 +9337,15 @@ export default function Board2Page() {
       });
       let gestureTrack = ruleBasedTrack;
       let smartGestureFallback = false;
+      let smartGestureFailure: string | null = null;
       if (smartGestures) {
+        setLipSyncPhase("Generating smart gestures (AI)…");
         setToast("Planning smart gestures…");
         try {
           const response = await fetch("/api/board2/gesture-track", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: controller.signal,
             body: JSON.stringify({ transcript, segments: timedTranscript, transcriptStart, transcriptEnd }),
           });
           const data: unknown = await response.json().catch(() => null);
@@ -9194,12 +9363,17 @@ export default function Board2Page() {
             : candidate;
           gestureTrack = applyGestureDwellRules(displayTrack, transcriptStart, transcriptEnd);
         } catch (error) {
+          if (isAbortError(error)) throw error;
           console.warn("[board2:gestures] Smart gesture generation failed; using rules", error);
           smartGestureFallback = true;
+          smartGestureFailure = error instanceof Error ? error.message : "Smart gesture generation failed";
           gestureTrack = ruleBasedTrack;
         }
       }
 
+      setLipSyncPhase("Applying cues…");
+      await waitForUiPaint();
+      controller.signal.throwIfAborted();
       if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
         throw new Error("Narration changed during analysis. Generate lip sync again.");
       }
@@ -9220,14 +9394,30 @@ export default function Board2Page() {
         sourceMatched: narrationGestureTrackSourceRef.current === narrationGestureSourceSignature(clipsRef.current),
         smart: smartGestures && !smartGestureFallback,
       });
+      const lipResult = `Lip sync generated — ${cueCount} mouth cue${cueCount === 1 ? "" : "s"}`;
+      setLipSyncMessage({ kind: "success", text: lipResult });
+      setGestureGenerationMessage(smartGestureFallback
+        ? { kind: "warning", text: `AI gestures failed — ${smartGestureFailure}; rule-based fallback applied — ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}` }
+        : { kind: "success", text: `${smartGestures ? "AI gestures" : "Gestures"} generated — ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}` });
       setToast(smartGestureFallback
-        ? `Smart gestures failed · using rule-based track (${gestureCount} gestures)`
-        : `Lip sync + gestures ready · ${cueCount} mouth cue${cueCount === 1 ? "" : "s"} · ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}`);
+        ? `Lip sync ready · AI gestures failed (${smartGestureFailure}) · ${gestureCount} fallback gestures applied`
+        : `${lipResult} · ${gestureCount} gesture${gestureCount === 1 ? "" : "s"}`);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not generate lip sync");
+      const cancelled = isAbortError(error);
+      const message = cancelled
+        ? "Lip sync generation cancelled"
+        : `Lip sync failed — ${error instanceof Error ? error.message : "unknown error"}`;
+      setLipSyncMessage({ kind: cancelled ? "cancelled" : "error", text: message });
+      setToast(message);
     } finally {
+      if (lipSyncAbortRef.current === controller) lipSyncAbortRef.current = null;
       setLipSyncStatus("idle");
+      setLipSyncPhase(null);
     }
+  }
+
+  function cancelNarrationLipSync() {
+    lipSyncAbortRef.current?.abort();
   }
 
   function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
@@ -9260,15 +9450,25 @@ export default function Board2Page() {
   async function transcribeNarrationWithWhisper(clip: Clip) {
     if (clip.type !== "narration" || transcribingNarrationId) return;
     const owner = activeCharacterIdRef.current;
+    const controller = new AbortController();
+    narrationTranscriptionAbortRef.current?.abort();
+    narrationTranscriptionAbortRef.current = controller;
     setTranscribingNarrationId(clip.id);
-    setToast("Transcribing narration with Whisper…");
+    setNarrationTranscriptionMessage(null);
+    setNarrationTranscriptionPhase("Preparing narration…");
+    setToast("Preparing Whisper transcription…");
     try {
+      await waitForUiPaint();
       const audio: Blob = clip.audioBlob instanceof Blob
         ? clip.audioBlob
-        : await fetch(clip.sourceUrl).then((response) => response.blob());
+        : await fetch(clip.sourceUrl, { signal: controller.signal }).then((response) => response.blob());
+      setNarrationTranscriptionPhase("Transcribing with Whisper…");
       const data = await transcribeAudioBlob(audio, `${clip.name || "narration"}.wav`, (current, total) => {
-        if (total > 1) setToast(`Transcribing narration with Whisper · part ${current}/${total}…`);
-      });
+        if (total > 1) {
+          setNarrationTranscriptionPhase(`Transcribing with Whisper — chunk ${current}/${total}…`);
+          setToast(`Transcribing narration with Whisper · chunk ${current}/${total}…`);
+        }
+      }, controller.signal);
       const segments: TranscriptSegment[] = Array.isArray(data.segments)
         ? data.segments
             .map((segment: TranscriptSegment) => ({ start: Number(segment.start), end: Number(segment.end), text: String(segment.text ?? "").trim() }))
@@ -9284,12 +9484,26 @@ export default function Board2Page() {
           ...narrationSpeechGestureActions(updatedClip, resolvedOwnerActions, owner),
         ]);
       }
-      setToast(`Whisper transcript ready · ${narrationSentenceCues(segments).length} sentences`);
+      const sentenceCount = narrationSentenceCues(segments).length;
+      const message = `Transcript generated — ${sentenceCount} sentence${sentenceCount === 1 ? "" : "s"}`;
+      setNarrationTranscriptionMessage({ kind: "success", text: message });
+      setToast(message);
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "Could not transcribe narration");
+      const cancelled = isAbortError(error);
+      const message = cancelled
+        ? "Whisper transcription cancelled"
+        : `Whisper transcription failed — ${error instanceof Error ? error.message : "unknown error"}`;
+      setNarrationTranscriptionMessage({ kind: cancelled ? "cancelled" : "error", text: message });
+      setToast(message);
     } finally {
+      if (narrationTranscriptionAbortRef.current === controller) narrationTranscriptionAbortRef.current = null;
       setTranscribingNarrationId(null);
+      setNarrationTranscriptionPhase(null);
     }
+  }
+
+  function cancelNarrationTranscription() {
+    narrationTranscriptionAbortRef.current?.abort();
   }
 
   function setNarrationSpeechGestures(clip: Clip, enabled: boolean) {
@@ -9637,7 +9851,11 @@ export default function Board2Page() {
   async function runNeuralSearch() {
     const concept = neuralConcept.trim();
     if (!concept) return;
+    const controller = new AbortController();
+    neuralSearchAbortRef.current?.abort();
+    neuralSearchAbortRef.current = controller;
     setNeuralError("");
+    setNeuralMessage(null);
     setNeuralPhase("Analyzing concept...");
     // The API call is a single round trip — stage the copy so the wait doesn't feel opaque.
     const t1 = setTimeout(() => setNeuralPhase("Searching YouTube..."), 1800);
@@ -9646,6 +9864,7 @@ export default function Board2Page() {
       const res = await fetch("/api/neural-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({ concept }),
       });
       if (!res.ok) {
@@ -9690,14 +9909,25 @@ export default function Board2Page() {
       });
       setNeuralPlaceholders((prev) => [...prev, ...newVideoPlaceholders]);
       setImagePlaceholders((prev) => [...prev, ...newImagePlaceholders]);
+      const message = `Neural search finished — ${newVideoPlaceholders.length} video${newVideoPlaceholders.length === 1 ? "" : "s"} + ${newImagePlaceholders.length} image${newImagePlaceholders.length === 1 ? "" : "s"}`;
+      setNeuralMessage({ kind: "success", text: message });
+      setToast(message);
       setNeuralModalOpen(false);
       setNeuralConcept("");
     } catch (e) {
-      setNeuralError(e instanceof Error ? e.message : "Search failed");
+      const cancelled = isAbortError(e);
+      const message = cancelled ? "Neural search cancelled" : `Neural search failed — ${e instanceof Error ? e.message : "unknown error"}`;
+      setNeuralError(message);
+      setNeuralMessage({ kind: cancelled ? "cancelled" : "error", text: message });
     } finally {
       clearTimeout(t1); clearTimeout(t2);
       setNeuralPhase(null);
+      if (neuralSearchAbortRef.current === controller) neuralSearchAbortRef.current = null;
     }
+  }
+
+  function cancelNeuralSearch() {
+    neuralSearchAbortRef.current?.abort();
   }
 
   function removeNeuralPlaceholder(id: string) {
@@ -9709,7 +9939,11 @@ export default function Board2Page() {
   async function runTop5Search() {
     const concept = top5Concept.trim();
     if (!concept) return;
+    const controller = new AbortController();
+    top5AbortRef.current?.abort();
+    top5AbortRef.current = controller;
     setTop5Error("");
+    setTop5Message(null);
     setTop5Phase("Generating list...");
     const t1 = setTimeout(() => setTop5Phase("Searching videos..."), 4000);
     const t2 = setTimeout(() => setTop5Phase("Arranging on board..."), 10000);
@@ -9717,6 +9951,7 @@ export default function Board2Page() {
       const res = await fetch("/api/top5-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({ concept }),
       });
       if (!res.ok) {
@@ -9839,14 +10074,25 @@ export default function Board2Page() {
 
       setAnnotations((prev) => [...prev, ...newAnnotations]);
       setNeuralPlaceholders((prev) => [...prev, ...newPlaceholders]);
+      const message = `Top 5 generated — ${data.items.length} ranks, ${newPlaceholders.length} video candidate${newPlaceholders.length === 1 ? "" : "s"}`;
+      setTop5Message({ kind: "success", text: message });
+      setToast(message);
       setTop5ModalOpen(false);
       setTop5Concept("");
     } catch (e) {
-      setTop5Error(e instanceof Error ? e.message : "Search failed");
+      const cancelled = isAbortError(e);
+      const message = cancelled ? "Top 5 generation cancelled" : `Top 5 generation failed — ${e instanceof Error ? e.message : "unknown error"}`;
+      setTop5Error(message);
+      setTop5Message({ kind: cancelled ? "cancelled" : "error", text: message });
     } finally {
       clearTimeout(t1); clearTimeout(t2);
       setTop5Phase(null);
+      if (top5AbortRef.current === controller) top5AbortRef.current = null;
     }
+  }
+
+  function cancelTop5Generation() {
+    top5AbortRef.current?.abort();
   }
 
   // ─ Mobile Top 5 Tinder flow ──────────────────────────────────────────────
@@ -9908,12 +10154,17 @@ export default function Board2Page() {
   async function runMobileTop5Search() {
     const concept = mobileTop5Concept.trim();
     if (!concept) return;
+    const controller = new AbortController();
+    mobileTop5AbortRef.current?.abort();
+    mobileTop5AbortRef.current = controller;
     setMobileTop5Error("");
+    setMobileTop5BuildMessage(null);
     setMobileTop5Screen("loading");
     try {
       const res = await fetch("/api/top5-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({ concept, itemCount: mobileTop5ListLength }),
       });
       if (!res.ok) {
@@ -9949,8 +10200,10 @@ export default function Board2Page() {
       setMobileTop5EditingLabel(false);
       setMobileTop5Screen("swipe");
     } catch (e) {
-      setMobileTop5Error(e instanceof Error ? e.message : "Search failed");
+      setMobileTop5Error(isAbortError(e) ? "Top 5 generation cancelled" : `Top 5 generation failed — ${e instanceof Error ? e.message : "unknown error"}`);
       setMobileTop5Screen("prompt");
+    } finally {
+      if (mobileTop5AbortRef.current === controller) mobileTop5AbortRef.current = null;
     }
   }
 
@@ -10053,8 +10306,13 @@ export default function Board2Page() {
   }
 
   async function buildMobileTop5Video(accepted: Map<number, { videoId: string; trimStart: number; trimEnd: number; title: string }>) {
+    const controller = new AbortController();
+    mobileTop5AbortRef.current?.abort();
+    mobileTop5AbortRef.current = controller;
     setMobileTop5Screen("build");
     setMobileTop5BuildPhase("Setting up...");
+    setMobileTop5BuildMessage(null);
+    await waitForUiPaint();
 
     const topRank = mobileTop5ListLength;
 
@@ -10110,7 +10368,18 @@ export default function Board2Page() {
     setAnnotations((prev) => [...prev, ...newAnnotations]);
 
     const ranks = Array.from({ length: topRank }, (_, ii) => topRank - ii); // [N, N-1, ..., 1]
+    const failedRanks: Array<{ rank: number; reason: string }> = [];
+    let downloadedCount = 0;
     for (let ri = 0; ri < ranks.length; ri++) {
+      if (controller.signal.aborted) {
+        const message = `Top ${topRank} build cancelled — ${downloadedCount}/${topRank} clips downloaded`;
+        setMobileTop5BuildMessage({ kind: "cancelled", text: message });
+        setMobileTop5Error(message);
+        setMobileTop5BuildPhase(null);
+        setMobileTop5Screen("done");
+        if (mobileTop5AbortRef.current === controller) mobileTop5AbortRef.current = null;
+        return;
+      }
       const rank = ranks[ri];
       const acc = accepted.get(rank);
       if (!acc) continue;
@@ -10123,6 +10392,7 @@ export default function Board2Page() {
         const dlRes = await fetch("/api/ytdl", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
           body: JSON.stringify({
             id: acc.videoId,
             start: acc.trimStart,
@@ -10155,16 +10425,31 @@ export default function Board2Page() {
         };
         clipsRef.current = [...clipsRef.current, clip];
         setClips((prev) => [...prev, clip]);
-      } catch {
-        // Continue even if one download fails
+        downloadedCount++;
+      } catch (error) {
+        if (isAbortError(error)) {
+          ri--;
+          continue;
+        }
+        failedRanks.push({ rank, reason: error instanceof Error ? error.message : "download failed" });
       }
     }
 
     setMobileTop5BuildPhase("Generating camera path...");
-    generateCameraKeyframes();
+    await generateCameraKeyframes();
 
     setMobileTop5BuildPhase(null);
+    const message = failedRanks.length
+      ? `Top ${topRank} built with warnings — ${downloadedCount}/${topRank} clips downloaded; failed ${failedRanks.map((item) => `#${item.rank} (${item.reason})`).join(", ")}`
+      : `Top ${topRank} generated — ${downloadedCount} clips, ${newAnnotations.length} labels, ${cameraKeyframesRef.current.length} camera keyframes`;
+    setMobileTop5BuildMessage({ kind: failedRanks.length ? "warning" : "success", text: message });
+    setToast(message);
     setMobileTop5Screen("done");
+    if (mobileTop5AbortRef.current === controller) mobileTop5AbortRef.current = null;
+  }
+
+  function cancelMobileTop5Generation() {
+    mobileTop5AbortRef.current?.abort();
   }
 
   function renderMobileTop5Flow() {
@@ -10311,7 +10596,7 @@ export default function Board2Page() {
                 <div style={{ fontSize: 11, color: "#6a6a6a" }}>Finding the best video candidates for each rank</div>
               </div>
               <button
-                onClick={() => { setMobileTop5Screen("prompt"); setMobileTop5Error(""); }}
+                onClick={cancelMobileTop5Generation}
                 style={{ fontFamily: "monospace", fontSize: 12, background: "transparent", border: "1.5px solid rgba(42,42,42,0.4)", padding: "10px 20px", cursor: "pointer", color: "#6a6a6a" }}
               >
                 Cancel
@@ -10510,6 +10795,7 @@ export default function Board2Page() {
                     </div>
                     <div style={{ fontSize: 12, color: "#6a6a6a" }}>{mobileTop5BuildPhase ?? "Preparing..."}</div>
                   </div>
+                  <button type="button" onClick={cancelMobileTop5Generation} style={{ fontFamily: "monospace", fontSize: 12, background: "transparent", border: "1.5px solid #a32916", padding: "10px 20px", cursor: "pointer", color: "#a32916" }}>Cancel build</button>
                 </>
               )}
               {mobileTop5Screen === "done" && (
@@ -10519,8 +10805,8 @@ export default function Board2Page() {
                     <div style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: ink, marginBottom: 8 }}>
                       Your Top {totalRanks} is ready!
                     </div>
-                    <div style={{ fontSize: 12, color: "#6a6a6a", lineHeight: 1.6 }}>
-                      {totalRanks} clips downloaded, labels added, and camera path generated.
+                    <div role="status" aria-live="polite" style={{ fontSize: 12, color: mobileTop5BuildMessage?.kind === "success" ? "#496700" : mobileTop5BuildMessage ? "#8a6200" : "#6a6a6a", lineHeight: 1.6 }}>
+                      {mobileTop5BuildMessage?.text ?? `${totalRanks} clips downloaded, labels added, and camera path generated.`}
                     </div>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%" }}>
@@ -10709,11 +10995,10 @@ export default function Board2Page() {
   }
 
   function deleteCharacterAction(id: string) {
-    if (characterActions2Ref.current.some((a) => a.id === id)) {
-      setCharacterActions2((prev) => prev.filter((a) => a.id !== id));
-    } else {
-      setCharacterActions((prev) => prev.filter((a) => a.id !== id));
-    }
+    const action = [...characterActionsRef.current, ...characterActions2Ref.current].find((candidate) => candidate.id === id);
+    const pairId = action?.sequencePairId;
+    setCharacterActions((prev) => prev.filter((candidate) => candidate.id !== id && (!pairId || candidate.sequencePairId !== pairId)));
+    setCharacterActions2((prev) => prev.filter((candidate) => candidate.id !== id && (!pairId || candidate.sequencePairId !== pairId)));
     if (selectedCharActionIdRef.current === id) {
       selectedCharActionIdRef.current = null;
       setSelectedCharActionId(null);
@@ -10725,6 +11010,59 @@ export default function Board2Page() {
   function updateCharacterActionsFor(id: CharacterId, updater: (prev: CharacterAction[]) => CharacterAction[]) {
     if (id === "c2") setCharacterActions2(updater);
     else setCharacterActions(updater);
+  }
+
+  function addKneeToFaceSequence() {
+    const attackerId = activeCharacterIdRef.current;
+    const victimId: CharacterId = attackerId === "c1" ? "c2" : "c1";
+    const poseFor = (id: CharacterId) => id === "c2"
+      ? evalCharAtTime(playheadRef.current, resolvedCharActions2Ref.current, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current)
+      : evalCharAtTime(playheadRef.current, resolvedCharActionsRef.current, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current);
+    const attackerPose = poseFor(attackerId);
+    const victimPose = poseFor(victimId);
+    const direction: 1 | -1 = victimPose.boardX === attackerPose.boardX
+      ? (attackerPose.facing ?? 1)
+      : victimPose.boardX > attackerPose.boardX ? 1 : -1;
+    const centerX = (attackerPose.boardX + victimPose.boardX) / 2;
+    const centerY = Math.max(attackerPose.boardY, victimPose.boardY);
+    const marks = sequenceSetupMarks(kneeToFaceSequence, { centerX, groundY: centerY, direction });
+    const maxTravel = Math.max(
+      Math.hypot(attackerPose.boardX - marks.attacker.x, attackerPose.boardY - marks.attacker.y),
+      Math.hypot(victimPose.boardX - marks.victim.x, victimPose.boardY - marks.victim.y),
+    );
+    const setupDuration = clamp(maxTravel / 360, 0.25, 1.2);
+    const duration = setupDuration + kneeToFaceSequence.durationSeconds;
+    let startTime = playheadRef.current;
+    const attackerActions = attackerId === "c1" ? characterActionsRef.current : characterActions2Ref.current;
+    const victimActions = victimId === "c1" ? characterActionsRef.current : characterActions2Ref.current;
+    startTime = nextAvailableCharacterActionStart(attackerActions, startTime, duration);
+    startTime = nextAvailableCharacterActionStart(victimActions, startTime, duration);
+    startTime = nextAvailableCharacterActionStart(attackerActions, startTime, duration);
+    const pairId = `sequence_${generateId()}`;
+    const makeAction = (role: SequenceRole): CharacterAction => ({
+      id: generateId(),
+      type: "sequence",
+      startTime,
+      duration,
+      targetX: Math.round(marks[role].x),
+      targetY: Math.round(marks[role].y),
+      sequenceId: kneeToFaceSequence.id,
+      sequenceRole: role,
+      sequencePairId: pairId,
+      sequenceSetupDuration: setupDuration,
+      sequenceCenterX: centerX,
+      sequenceCenterY: centerY,
+      sequenceDirection: direction,
+    });
+    updateCharacterActionsFor(attackerId, (previous) => [...previous, makeAction("attacker")]);
+    updateCharacterActionsFor(victimId, (previous) => [...previous, makeAction("victim")]);
+    setShowCharacter(true);
+    setShowCharacter2(true);
+    setCharacterMode("manual");
+    setCharacterMode2("manual");
+    setPlayhead(startTime);
+    playheadRef.current = startTime;
+    setToast("Knee to face queued: both characters walk to their marks, then fight");
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {
@@ -11834,7 +12172,23 @@ export default function Board2Page() {
     if (cameraKeyframesRef.current.length > 0) generateCameraKeyframes();
   }
 
-  function generateCameraKeyframes() {
+  async function generateCameraKeyframes() {
+    const runId = ++cameraGenerationRunRef.current;
+    setCameraGenerationMessage(null);
+    setCameraGenerationPhase("Calculating camera path…");
+    await waitForUiPaint();
+    const previousCameraTrack = cameraKeyframesRef.current;
+    queueMicrotask(() => {
+      if (cameraGenerationRunRef.current !== runId) return;
+      const count = cameraKeyframesRef.current.length;
+      if (cameraKeyframesRef.current !== previousCameraTrack && count > 0) {
+        const message = `Camera generated — ${count} keyframe${count === 1 ? "" : "s"}`;
+        setCameraGenerationMessage({ kind: "success", text: message });
+      } else {
+        setCameraGenerationMessage({ kind: "error", text: "Camera generation failed — no usable board clips or camera stops" });
+      }
+      setCameraGenerationPhase(null);
+    });
     const topicAwareClips = clipsRef.current
       .filter((clip) => isFeaturedTimelineClip(clip) && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
@@ -11882,7 +12236,10 @@ export default function Board2Page() {
         cameraKeyframesRef.current = generated;
         setKeyframesOutOfDate(false);
         drawFrame(playheadRef.current);
-        setToast(`Camera keyframes generated: ${topicAwareClips.length} clips + ${topicIds.length} topic establishing beat${topicIds.length === 1 ? "" : "s"}`);
+        const message = `Camera generated — ${generated.length} keyframes for ${topicAwareClips.length} clips + ${topicIds.length} topic beat${topicIds.length === 1 ? "" : "s"}`;
+        setCameraGenerationMessage({ kind: "success", text: message });
+        if (cameraGenerationRunRef.current === runId) setCameraGenerationPhase(null);
+        setToast(message);
         return;
       }
     }
@@ -12074,8 +12431,9 @@ export default function Board2Page() {
 
   // ─ AI annotation generation ────────────────────────────────────────────────
 
-  async function applyAnnotationsFromTranscript(transcript: string): Promise<boolean> {
+  async function applyAnnotationsFromTranscript(transcript: string, signal?: AbortSignal): Promise<boolean> {
     setAiPhase("Generating annotations...");
+    await waitForUiPaint();
     const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
     const sendClips = boardClips.map((c) => ({
       id: c.id,
@@ -12086,18 +12444,34 @@ export default function Board2Page() {
       boardH: c.boardH!,
       ...(c.sourceUrl?.startsWith("http") ? { sourceUrl: c.sourceUrl } : {}),
     }));
-    const r = await fetch("/api/board2/generate-annotations", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        transcript,
-        board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
-        clips: sendClips,
-      }),
-    }).catch(() => null);
-    if (!r) { setAiError("Network error. Try again."); setAiPhase(null); return false; }
-    const d = await r.json();
-    if (!r.ok) { setAiError(d.error || "Failed to generate annotations"); setAiPhase(null); return false; }
+    let r: Response;
+    try {
+      r = await fetch("/api/board2/generate-annotations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          transcript,
+          board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
+          clips: sendClips,
+        }),
+      });
+    } catch (error) {
+      const cancelled = isAbortError(error);
+      const message = cancelled ? "Annotation generation cancelled" : "Annotation generation failed — network error. Try again.";
+      setAiError(message);
+      setAiMessage({ kind: cancelled ? "cancelled" : "error", text: message });
+      setAiPhase(null);
+      return false;
+    }
+    const d = await r.json().catch(() => ({})) as { error?: string; annotations?: unknown };
+    if (!r.ok) {
+      const message = `Annotation generation failed — ${d.error || `server returned ${r.status}`}`;
+      setAiError(message);
+      setAiMessage({ kind: "error", text: message });
+      setAiPhase(null);
+      return false;
+    }
     const raw: Partial<Annotation>[] = Array.isArray(d.annotations) ? d.annotations : [];
     const validTypes = new Set(["text", "arrow", "circle", "highlight", "emoji"]);
     const newAnnotations: Annotation[] = raw
@@ -12122,8 +12496,18 @@ export default function Board2Page() {
         ...(a.emoji != null ? { emoji: String(a.emoji) } : {}),
         source: "auto" as const,
       }));
+    if (!newAnnotations.length) {
+      const message = "Annotation generation failed — the model returned no usable annotations";
+      setAiError(message);
+      setAiMessage({ kind: "error", text: message });
+      setAiPhase(null);
+      return false;
+    }
     setAnnotations((prev) => [...prev, ...newAnnotations]);
-    setToast(`Generated ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`);
+    setAiSource(generatedBoardSourceSignature(clipsRef.current));
+    const message = `Annotations generated — ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`;
+    setAiMessage({ kind: "success", text: message });
+    setToast(message);
     setAiPhase(null);
     return true;
   }
@@ -12131,25 +12515,45 @@ export default function Board2Page() {
   async function handleGenerateAnnotations() {
     const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
     if (boardClips.length === 0) return;
+    const controller = new AbortController();
+    annotationAbortRef.current?.abort();
+    annotationAbortRef.current = controller;
     setAiError(null);
+    setAiMessage(null);
 
     let transcript = aiScriptText.trim();
 
     if (aiTab === "audio") {
-      if (!aiAudioFile) return;
+      if (!aiAudioFile) {
+        if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
+        return;
+      }
       setAiPhase("Transcribing audio...");
       try {
-        const data = await transcribeAudioBlob(aiAudioFile, aiAudioFile.name || "annotations-audio");
-        if (!data.transcript.trim()) { setAiError("Couldn't understand the audio. Try pasting the script instead."); setAiPhase(null); return; }
+        await waitForUiPaint();
+        const data = await transcribeAudioBlob(aiAudioFile, aiAudioFile.name || "annotations-audio", (current, total) => {
+          if (total > 1) setAiPhase(`Transcribing audio — chunk ${current}/${total}...`);
+        }, controller.signal);
+        if (!data.transcript.trim()) {
+          const message = "Annotation generation failed — couldn't understand the audio. Try pasting the script instead.";
+          setAiError(message); setAiMessage({ kind: "error", text: message }); setAiPhase(null);
+          if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
+          return;
+        }
         transcript = data.transcript;
       } catch (error) {
-        setAiError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
+        const cancelled = isAbortError(error);
+        const message = cancelled ? "Annotation generation cancelled" : `Annotation transcription failed — ${error instanceof Error ? error.message : "network error"}`;
+        setAiError(message);
+        setAiMessage({ kind: cancelled ? "cancelled" : "error", text: message });
         setAiPhase(null);
+        if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
         return;
       }
     }
 
-    const ok = await applyAnnotationsFromTranscript(transcript);
+    const ok = await applyAnnotationsFromTranscript(transcript, controller.signal);
+    if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
     if (ok) {
       setAiModalOpen(false);
       setAiAudioFile(null);
@@ -12161,15 +12565,25 @@ export default function Board2Page() {
     const narrationClips = clipsRef.current.filter((c) => c.type === "narration");
     if (narrationClips.length === 0) return;
     if (clipsRef.current.filter((c) => c.boardX !== undefined).length === 0) return;
+    const controller = new AbortController();
+    annotationAbortRef.current?.abort();
+    annotationAbortRef.current = controller;
     setAiError(null);
+    setAiMessage(null);
 
     let blob: Blob;
     try {
       setAiPhase("Preparing audio...");
+      await waitForUiPaint();
       blob = await compileNarrationToBlob(narrationClips);
+      controller.signal.throwIfAborted();
     } catch (e) {
-      setAiError(e instanceof Error ? e.message : "Failed to compile narration audio");
+      const cancelled = isAbortError(e);
+      const message = cancelled ? "Annotation generation cancelled" : `Annotation generation failed — ${e instanceof Error ? e.message : "failed to compile narration audio"}`;
+      setAiError(message);
+      setAiMessage({ kind: cancelled ? "cancelled" : "error", text: message });
       setAiPhase(null);
+      if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
       return;
     }
 
@@ -12177,13 +12591,25 @@ export default function Board2Page() {
     try {
       const data = await transcribeAudioBlob(blob, "narration.wav", (current, total) => {
         if (total > 1) setAiPhase(`Transcribing (${current}/${total})...`);
-      });
-      if (!data.transcript.trim()) { setAiError("Couldn't understand the narration. Try pasting the script instead."); setAiPhase(null); return; }
-      await applyAnnotationsFromTranscript(data.transcript);
+      }, controller.signal);
+      if (!data.transcript.trim()) {
+        const message = "Annotation generation failed — couldn't understand the narration. Try pasting the script instead.";
+        setAiError(message); setAiMessage({ kind: "error", text: message }); setAiPhase(null); return;
+      }
+      await applyAnnotationsFromTranscript(data.transcript, controller.signal);
     } catch (error) {
-      setAiError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
+      const cancelled = isAbortError(error);
+      const message = cancelled ? "Annotation generation cancelled" : `Annotation transcription failed — ${error instanceof Error ? error.message : "network error"}`;
+      setAiError(message);
+      setAiMessage({ kind: cancelled ? "cancelled" : "error", text: message });
       setAiPhase(null);
+    } finally {
+      if (annotationAbortRef.current === controller) annotationAbortRef.current = null;
     }
+  }
+
+  function cancelAnnotationGeneration() {
+    annotationAbortRef.current?.abort();
   }
 
   // ─ AI character choreography ────────────────────────────────────────────────
@@ -12200,7 +12626,13 @@ export default function Board2Page() {
       setChoreoError("Describe what the character should do, or enable narration sync");
       return;
     }
+    const controller = new AbortController();
+    choreographyAbortRef.current?.abort();
+    choreographyAbortRef.current = controller;
     setChoreoError(null);
+    setChoreoMessage(null);
+    setChoreoPhase(wantsSync ? "Compiling narration…" : "Preparing choreography…");
+    await waitForUiPaint();
 
     let transcriptPayload: { text: string; segments: { start: number; end: number; text: string }[] } | undefined;
 
@@ -12209,22 +12641,36 @@ export default function Board2Page() {
       let blob: Blob;
       try {
         blob = await compileNarrationToBlob(narrationClips);
+        controller.signal.throwIfAborted();
       } catch (e) {
-        setChoreoError(e instanceof Error ? e.message : "Failed to compile narration audio");
+        const cancelled = isAbortError(e);
+        const message = cancelled ? "Choreography generation cancelled" : `Choreography failed — ${e instanceof Error ? e.message : "failed to compile narration audio"}`;
+        setChoreoError(message);
+        setChoreoMessage({ kind: cancelled ? "cancelled" : "error", text: message });
         setChoreoPhase(null);
+        if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
         return;
       }
       let d: MergedTranscription;
       try {
         d = await transcribeAudioBlob(blob, "narration.wav", (current, total) => {
           if (total > 1) setChoreoPhase(`Transcribing (${current}/${total})...`);
-        });
+        }, controller.signal);
       } catch (error) {
-        setChoreoError(error instanceof Error ? error.message : "Network error during transcription. Try again.");
+        const cancelled = isAbortError(error);
+        const message = cancelled ? "Choreography generation cancelled" : `Choreography transcription failed — ${error instanceof Error ? error.message : "network error"}`;
+        setChoreoError(message);
+        setChoreoMessage({ kind: cancelled ? "cancelled" : "error", text: message });
         setChoreoPhase(null);
+        if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
         return;
       }
-      if (!d.transcript?.trim()) { setChoreoError("Couldn't understand the narration. Try pasting a direction instead."); setChoreoPhase(null); return; }
+      if (!d.transcript?.trim()) {
+        const message = "Choreography failed — couldn't understand the narration. Try pasting a direction instead.";
+        setChoreoError(message); setChoreoMessage({ kind: "error", text: message }); setChoreoPhase(null);
+        if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
+        return;
+      }
       // compileNarrationToBlob renders narration clips relative to the first clip's startTime —
       // segment timestamps come back relative to that same origin, so offset them back onto the
       // absolute timeline before they're used to time anything against clip start/holdEnd times.
@@ -12256,18 +12702,36 @@ export default function Board2Page() {
     }));
     const totalDurationSec = Math.max(0, ...allClips.filter(isFeaturedTimelineClip).map((c) => c.startTime + c.duration));
 
-    const r2 = await fetch("/api/board2/character-choreography", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        direction,
-        transcript: transcriptPayload,
-        timeline: { totalDurationSec, clips: timelineClips, cameraFocusOrder },
-      }),
-    }).catch(() => null);
-    if (!r2) { setChoreoError("Network error. Try again."); setChoreoPhase(null); return; }
-    const d2 = await r2.json();
-    if (!r2.ok) { setChoreoError(d2.error || "Failed to generate choreography"); setChoreoPhase(null); return; }
+    let r2: Response;
+    try {
+      r2 = await fetch("/api/board2/character-choreography", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          direction,
+          transcript: transcriptPayload,
+          timeline: { totalDurationSec, clips: timelineClips, cameraFocusOrder },
+        }),
+      });
+    } catch (error) {
+      const cancelled = isAbortError(error);
+      const message = cancelled ? "Choreography generation cancelled" : "Choreography failed — network error. Try again.";
+      setChoreoError(message);
+      setChoreoMessage({ kind: cancelled ? "cancelled" : "error", text: message });
+      setChoreoPhase(null);
+      if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
+      return;
+    }
+    const d2 = await r2.json().catch(() => ({})) as { error?: string; actions?: unknown };
+    if (!r2.ok) {
+      const message = `Choreography failed — ${d2.error || `server returned ${r2.status}`}`;
+      setChoreoError(message);
+      setChoreoMessage({ kind: "error", text: message });
+      setChoreoPhase(null);
+      if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
+      return;
+    }
 
     // Server already dropped unknown types / dangling clip refs and clamped times — this pass
     // turns the raw actions into real CharacterAction objects and re-validates targetClipId
@@ -12299,6 +12763,15 @@ export default function Board2Page() {
         } as CharacterAction;
       });
 
+    if (!cleaned.length) {
+      const message = "Choreography failed — the model returned no usable character actions";
+      setChoreoError(message);
+      setChoreoMessage({ kind: "error", text: message });
+      setChoreoPhase(null);
+      if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
+      return;
+    }
+
     // Regenerate = clean slate for AI actions, but hand-placed ones are never touched. Then
     // enforce no-overlap across the whole character row: later-starting action wins, the one
     // that starts earlier gets truncated to make room (matches the drag/resize invariant that
@@ -12316,9 +12789,17 @@ export default function Board2Page() {
       return combined;
     });
 
-    setToast(`Generated ${cleaned.length} choreographed action${cleaned.length === 1 ? "" : "s"}`);
+    const message = `Choreography generated — ${cleaned.length} action${cleaned.length === 1 ? "" : "s"}`;
+    setChoreoSource(generatedBoardSourceSignature(allClips));
+    setChoreoMessage({ kind: "success", text: message });
+    setToast(message);
     setChoreoPhase(null);
+    if (choreographyAbortRef.current === controller) choreographyAbortRef.current = null;
     setDirectCharacterOpen(false);
+  }
+
+  function cancelChoreographyGeneration() {
+    choreographyAbortRef.current?.abort();
   }
 
   // ─ Export ─────────────────────────────────────────────────────────────────
@@ -15300,11 +15781,10 @@ export default function Board2Page() {
           {/* Footer */}
           <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button
-              onClick={() => { if (!neuralPhase) setNeuralModalOpen(false); }}
-              disabled={!!neuralPhase}
-              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: neuralPhase ? 0.4 : 1 }}
+              onClick={() => { if (neuralPhase) cancelNeuralSearch(); else setNeuralModalOpen(false); }}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, color: neuralPhase ? "#a32916" : undefined, borderColor: neuralPhase ? "#a32916" : undefined }}
             >
-              Cancel
+              {neuralPhase ? "Cancel search" : "Cancel"}
             </button>
             <button
               onClick={runNeuralSearch}
@@ -15377,11 +15857,10 @@ export default function Board2Page() {
           {/* Footer */}
           <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
             <button
-              onClick={() => { if (!top5Phase) setTop5ModalOpen(false); }}
-              disabled={!!top5Phase}
-              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: top5Phase ? 0.4 : 1 }}
+              onClick={() => { if (top5Phase) cancelTop5Generation(); else setTop5ModalOpen(false); }}
+              style={{ ...miniButton, padding: "6px 14px", fontSize: 11, color: top5Phase ? "#a32916" : undefined, borderColor: top5Phase ? "#a32916" : undefined }}
             >
-              Cancel
+              {top5Phase ? "Cancel generation" : "Cancel"}
             </button>
             <button
               onClick={runTop5Search}
@@ -15911,10 +16390,10 @@ export default function Board2Page() {
           >{isPlaying ? "⏸" : "▶"}</button>
           <button
             onClick={generateCameraKeyframes}
-            disabled={!canGenerateCamera}
+            disabled={!canGenerateCamera || !!cameraGenerationPhase}
             title={canGenerateCamera ? "Generate camera keyframes from the clip schedule" : "Upload and place media first"}
-            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canGenerateCamera ? "pointer" : "not-allowed", opacity: canGenerateCamera ? 1 : 0.35, flexShrink: 0 }}
-          >⬡</button>
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canGenerateCamera && !cameraGenerationPhase ? "pointer" : "not-allowed", opacity: canGenerateCamera ? 1 : 0.35, flexShrink: 0 }}
+          >{cameraGenerationPhase ? "⟳" : "⬡"}</button>
           <button
             onClick={isExporting ? cancelExport : startExport}
             title={isExporting ? "Cancel export" : "Export video"}
@@ -16375,8 +16854,11 @@ export default function Board2Page() {
                           /> sec
                         </label>
                       </div>
+                      {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
+                      {autoBuildCancelled && !autoBuildPhase && <div style={{ fontSize: 10, color: "#8a6200" }}>⚠ Auto-build cancelled</div>}
                       {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
+                      {!autoBuildPhase && <div style={{ fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
                     <button
@@ -16458,13 +16940,18 @@ export default function Board2Page() {
                           style={{ ...sketchButton, width: "100%", padding: "10px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                         >
                           {transcribingNarrationId === selectedClip.id
-                            ? "⟳ Whisper transcription…"
+                            ? `⟳ ${narrationTranscriptionPhase ?? "Whisper transcription…"}`
                             : transcribingNarrationId
                               ? "⟳ Whisper is busy…"
                               : selectedClip.transcriptSegments?.length
                               ? "↻ Re-transcribe with Whisper"
                               : "✎ Transcribe with Whisper"}
                         </button>
+                        {transcribingNarrationId === selectedClip.id && <button type="button" onClick={cancelNarrationTranscription} style={{ ...miniButton, color: "#a32916", borderColor: "#a32916" }}>Cancel transcription</button>}
+                        <div role="status" aria-live="polite" style={{ fontFamily: "monospace", fontSize: 9, color: selectedClip.transcriptSegments?.length ? "#496700" : "#6a6a6a" }}>
+                          Transcript: {selectedClip.transcriptSegments?.length ? `✓ ${narrationSentenceCues(selectedClip.transcriptSegments).length} sentences` : "none"}
+                        </div>
+                        {narrationTranscriptionMessage && <div style={{ fontFamily: "monospace", fontSize: 9, color: narrationTranscriptionMessage.kind === "success" ? "#496700" : narrationTranscriptionMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{narrationTranscriptionMessage.kind === "success" ? "✓ " : narrationTranscriptionMessage.kind === "error" ? "✗ " : "⚠ "}{narrationTranscriptionMessage.text}</div>}
                         {selectedClip.transcriptSegments?.length ? (
                           <>
                             <button
@@ -17287,6 +17774,15 @@ export default function Board2Page() {
         return clip;
       });
       setClips(migratedClips);
+      setAutoBuildSource(null);
+      setAiSource(null);
+      setChoreoSource(null);
+      setAutoBuildSummary(null);
+      setAutoBuildError(null);
+      setAutoBuildCancelled(false);
+      setAiMessage(null);
+      setChoreoMessage(null);
+      setCameraGenerationMessage(null);
       const loadedLipSyncTrack = isVisemeTrack(manifest.narrationVisemeTrack) ? manifest.narrationVisemeTrack : [];
       const loadedLipSyncSource = typeof manifest.narrationVisemeTrackSource === "string" ? manifest.narrationVisemeTrackSource : null;
       setNarrationVisemeTrack(loadedLipSyncTrack);
@@ -17584,23 +18080,22 @@ export default function Board2Page() {
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               onClick={generateCameraKeyframes}
-              disabled={!canGenerateCamera}
+              disabled={!canGenerateCamera || !!cameraGenerationPhase}
               title={canGenerateCamera ? "Generate camera keyframes from board positions and the clip schedule" : "Upload and place media first"}
               style={{
                 ...sketchButton,
                 padding: "4px 10px",
                 fontSize: 11,
-                opacity: canGenerateCamera ? 1 : 0.45,
-                cursor: canGenerateCamera ? "pointer" : "not-allowed",
+                opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : 0.45,
+                cursor: canGenerateCamera && !cameraGenerationPhase ? "pointer" : "not-allowed",
               }}
             >
-              ⬡ Generate camera keyframes
+              {cameraGenerationPhase ? `⟳ ${cameraGenerationPhase}` : "⬡ Generate camera keyframes"}
             </button>
-            {keyframesOutOfDate && (
-              <span style={{ fontSize: 9, fontFamily: "monospace", color: "#ff5e3a", border: "1px solid #ff5e3a", padding: "2px 5px", whiteSpace: "nowrap" }}>
-                ↻ keyframes out of date
-              </span>
-            )}
+            <span role="status" aria-live="polite" title={cameraGenerationMessage?.text} style={{ fontSize: 9, fontFamily: "monospace", color: keyframesOutOfDate ? "#ff5e3a" : cameraKeyframes.length ? "#496700" : "#6a6a6a", border: "1px solid currentColor", padding: "2px 5px", whiteSpace: "nowrap" }}>
+              Camera: {keyframesOutOfDate ? "⚠ stale" : cameraKeyframes.length ? `✓ ${cameraKeyframes.length} keyframes` : "none"}
+            </span>
+            {cameraGenerationMessage?.kind === "error" && <span style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9, fontFamily: "monospace", color: "#a32916" }}>✗ {cameraGenerationMessage.text}</span>}
           </div>
           {LIVE_FEATURES_ENABLED && (
             <ProGated featureName="Play Mode">
@@ -17631,7 +18126,7 @@ export default function Board2Page() {
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
-          <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera ? 1 : .45 }}>⬡ Camera</button>
+          <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { if (isExporting) cancelExport(); else void startExport(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>{isExporting ? "✕ Export" : "⬇ Export"}</button>
           <button onClick={() => { void exportBoardImage(); setMobileEditorMenuOpen(false); }} disabled={isExporting || isExportingBoardImage} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isExporting || isExportingBoardImage ? .45 : 1 }}>▣ Board image</button>
           <button onClick={() => setSnapshotIncludeCharacter((value) => !value)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: snapshotIncludeCharacter ? "#c8f135" : "#fffdf5" }}>{snapshotIncludeCharacter ? "✓ Character" : "○ Character"}</button>
@@ -17764,12 +18259,17 @@ export default function Board2Page() {
                 >
                   {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
                 </button>
+                {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", marginTop: 5, color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
                 {autoBuildError && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
+                )}
+                {autoBuildCancelled && !autoBuildPhase && (
+                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#8a6200" }}>⚠ Auto-build cancelled</div>
                 )}
                 {autoBuildSummary && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>
                 )}
+                {!autoBuildPhase && <div style={{ marginTop: 5, fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
               </div>
             </ProGated>
             {isRecording && (
@@ -17827,6 +18327,11 @@ export default function Board2Page() {
                         ✗ {aiError}
                       </div>
                     )}
+                    {!aiModalOpen && aiPhase && <button type="button" onClick={cancelAnnotationGeneration} style={{ ...miniButton, width: "100%", marginTop: 4, color: "#a32916", borderColor: "#a32916" }}>Cancel annotation generation</button>}
+                    <div role="status" aria-live="polite" style={{ fontSize: 9, color: annotations.some((annotation) => annotation.source === "auto") ? aiSource && aiSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a", marginTop: 4, fontFamily: "monospace" }}>
+                      Annotations: {annotations.some((annotation) => annotation.source === "auto") ? `${aiSource && aiSource !== currentGeneratedBoardSource ? "⚠ stale (board/narration changed)" : "✓"} ${annotations.filter((annotation) => annotation.source === "auto").length} generated` : "none generated"}
+                    </div>
+                    {!aiModalOpen && aiMessage && <div style={{ fontSize: 9, color: aiMessage.kind === "success" ? "#496700" : aiMessage.kind === "error" ? "#a32916" : "#8a6200", marginTop: 3, fontFamily: "monospace" }}>{aiMessage.kind === "success" ? "✓ " : aiMessage.kind === "error" ? "✗ " : "⚠ "}{aiMessage.text}</div>}
                   </>
                 );
               })()}
@@ -19052,10 +19557,10 @@ export default function Board2Page() {
 
             {(selectedCharAction || characterPanelOpen) && (() => {
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: selectedCharAction?.emoji ?? "🤔",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: selectedCharAction?.emoji ?? "🤔",
                 flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", idle: "⏸",
               };
-              const targetableAction = selectedCharAction && !["emote", "idle"].includes(selectedCharAction.type);
+              const targetableAction = selectedCharAction && !["emote", "idle", "sequence"].includes(selectedCharAction.type);
               const addButtons: Array<{ mode: CharacterAddMode; label: string; title: string }> = [
                 { mode: "walkTo", label: "Walk", title: "Click board to walk to a position" },
                 { mode: "jumpTo", label: "Jump", title: "Click board to jump to a position" },
@@ -19304,14 +19809,19 @@ export default function Board2Page() {
                       </ProGated>
                       )}
                       <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: narrationSpeechTracksAreCurrent ? "#f0ffe0" : "transparent" }}>
-                        <button
-                          type="button"
-                          onClick={() => void generateNarrationLipSync()}
-                          disabled={lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration")}
-                          style={{ ...miniButton, background: narrationSpeechTracksAreCurrent ? "#c8f135" : "transparent", opacity: lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
-                        >
-                          {lipSyncStatus === "analyzing" ? "Analyzing narration…" : narrationSpeechTracksAreCurrent ? "✓ Lip sync + gestures generated" : narrationVisemeTrack.length || narrationGestureTrack.length ? "Regenerate lip sync + gestures" : "Generate lip sync + gestures"}
-                        </button>
+                        <div style={{ display: "flex", gap: 5 }}>
+                          <button
+                            type="button"
+                            onClick={() => void generateNarrationLipSync()}
+                            disabled={lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration")}
+                            style={{ ...miniButton, flex: 1, background: narrationSpeechTracksAreCurrent ? "#c8f135" : "transparent", opacity: lipSyncStatus === "analyzing" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
+                          >
+                            {lipSyncStatus === "analyzing" ? `⟳ ${lipSyncPhase ?? "Generating…"}` : narrationSpeechTracksAreCurrent ? "↻ Regenerate lip sync + gestures" : narrationVisemeTrack.length || narrationGestureTrack.length ? "↻ Regenerate lip sync + gestures" : "Generate lip sync + gestures"}
+                          </button>
+                          {lipSyncStatus === "analyzing" && (
+                            <button type="button" onClick={cancelNarrationLipSync} style={{ ...miniButton, color: "#a32916", borderColor: "#a32916" }}>Cancel</button>
+                          )}
+                        </div>
                         <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "monospace", fontSize: 10, cursor: lipSyncStatus === "analyzing" ? "default" : "pointer" }}>
                           <input
                             type="checkbox"
@@ -19321,9 +19831,17 @@ export default function Board2Page() {
                           />
                           Smart gestures (AI)
                         </label>
-                        {(narrationVisemeTrack.length > 0 || narrationGestureTrack.length > 0) && !narrationSpeechTracksAreCurrent && (
-                          <span style={{ fontFamily: "monospace", fontSize: 9, color: "#a14d00" }}>Narration changed · regenerate before preview/export</span>
-                        )}
+                        <div role="status" aria-live="polite" style={{ display: "flex", flexDirection: "column", gap: 2, fontFamily: "monospace", fontSize: 9, lineHeight: 1.35 }}>
+                          <span style={{ color: narrationVisemeTrackIsCurrent ? "#496700" : narrationVisemeTrack.length ? "#a14d00" : "#6a6a6a" }}>
+                            Lip sync: {narrationVisemeTrackIsCurrent ? `✓ ${narrationVisemeTrack.length} cues` : narrationVisemeTrack.length ? "⚠ stale (narration changed — regenerate)" : "none"}
+                          </span>
+                          <span style={{ color: narrationGestureTrackIsCurrent ? "#496700" : narrationGestureTrack.length ? "#a14d00" : "#6a6a6a" }}>
+                            Gestures: {narrationGestureTrackIsCurrent ? `✓ ${narrationGestureTrack.filter((point) => point.gesture !== "neutral").length} gestures` : narrationGestureTrack.length ? "⚠ stale (narration changed — regenerate)" : "none"}
+                          </span>
+                          {lipSyncPhase && <span style={{ color: "#1a6fd4" }}>⟳ {lipSyncPhase}</span>}
+                          {lipSyncMessage && <span style={{ color: lipSyncMessage.kind === "success" ? "#496700" : lipSyncMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{lipSyncMessage.kind === "error" ? "✗ " : lipSyncMessage.kind === "success" ? "✓ " : "⚠ "}{lipSyncMessage.text}</span>}
+                          {gestureGenerationMessage && <span style={{ color: gestureGenerationMessage.kind === "success" ? "#496700" : gestureGenerationMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{gestureGenerationMessage.kind === "success" ? "✓ " : "⚠ "}{gestureGenerationMessage.text}</span>}
+                        </div>
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button
@@ -19485,6 +20003,26 @@ export default function Board2Page() {
                           </button>
                         ))}
                       </div>
+                      {activeCharacter.characterType !== "explainer" && (
+                        <div style={{ display: "flex", gap: 5 }}>
+                          <button
+                            type="button"
+                            title="Move both characters to the required spacing, then play Knee to face"
+                            onClick={addKneeToFaceSequence}
+                            style={{ ...miniButton, flex: 1, padding: "5px 6px", background: "#ffd34e", fontWeight: 700 }}
+                          >
+                            💥 Knee fight
+                          </button>
+                          <button
+                            type="button"
+                            title="Open the isolated animation test harness"
+                            onClick={() => { window.location.href = "/board2/anim"; }}
+                            style={{ ...miniButton, flex: 1, padding: "5px 6px" }}
+                          >
+                            ▶ Anim harness
+                          </button>
+                        </div>
+                      )}
                       {characterAddMode && characterAddMode !== "emote" && (
                         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>Click the board to place {characterAddMode}.</div>
                       )}
@@ -19534,6 +20072,10 @@ export default function Board2Page() {
                           </button>
                         )}
                       </div>
+                      <div role="status" aria-live="polite" style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.35, color: activeCharacter.actions.some((action) => action.aiGenerated) ? choreoSource && choreoSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>
+                        AI choreography: {activeCharacter.actions.some((action) => action.aiGenerated) ? `${choreoSource && choreoSource !== currentGeneratedBoardSource ? "⚠ stale (board/narration changed)" : "✓"} ${activeCharacter.actions.filter((action) => action.aiGenerated).length} actions` : "none"}
+                      </div>
+                      {choreoMessage && <div style={{ fontFamily: "monospace", fontSize: 9, lineHeight: 1.35, color: choreoMessage.kind === "success" ? "#496700" : choreoMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{choreoMessage.kind === "success" ? "✓ " : choreoMessage.kind === "error" ? "✗ " : "⚠ "}{choreoMessage.text}</div>}
                     </div>
                   </ProGated>
                 </>
@@ -19648,13 +20190,18 @@ export default function Board2Page() {
                       style={{ ...sketchButton, width: "100%", padding: "7px 8px", background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
                     >
                       {transcribingNarrationId === selectedClip.id
-                        ? "⟳ Whisper transcription…"
+                        ? `⟳ ${narrationTranscriptionPhase ?? "Whisper transcription…"}`
                         : transcribingNarrationId
                           ? "⟳ Whisper is busy…"
                           : selectedClip.transcriptSegments?.length
                           ? "↻ Re-transcribe with Whisper"
                           : "✎ Transcribe with Whisper"}
                     </button>
+                    {transcribingNarrationId === selectedClip.id && <button type="button" onClick={cancelNarrationTranscription} style={{ ...miniButton, color: "#a32916", borderColor: "#a32916" }}>Cancel transcription</button>}
+                    <div role="status" aria-live="polite" style={{ fontFamily: "monospace", fontSize: 9, color: selectedClip.transcriptSegments?.length ? "#496700" : "#6a6a6a" }}>
+                      Transcript: {selectedClip.transcriptSegments?.length ? `✓ ${narrationSentenceCues(selectedClip.transcriptSegments).length} sentences` : "none"}
+                    </div>
+                    {narrationTranscriptionMessage && <div style={{ fontFamily: "monospace", fontSize: 9, color: narrationTranscriptionMessage.kind === "success" ? "#496700" : narrationTranscriptionMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{narrationTranscriptionMessage.kind === "success" ? "✓ " : narrationTranscriptionMessage.kind === "error" ? "✗ " : "⚠ "}{narrationTranscriptionMessage.text}</div>}
                     {selectedClip.transcriptSegments?.length ? (
                       <>
                         <button
@@ -20146,7 +20693,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
@@ -20244,7 +20791,7 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: "💥", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
@@ -20843,11 +21390,10 @@ export default function Board2Page() {
             {/* Footer */}
             <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button
-                onClick={() => { if (!choreoPhase) setDirectCharacterOpen(false); }}
-                disabled={!!choreoPhase}
-                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: choreoPhase ? 0.4 : 1 }}
+                onClick={() => { if (choreoPhase) cancelChoreographyGeneration(); else setDirectCharacterOpen(false); }}
+                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, color: choreoPhase ? "#a32916" : undefined, borderColor: choreoPhase ? "#a32916" : undefined }}
               >
-                Cancel
+                {choreoPhase ? "Cancel generation" : "Cancel"}
               </button>
               <button
                 onClick={handleGenerateChoreography}
@@ -20962,11 +21508,10 @@ export default function Board2Page() {
             {/* Footer */}
             <div style={{ padding: "10px 16px", borderTop: "1.5px solid #2a2a2a", display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button
-                onClick={() => { if (!aiPhase) setAiModalOpen(false); }}
-                disabled={!!aiPhase}
-                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, opacity: aiPhase ? 0.4 : 1 }}
+                onClick={() => { if (aiPhase) cancelAnnotationGeneration(); else setAiModalOpen(false); }}
+                style={{ ...miniButton, padding: "6px 14px", fontSize: 11, color: aiPhase ? "#a32916" : undefined, borderColor: aiPhase ? "#a32916" : undefined }}
               >
-                Cancel
+                {aiPhase ? "Cancel generation" : "Cancel"}
               </button>
               <button
                 onClick={handleGenerateAnnotations}
@@ -21005,6 +21550,12 @@ export default function Board2Page() {
       {toast && (
         <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
           {toast}
+        </div>
+      )}
+      {(neuralMessage || top5Message) && !isMobile && (
+        <div role="status" aria-live="polite" style={{ position: "fixed", right: 18, bottom: isExporting ? 190 : 18, zIndex: 9996, width: 300, display: "flex", flexDirection: "column", gap: 4, padding: "7px 9px", background: "rgba(255,253,245,.96)", border: "1px solid rgba(42,42,42,.35)", boxShadow: "2px 2px 0 rgba(42,42,42,.25)", fontFamily: "monospace", fontSize: 9, lineHeight: 1.35 }}>
+          {neuralMessage && <span style={{ color: neuralMessage.kind === "success" ? "#496700" : neuralMessage.kind === "error" ? "#a32916" : "#8a6200" }}>Neural search: {neuralMessage.kind === "success" ? "✓ " : neuralMessage.kind === "error" ? "✗ " : "⚠ "}{neuralMessage.text}</span>}
+          {top5Message && <span style={{ color: top5Message.kind === "success" ? "#496700" : top5Message.kind === "error" ? "#a32916" : "#8a6200" }}>Top 5: {top5Message.kind === "success" ? "✓ " : top5Message.kind === "error" ? "✗ " : "⚠ "}{top5Message.text}</span>}
         </div>
       )}
       {renderDownloadToasts()}
