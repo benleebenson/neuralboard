@@ -88,6 +88,7 @@ export function normalizeLoadedCharacterActionRecord(
   for (const field of [
     "targetX", "targetY", "targetLocalX", "targetLocalY", "startX", "startY",
     "narrationGestureCueIndex", "sequenceSetupDuration", "sequenceCenterX", "sequenceCenterY", "sequenceDirection",
+    "revealStartSeconds",
   ]) {
     const numeric = optionalFiniteNumber(raw[field]);
     if (numeric === undefined) delete normalized[field];

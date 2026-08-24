@@ -70,7 +70,13 @@ import {
   characterDespawnedAt,
   explodeShakeAt,
 } from "@/lib/character/explode";
-import { trenchCoatRevealPose } from "@/lib/character/trench-coat-reveal";
+import {
+  DEFAULT_TRENCH_COAT_HOLD_SECONDS,
+  MIN_TRENCH_COAT_REVEAL_SECONDS,
+  normalizeTrenchCoatRevealStartSeconds,
+  trenchCoatRevealPose,
+  trenchCoatRevealProgress,
+} from "@/lib/character/trench-coat-reveal";
 import { isGrounded } from "@/lib/character/grounding";
 import {
   isRhubarbCue,
@@ -1184,9 +1190,17 @@ type CharacterAction = {
   sequenceCenterY?: number;
   sequenceDirection?: 1 | -1;
   revealMediaId?: string;
+  revealStartSeconds?: number;
   source?: ClipSource; // provenance: "auto" mirrors aiGenerated, else "manual". Narrower in practice
                         // (never neuralSearch/top5) but shares the ClipSource union for one schema.
 };
+
+function trenchCoatActionTiming(action: CharacterAction) {
+  const setupDuration = clamp(action.sequenceSetupDuration ?? 0, 0, Math.max(0, action.duration - MIN_TRENCH_COAT_REVEAL_SECONDS));
+  const sequenceDuration = Math.max(MIN_TRENCH_COAT_REVEAL_SECONDS, action.duration - setupDuration);
+  const revealStartSeconds = normalizeTrenchCoatRevealStartSeconds(action.revealStartSeconds, sequenceDuration);
+  return { setupDuration, sequenceDuration, revealStartSeconds };
+}
 
 type CharacterAddMode = "walkTo" | "jumpTo" | "skateTo" | "pointAt" | "emote" | "grapple" | "pullUps" | "mirrorCheck" | "dance" | "bazooka" | "flip" | "zipline" | "wallClimb" | "sitAndWatch" | "explainGesture";
 const EXPLAINER_ACTION_TYPES = new Set<CharacterAction["type"]>(["idle", "explainGesture", "pointAt"]);
@@ -3508,7 +3522,11 @@ function evalCharPoseRaw(
       const distance = Math.hypot(targetX - active.fromX, targetY - active.fromY);
       return travelPoseBetween(time, active.fromX, active.fromY, targetX, targetY, elapsed / Math.max(0.001, setupDuration), clips, distance / Math.max(0.001, setupDuration) > 520, craters, active.traversalMode);
     }
-    const sequenceProgress = clamp((elapsed - setupDuration) / Math.max(0.001, active.duration - setupDuration), 0, 1);
+    const sequenceElapsed = elapsed - setupDuration;
+    const sequenceDuration = Math.max(0.001, active.duration - setupDuration);
+    const sequenceProgress = sequence.kind === "single-canvas" && sequence.renderer === "trenchCoatReveal"
+      ? trenchCoatRevealProgress(sequenceElapsed, sequenceDuration, active.revealStartSeconds)
+      : clamp(sequenceElapsed / sequenceDuration, 0, 1);
     if (sequence.kind === "single-canvas") {
       const basePose = idlePose(active.targetX ?? active.sequenceCenterX, active.targetY ?? active.sequenceCenterY);
       const sequencePose = sequence.renderer === "trenchCoatReveal"
@@ -11190,28 +11208,26 @@ export default function Board2Page() {
     const resolved = characterId === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
     const initX = characterId === "c2" ? charInit2XRef.current : charInitXRef.current;
     const initY = characterId === "c2" ? charInit2YRef.current : charInitYRef.current;
-    const longestDuration = trenchCoatRevealSequence.durationSeconds + 1.2;
-    const startTime = nextAvailableCharacterActionStart(actions, playheadRef.current, longestDuration);
+    const duration = DEFAULT_TRENCH_COAT_HOLD_SECONDS + trenchCoatRevealSequence.durationSeconds;
+    const startTime = nextAvailableCharacterActionStart(actions, playheadRef.current, duration);
     const currentPose = evalCharAtTime(startTime, resolved, initX, initY, clipsRef.current, authoredAnimationsRef.current);
-    const camera = editorCameraAtTime(startTime, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
-    const targetX = clamp(camera.cameraX, 120, boardDimensionsRef.current.width - 120);
-    const targetY = resolveGroundY(targetX, currentPose.boardY, clipsRef.current, streamCratersRef.current);
-    const distance = Math.hypot(targetX - currentPose.boardX, targetY - currentPose.boardY);
-    const setupDuration = distance < CHAR_STATIONARY_NEAR_TARGET_PX ? 0 : clamp(distance / CHAR_STATIONARY_WALK_SPEED, 0.25, 1.2);
+    const targetX = currentPose.boardX;
+    const targetY = currentPose.boardY;
     const id = generateId();
     const action: CharacterAction = {
       id,
       type: "sequence",
       startTime,
-      duration: setupDuration + trenchCoatRevealSequence.durationSeconds,
+      duration,
       targetX: Math.round(targetX),
       targetY: Math.round(targetY),
       sequenceId: trenchCoatRevealSequence.id,
       sequenceRole: "performer",
-      sequenceSetupDuration: setupDuration,
+      sequenceSetupDuration: 0,
       sequenceCenterX: targetX,
       sequenceCenterY: targetY,
       sequenceDirection: currentPose.facing,
+      revealStartSeconds: DEFAULT_TRENCH_COAT_HOLD_SECONDS,
     };
     updateCharacterActionsFor(characterId, (previous) => [...previous, action]);
     if (characterId === "c2") {
@@ -11226,9 +11242,7 @@ export default function Board2Page() {
     setCharacterPanelOpen(true);
     setPlayhead(startTime);
     playheadRef.current = startTime;
-    setToast(setupDuration > 0
-      ? "Trench coat reveal queued: the character walks into frame, then opens the coat"
-      : "Trench coat reveal queued — choose an image in Action properties");
+    setToast("Trench coat reveal queued here — choose an image and set the reveal time in Action properties");
   }
 
   function addExplodeSequence() {
@@ -12140,20 +12154,75 @@ export default function Board2Page() {
           }
           if (drag.kind === "resize-right") {
             const newEnd = Math.max(drag.origStartTime + 0.1, drag.origStartTime + drag.origDuration + deltaSeconds);
-            return { ...a, duration: Math.max(0.1, newEnd - drag.origStartTime) };
+            const duration = Math.max(0.1, newEnd - drag.origStartTime);
+            if (a.sequenceId !== trenchCoatRevealSequence.id) return { ...a, duration };
+            const setupDuration = clamp(a.sequenceSetupDuration ?? 0, 0, Math.max(0, duration - MIN_TRENCH_COAT_REVEAL_SECONDS));
+            return {
+              ...a,
+              duration,
+              revealStartSeconds: normalizeTrenchCoatRevealStartSeconds(a.revealStartSeconds, duration - setupDuration),
+            };
           }
           // resize-left
           const newStart = clamp(drag.origStartTime + deltaSeconds, 0, drag.origStartTime + drag.origDuration - 0.1);
+          const duration = Math.max(0.1, drag.origStartTime + drag.origDuration - newStart);
           return {
             ...a,
             startTime: newStart,
-            duration: Math.max(0.1, drag.origStartTime + drag.origDuration - newStart),
+            duration,
+            ...(a.sequenceId === trenchCoatRevealSequence.id ? {
+              revealStartSeconds: normalizeTrenchCoatRevealStartSeconds(
+                a.revealStartSeconds,
+                duration - clamp(a.sequenceSetupDuration ?? 0, 0, Math.max(0, duration - MIN_TRENCH_COAT_REVEAL_SECONDS)),
+              ),
+            } : {}),
           };
         })
       );
     };
     const onEnd = () => {
       charActionDragRef.current = null;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+  }
+
+  function handleTrenchCoatRevealDividerPointerDown(e: React.PointerEvent, action: CharacterAction) {
+    e.stopPropagation();
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSecRef.current);
+    const innerWidth = actionPx - HANDLE_W * 2;
+    const innerStart = action.startTime * pxPerSecRef.current + HANDLE_W;
+    const owner: CharacterId = characterActions2Ref.current.some((candidate) => candidate.id === action.id) ? "c2" : "c1";
+    const { setupDuration, sequenceDuration } = trenchCoatActionTiming(action);
+
+    const onMove = (event: PointerEvent) => {
+      const rect = scrollerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const cursorX = event.clientX - rect.left + timelineScrollRef.current;
+      const actionSeconds = clamp((cursorX - innerStart) / Math.max(1, innerWidth), 0, 1) * action.duration;
+      let revealStartSeconds = normalizeTrenchCoatRevealStartSeconds(actionSeconds - setupDuration, sequenceDuration);
+      const snapStep = sequenceDuration >= 5 ? 0.5 : 0.25;
+      const snapped = Math.round(revealStartSeconds / snapStep) * snapStep;
+      if (Math.abs(revealStartSeconds - snapped) < 0.08) revealStartSeconds = snapped;
+      revealStartSeconds = normalizeTrenchCoatRevealStartSeconds(revealStartSeconds, sequenceDuration);
+      setDividerTooltip({
+        label: `Closed coat: ${revealStartSeconds.toFixed(2)}s / Reveal: ${(sequenceDuration - revealStartSeconds).toFixed(2)}s`,
+        x: event.clientX,
+        y: event.clientY,
+      });
+      updateCharacterActionsFor(owner, (previous) => previous.map((candidate) => candidate.id === action.id
+        ? { ...candidate, revealStartSeconds }
+        : candidate));
+    };
+
+    const onEnd = () => {
+      setDividerTooltip(null);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
       window.removeEventListener("pointercancel", onEnd);
@@ -19810,6 +19879,9 @@ export default function Board2Page() {
               const selectedSequence = selectedCharAction?.sequenceId ? characterSequenceById[selectedCharAction.sequenceId] : undefined;
               const selectedIsTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
               const selectedIsExplode = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode";
+              const selectedTrenchTiming = selectedIsTrenchReveal && selectedCharAction
+                ? trenchCoatActionTiming(selectedCharAction)
+                : null;
               const selectedRevealClip = selectedIsTrenchReveal ? revealImageClip(selectedCharAction?.revealMediaId, clips) : undefined;
               const boardRevealChoices = boardEntitiesForDisplay(clips).filter((clip) => clip.type === "image");
               const actionIcons: Record<string, string> = {
@@ -19858,7 +19930,7 @@ export default function Board2Page() {
                         />
                       </label>
                       <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "monospace", fontSize: 9, color: "#6a6a6a" }}>
-                        Duration
+                        {selectedIsTrenchReveal ? "Total duration" : "Duration"}
                         <input
                           type="number"
                           min={0.1}
@@ -19867,7 +19939,17 @@ export default function Board2Page() {
                           onChange={(e) => {
                             const v = parseFloat(e.target.value);
                             if (!Number.isFinite(v)) return;
-                            updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (prev) => prev.map((a) => a.id === selectedCharAction.id ? { ...a, duration: Math.max(0.1, v) } : a));
+                            updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (prev) => prev.map((a) => {
+                              if (a.id !== selectedCharAction.id) return a;
+                              const duration = Math.max(0.1, v);
+                              if (!selectedIsTrenchReveal) return { ...a, duration };
+                              const setupDuration = clamp(a.sequenceSetupDuration ?? 0, 0, Math.max(0, duration - MIN_TRENCH_COAT_REVEAL_SECONDS));
+                              return {
+                                ...a,
+                                duration,
+                                revealStartSeconds: normalizeTrenchCoatRevealStartSeconds(a.revealStartSeconds, duration - setupDuration),
+                              };
+                            }));
                           }}
                           style={{ width: "100%", fontFamily: "monospace", fontSize: 11, padding: "4px 6px", border: "1px solid rgba(42,42,42,0.4)", background: "#fff", boxSizing: "border-box" }}
                         />
@@ -19907,6 +19989,38 @@ export default function Board2Page() {
                       )}
                       {selectedIsTrenchReveal && (
                         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          {selectedTrenchTiming && (
+                            <div style={{ display: "flex", flexDirection: "column", gap: 5, padding: 7, border: "1px solid rgba(42,42,42,.25)", background: "rgba(200,241,53,.14)" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                                <div style={{ ...panelLabelStyle, marginBottom: 0 }}>Reveal timing</div>
+                                <span style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700 }}>
+                                  {selectedTrenchTiming.revealStartSeconds.toFixed(2)}s
+                                </span>
+                              </div>
+                              <input
+                                type="range"
+                                min={0}
+                                max={Math.max(0, selectedTrenchTiming.sequenceDuration - MIN_TRENCH_COAT_REVEAL_SECONDS)}
+                                step={0.05}
+                                value={selectedTrenchTiming.revealStartSeconds}
+                                aria-label="Time before trench-coat reveal"
+                                onChange={(event) => {
+                                  const revealStartSeconds = normalizeTrenchCoatRevealStartSeconds(Number(event.target.value), selectedTrenchTiming.sequenceDuration);
+                                  updateCharacterActionsFor(selectedCharActionOwner ?? activeCharacterId, (previous) => previous.map((action) => action.id === selectedCharAction.id
+                                    ? { ...action, revealStartSeconds }
+                                    : action));
+                                }}
+                                style={{ width: "100%", accentColor: "#2a2a2a" }}
+                              />
+                              <div style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 8, color: "#6a6a6a" }}>
+                                <span>Closed coat: {selectedTrenchTiming.revealStartSeconds.toFixed(2)}s</span>
+                                <span>Reveal: {(selectedTrenchTiming.sequenceDuration - selectedTrenchTiming.revealStartSeconds).toFixed(2)}s</span>
+                              </div>
+                              <div style={{ fontFamily: "monospace", fontSize: 8, color: "#6a6a6a" }}>
+                                Drag this slider or the divider in the character timeline. Increase Total duration for a 10–15 second hold.
+                              </div>
+                            </div>
+                          )}
                           <div style={{ ...panelLabelStyle, marginBottom: 0 }}>Reveal image</div>
                           {selectedRevealClip ? (
                             <div style={{ display: "flex", gap: 7, alignItems: "center", minWidth: 0 }}>
@@ -19918,7 +20032,17 @@ export default function Board2Page() {
                               <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", fontFamily: "monospace", fontSize: 9 }}>{selectedRevealClip.name}</span>
                             </div>
                           ) : (
-                            <div style={{ padding: 7, border: "1px dashed rgba(42,42,42,.35)", background: "#c8f135", fontFamily: "monospace", fontSize: 9 }}>No image — using the REVEAL placeholder</div>
+                            <label style={{ position: "relative", overflow: "hidden", padding: 9, border: "1px dashed rgba(42,42,42,.5)", background: "#c8f135", fontFamily: "monospace", fontSize: 9, fontWeight: 700, textAlign: "center", cursor: "pointer" }}>
+                              REVEAL — click to upload an image
+                              <input
+                                type="file"
+                                accept="image/*"
+                                aria-label="Upload image for the trench-coat reveal placeholder"
+                                onClick={(event) => { event.currentTarget.value = ""; }}
+                                onChange={(event) => void handleRevealImageUpload(event, selectedCharAction.id)}
+                                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
+                              />
+                            </label>
                           )}
                           <div style={{ display: "flex", gap: 5 }}>
                             <label style={{ ...miniButton, position: "relative", overflow: "hidden", flex: 1, textAlign: "center", padding: "5px 6px" }}>
@@ -21023,6 +21147,11 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
+                    const trenchTiming = action.sequenceId === trenchCoatRevealSequence.id ? trenchCoatActionTiming(action) : null;
+                    const actionInnerWidth = actionPx - HANDLE_W * 2;
+                    const revealDividerLeft = trenchTiming
+                      ? HANDLE_W + actionInnerWidth * (trenchTiming.setupDuration + trenchTiming.revealStartSeconds) / action.duration
+                      : 0;
                     const icons: Record<string, string> = {
                       walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? sequence.renderer === "explode" ? "💥" : "🧥" : "🥊", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
@@ -21032,7 +21161,7 @@ export default function Board2Page() {
                         key={action.id}
                         data-charaction
                         data-actionid={action.id}
-                        title={characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
+                        title={trenchTiming ? `Closed coat ${trenchTiming.revealStartSeconds.toFixed(2)}s, then reveal` : characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
                         style={{
                           position: "absolute",
                           left: action.startTime * pxPerSec,
@@ -21058,6 +21187,20 @@ export default function Board2Page() {
                         }}
                         onClick={isAuto ? undefined : (e) => { e.stopPropagation(); selectCharAction(action.id); }}
                       >
+                        {trenchTiming && (
+                          <>
+                            <div style={{ position: "absolute", left: HANDLE_W, top: 0, bottom: 0, width: Math.max(0, revealDividerLeft - HANDLE_W), background: "rgba(42,42,42,.12)", pointerEvents: "none", zIndex: 1 }} />
+                            <div style={{ position: "absolute", left: revealDividerLeft, right: HANDLE_W, top: 0, bottom: 0, background: "rgba(200,241,53,.5)", pointerEvents: "none", zIndex: 1 }} />
+                            {!isAuto && (
+                              <div
+                                title="Drag to choose when the coat opens"
+                                aria-label="Adjust trench-coat reveal time"
+                                style={{ position: "absolute", left: revealDividerLeft - 2, top: 0, bottom: 0, width: 5, background: "#2a2a2a", cursor: "col-resize", zIndex: 7 }}
+                                onPointerDown={(event) => handleTrenchCoatRevealDividerPointerDown(event, action)}
+                              />
+                            )}
+                          </>
+                        )}
                         {/* Left resize — manual only */}
                         {!isAuto && (
                           <div
@@ -21122,6 +21265,11 @@ export default function Board2Page() {
                     const selected = selectedCharActionId === action.id;
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
+                    const trenchTiming = action.sequenceId === trenchCoatRevealSequence.id ? trenchCoatActionTiming(action) : null;
+                    const actionInnerWidth = actionPx - HANDLE_W * 2;
+                    const revealDividerLeft = trenchTiming
+                      ? HANDLE_W + actionInnerWidth * (trenchTiming.setupDuration + trenchTiming.revealStartSeconds) / action.duration
+                      : 0;
                     const icons: Record<string, string> = {
                       walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? sequence.renderer === "explode" ? "💥" : "🧥" : "🥊", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
@@ -21131,7 +21279,7 @@ export default function Board2Page() {
                         key={action.id}
                         data-charaction
                         data-actionid={action.id}
-                        title={characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
+                        title={trenchTiming ? `Closed coat ${trenchTiming.revealStartSeconds.toFixed(2)}s, then reveal` : characterActionHasWalkIn(action, clips) ? `${action.type} includes walk-in` : action.type}
                         style={{
                           position: "absolute",
                           left: action.startTime * pxPerSec,
@@ -21157,6 +21305,20 @@ export default function Board2Page() {
                         }}
                         onClick={isAuto ? undefined : (e) => { e.stopPropagation(); selectCharAction(action.id); }}
                       >
+                        {trenchTiming && (
+                          <>
+                            <div style={{ position: "absolute", left: HANDLE_W, top: 0, bottom: 0, width: Math.max(0, revealDividerLeft - HANDLE_W), background: "rgba(42,42,42,.1)", pointerEvents: "none", zIndex: 1 }} />
+                            <div style={{ position: "absolute", left: revealDividerLeft, right: HANDLE_W, top: 0, bottom: 0, background: "rgba(200,241,53,.55)", pointerEvents: "none", zIndex: 1 }} />
+                            {!isAuto && (
+                              <div
+                                title="Drag to choose when the coat opens"
+                                aria-label="Adjust trench-coat reveal time"
+                                style={{ position: "absolute", left: revealDividerLeft - 2, top: 0, bottom: 0, width: 5, background: "#2a2a2a", cursor: "col-resize", zIndex: 7 }}
+                                onPointerDown={(event) => handleTrenchCoatRevealDividerPointerDown(event, action)}
+                              />
+                            )}
+                          </>
+                        )}
                         {!isAuto && (
                           <div
                             style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, cursor: "ew-resize", background: "rgba(42,42,42,0.2)", zIndex: 6 }}

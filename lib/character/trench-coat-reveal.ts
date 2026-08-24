@@ -2,6 +2,8 @@ import type { Pose } from "../characterAnimations.ts";
 import { STREAM_CHARACTER_GEOMETRY } from "./geometry.ts";
 
 export const TRENCH_COAT_REVEAL_DURATION = 4.2;
+export const DEFAULT_TRENCH_COAT_HOLD_SECONDS = 1;
+export const MIN_TRENCH_COAT_REVEAL_SECONDS = 0.1;
 
 export const TRENCH_COAT_REVEAL_BEATS = [
   { t: 0, label: "Idle in coat", shortLabel: "Idle", reach: 0, open: 0 },
@@ -50,6 +52,29 @@ const easeInOut = (t: number) => {
   return value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2;
 };
 const point = (x: number, y: number): TrenchCoatPoint => ({ x, y });
+
+/**
+ * Keeps the editable closed-coat hold inside the action while always leaving a small reveal
+ * phase. Missing values intentionally resolve to zero so boards saved before this control was
+ * introduced retain their original timing.
+ */
+export function normalizeTrenchCoatRevealStartSeconds(value: unknown, duration: number): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  const requested = Number.isFinite(numeric) ? numeric : 0;
+  return clamp(requested, 0, Math.max(0, duration - MIN_TRENCH_COAT_REVEAL_SECONDS));
+}
+
+/** Holds on the closed first frame, then maps the remainder of the action across the reveal. */
+export function trenchCoatRevealProgress(
+  elapsedSeconds: number,
+  durationSeconds: number,
+  revealStartSeconds: unknown,
+): number {
+  const duration = Math.max(MIN_TRENCH_COAT_REVEAL_SECONDS, durationSeconds);
+  const revealStart = normalizeTrenchCoatRevealStartSeconds(revealStartSeconds, duration);
+  if (elapsedSeconds <= revealStart) return 0;
+  return clamp((elapsedSeconds - revealStart) / Math.max(MIN_TRENCH_COAT_REVEAL_SECONDS, duration - revealStart));
+}
 
 export function sampleTrenchCoatReveal(progress: number): TrenchCoatRevealSample {
   const t = clamp(progress);
