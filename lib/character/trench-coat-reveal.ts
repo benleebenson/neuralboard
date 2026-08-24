@@ -37,10 +37,10 @@ export type TrenchCoatJoints = {
 
 const DEFAULT_REVEAL_RECT: RevealRect = { x: -38, y: -154, width: 76, height: 82 };
 const RELAXED_ARMS = {
-  leftArmA: 0.25,
-  rightArmA: -0.25,
-  leftForeA: 0.18,
-  rightForeA: -0.18,
+  leftArmA: 0.45,
+  rightArmA: -0.45,
+  leftForeA: 0.35,
+  rightForeA: -0.35,
 } as const;
 
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
@@ -110,7 +110,9 @@ export function trenchCoatRevealPose(progress: number): Partial<Pose> {
       ? { arm: RELAXED_ARMS.leftArmA, fore: RELAXED_ARMS.leftForeA }
       : { arm: RELAXED_ARMS.rightArmA, fore: RELAXED_ARMS.rightForeA };
     const relaxedHand = armHand(relaxed.arm, relaxed.fore, side);
-    const openHand = point(side * lerp(8, 54, openness), shoulderY + lerp(15, 11, openness));
+    // Keep the hands below the shoulders so the bent sleeves read as coat sleeves
+    // instead of folding upward into a cape-like diamond around the neck.
+    const openHand = point(side * lerp(10, 52, openness), shoulderY + lerp(25, 30, openness));
     const target = point(lerp(relaxedHand.x, openHand.x, sample.reach), lerp(relaxedHand.y, openHand.y, sample.reach));
     const solved = armAnglesForTarget(target, side);
     const arm = lerp(relaxed.arm, solved.arm, easeInOut(sample.reach));
@@ -234,17 +236,17 @@ export function drawTrenchCoatPropToCanvas(
   const { joints } = args;
   const open = easeInOut(sample.open);
   const torso = args.torsoLength;
-  const hemY = joints.hip.y + torso * 0.88;
-  const shoulderWidth = Math.max(
+  const hemY = joints.hip.y + torso * 0.92;
+  const coatShoulderX = Math.max(
     Math.abs(joints.leftShoulder.x),
     Math.abs(joints.rightShoulder.x),
-    torso * (args.physique === "jacked" ? 0.42 : 0.28),
+    torso * (args.physique === "jacked" ? 0.48 : 0.43),
   );
-  const outerX = shoulderWidth + torso * 0.25;
+  const closedOuterX = coatShoulderX + torso * 0.13;
   const revealBounds: RevealRect = {
-    x: -torso * 0.39,
+    x: -torso * 0.36,
     y: joints.torsoTop.y + torso * 0.18,
-    width: torso * 0.78,
+    width: torso * 0.72,
     height: torso * 0.76,
   };
   const coatBack = "#eeece4";
@@ -257,62 +259,120 @@ export function drawTrenchCoatPropToCanvas(
   ctx.lineWidth = args.strokeWidth;
   ctx.strokeStyle = ink;
 
+  // The back gives the closed coat one continuous, long silhouette. It recedes
+  // once the two front halves are pulled apart.
+  ctx.save();
+  ctx.globalAlpha *= lerp(1, 0.2, open);
   ctx.fillStyle = coatBack;
   ctx.beginPath();
-  ctx.moveTo(joints.leftShoulder.x - torso * 0.08, joints.leftShoulder.y - torso * 0.08);
-  ctx.quadraticCurveTo(-outerX, joints.hip.y - torso * 0.08, -outerX * 0.92, hemY);
-  ctx.quadraticCurveTo(0, hemY + torso * 0.1, outerX * 0.92, hemY);
-  ctx.quadraticCurveTo(outerX, joints.hip.y - torso * 0.08, joints.rightShoulder.x + torso * 0.08, joints.rightShoulder.y - torso * 0.08);
+  ctx.moveTo(-coatShoulderX, joints.leftShoulder.y - torso * 0.03);
+  ctx.quadraticCurveTo(-closedOuterX, joints.hip.y - torso * 0.12, -closedOuterX * 0.96, hemY);
+  ctx.quadraticCurveTo(0, hemY + torso * 0.04, closedOuterX * 0.96, hemY);
+  ctx.quadraticCurveTo(closedOuterX, joints.hip.y - torso * 0.12, coatShoulderX, joints.rightShoulder.y - torso * 0.03);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
+  ctx.restore();
 
   drawRevealContent(ctx, args.revealImage, revealBounds, open, sample.revealAlpha, ink);
+
+  // Sleeves sit behind the front panels. Their seams begin at the garment's
+  // shoulders, not the stick figure's center-line shoulder joints.
+  ctx.fillStyle = coatFront;
+  for (const [side, jointShoulder, jointElbow, jointHand] of [
+    [-1, joints.leftShoulder, joints.leftElbow, joints.leftHand],
+    [1, joints.rightShoulder, joints.rightElbow, joints.rightHand],
+  ] as const) {
+    const sleeveShoulder = point(side * coatShoulderX, jointShoulder.y - torso * 0.01);
+    const restingElbow = point(side * closedOuterX, joints.hip.y - torso * 0.22);
+    const restingCuff = point(side * closedOuterX * 0.9, joints.hip.y + torso * 0.27);
+    const cuffAtHand = point(
+      lerp(jointElbow.x, jointHand.x, 0.9),
+      lerp(jointElbow.y, jointHand.y, 0.9),
+    );
+    const sleeveElbow = point(
+      lerp(restingElbow.x, jointElbow.x, sample.reach),
+      lerp(restingElbow.y, jointElbow.y, sample.reach),
+    );
+    const sleeveCuff = point(
+      lerp(restingCuff.x, cuffAtHand.x, sample.reach),
+      lerp(restingCuff.y, cuffAtHand.y, sample.reach),
+    );
+    traceSleeve(ctx, sleeveShoulder, sleeveElbow, sleeveCuff, torso * (args.physique === "jacked" ? 0.17 : 0.125));
+    ctx.fill();
+    ctx.stroke();
+  }
 
   for (const side of [-1, 1] as const) {
     const shoulder = side === -1 ? joints.leftShoulder : joints.rightShoulder;
     const hand = side === -1 ? joints.leftHand : joints.rightHand;
-    const innerTopX = side * lerp(1.5, Math.abs(hand.x) * 0.78, open);
-    const innerHemX = side * lerp(2.5, Math.max(torso * 0.33, Math.abs(hand.x) * 0.72), open);
-    const outerHemX = side * lerp(outerX * 0.78, outerX * 1.12 + Math.abs(hand.x) * 0.2, open);
-    const grip = point(lerp(side * torso * 0.15, hand.x, open), lerp(joints.torsoTop.y + torso * 0.38, hand.y, open));
+    const neck = point(side * torso * 0.075, joints.torsoTop.y + torso * 0.01);
+    const garmentShoulder = point(side * coatShoulderX, shoulder.y - torso * 0.03);
+    const grip = point(
+      lerp(side * torso * 0.055, hand.x, open),
+      lerp(joints.torsoTop.y + torso * 0.55, hand.y, open),
+    );
+    const outerWaist = point(
+      side * lerp(closedOuterX, Math.abs(hand.x) + torso * 0.18, open),
+      lerp(joints.hip.y - torso * 0.12, joints.hip.y + torso * 0.02, open),
+    );
+    const outerHemX = side * lerp(
+      closedOuterX * 0.96,
+      Math.max(torso * 0.9, Math.abs(hand.x) + torso * 0.24),
+      open,
+    );
+    const innerHemX = side * lerp(
+      torso * 0.035,
+      Math.max(torso * 0.34, Math.abs(hand.x) * 0.42),
+      open,
+    );
     ctx.fillStyle = coatFront;
     ctx.beginPath();
-    ctx.moveTo(side * torso * 0.05, joints.torsoTop.y + torso * 0.02);
-    ctx.lineTo(shoulder.x + side * torso * 0.13, shoulder.y - torso * 0.07);
-    ctx.quadraticCurveTo(side * outerX, joints.hip.y - torso * 0.2, grip.x, grip.y);
-    ctx.quadraticCurveTo(outerHemX, joints.hip.y + torso * 0.35, outerHemX, hemY);
-    ctx.lineTo(innerHemX, hemY + torso * 0.04);
-    ctx.lineTo(innerTopX, joints.torsoTop.y + torso * 0.42);
+    ctx.moveTo(neck.x, neck.y);
+    ctx.lineTo(garmentShoulder.x, garmentShoulder.y);
+    ctx.quadraticCurveTo(side * closedOuterX, joints.hip.y - torso * 0.3, outerWaist.x, outerWaist.y);
+    ctx.quadraticCurveTo(outerHemX, joints.hip.y + torso * 0.42, outerHemX, hemY);
+    ctx.lineTo(innerHemX, hemY + torso * 0.025);
+    ctx.quadraticCurveTo(grip.x * 0.98, joints.hip.y + torso * 0.12, grip.x, grip.y);
+    ctx.lineTo(neck.x, neck.y);
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
 
+    // Narrow notched lapels while closed; long pulled edges when fully open.
+    const collarOuter = point(side * torso * 0.24, joints.torsoTop.y + torso * 0.1);
+    const collarNotch = point(side * torso * 0.17, joints.torsoTop.y + torso * 0.18);
+    const lapelPoint = point(
+      lerp(side * torso * 0.045, grip.x, open),
+      lerp(joints.torsoTop.y + torso * 0.47, grip.y, open),
+    );
     ctx.beginPath();
-    ctx.moveTo(side * torso * 0.04, joints.torsoTop.y + torso * 0.03);
-    ctx.lineTo(side * torso * 0.23, joints.torsoTop.y + torso * 0.3);
-    ctx.lineTo(side * lerp(torso * 0.19, torso * 0.42, open), joints.torsoTop.y + torso * 0.23);
-    ctx.lineTo(innerTopX, joints.torsoTop.y + torso * 0.48);
+    ctx.moveTo(neck.x, neck.y);
+    ctx.lineTo(collarOuter.x, collarOuter.y);
+    ctx.lineTo(collarNotch.x, collarNotch.y);
+    ctx.lineTo(lapelPoint.x, lapelPoint.y);
+    ctx.closePath();
     ctx.stroke();
   }
 
-  ctx.fillStyle = coatFront;
-  for (const [shoulder, elbow, hand] of [
-    [joints.leftShoulder, joints.leftElbow, joints.leftHand],
-    [joints.rightShoulder, joints.rightElbow, joints.rightHand],
-  ] as const) {
-    traceSleeve(ctx, shoulder, elbow, hand, torso * (args.physique === "jacked" ? 0.17 : 0.13));
-    ctx.fill();
-    ctx.stroke();
-  }
-
+  // A center closure and buttons make the idle silhouette read immediately as
+  // a trench coat, then disappear naturally as the fronts part.
+  ctx.save();
+  ctx.globalAlpha *= 1 - open;
   ctx.beginPath();
-  ctx.moveTo(-torso * 0.23, joints.torsoTop.y + torso * 0.02);
-  ctx.lineTo(-torso * 0.08, joints.torsoTop.y - torso * 0.08);
-  ctx.lineTo(0, joints.torsoTop.y + torso * 0.07);
-  ctx.lineTo(torso * 0.08, joints.torsoTop.y - torso * 0.08);
-  ctx.lineTo(torso * 0.23, joints.torsoTop.y + torso * 0.02);
+  ctx.moveTo(0, joints.torsoTop.y + torso * 0.5);
+  ctx.lineTo(0, hemY);
   ctx.stroke();
+  ctx.fillStyle = ink;
+  for (const buttonY of [joints.torsoTop.y + torso * 0.58, joints.torsoTop.y + torso * 0.78]) {
+    ctx.beginPath();
+    ctx.arc(-torso * 0.075, buttonY, Math.max(1, args.strokeWidth * 0.7), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(torso * 0.075, buttonY, Math.max(1, args.strokeWidth * 0.7), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
   ctx.restore();
   return sample;
 }
