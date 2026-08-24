@@ -247,7 +247,7 @@ export default function AnimationHarnessPage() {
     <main className={styles.page}>
       <section className={styles.stage} aria-label="Animation preview stage">
         <div className={styles.stageMeta} aria-live="polite">
-          <span className={styles.stageEyebrow}>8-frame study</span>
+          <span className={styles.stageEyebrow}>7-frame study</span>
           <strong>{selected.kind === "trench" ? trenchSample.beatLabel : selected.label}</strong>
         </div>
         <canvas ref={canvasRef} className={styles.canvas} />

@@ -1,4 +1,4 @@
-export const TRENCH_COAT_REVEAL_DURATION = 4.8;
+export const TRENCH_COAT_REVEAL_DURATION = 4.2;
 
 export const TRENCH_COAT_REVEAL_BEATS = [
   { t: 0, label: "Idle in coat", shortLabel: "Idle", reach: 0, open: 0 },
@@ -7,8 +7,7 @@ export const TRENCH_COAT_REVEAL_BEATS = [
   { t: 0.42, label: "Coat opens a little", shortLabel: "A little", reach: 1, open: 0.3 },
   { t: 0.56, label: "Coat opens wider", shortLabel: "Wider", reach: 1, open: 0.62 },
   { t: 0.7, label: "Full open reveal", shortLabel: "Reveal", reach: 1, open: 1 },
-  { t: 0.84, label: "Hold open pose", shortLabel: "Hold", reach: 1, open: 1 },
-  { t: 1, label: "Relax / loop pose", shortLabel: "Relax", reach: 0, open: 0 },
+  { t: 1, label: "Hold open pose", shortLabel: "Hold", reach: 1, open: 1 },
 ] as const;
 
 export type TrenchCoatRevealSample = {
@@ -126,6 +125,29 @@ function drawHand(ctx: CanvasRenderingContext2D, point: Point, side: -1 | 1, gri
   ctx.restore();
 }
 
+function drawCoatBack(ctx: CanvasRenderingContext2D) {
+  // The back stays on the body while the two front panels are pulled apart.
+  // Drawing it as its own lower layer keeps the figure from reading as two
+  // disconnected pieces of fabric at the full-open pose.
+  ctx.beginPath();
+  ctx.moveTo(-27, -168);
+  ctx.quadraticCurveTo(-43, -146, -45, -111);
+  ctx.quadraticCurveTo(-51, -84, -50, -67);
+  ctx.quadraticCurveTo(0, -56, 50, -67);
+  ctx.quadraticCurveTo(51, -84, 45, -111);
+  ctx.quadraticCurveTo(43, -146, 27, -168);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // A restrained hem/fold detail distinguishes the coat body from the moving
+  // front panels without competing with the reveal in the middle.
+  ctx.beginPath();
+  ctx.moveTo(-31, -72);
+  ctx.quadraticCurveTo(0, -65, 31, -72);
+  ctx.stroke();
+}
+
 function drawCoatPanel(ctx: CanvasRenderingContext2D, side: -1 | 1, open: number, hand: Point) {
   const innerTopX = side * lerp(2, 10, open);
   const innerHemX = side * lerp(4, 31, open);
@@ -171,6 +193,7 @@ export function drawTrenchCoatRevealToCanvas(
   const ink = "#20201e";
   const paper = "#fffdf7";
   const coat = "#f7f5ee";
+  const coatBack = "#eeece4";
   const grip = reach > 0.7;
 
   ctx.save();
@@ -182,7 +205,13 @@ export function drawTrenchCoatRevealToCanvas(
   ctx.fillStyle = paper;
   ctx.lineWidth = 3;
 
-  // Legs and the simple stick body are visible below and then through the opening.
+  // The stationary back panel establishes one continuous coat silhouette.
+  ctx.fillStyle = coatBack;
+  drawCoatBack(ctx);
+
+  // Legs and the simple stick body sit in front of the coat back and remain
+  // visible below and through the opening between the front panels.
+  ctx.fillStyle = paper;
   roundedLine(ctx, { x: 0, y: -76 }, { x: -11, y: -39 }, { x: -16, y: -3 });
   roundedLine(ctx, { x: -16, y: -3 }, { x: -25, y: -1 }, { x: -29, y: 0 });
   roundedLine(ctx, { x: 0, y: -76 }, { x: 12, y: -39 }, { x: 17, y: -3 });
@@ -220,6 +249,7 @@ export function drawTrenchCoatRevealToCanvas(
     [1]: { x: handMagnitude.x, y: handMagnitude.y },
   };
 
+  // These are the separate front flaps that the hands pull away from the back.
   ctx.fillStyle = coat;
   drawCoatPanel(ctx, -1, open, hands[-1]);
   drawCoatPanel(ctx, 1, open, hands[1]);
