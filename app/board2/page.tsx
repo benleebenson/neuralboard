@@ -66,6 +66,11 @@ import type { Expression } from "@/lib/character/explainer-renderer";
 import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
+import {
+  characterDespawnedAt,
+  explodeAnticipationPose,
+  explodeShakeAt,
+} from "@/lib/character/explode";
 import { isGrounded } from "@/lib/character/grounding";
 import {
   isRhubarbCue,
@@ -128,7 +133,7 @@ import {
   nextBazookaHealth,
 } from "@/lib/character/impacts";
 import { AuthoredAnimation, FORWARD_TUCK_FLIP_KEYFRAMES, SKATE_OLLY_KEYFRAMES, SKATE_PEDAL_KEYFRAMES, Pose, animationMap, normalizeAnimation, sampleAnimation } from "@/lib/characterAnimations";
-import { characterSequenceById, kneeToFaceSequence, sampleSequence, sequenceSetupMarks, trenchCoatRevealSequence, type SequenceRole } from "@/lib/character/sequences";
+import { characterSequenceById, explodeSequence, kneeToFaceSequence, sampleSequence, sequenceSetupMarks, trenchCoatRevealSequence, type SequenceRole } from "@/lib/character/sequences";
 import {
   easeInOutCubic,
   interpolateCameraKeyframes as interpolateCameraTrack,
@@ -3097,10 +3102,11 @@ type CharPoseResult = {
   sequenceShakeX?: number;
   sequenceShakeY?: number;
   sequenceEffects?: Array<{ type: "impactStars" | "motionLines" | "dustPuff" | "screenShake"; x: number; y: number; alpha: number; intensity?: number }>;
-  sequenceRenderer?: "trenchCoatReveal";
+  sequenceRenderer?: "trenchCoatReveal" | "explode";
   sequenceProgress?: number;
   sequenceRevealMediaId?: string;
   sequenceRevealImage?: CanvasImageSource | null;
+  characterHidden?: boolean;
   spriteGesture?: Gesture;
 };
 
@@ -3504,8 +3510,13 @@ function evalCharPoseRaw(
     }
     const sequenceProgress = clamp((elapsed - setupDuration) / Math.max(0.001, active.duration - setupDuration), 0, 1);
     if (sequence.kind === "single-canvas") {
+      const basePose = idlePose(active.targetX ?? active.sequenceCenterX, active.targetY ?? active.sequenceCenterY);
+      const explodePose = sequence.renderer === "explode"
+        ? explodeAnticipationPose(sequenceProgress)
+        : null;
       return {
-        ...idlePose(active.targetX ?? active.sequenceCenterX, active.targetY ?? active.sequenceCenterY),
+        ...basePose,
+        ...(explodePose ?? {}),
         facing: active.sequenceDirection ?? 1,
         actionType: "sequence",
         sequenceRenderer: sequence.renderer,
@@ -4526,6 +4537,7 @@ function evalCharAtTime(
     momentumScaleX: scaleX,
     momentumScaleY: scaleY,
     actionType:active?.type??"idle",
+    characterHidden: characterDespawnedAt(time, resolved),
     terrainGrounded: terrainFootIK.terrainGrounded,
     terrainLeftFootY: terrainFootIK.leftFootY,
     terrainRightFootY: terrainFootIK.rightFootY,
@@ -4613,6 +4625,7 @@ function characterHeadSpeechAnchor(
 }
 
 function poseAllowsSpeechBubble(pose: CharPoseResult): boolean {
+  if (pose.characterHidden) return false;
   const action = pose.actionType ?? "idle";
   if (pose.grappleRopeAlpha || pose.pullUpBarAlpha || pose.skateboardVisible || pose.spinAngle || Math.abs(pose.airY) > 18) return false;
   return ![
@@ -6867,8 +6880,11 @@ export default function Board2Page() {
       : { craters: [...streamCratersRef.current], events: [] as BazookaVisualEvent[] };
     const renderCraters = authoredBazooka.craters;
     const authoredShake = bazookaShake(authoredBazooka.events, time * 1000);
+    const sequenceShake = !liveMode
+      ? explodeShakeAt(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current])
+      : { x: 0, y: 0 };
     ctx.save();
-    ctx.translate(authoredShake.x, authoredShake.y);
+    ctx.translate(authoredShake.x + sequenceShake.x, authoredShake.y + sequenceShake.y);
     const sortedClips = boardEntityRepresentativesAtTime(currentClips, time).sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
@@ -7121,6 +7137,15 @@ export default function Board2Page() {
   const drawCharacterBoardOverlay = useCallback((canvas: HTMLCanvasElement, time: number) => {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    const authoredBazooka = authoredBazookaTimeline(
+      time,
+      [resolvedCharActionsRef.current, resolvedCharActions2Ref.current],
+      clipsRef.current,
+      streamCratersRef.current,
+    );
+    const bazookaFrameShake = bazookaShake(authoredBazooka.events, time * 1000);
+    const explodeFrameShake = explodeShakeAt(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current]);
+    canvas.style.transform = `translate(${bazookaFrameShake.x + explodeFrameShake.x}px, ${bazookaFrameShake.y + explodeFrameShake.y}px)`;
     const logicalWidth = canvas.width / editorCanvasDpr;
     const logicalHeight = canvas.height / editorCanvasDpr;
     ctx.setTransform(editorCanvasDpr, 0, 0, editorCanvasDpr, 0, 0);
@@ -7133,12 +7158,6 @@ export default function Board2Page() {
     const sf = W / boardDimensionsRef.current.width;
     const cam = { cameraX: BOARD_W / 2, cameraY: BOARD_H / 2, boardZoom: 1 };
     const currentClips = clipsRef.current;
-    const authoredBazooka = authoredBazookaTimeline(
-      time,
-      [resolvedCharActionsRef.current, resolvedCharActions2Ref.current],
-      currentClips,
-      streamCratersRef.current,
-    );
     let speechBubbleAnchor: SpeechBubbleAnchor | null = null;
     const setSpeechAnchor = (id: CharacterId, anchor: SpeechBubbleAnchor) => {
       if (!speechBubbleAnchor || activeCharacterIdRef.current === id) speechBubbleAnchor = anchor;
@@ -7225,7 +7244,12 @@ export default function Board2Page() {
       currentClips,
       streamCratersRef.current,
     );
-    const shake = bazookaShake(authoredBazooka.events, time * 1000);
+    const bazookaFrameShake = bazookaShake(authoredBazooka.events, time * 1000);
+    const explodeFrameShake = explodeShakeAt(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current]);
+    const shake = {
+      x: bazookaFrameShake.x + explodeFrameShake.x,
+      y: bazookaFrameShake.y + explodeFrameShake.y,
+    };
     for (const clip of currentClips) {
       if (clip.type !== "image" || clip.boardX === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
       const renderUrl = clip.previewUrl ?? clip.sourceUrl;
@@ -11205,6 +11229,55 @@ export default function Board2Page() {
     setToast(setupDuration > 0
       ? "Trench coat reveal queued: the character walks into frame, then opens the coat"
       : "Trench coat reveal queued — choose an image in Action properties");
+  }
+
+  function addExplodeSequence() {
+    const characterId = activeCharacterIdRef.current;
+    const actions = characterId === "c2" ? characterActions2Ref.current : characterActionsRef.current;
+    const resolved = characterId === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+    const initX = characterId === "c2" ? charInit2XRef.current : charInitXRef.current;
+    const initY = characterId === "c2" ? charInit2YRef.current : charInitYRef.current;
+    const longestDuration = explodeSequence.durationSeconds + 1.2;
+    const startTime = nextAvailableCharacterActionStart(actions, playheadRef.current, longestDuration);
+    const currentPose = evalCharAtTime(startTime, resolved, initX, initY, clipsRef.current, authoredAnimationsRef.current);
+    const camera = editorCameraAtTime(startTime, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+    const targetX = clamp(camera.cameraX, 120, boardDimensionsRef.current.width - 120);
+    const targetY = resolveGroundY(targetX, currentPose.boardY, clipsRef.current, streamCratersRef.current);
+    const distance = Math.hypot(targetX - currentPose.boardX, targetY - currentPose.boardY);
+    const setupDuration = distance < CHAR_STATIONARY_NEAR_TARGET_PX
+      ? 0
+      : clamp(distance / CHAR_STATIONARY_WALK_SPEED, 0.25, 1.2);
+    const id = generateId();
+    const action: CharacterAction = {
+      id,
+      type: "sequence",
+      startTime,
+      duration: setupDuration + explodeSequence.durationSeconds,
+      targetX: Math.round(targetX),
+      targetY: Math.round(targetY),
+      sequenceId: explodeSequence.id,
+      sequenceRole: "performer",
+      sequenceSetupDuration: setupDuration,
+      sequenceCenterX: targetX,
+      sequenceCenterY: targetY,
+      sequenceDirection: currentPose.facing,
+    };
+    updateCharacterActionsFor(characterId, (previous) => [...previous, action]);
+    if (characterId === "c2") {
+      setShowCharacter2(true);
+      setCharacterMode2("manual");
+    } else {
+      setShowCharacter(true);
+      setCharacterMode("manual");
+    }
+    selectedCharActionIdRef.current = id;
+    setSelectedCharActionId(id);
+    setCharacterPanelOpen(true);
+    setPlayhead(startTime);
+    playheadRef.current = startTime;
+    setToast(setupDuration > 0
+      ? "Explode queued: the character walks into position, then detonates"
+      : "Explode queued: anticipation, detonation, crater, and despawn");
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {
@@ -19742,10 +19815,11 @@ export default function Board2Page() {
             {(selectedCharAction || characterPanelOpen) && (() => {
               const selectedSequence = selectedCharAction?.sequenceId ? characterSequenceById[selectedCharAction.sequenceId] : undefined;
               const selectedIsTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
+              const selectedIsExplode = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode";
               const selectedRevealClip = selectedIsTrenchReveal ? revealImageClip(selectedCharAction?.revealMediaId, clips) : undefined;
               const boardRevealChoices = boardEntitiesForDisplay(clips).filter((clip) => clip.type === "image");
               const actionIcons: Record<string, string> = {
-                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: selectedIsTrenchReveal ? "🧥" : "💥", emote: selectedCharAction?.emoji ?? "🤔",
+                walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: selectedIsTrenchReveal ? "🧥" : selectedIsExplode ? "💥" : "🥊", emote: selectedCharAction?.emoji ?? "🤔",
                 flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿", idle: "⏸",
               };
               const targetableAction = selectedCharAction && !["emote", "idle", "sequence"].includes(selectedCharAction.type);
@@ -20266,6 +20340,14 @@ export default function Board2Page() {
                             style={{ ...miniButton, padding: "5px 6px", background: "#e7ddff", fontWeight: 700 }}
                           >
                             🧥 Trench coat reveal
+                          </button>
+                          <button
+                            type="button"
+                            title="Walk the active character into position, detonate, leave a crater, and despawn until their next action"
+                            onClick={addExplodeSequence}
+                            style={{ ...miniButton, gridColumn: "1 / -1", padding: "5px 6px", background: "#ffb347", fontWeight: 700 }}
+                          >
+                            💥 Explode
                           </button>
                           <button
                             type="button"
@@ -20948,7 +21030,7 @@ export default function Board2Page() {
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? "🧥" : "💥", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? sequence.renderer === "explode" ? "💥" : "🧥" : "🥊", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (
@@ -21047,7 +21129,7 @@ export default function Board2Page() {
                     const actionPx = Math.max(HANDLE_W * 2 + 4, action.duration * pxPerSec);
                     const sequence = action.sequenceId ? characterSequenceById[action.sequenceId] : undefined;
                     const icons: Record<string, string> = {
-                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? "🧥" : "💥", emote: action.emoji ?? "🤔", idle: "⏸",
+                      walkTo: "⇒", jumpTo: "↑", skateTo: "🛹", grapple: "🪝", pointAt: "→", dance: "♪", pullUps: "💪", bazooka: "🚀", mirrorCheck: "▯", explainGesture: "💬", sequence: sequence?.kind === "single-canvas" ? sequence.renderer === "explode" ? "💥" : "🧥" : "🥊", emote: action.emoji ?? "🤔", idle: "⏸",
                       flip: "🤸", zipline: "🪢", wallClimb: "🧗", sitAndWatch: "🍿",
                     };
                     return (

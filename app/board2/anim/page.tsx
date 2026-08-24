@@ -3,7 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { CharacterEntity, LocalInputAdapter, previewEntityActionPose } from "@/lib/character/entity";
-import { drawCharacterSkeletonOverlayToCanvas, type BoardCharPoseResult } from "@/lib/character/board-renderer";
+import { drawBoardCharacterToCanvas, drawCharacterSkeletonOverlayToCanvas, type BoardCharPoseResult } from "@/lib/character/board-renderer";
+import {
+  characterDespawnedAt,
+  explodeAnticipationPose,
+  explodeShakeAt,
+} from "@/lib/character/explode";
 import {
   drawTrenchCoatRevealToCanvas,
   sampleTrenchCoatReveal,
@@ -135,8 +140,29 @@ export default function AnimationHarnessPage() {
     const idleB = poseResult(DEFAULT_POSE, characterB.x, characterB.facing);
     if (selected.kind === "sequence") {
       const sequence = characterSequences.find((item) => item.id === selected.key);
-      if (!sequence || sequence.kind === "single-canvas") {
+      if (!sequence) {
         return { a: poseResult(DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
+      }
+      if (sequence.kind === "single-canvas") {
+        const base = poseResult(DEFAULT_POSE, characterA.x, characterA.facing);
+        if (sequence.renderer !== "explode") return { a: base, b: idleB };
+        return {
+          a: {
+            ...base,
+            ...explodeAnticipationPose(progress),
+            actionType: "sequence",
+            sequenceRenderer: "explode",
+            sequenceProgress: progress,
+            characterHidden: characterDespawnedAt(currentTime, [{
+              id: "harness-explode",
+              type: "sequence",
+              startTime: 0,
+              duration: sequence.durationSeconds,
+              sequenceId: sequence.id,
+            }]),
+          },
+          b: idleB,
+        };
       }
       const direction: 1 | -1 = characterB.x >= characterA.x ? 1 : -1;
       const sampled = sampleSequence(sequence, progress, {
@@ -157,7 +183,7 @@ export default function AnimationHarnessPage() {
       a: previewEntityActionPose({ x: characterA.x, y: GROUND_Y, facing: characterA.facing, actionType: selected.key, progress, physique: characterA.physique, emoji: "💥" }),
       b: idleB,
     };
-  }, [characterA, characterB, progress, selected]);
+  }, [characterA, characterB, currentTime, progress, selected]);
 
   useEffect(() => {
     if (!playing) return;
@@ -210,11 +236,30 @@ export default function AnimationHarnessPage() {
       ctx.fillStyle = BOARD_SURFACE_COLOR;
       ctx.fillRect(0, 0, rect.width, rect.height);
       const cam = { cameraX: 0, cameraY: 0, boardZoom: 1 };
+      const selectedSequence = selected.kind === "sequence" ? characterSequences.find((item) => item.id === selected.key) : null;
+      const harnessExplodeAction = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode"
+        ? {
+            id: "harness-explode",
+            type: "sequence",
+            startTime: 0,
+            duration: selectedSequence.durationSeconds,
+            sequenceId: selectedSequence.id,
+            sequenceRole: "performer",
+            sequenceSetupDuration: 0,
+            sequenceCenterX: characterA.x,
+            sequenceCenterY: GROUND_Y,
+            targetX: characterA.x,
+            targetY: GROUND_Y,
+          }
+        : null;
+      const shake = harnessExplodeAction
+        ? explodeShakeAt(currentTime, [[harnessExplodeAction]])
+        : { x: 0, y: 0 };
+      ctx.translate(shake.x, shake.y);
       ctx.strokeStyle = "rgba(42,42,42,0.34)";
       ctx.lineWidth = 1.5;
       const groundScreenY = GROUND_Y + rect.height / 2;
       ctx.beginPath(); ctx.moveTo(32, groundScreenY); ctx.lineTo(rect.width - 32, groundScreenY); ctx.stroke();
-      const selectedSequence = selected.kind === "sequence" ? characterSequences.find((item) => item.id === selected.key) : null;
       if (selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal") {
         drawTrenchCoatRevealToCanvas(ctx, {
           x: characterA.x + rect.width / 2,
@@ -222,6 +267,35 @@ export default function AnimationHarnessPage() {
           progress,
           scale: Math.min(1.15, Math.max(0.82, (rect.height - 42) / 275)),
         });
+        return;
+      }
+      if (selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode" && harnessExplodeAction) {
+        const physique = characterA.style === "jacked" ? "jacked" : characterA.physique;
+        const skin: CharacterSkin = characterA.style === "styled" ? "styled" : "stick";
+        drawBoardCharacterToCanvas(
+          ctx,
+          currentTime,
+          [harnessExplodeAction],
+          true,
+          cam,
+          1,
+          rect.width,
+          rect.height,
+          characterA.x,
+          GROUND_Y,
+          [],
+          -Infinity,
+          {},
+          null,
+          skin,
+          "stickFigure",
+          "neutral",
+          poses.a,
+          { evalCharAtTime: () => poses.a, physiqueAt: () => physique },
+        );
+        if (characterA.skeleton && !poses.a.characterHidden) {
+          drawCharacterSkeletonOverlayToCanvas(ctx, poses.a, cam, 1, rect.width, rect.height);
+        }
         return;
       }
       const makeEntity = (name: "A" | "B", controls: CharacterControls, pose: BoardCharPoseResult) => {
@@ -260,12 +334,13 @@ export default function AnimationHarnessPage() {
   };
   const selectedSequence = selected.kind === "sequence" ? characterSequences.find((item) => item.id === selected.key) : null;
   const isTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
-  const poseKeys: Array<"a" | "b"> = isTrenchReveal ? ["a"] : ["a", "b"];
+  const isSingleSequence = selectedSequence?.kind === "single-canvas";
+  const poseKeys: Array<"a" | "b"> = isSingleSequence ? ["a"] : ["a", "b"];
   return (
     <main className={styles.page}>
       <section className={styles.stage} aria-label="Animation preview stage">
         <div className={styles.stageMeta} aria-live="polite">
-          <span className={styles.stageEyebrow}>7-frame study</span>
+          <span className={styles.stageEyebrow}>{isTrenchReveal ? "7-frame study" : "sequence study"}</span>
           <strong>{isTrenchReveal ? trenchSample.beatLabel : selected.label}</strong>
         </div>
         <canvas ref={canvasRef} className={styles.canvas} />
@@ -303,7 +378,7 @@ export default function AnimationHarnessPage() {
           </div>
         )}
         <CharacterControlRow name="A" value={characterA} onChange={setCharacterA} />
-        {!isTrenchReveal && <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />}
+        {!isSingleSequence && <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />}
         <div className={styles.readouts}>
           {poseKeys.map((key) => <div className={styles.posePanel} key={key}><div className={styles.poseTitle}>Character {key.toUpperCase()} pose</div><div className={styles.poseGrid}>{poseReadout(poses[key]).map(([name, value]) => <span key={name}>{name} {Number(value).toFixed(3)}</span>)}</div></div>)}
         </div>

@@ -2,6 +2,16 @@ import type { CharacterSkin, HeadLocalPoint, Viseme } from "../stream";
 import { BOARD_SURFACE_COLOR } from "../board-theme";
 import { solveFixedLegChain, STREAM_CHARACTER_GEOMETRY } from "./geometry";
 import { drawExplainerCharacter, type Expression } from "./explainer-renderer";
+import {
+  characterDespawnedAt,
+  drawExplodeSequenceToCanvas,
+  drawImpactCraterToCanvas,
+  explodeActionPoint,
+  explodeDetonationTime,
+  explodeSeed,
+  isExplodeAction,
+  type ExplodeTimelineAction,
+} from "./explode";
 import { drawTrenchCoatRevealToCanvas } from "./trench-coat-reveal";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
@@ -429,7 +439,21 @@ export function drawBoardCharacterToCanvas(
   poseOverride: BoardCharPoseResult | null = null,
   evaluators: BoardCharacterDrawEvaluators
 ) {
-  if (!showChar || time < entranceTime) return;
+  if (!showChar) return;
+  const timelineActions = resolved as ExplodeTimelineAction[];
+  const explodeActions = timelineActions.filter(isExplodeAction);
+  for (const action of explodeActions) {
+    if (time + 1e-9 < explodeDetonationTime(action)) continue;
+    const point = explodeActionPoint(action);
+    drawImpactCraterToCanvas(ctx, {
+      x: (point.x - cam.cameraX) * sf + W / 2,
+      groundY: (point.y - cam.cameraY) * sf + H / 2,
+      scale: sf,
+      seed: explodeSeed(action.id),
+      physique: evaluators.physiqueAt(explodeDetonationTime(action), resolved),
+    });
+  }
+  if (time < entranceTime) return;
   const hasFace = !!characterFace?.image;
   const faceAspect = clamp(characterFace?.aspect ?? 1, 0.75, 1.6);
   const p = poseOverride ?? evaluators.evalCharAtTime(time, resolved, initX, initY, clips, authoredAnimations, hasFace, faceAspect);
@@ -442,6 +466,23 @@ export function drawBoardCharacterToCanvas(
   const sy = (p.boardY - cam.cameraY) * sf + H / 2 + (p.sequenceShakeY ?? 0) * sf;
   if (Array.isArray(p.sequenceEffects)) {
     drawCharacterSequenceEffectsToCanvas(ctx, p.sequenceEffects, cam, sf, W, H);
+  }
+  if (p.sequenceRenderer === "explode") {
+    const activeExplode = resolved.find((action) =>
+      isExplodeAction(action as ExplodeTimelineAction)
+      && time >= action.startTime
+      && time < action.startTime + action.duration
+    ) as ExplodeTimelineAction | undefined;
+    const sample = drawExplodeSequenceToCanvas(ctx, {
+      x: sx,
+      groundY: sy,
+      progress: p.sequenceProgress ?? 0,
+      scale: sf,
+      seed: explodeSeed(activeExplode?.id ?? "explode"),
+    });
+    if (!sample.characterVisible) return;
+  } else if (characterDespawnedAt(time, timelineActions)) {
+    return;
   }
   if (p.sequenceRenderer === "trenchCoatReveal") {
     drawTrenchCoatRevealToCanvas(ctx, {

@@ -2,7 +2,7 @@
 
 Sequences are plain TypeScript data. Register one by importing its module and adding it to `characterSequences` in `index.ts`. The animation harness and board action UI both consume that registry, so they do not need separate edits.
 
-`paired-pose` sequences have `attacker` and `victim` pose tracks. `single-canvas` sequences have one `performer` and name a shared canvas renderer; the trench-coat reveal is the first example. Timeline actions store one role per participating character, so a single-character sequence is one action while a paired sequence is two linked actions.
+`paired-pose` sequences have `attacker` and `victim` pose tracks. `single-canvas` sequences have one `performer` and name a shared canvas renderer; the trench-coat reveal and explode sequence use this path. Timeline actions store one role per participating character, so a single-character sequence is one action while a paired sequence is two linked actions. Persistent results such as explode craters and despawn state are derived from action timestamps during rendering, keeping preview, scrubbing, and export deterministic.
 
 Each paired pose sequence declares its duration, setup spacing, and ordered keyframes. `t` is a fraction from `0` to `1`. `easing` controls the trip from that keyframe to the next: `linear`, `easeIn`, `easeOut`, `easeInOut`, or `hold`.
 

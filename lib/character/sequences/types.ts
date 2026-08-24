@@ -58,7 +58,7 @@ export type PairedCharacterSequence = CharacterSequenceBase & {
 export type SingleCharacterSequence = CharacterSequenceBase & {
   kind: "single-canvas";
   roles: readonly ["performer"];
-  renderer: "trenchCoatReveal";
+  renderer: "trenchCoatReveal" | "explode";
 };
 
 export type CharacterSequence = PairedCharacterSequence | SingleCharacterSequence;
