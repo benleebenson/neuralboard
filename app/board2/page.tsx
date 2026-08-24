@@ -68,7 +68,14 @@ import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroun
 import { CharacterEntity } from "@/lib/character/entity";
 import {
   characterDespawnedAt,
+  drawSecondaryCombustionToCanvas,
+  explodeActionPoint,
+  explodeDetonationTime,
   explodeShakeAt,
+  isExplodeAction,
+  sampleSecondaryCombustion,
+  sharedExplosionImageSurfaceId,
+  type SecondaryCombustionEvent,
 } from "@/lib/character/explode";
 import {
   DEFAULT_TRENCH_COAT_HOLD_SECONDS,
@@ -4562,6 +4569,59 @@ function evalCharAtTime(
   };
 }
 
+function secondaryTimelineCombustionAt(
+  time: number,
+  victimId: CharacterId,
+  victimActions: ResolvedCharAction[],
+  sourceActions: ResolvedCharAction[],
+  victimInitX: number,
+  victimInitY: number,
+  clips: CharSurfaceClip[],
+  authoredAnimations: Record<string, AuthoredAnimation>,
+  craters: readonly StreamCrater[] = [],
+): SecondaryCombustionEvent | null {
+  const surfaces = clips
+    .filter((clip) => typeof clip.id === "string" && clip.type === "image" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+    .map((clip) => ({ id: clip.id!, type: "image", boardX: clip.boardX!, boardY: clip.boardY!, boardW: clip.boardW!, boardH: clip.boardH! }));
+  const explosions = sourceActions
+    .filter(isExplodeAction)
+    .filter((action) => explodeDetonationTime(action) <= time + 1e-9)
+    .sort((a, b) => explodeDetonationTime(b) - explodeDetonationTime(a));
+  for (const explosion of explosions) {
+    const detonationTime = explodeDetonationTime(explosion);
+    const victimAlsoExplodes = victimActions.some((action) =>
+      isExplodeAction(action) && Math.abs(explodeDetonationTime(action) - detonationTime) < 1e-6
+    );
+    if (victimAlsoExplodes) continue;
+    const hasRespawned = victimActions.some((action) =>
+      action.startTime > detonationTime + 1e-6 && action.startTime <= time + 1e-9
+    );
+    if (hasRespawned) continue;
+    const victimPose = evalCharAtTime(
+      detonationTime,
+      victimActions,
+      victimInitX,
+      victimInitY,
+      clips,
+      authoredAnimations,
+      false,
+      1,
+      craters,
+    );
+    if (victimPose.characterHidden) continue;
+    const origin = explodeActionPoint(explosion);
+    const victimStart = { x: victimPose.boardX, y: victimPose.boardY };
+    if (!sharedExplosionImageSurfaceId(origin, victimStart, surfaces)) continue;
+    return {
+      id: `${explosion.id}:secondary:${victimId}`,
+      detonationTime,
+      origin,
+      victimStart,
+    };
+  }
+  return null;
+}
+
 function liveRuntimeSeconds(runtime: LiveCharacterRuntime, wallMs: number): number {
   return Math.max(0, (wallMs - runtime.startWallMs) / 1000);
 }
@@ -6901,8 +6961,12 @@ export default function Board2Page() {
     const sequenceShake = !liveMode
       ? explodeShakeAt(time, [resolvedCharActionsRef.current, resolvedCharActions2Ref.current])
       : { x: 0, y: 0 };
+    const outputShakeScale = Math.max(1, W / 1280);
     ctx.save();
-    ctx.translate(authoredShake.x + sequenceShake.x, authoredShake.y + sequenceShake.y);
+    ctx.translate(
+      (authoredShake.x + sequenceShake.x) * outputShakeScale,
+      (authoredShake.y + sequenceShake.y) * outputShakeScale,
+    );
     const sortedClips = boardEntityRepresentativesAtTime(currentClips, time).sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
@@ -7044,45 +7108,63 @@ export default function Board2Page() {
     } else if (includeCharacter && showCharacterRef.current && (timelineRendering || !playModeRef.current)) {
       const resolved = resolvedCharActionsRef.current;
       const pose = evalCharAtTime(time, resolved, charInitXRef.current, charInitYRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c1", time, resolved, "timeline"));
-      if (time >= characterEntranceTimeRef.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
-      CharacterEntity.drawBoardCharacterToCanvas(
-        ctx, time, resolved, true,
-        cam, sf, W, H, charInitXRef.current, charInitYRef.current,
-        clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
-        characterFaceRef.current && characterFaceImageRef.current
-          ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
-          : null,
-        characterSkinRef.current,
-        characterTypeRef.current, characterExpressionRef.current,
-        { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
-        boardCharacterDrawEvaluators()
-      );
-      const active = authoredBazookaDisplayAction(time, resolved);
-      if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
+      const secondary = showCharacter2Ref.current ? secondaryTimelineCombustionAt(
+        time, "c1", resolved, resolvedCharActions2Ref.current,
+        charInitXRef.current, charInitYRef.current, currentClips, authoredAnimationsRef.current, renderCraters,
+      ) : null;
+      if (secondary) {
+        const sample = sampleSecondaryCombustion(time, secondary);
+        if (sample) drawSecondaryCombustionToCanvas(ctx, sample, cam, sf, W, H);
+      } else {
+        if (time >= characterEntranceTimeRef.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c1", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFaceRef.current && characterFaceImageRef.current), characterFaceRef.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+        CharacterEntity.drawBoardCharacterToCanvas(
+          ctx, time, resolved, true,
+          cam, sf, W, H, charInitXRef.current, charInitYRef.current,
+          clipsRef.current, characterEntranceTimeRef.current, authoredAnimationsRef.current,
+          characterFaceRef.current && characterFaceImageRef.current
+            ? { image: characterFaceImageRef.current, aspect: characterFaceRef.current.faceAspect, mouthAnchor: characterFaceRef.current.mouthAnchor }
+            : null,
+          characterSkinRef.current,
+          characterTypeRef.current, characterExpressionRef.current,
+          { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c1", time, currentClips, resolved) },
+          boardCharacterDrawEvaluators()
+        );
+        const active = authoredBazookaDisplayAction(time, resolved);
+        if (active?.targetX !== undefined && active.targetY !== undefined) {
+          const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+          drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
+        }
       }
     }
     if (includeCharacter && !liveMode && showCharacter2Ref.current && (timelineRendering || !playModeRef.current)) {
       const resolved = resolvedCharActions2Ref.current;
       const pose = evalCharAtTime(time, resolved, charInit2XRef.current, charInit2YRef.current, clipsRef.current, authoredAnimationsRef.current, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, renderCraters, resolvedCharacterGesture("c2", time, resolved, "timeline"));
-      if (time >= characterEntranceTime2Ref.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
-      CharacterEntity.drawBoardCharacterToCanvas(
-        ctx, time, resolved, showCharacter2Ref.current,
-        cam, sf, W, H, charInit2XRef.current, charInit2YRef.current,
-        clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
-        characterFace2Ref.current && characterFace2ImageRef.current
-          ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
-          : null,
-        characterSkin2Ref.current,
-        characterType2Ref.current, characterExpression2Ref.current,
-        { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
-        boardCharacterDrawEvaluators()
-      );
-      const active = authoredBazookaDisplayAction(time, resolved);
-      if (active?.targetX !== undefined && active.targetY !== undefined) {
-        const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
-        drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
+      const secondary = showCharacterRef.current ? secondaryTimelineCombustionAt(
+        time, "c2", resolved, resolvedCharActionsRef.current,
+        charInit2XRef.current, charInit2YRef.current, currentClips, authoredAnimationsRef.current, renderCraters,
+      ) : null;
+      if (secondary) {
+        const sample = sampleSecondaryCombustion(time, secondary);
+        if (sample) drawSecondaryCombustionToCanvas(ctx, sample, cam, sf, W, H);
+      } else {
+        if (time >= characterEntranceTime2Ref.current && poseAllowsSpeechBubble(pose)) setSpeechAnchor("c2", characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(characterFace2Ref.current && characterFace2ImageRef.current), characterFace2Ref.current?.faceAspect ?? 1, physiqueAt(time, resolved)));
+        CharacterEntity.drawBoardCharacterToCanvas(
+          ctx, time, resolved, showCharacter2Ref.current,
+          cam, sf, W, H, charInit2XRef.current, charInit2YRef.current,
+          clipsRef.current, characterEntranceTime2Ref.current, authoredAnimationsRef.current,
+          characterFace2Ref.current && characterFace2ImageRef.current
+            ? { image: characterFace2ImageRef.current, aspect: characterFace2Ref.current.faceAspect, mouthAnchor: characterFace2Ref.current.mouthAnchor }
+            : null,
+          characterSkin2Ref.current,
+          characterType2Ref.current, characterExpression2Ref.current,
+          { ...withSequenceRevealImage(pose, currentClips, quality), viseme: resolvedCharacterViseme("c2", time, currentClips, resolved) },
+          boardCharacterDrawEvaluators()
+        );
+        const active = authoredBazookaDisplayAction(time, resolved);
+        if (active?.targetX !== undefined && active.targetY !== undefined) {
+          const isActive=time>=active.startTime&&time<active.startTime+active.duration,progress=clamp((time-active.startTime)/active.duration,0,1),fireFraction=authoredBazookaFireFraction(active,resolved),recoilAge=time-(active.startTime+active.duration*fireFraction),recoil=isActive&&recoilAge>=0&&recoilAge<.26?Math.sin((1-recoilAge/.26)*Math.PI)*9:0,pickup=!isActive||authoredBazookaIsChained(active,resolved)?1:authoredBazookaPickupProgress(progress);
+          drawBazookaHeld(ctx,{x:pose.boardX,y:pose.boardY,facing:pose.facing},{x:active.targetX,y:active.targetY},cam,sf,W,H,recoil,pickup,{bodyLean:pose.bodyLean,headBob:pose.headBob});
+        }
       }
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
@@ -7200,6 +7282,16 @@ export default function Board2Page() {
         !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, authoredBazooka.craters,
         resolvedCharacterGesture(id, time, resolved, "timeline"),
       );
+      const otherEnabled = id === "c1" ? showCharacter2Ref.current : showCharacterRef.current;
+      const otherActions = id === "c1" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
+      const secondary = otherEnabled ? secondaryTimelineCombustionAt(
+        time, id, resolved, otherActions, initX, initY, currentClips, authoredAnimationsRef.current, authoredBazooka.craters,
+      ) : null;
+      if (secondary) {
+        const sample = sampleSecondaryCombustion(time, secondary);
+        if (sample) drawSecondaryCombustionToCanvas(ctx, sample, cam, sf, W, H);
+        return;
+      }
       if (poseAllowsSpeechBubble(pose)) setSpeechAnchor(id, characterHeadSpeechAnchor(pose, cam, sf, W, H, !!(faceSettings && faceImage), faceSettings?.faceAspect ?? 1, physiqueAt(time, resolved)));
       CharacterEntity.drawBoardCharacterToCanvas(
         ctx, time, resolved, true, cam, sf, W, H, initX, initY,

@@ -53,6 +53,16 @@ const easeInOut = (t: number) => {
 };
 const point = (x: number, y: number): TrenchCoatPoint => ({ x, y });
 
+/** Uses almost the full opened garment, from upper chest to just above the coat hem. */
+export function trenchCoatRevealBounds(torsoLength: number, torsoTopY: number): RevealRect {
+  return {
+    x: -torsoLength * 0.775,
+    y: torsoTopY + torsoLength * 0.08,
+    width: torsoLength * 1.55,
+    height: torsoLength * 1.65,
+  };
+}
+
 /**
  * Keeps the editable closed-coat hold inside the action while always leaving a small reveal
  * phase. Missing values intentionally resolve to zero so boards saved before this control was
@@ -268,12 +278,7 @@ export function drawTrenchCoatPropToCanvas(
     torso * (args.physique === "jacked" ? 0.48 : 0.43),
   );
   const closedOuterX = coatShoulderX + torso * 0.13;
-  const revealBounds: RevealRect = {
-    x: -torso * 0.36,
-    y: joints.torsoTop.y + torso * 0.18,
-    width: torso * 0.72,
-    height: torso * 0.76,
-  };
+  const revealBounds = trenchCoatRevealBounds(torso, joints.torsoTop.y);
   const coatBack = "#eeece4";
   const coatFront = "#f7f5ee";
   const ink = "#2a2a2a";

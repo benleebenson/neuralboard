@@ -1234,7 +1234,11 @@ export function drawBoardCharacterToCanvas(
   }
 
   // Permanent wrist launcher: the same forearm endpoint used by the rope anchor drives this prop.
-  if (!p.hideArms && (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0))) {
+  if (
+    p.sequenceRenderer !== "trenchCoatReveal"
+    && !p.hideArms
+    && (LAUNCHER_ALWAYS_VISIBLE || (p.grappleRopeAlpha && p.grappleRopeAlpha > 0))
+  ) {
     // Pointing and force-choke poses resolve their final arm angles inside the renderer. Mount
     // against those resolved angles so the launcher remains strapped to the moving forearm.
     const resolvedLauncherMount = getForearmMount(true, {

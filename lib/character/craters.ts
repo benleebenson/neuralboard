@@ -45,7 +45,7 @@ export function explodeCratersAt(
   return craters;
 }
 
-export function bazookaShake(events:BazookaVisualEvent[],now=Date.now()){const event=events[events.length-1];if(!event||event.fizzle)return{x:0,y:0};const travel=Math.hypot(event.target.x-event.from.x,event.target.y-event.from.y)/1100,age=(now-event.startTime)/1000-travel;if(age<0||age>.25)return{x:0,y:0};const strength=(1-age/.25)*6;return{x:Math.sin(event.seed+age*95)*strength,y:Math.cos(event.seed*.7+age*117)*strength};}
+export function bazookaShake(events:BazookaVisualEvent[],now=Date.now()){const event=events[events.length-1];if(!event||event.fizzle)return{x:0,y:0};const travel=Math.hypot(event.target.x-event.from.x,event.target.y-event.from.y)/1100,age=(now-event.startTime)/1000-travel,duration=.42;if(age<0||age>duration)return{x:0,y:0};const strength=Math.pow(1-age/duration,1.3)*22;return{x:Math.sin(event.seed+age*95)*strength,y:Math.cos(event.seed*.7+age*117)*strength};}
 
 export function drawCrateredImage(ctx:CanvasRenderingContext2D,img:CanvasImageSource,x:number,y:number,w:number,h:number,boardW:number,boardH:number,craters:StreamCrater[]){
   if(!craters.length){ctx.drawImage(img,x,y,w,h);return;}
