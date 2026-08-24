@@ -63,14 +63,14 @@ import {
 } from "@/lib/character/renderer";
 import { DEFAULT_MOUTH_ANCHOR, VISEME_MOUTH, type BoardCharacterDrawEvaluators } from "@/lib/character/board-renderer";
 import type { Expression } from "@/lib/character/explainer-renderer";
-import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, type BazookaVisualEvent } from "@/lib/character/craters";
+import { bazookaShake, craterForImpact, drawBazookaEffect, drawCrateredImage, explodeCratersAt, type BazookaVisualEvent } from "@/lib/character/craters";
 import { groundProfileY, raycastSolid, resolveCharacterSolidMotion, resolveGroundedCharacterMotion, type TerrainClip, type TerrainPoint } from "@/lib/character/terrain";
 import { CharacterEntity } from "@/lib/character/entity";
 import {
   characterDespawnedAt,
-  explodeAnticipationPose,
   explodeShakeAt,
 } from "@/lib/character/explode";
+import { trenchCoatRevealPose } from "@/lib/character/trench-coat-reveal";
 import { isGrounded } from "@/lib/character/grounding";
 import {
   isRhubarbCue,
@@ -1256,7 +1256,7 @@ function authoredBazookaTimeline(
   const actions = actionGroups.flatMap((group) => group.filter((action) => action.type === "bazooka" && action.targetX !== undefined && action.targetY !== undefined)
     .map((action) => ({ action, fireFraction: authoredBazookaFireFraction(action, group) })))
     .sort((a, b) => a.action.startTime - b.action.startTime || a.action.id.localeCompare(b.action.id));
-  const craters = [...initialCraters];
+  const craters = explodeCratersAt(time, actionGroups, terrain, initialCraters);
   const events: BazookaVisualEvent[] = [];
   for (const entry of actions) {
     const { action, fireFraction } = entry;
@@ -3511,12 +3511,12 @@ function evalCharPoseRaw(
     const sequenceProgress = clamp((elapsed - setupDuration) / Math.max(0.001, active.duration - setupDuration), 0, 1);
     if (sequence.kind === "single-canvas") {
       const basePose = idlePose(active.targetX ?? active.sequenceCenterX, active.targetY ?? active.sequenceCenterY);
-      const explodePose = sequence.renderer === "explode"
-        ? explodeAnticipationPose(sequenceProgress)
+      const sequencePose = sequence.renderer === "trenchCoatReveal"
+        ? trenchCoatRevealPose(sequenceProgress)
         : null;
       return {
         ...basePose,
-        ...(explodePose ?? {}),
+        ...(sequencePose ?? {}),
         facing: active.sequenceDirection ?? 1,
         actionType: "sequence",
         sequenceRenderer: sequence.renderer,
@@ -11237,16 +11237,12 @@ export default function Board2Page() {
     const resolved = characterId === "c2" ? resolvedCharActions2Ref.current : resolvedCharActionsRef.current;
     const initX = characterId === "c2" ? charInit2XRef.current : charInitXRef.current;
     const initY = characterId === "c2" ? charInit2YRef.current : charInitYRef.current;
-    const longestDuration = explodeSequence.durationSeconds + 1.2;
+    const longestDuration = explodeSequence.durationSeconds;
     const startTime = nextAvailableCharacterActionStart(actions, playheadRef.current, longestDuration);
     const currentPose = evalCharAtTime(startTime, resolved, initX, initY, clipsRef.current, authoredAnimationsRef.current);
-    const camera = editorCameraAtTime(startTime, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
-    const targetX = clamp(camera.cameraX, 120, boardDimensionsRef.current.width - 120);
-    const targetY = resolveGroundY(targetX, currentPose.boardY, clipsRef.current, streamCratersRef.current);
-    const distance = Math.hypot(targetX - currentPose.boardX, targetY - currentPose.boardY);
-    const setupDuration = distance < CHAR_STATIONARY_NEAR_TARGET_PX
-      ? 0
-      : clamp(distance / CHAR_STATIONARY_WALK_SPEED, 0.25, 1.2);
+    const targetX = currentPose.boardX;
+    const targetY = currentPose.boardY;
+    const setupDuration = 0;
     const id = generateId();
     const action: CharacterAction = {
       id,
@@ -11275,9 +11271,7 @@ export default function Board2Page() {
     setCharacterPanelOpen(true);
     setPlayhead(startTime);
     playheadRef.current = startTime;
-    setToast(setupDuration > 0
-      ? "Explode queued: the character walks into position, then detonates"
-      : "Explode queued: anticipation, detonation, crater, and despawn");
+    setToast("Explode queued: instant blast, crater, and despawn");
   }
 
   function clientToBoardPoint(clientX: number, clientY: number) {

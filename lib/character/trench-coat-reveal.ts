@@ -1,3 +1,6 @@
+import type { Pose } from "../characterAnimations.ts";
+import { STREAM_CHARACTER_GEOMETRY } from "./geometry.ts";
+
 export const TRENCH_COAT_REVEAL_DURATION = 4.2;
 
 export const TRENCH_COAT_REVEAL_BEATS = [
@@ -18,10 +21,27 @@ export type TrenchCoatRevealSample = {
   revealAlpha: number;
 };
 
-type Point = { x: number; y: number };
+export type TrenchCoatPoint = { x: number; y: number };
 export type RevealRect = { x: number; y: number; width: number; height: number };
 
-const REVEAL_RECT: RevealRect = { x: -38, y: -154, width: 76, height: 82 };
+export type TrenchCoatJoints = {
+  hip: TrenchCoatPoint;
+  torsoTop: TrenchCoatPoint;
+  leftShoulder: TrenchCoatPoint;
+  rightShoulder: TrenchCoatPoint;
+  leftElbow: TrenchCoatPoint;
+  rightElbow: TrenchCoatPoint;
+  leftHand: TrenchCoatPoint;
+  rightHand: TrenchCoatPoint;
+};
+
+const DEFAULT_REVEAL_RECT: RevealRect = { x: -38, y: -154, width: 76, height: 82 };
+const RELAXED_ARMS = {
+  leftArmA: 0.25,
+  rightArmA: -0.25,
+  leftForeA: 0.18,
+  rightForeA: -0.18,
+} as const;
 
 const clamp = (value: number, min = 0, max = 1) => Math.max(min, Math.min(max, value));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -29,6 +49,7 @@ const easeInOut = (t: number) => {
   const value = clamp(t);
   return value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2;
 };
+const point = (x: number, y: number): TrenchCoatPoint => ({ x, y });
 
 export function sampleTrenchCoatReveal(progress: number): TrenchCoatRevealSample {
   const t = clamp(progress);
@@ -49,145 +70,64 @@ export function sampleTrenchCoatReveal(progress: number): TrenchCoatRevealSample
   };
 }
 
-function roundedLine(ctx: CanvasRenderingContext2D, from: Point, via: Point, to: Point) {
-  ctx.beginPath();
-  ctx.moveTo(from.x, from.y);
-  ctx.lineTo(via.x, via.y);
-  ctx.lineTo(to.x, to.y);
-  ctx.stroke();
+function armHand(upperAngle: number, foreAngle: number, side: -1 | 1): TrenchCoatPoint {
+  const arm = STREAM_CHARACTER_GEOMETRY.armRaw;
+  const shoulderY = -STREAM_CHARACTER_GEOMETRY.torsoRaw * STREAM_CHARACTER_GEOMETRY.shoulderFactor;
+  const elbow = point(-Math.sin(upperAngle) * arm, shoulderY + Math.cos(upperAngle) * arm);
+  const hand = point(elbow.x - Math.sin(foreAngle) * arm, elbow.y + Math.cos(foreAngle) * arm);
+  return point(Math.abs(hand.x) * side, hand.y);
 }
 
-function drawSleeve(ctx: CanvasRenderingContext2D, side: -1 | 1, shoulder: Point, elbow: Point, hand: Point) {
-  const widthAtShoulder = 10;
-  const widthAtElbow = 7.5;
-  const widthAtWrist = 5.5;
-  const segmentNormal = (a: Point, b: Point) => {
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const length = Math.max(0.001, Math.hypot(dx, dy));
-    return { x: -dy / length, y: dx / length };
-  };
-  const upperNormal = segmentNormal(shoulder, elbow);
-  const lowerNormal = segmentNormal(elbow, hand);
-  const normal = {
-    x: (upperNormal.x + lowerNormal.x) / 2,
-    y: (upperNormal.y + lowerNormal.y) / 2,
-  };
-  ctx.beginPath();
-  ctx.moveTo(shoulder.x + upperNormal.x * widthAtShoulder, shoulder.y + upperNormal.y * widthAtShoulder);
-  ctx.lineTo(elbow.x + normal.x * widthAtElbow, elbow.y + normal.y * widthAtElbow);
-  ctx.lineTo(hand.x + lowerNormal.x * widthAtWrist, hand.y + lowerNormal.y * widthAtWrist);
-  ctx.lineTo(hand.x - lowerNormal.x * widthAtWrist, hand.y - lowerNormal.y * widthAtWrist);
-  ctx.lineTo(elbow.x - normal.x * widthAtElbow, elbow.y - normal.y * widthAtElbow);
-  ctx.lineTo(shoulder.x - upperNormal.x * widthAtShoulder, shoulder.y - upperNormal.y * widthAtShoulder);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  // Reference cuff/watch: the small burnt-orange accent stays on the viewer's left wrist.
-  if (side === -1) {
-    const angle = Math.atan2(hand.y - elbow.y, hand.x - elbow.x);
-    ctx.save();
-    ctx.translate(lerp(elbow.x, hand.x, 0.88), lerp(elbow.y, hand.y, 0.88));
-    ctx.rotate(angle);
-    ctx.fillStyle = "#b9550c";
-    ctx.fillRect(-5, -7, 9, 14);
-    ctx.strokeRect(-5, -7, 9, 14);
-    ctx.restore();
-  }
+function armAnglesForTarget(target: TrenchCoatPoint, side: -1 | 1) {
+  const arm = STREAM_CHARACTER_GEOMETRY.armRaw;
+  const shoulder = point(0, -STREAM_CHARACTER_GEOMETRY.torsoRaw * STREAM_CHARACTER_GEOMETRY.shoulderFactor);
+  const dx = target.x - shoulder.x;
+  const dy = target.y - shoulder.y;
+  const rawDistance = Math.max(0.001, Math.hypot(dx, dy));
+  const distance = Math.min(rawDistance, arm * 2 * 0.99);
+  const end = point(shoulder.x + dx / rawDistance * distance, shoulder.y + dy / rawDistance * distance);
+  const mid = point((shoulder.x + end.x) / 2, (shoulder.y + end.y) / 2);
+  const bend = Math.sqrt(Math.max(0, arm ** 2 - (distance / 2) ** 2));
+  const perpendicular = point(-(end.y - shoulder.y) / distance, (end.x - shoulder.x) / distance);
+  const candidates = [
+    point(mid.x + perpendicular.x * bend, mid.y + perpendicular.y * bend),
+    point(mid.x - perpendicular.x * bend, mid.y - perpendicular.y * bend),
+  ];
+  const elbow = candidates.sort((a, b) => b.x * side - a.x * side)[0];
+  const angle = (from: TrenchCoatPoint, to: TrenchCoatPoint) => Math.atan2(-(to.x - from.x), to.y - from.y);
+  return { arm: angle(shoulder, elbow), fore: angle(elbow, end) };
 }
 
-function drawHand(ctx: CanvasRenderingContext2D, point: Point, side: -1 | 1, gripping: boolean) {
-  ctx.save();
-  ctx.translate(point.x, point.y);
-  ctx.fillStyle = "#fffdf7";
-  ctx.lineWidth = 2.4;
-  if (gripping) {
-    ctx.beginPath();
-    ctx.roundRect(-5, -8, 10, 16, 4);
-    ctx.fill();
-    ctx.stroke();
-    for (const y of [-4, 0, 4]) {
-      ctx.beginPath();
-      ctx.moveTo(side * -4, y);
-      ctx.lineTo(side * 3, y + 1);
-      ctx.stroke();
-    }
-  } else {
-    ctx.beginPath();
-    ctx.moveTo(side * -3, -7);
-    ctx.lineTo(side * -2, 7);
-    ctx.stroke();
-    for (const offset of [-4, 0, 4]) {
-      ctx.beginPath();
-      ctx.moveTo(side * -1, 4);
-      ctx.lineTo(side * (3 + offset * 0.18), 11 + Math.abs(offset) * 0.18);
-      ctx.stroke();
+/** Uses the shared arm lengths to move the real character's hands from rest to the lapels. */
+export function trenchCoatRevealPose(progress: number): Partial<Pose> {
+  const sample = sampleTrenchCoatReveal(progress);
+  if (sample.reach <= 0.0001) return { ...RELAXED_ARMS };
+  const shoulderY = -STREAM_CHARACTER_GEOMETRY.torsoRaw * STREAM_CHARACTER_GEOMETRY.shoulderFactor;
+  const openness = easeInOut(sample.open);
+  const pose: Partial<Pose> = {};
+  for (const side of [-1, 1] as const) {
+    const relaxed = side === -1
+      ? { arm: RELAXED_ARMS.leftArmA, fore: RELAXED_ARMS.leftForeA }
+      : { arm: RELAXED_ARMS.rightArmA, fore: RELAXED_ARMS.rightForeA };
+    const relaxedHand = armHand(relaxed.arm, relaxed.fore, side);
+    const openHand = point(side * lerp(8, 54, openness), shoulderY + lerp(15, 11, openness));
+    const target = point(lerp(relaxedHand.x, openHand.x, sample.reach), lerp(relaxedHand.y, openHand.y, sample.reach));
+    const solved = armAnglesForTarget(target, side);
+    const arm = lerp(relaxed.arm, solved.arm, easeInOut(sample.reach));
+    const fore = lerp(relaxed.fore, solved.fore, easeInOut(sample.reach));
+    if (side === -1) {
+      pose.leftArmA = arm;
+      pose.leftForeA = fore;
+    } else {
+      pose.rightArmA = arm;
+      pose.rightForeA = fore;
     }
   }
-  ctx.restore();
-}
-
-function drawCoatBack(ctx: CanvasRenderingContext2D) {
-  // The back stays on the body while the two front panels are pulled apart.
-  // Drawing it as its own lower layer keeps the figure from reading as two
-  // disconnected pieces of fabric at the full-open pose.
-  ctx.beginPath();
-  ctx.moveTo(-27, -168);
-  ctx.quadraticCurveTo(-43, -146, -45, -111);
-  ctx.quadraticCurveTo(-51, -84, -50, -67);
-  ctx.quadraticCurveTo(0, -56, 50, -67);
-  ctx.quadraticCurveTo(51, -84, 45, -111);
-  ctx.quadraticCurveTo(43, -146, 27, -168);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  // A restrained hem/fold detail distinguishes the coat body from the moving
-  // front panels without competing with the reveal in the middle.
-  ctx.beginPath();
-  ctx.moveTo(-31, -72);
-  ctx.quadraticCurveTo(0, -65, 31, -72);
-  ctx.stroke();
-}
-
-function drawCoatPanel(ctx: CanvasRenderingContext2D, side: -1 | 1, open: number, hand: Point) {
-  const innerTopX = side * lerp(2, 27, open);
-  const innerHemX = side * lerp(4, 44, open);
-  const outerHemX = side * lerp(39, 92, open);
-  const shoulderX = side * 27;
-  const lapelX = side * lerp(19, 31, open);
-  const heldX = lerp(side * 37, hand.x, open);
-  const heldY = lerp(-139, hand.y + 4, open);
-
-  ctx.beginPath();
-  ctx.moveTo(side * 8, -176);
-  ctx.lineTo(shoulderX, -168);
-  ctx.quadraticCurveTo(side * 42, -145, heldX, heldY);
-  ctx.quadraticCurveTo(outerHemX, -91, outerHemX, -64);
-  ctx.quadraticCurveTo(side * 58, -69, innerHemX, -72);
-  ctx.lineTo(innerTopX, -147);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  // Notched lapel and long fold mirror the storyboard silhouette.
-  ctx.beginPath();
-  ctx.moveTo(side * 7, -174);
-  ctx.lineTo(side * 19, -158);
-  ctx.lineTo(lapelX, -162);
-  ctx.lineTo(side * lerp(24, 36, open), -145);
-  ctx.lineTo(side * lerp(8, 18, open), -128);
-  ctx.lineTo(innerTopX, -147);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(innerTopX, -147);
-  ctx.lineTo(innerHemX, -72);
-  ctx.stroke();
+  return pose;
 }
 
 /** Object-fit contain geometry used for both preview and export canvas rendering. */
-export function fitRevealImage(sourceWidth: number, sourceHeight: number, bounds: RevealRect = REVEAL_RECT): RevealRect {
+export function fitRevealImage(sourceWidth: number, sourceHeight: number, bounds: RevealRect = DEFAULT_REVEAL_RECT): RevealRect {
   const width = Math.max(1, sourceWidth);
   const height = Math.max(1, sourceHeight);
   const scale = Math.min(bounds.width / width, bounds.height / height);
@@ -216,131 +156,163 @@ function revealSourceDimensions(source: CanvasImageSource): { width: number; hei
   };
 }
 
-function clipRevealOpening(ctx: CanvasRenderingContext2D, open: number) {
-  const top = lerp(1, 27, open);
-  const bottom = lerp(2, 44, open);
+function traceSleeve(ctx: CanvasRenderingContext2D, shoulder: TrenchCoatPoint, elbow: TrenchCoatPoint, hand: TrenchCoatPoint, width: number) {
+  const normal = (from: TrenchCoatPoint, to: TrenchCoatPoint) => {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const length = Math.max(0.001, Math.hypot(dx, dy));
+    return point(-dy / length, dx / length);
+  };
+  const upperN = normal(shoulder, elbow);
+  const lowerN = normal(elbow, hand);
+  const elbowN = point((upperN.x + lowerN.x) / 2, (upperN.y + lowerN.y) / 2);
   ctx.beginPath();
-  ctx.moveTo(-top, REVEAL_RECT.y);
-  ctx.lineTo(top, REVEAL_RECT.y);
-  ctx.lineTo(bottom, REVEAL_RECT.y + REVEAL_RECT.height);
-  ctx.lineTo(-bottom, REVEAL_RECT.y + REVEAL_RECT.height);
+  ctx.moveTo(shoulder.x + upperN.x * width, shoulder.y + upperN.y * width);
+  ctx.lineTo(elbow.x + elbowN.x * width * 0.72, elbow.y + elbowN.y * width * 0.72);
+  ctx.lineTo(hand.x + lowerN.x * width * 0.46, hand.y + lowerN.y * width * 0.46);
+  ctx.lineTo(hand.x - lowerN.x * width * 0.46, hand.y - lowerN.y * width * 0.46);
+  ctx.lineTo(elbow.x - elbowN.x * width * 0.72, elbow.y - elbowN.y * width * 0.72);
+  ctx.lineTo(shoulder.x - upperN.x * width, shoulder.y - upperN.y * width);
   ctx.closePath();
-  ctx.clip();
 }
 
-function drawRevealContent(ctx: CanvasRenderingContext2D, image: CanvasImageSource | null | undefined, open: number, alpha: number, ink: string) {
+function drawRevealContent(
+  ctx: CanvasRenderingContext2D,
+  image: CanvasImageSource | null | undefined,
+  bounds: RevealRect,
+  open: number,
+  alpha: number,
+  ink: string,
+) {
   ctx.save();
   ctx.globalAlpha *= alpha;
-  clipRevealOpening(ctx, open);
+  const topHalf = lerp(1, bounds.width * 0.38, open);
+  const bottomHalf = lerp(2, bounds.width * 0.5, open);
+  ctx.beginPath();
+  ctx.moveTo(-topHalf, bounds.y);
+  ctx.lineTo(topHalf, bounds.y);
+  ctx.lineTo(bottomHalf, bounds.y + bounds.height);
+  ctx.lineTo(-bottomHalf, bounds.y + bounds.height);
+  ctx.closePath();
+  ctx.clip();
+  ctx.fillStyle = "#fffdf7";
+  ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
   if (image) {
     const source = revealSourceDimensions(image);
-    const fitted = fitRevealImage(source.width, source.height);
-    ctx.fillStyle = "#fffdf7";
-    ctx.fillRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height);
+    const fitted = fitRevealImage(source.width, source.height, bounds);
     ctx.drawImage(image, fitted.x, fitted.y, fitted.width, fitted.height);
-    ctx.strokeStyle = ink;
-    ctx.lineWidth = 2.2;
-    ctx.strokeRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height);
   } else {
     ctx.fillStyle = "#c8f135";
-    ctx.beginPath();
-    ctx.roundRect(REVEAL_RECT.x, REVEAL_RECT.y, REVEAL_RECT.width, REVEAL_RECT.height, 6);
-    ctx.fill();
-    ctx.stroke();
+    ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
     ctx.fillStyle = ink;
-    ctx.font = "800 13px monospace";
+    ctx.font = `800 ${Math.max(8, bounds.height * 0.18)}px monospace`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("REVEAL", 0, REVEAL_RECT.y + REVEAL_RECT.height / 2);
+    ctx.fillText("REVEAL", 0, bounds.y + bounds.height / 2);
   }
+  ctx.strokeStyle = ink;
+  ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
   ctx.restore();
 }
 
-export function drawTrenchCoatRevealToCanvas(
+/**
+ * Draws only the coat prop. The caller has already drawn the live CharacterEntity and supplies
+ * its resolved torso/arm joints in the same transformed coordinate space.
+ */
+export function drawTrenchCoatPropToCanvas(
   ctx: CanvasRenderingContext2D,
-  args: { x: number; groundY: number; scale?: number; progress: number; revealImage?: CanvasImageSource | null },
+  args: {
+    progress: number;
+    joints: TrenchCoatJoints;
+    torsoLength: number;
+    strokeWidth: number;
+    revealImage?: CanvasImageSource | null;
+    physique?: "slim" | "jacked";
+  },
 ) {
   const sample = sampleTrenchCoatReveal(args.progress);
-  const { open, reach } = sample;
-  const scale = args.scale ?? 1;
-  const ink = "#20201e";
-  const paper = "#fffdf7";
-  const coat = "#f7f5ee";
+  const { joints } = args;
+  const open = easeInOut(sample.open);
+  const torso = args.torsoLength;
+  const hemY = joints.hip.y + torso * 0.88;
+  const shoulderWidth = Math.max(
+    Math.abs(joints.leftShoulder.x),
+    Math.abs(joints.rightShoulder.x),
+    torso * (args.physique === "jacked" ? 0.42 : 0.28),
+  );
+  const outerX = shoulderWidth + torso * 0.25;
+  const revealBounds: RevealRect = {
+    x: -torso * 0.39,
+    y: joints.torsoTop.y + torso * 0.18,
+    width: torso * 0.78,
+    height: torso * 0.76,
+  };
   const coatBack = "#eeece4";
-  const grip = reach > 0.7;
+  const coatFront = "#f7f5ee";
+  const ink = "#2a2a2a";
 
   ctx.save();
-  ctx.translate(args.x, args.groundY);
-  ctx.scale(scale, scale);
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
+  ctx.lineWidth = args.strokeWidth;
   ctx.strokeStyle = ink;
-  ctx.fillStyle = paper;
-  ctx.lineWidth = 3;
 
-  // The stationary back panel establishes one continuous coat silhouette.
   ctx.fillStyle = coatBack;
-  drawCoatBack(ctx);
-
-  // Legs and the simple stick body sit in front of the coat back and remain
-  // visible below and through the opening between the front panels.
-  ctx.fillStyle = paper;
-  roundedLine(ctx, { x: 0, y: -76 }, { x: -11, y: -39 }, { x: -16, y: -3 });
-  roundedLine(ctx, { x: -16, y: -3 }, { x: -25, y: -1 }, { x: -29, y: 0 });
-  roundedLine(ctx, { x: 0, y: -76 }, { x: 12, y: -39 }, { x: 17, y: -3 });
-  roundedLine(ctx, { x: 17, y: -3 }, { x: 25, y: -1 }, { x: 29, y: 0 });
   ctx.beginPath();
-  ctx.moveTo(0, -169);
-  ctx.lineTo(0, -76);
-  ctx.stroke();
-
-  // The reveal lives behind the moving front flaps and is clipped to the widening opening.
-  // A built-in card remains as a safe fallback when an action has no image reference.
-  drawRevealContent(ctx, args.revealImage, open, sample.revealAlpha, ink);
-
-  const lapelHandX = 15;
-  const downHand: Point = { x: 47, y: -78 };
-  const lapelHand: Point = { x: lapelHandX, y: -137 };
-  const openHand: Point = { x: lerp(21, 96, open), y: lerp(-136, -122, open) };
-  const handMagnitude: Point = {
-    x: lerp(downHand.x, open > 0.02 ? openHand.x : lapelHand.x, reach),
-    y: lerp(downHand.y, open > 0.02 ? openHand.y : lapelHand.y, reach),
-  };
-  const hands: Record<-1 | 1, Point> = {
-    [-1]: { x: -handMagnitude.x, y: handMagnitude.y },
-    [1]: { x: handMagnitude.x, y: handMagnitude.y },
-  };
-
-  // These are the separate front flaps that the hands pull away from the back.
-  ctx.fillStyle = coat;
-  drawCoatPanel(ctx, -1, open, hands[-1]);
-  drawCoatPanel(ctx, 1, open, hands[1]);
-
-  for (const side of [-1, 1] as const) {
-    const shoulder = { x: side * 31, y: -163 };
-    const elbowDown = { x: side * 44, y: -118 };
-    const elbowLapel = { x: side * 31, y: -130 };
-    const elbowOpen = { x: side * lerp(42, 66, open), y: lerp(-136, -142, open) };
-    const targetElbow = open > 0.02 ? elbowOpen : elbowLapel;
-    const elbow = { x: lerp(elbowDown.x, targetElbow.x, reach), y: lerp(elbowDown.y, targetElbow.y, reach) };
-    drawSleeve(ctx, side, shoulder, elbow, hands[side]);
-  }
-
-  // Collar, neck, and blank oval head match the clean line-art reference.
-  ctx.fillStyle = paper;
-  ctx.beginPath();
-  ctx.moveTo(-23, -170);
-  ctx.lineTo(-10, -180);
-  ctx.lineTo(0, -169);
-  ctx.lineTo(10, -180);
-  ctx.lineTo(23, -170);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.ellipse(0, -220, 37, 42, 0, 0, Math.PI * 2);
+  ctx.moveTo(joints.leftShoulder.x - torso * 0.08, joints.leftShoulder.y - torso * 0.08);
+  ctx.quadraticCurveTo(-outerX, joints.hip.y - torso * 0.08, -outerX * 0.92, hemY);
+  ctx.quadraticCurveTo(0, hemY + torso * 0.1, outerX * 0.92, hemY);
+  ctx.quadraticCurveTo(outerX, joints.hip.y - torso * 0.08, joints.rightShoulder.x + torso * 0.08, joints.rightShoulder.y - torso * 0.08);
+  ctx.closePath();
   ctx.fill();
   ctx.stroke();
 
-  for (const side of [-1, 1] as const) drawHand(ctx, hands[side], side, grip);
+  drawRevealContent(ctx, args.revealImage, revealBounds, open, sample.revealAlpha, ink);
+
+  for (const side of [-1, 1] as const) {
+    const shoulder = side === -1 ? joints.leftShoulder : joints.rightShoulder;
+    const hand = side === -1 ? joints.leftHand : joints.rightHand;
+    const innerTopX = side * lerp(1.5, Math.abs(hand.x) * 0.78, open);
+    const innerHemX = side * lerp(2.5, Math.max(torso * 0.33, Math.abs(hand.x) * 0.72), open);
+    const outerHemX = side * lerp(outerX * 0.78, outerX * 1.12 + Math.abs(hand.x) * 0.2, open);
+    const grip = point(lerp(side * torso * 0.15, hand.x, open), lerp(joints.torsoTop.y + torso * 0.38, hand.y, open));
+    ctx.fillStyle = coatFront;
+    ctx.beginPath();
+    ctx.moveTo(side * torso * 0.05, joints.torsoTop.y + torso * 0.02);
+    ctx.lineTo(shoulder.x + side * torso * 0.13, shoulder.y - torso * 0.07);
+    ctx.quadraticCurveTo(side * outerX, joints.hip.y - torso * 0.2, grip.x, grip.y);
+    ctx.quadraticCurveTo(outerHemX, joints.hip.y + torso * 0.35, outerHemX, hemY);
+    ctx.lineTo(innerHemX, hemY + torso * 0.04);
+    ctx.lineTo(innerTopX, joints.torsoTop.y + torso * 0.42);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(side * torso * 0.04, joints.torsoTop.y + torso * 0.03);
+    ctx.lineTo(side * torso * 0.23, joints.torsoTop.y + torso * 0.3);
+    ctx.lineTo(side * lerp(torso * 0.19, torso * 0.42, open), joints.torsoTop.y + torso * 0.23);
+    ctx.lineTo(innerTopX, joints.torsoTop.y + torso * 0.48);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = coatFront;
+  for (const [shoulder, elbow, hand] of [
+    [joints.leftShoulder, joints.leftElbow, joints.leftHand],
+    [joints.rightShoulder, joints.rightElbow, joints.rightHand],
+  ] as const) {
+    traceSleeve(ctx, shoulder, elbow, hand, torso * (args.physique === "jacked" ? 0.17 : 0.13));
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(-torso * 0.23, joints.torsoTop.y + torso * 0.02);
+  ctx.lineTo(-torso * 0.08, joints.torsoTop.y - torso * 0.08);
+  ctx.lineTo(0, joints.torsoTop.y + torso * 0.07);
+  ctx.lineTo(torso * 0.08, joints.torsoTop.y - torso * 0.08);
+  ctx.lineTo(torso * 0.23, joints.torsoTop.y + torso * 0.02);
+  ctx.stroke();
   ctx.restore();
   return sample;
 }

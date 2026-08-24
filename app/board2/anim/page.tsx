@@ -6,12 +6,11 @@ import { CharacterEntity, LocalInputAdapter, previewEntityActionPose } from "@/l
 import { drawBoardCharacterToCanvas, drawCharacterSkeletonOverlayToCanvas, type BoardCharPoseResult } from "@/lib/character/board-renderer";
 import {
   characterDespawnedAt,
-  explodeAnticipationPose,
   explodeShakeAt,
 } from "@/lib/character/explode";
 import {
-  drawTrenchCoatRevealToCanvas,
   sampleTrenchCoatReveal,
+  trenchCoatRevealPose,
   TRENCH_COAT_REVEAL_BEATS,
 } from "@/lib/character/trench-coat-reveal";
 import { characterSequences, sampleSequence } from "@/lib/character/sequences";
@@ -145,21 +144,23 @@ export default function AnimationHarnessPage() {
       }
       if (sequence.kind === "single-canvas") {
         const base = poseResult(DEFAULT_POSE, characterA.x, characterA.facing);
-        if (sequence.renderer !== "explode") return { a: base, b: idleB };
+        const sequencePose = sequence.renderer === "trenchCoatReveal" ? trenchCoatRevealPose(progress) : {};
         return {
           a: {
             ...base,
-            ...explodeAnticipationPose(progress),
+            ...sequencePose,
             actionType: "sequence",
-            sequenceRenderer: "explode",
+            sequenceRenderer: sequence.renderer,
             sequenceProgress: progress,
-            characterHidden: characterDespawnedAt(currentTime, [{
-              id: "harness-explode",
-              type: "sequence",
-              startTime: 0,
-              duration: sequence.durationSeconds,
-              sequenceId: sequence.id,
-            }]),
+            ...(sequence.renderer === "explode" ? {
+              characterHidden: characterDespawnedAt(currentTime, [{
+                id: "harness-explode",
+                type: "sequence",
+                startTime: 0,
+                duration: sequence.durationSeconds,
+                sequenceId: sequence.id,
+              }]),
+            } : {}),
           },
           b: idleB,
         };
@@ -260,15 +261,6 @@ export default function AnimationHarnessPage() {
       ctx.lineWidth = 1.5;
       const groundScreenY = GROUND_Y + rect.height / 2;
       ctx.beginPath(); ctx.moveTo(32, groundScreenY); ctx.lineTo(rect.width - 32, groundScreenY); ctx.stroke();
-      if (selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal") {
-        drawTrenchCoatRevealToCanvas(ctx, {
-          x: characterA.x + rect.width / 2,
-          groundY: groundScreenY,
-          progress,
-          scale: Math.min(1.15, Math.max(0.82, (rect.height - 42) / 275)),
-        });
-        return;
-      }
       if (selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode" && harnessExplodeAction) {
         const physique = characterA.style === "jacked" ? "jacked" : characterA.physique;
         const skin: CharacterSkin = characterA.style === "styled" ? "styled" : "stick";

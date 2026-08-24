@@ -1,4 +1,11 @@
-import type { StreamBazookaFireMessage, StreamCrater, StreamCamera } from "@/lib/stream";
+import type { StreamBazookaFireMessage, StreamCrater, StreamCamera } from "../stream";
+import {
+  explodeActionPoint,
+  explodeDetonationTime,
+  explodeSeed,
+  isExplodeAction,
+  type ExplodeTimelineAction,
+} from "./explode.ts";
 
 export type BazookaVisualEvent = StreamBazookaFireMessage & { fizzle?: boolean };
 
@@ -7,6 +14,36 @@ function random(seed: number) { let x=seed|0;return()=>{x^=x<<13;x^=x>>>17;x^=x<
 function craterPath(ctx:CanvasRenderingContext2D,cx:number,cy:number,r:number,seed:number){const rng=random(seed),jitter=Math.min(6,r*.08);ctx.beginPath();for(let i=0;i<18;i++){const a=i/18*Math.PI*2,rr=r+(rng()*2-1)*jitter,x=cx+Math.cos(a)*rr,y=cy+Math.sin(a)*rr;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.closePath();}
 
 export function craterForImpact(clip:{id:string;boardX:number;boardY:number;boardW:number;boardH:number},target:{x:number;y:number},seed:number):StreamCrater{return{clipId:clip.id,cx:target.x-clip.boardX,cy:target.y-clip.boardY,r:Math.min(Math.min(clip.boardW,clip.boardH)*.25,60+(seed%31)),seed};}
+
+type CraterSurface = { id: string; boardX: number; boardY: number; boardW: number; boardH: number };
+
+/**
+ * Adds timeline-derived explode craters through the exact bazooka crater data path. Rendering
+ * remains owned by drawCrateredImage, including its destination-out cutout and scorch rim.
+ */
+export function explodeCratersAt(
+  time: number,
+  actionGroups: readonly (readonly ExplodeTimelineAction[])[],
+  surfaces: readonly CraterSurface[],
+  initialCraters: readonly StreamCrater[] = [],
+): StreamCrater[] {
+  const craters = [...initialCraters];
+  const actions = actionGroups.flat().filter(isExplodeAction)
+    .sort((a, b) => explodeDetonationTime(a) - explodeDetonationTime(b) || a.id.localeCompare(b.id));
+  for (const action of actions) {
+    if (explodeDetonationTime(action) > time + 1e-9) continue;
+    const target = explodeActionPoint(action);
+    const surface = surfaces
+      .filter((candidate) => target.x >= candidate.boardX && target.x <= candidate.boardX + candidate.boardW)
+      .sort((a, b) => Math.abs(a.boardY - target.y) - Math.abs(b.boardY - target.y))[0];
+    if (!surface) continue;
+    const crater = craterForImpact(surface, target, explodeSeed(action.id));
+    if (craters.some((candidate) => candidate.clipId === crater.clipId && candidate.seed === crater.seed)) continue;
+    const sameSurface = craters.filter((candidate) => candidate.clipId === surface.id);
+    craters.splice(0, craters.length, ...craters.filter((candidate) => candidate.clipId !== surface.id), ...sameSurface.slice(-23), crater);
+  }
+  return craters;
+}
 
 export function bazookaShake(events:BazookaVisualEvent[],now=Date.now()){const event=events[events.length-1];if(!event||event.fizzle)return{x:0,y:0};const travel=Math.hypot(event.target.x-event.from.x,event.target.y-event.from.y)/1100,age=(now-event.startTime)/1000-travel;if(age<0||age>.25)return{x:0,y:0};const strength=(1-age/.25)*6;return{x:Math.sin(event.seed+age*95)*strength,y:Math.cos(event.seed*.7+age*117)*strength};}
 

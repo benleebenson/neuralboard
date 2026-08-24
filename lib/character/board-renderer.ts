@@ -5,14 +5,11 @@ import { drawExplainerCharacter, type Expression } from "./explainer-renderer";
 import {
   characterDespawnedAt,
   drawExplodeSequenceToCanvas,
-  drawImpactCraterToCanvas,
-  explodeActionPoint,
-  explodeDetonationTime,
   explodeSeed,
   isExplodeAction,
   type ExplodeTimelineAction,
 } from "./explode";
-import { drawTrenchCoatRevealToCanvas } from "./trench-coat-reveal";
+import { drawTrenchCoatPropToCanvas } from "./trench-coat-reveal";
 
 const CHAR_HIP_RAW = STREAM_CHARACTER_GEOMETRY.hipRaw;
 const CHAR_TORSO_RAW = STREAM_CHARACTER_GEOMETRY.torsoRaw;
@@ -441,18 +438,6 @@ export function drawBoardCharacterToCanvas(
 ) {
   if (!showChar) return;
   const timelineActions = resolved as ExplodeTimelineAction[];
-  const explodeActions = timelineActions.filter(isExplodeAction);
-  for (const action of explodeActions) {
-    if (time + 1e-9 < explodeDetonationTime(action)) continue;
-    const point = explodeActionPoint(action);
-    drawImpactCraterToCanvas(ctx, {
-      x: (point.x - cam.cameraX) * sf + W / 2,
-      groundY: (point.y - cam.cameraY) * sf + H / 2,
-      scale: sf,
-      seed: explodeSeed(action.id),
-      physique: evaluators.physiqueAt(explodeDetonationTime(action), resolved),
-    });
-  }
   if (time < entranceTime) return;
   const hasFace = !!characterFace?.image;
   const faceAspect = clamp(characterFace?.aspect ?? 1, 0.75, 1.6);
@@ -482,18 +467,6 @@ export function drawBoardCharacterToCanvas(
     });
     if (!sample.characterVisible) return;
   } else if (characterDespawnedAt(time, timelineActions)) {
-    return;
-  }
-  if (p.sequenceRenderer === "trenchCoatReveal") {
-    drawTrenchCoatRevealToCanvas(ctx, {
-      x: sx,
-      groundY: sy,
-      progress: p.sequenceProgress ?? 0,
-      revealImage: p.sequenceRevealImage ?? null,
-      // The coat study is intentionally a touch larger than the standard rig so an inserted
-      // reveal stays readable at ordinary generated-camera framing.
-      scale: sf * 1.16,
-    });
     return;
   }
   if (characterType === "explainer") {
@@ -1135,20 +1108,20 @@ export function drawBoardCharacterToCanvas(
     }
   };
 
-  if (isJacked) {
+  const jackedJoints = isJacked ? buildJackedJoints() : null;
+  if (isJacked && jackedJoints) {
     ctx.fillStyle = "#e4d6c4";
     ctx.strokeStyle = "#2a2a2a";
     const frontIsRight = facing >= 0;
-    const joints = buildJackedJoints();
     if (!p.hideArms) {
-      if (frontIsRight) drawJackedArmWorld("left", joints);
-      else drawJackedArmWorld("right", joints);
+      if (frontIsRight) drawJackedArmWorld("left", jackedJoints);
+      else drawJackedArmWorld("right", jackedJoints);
     }
-    drawJackedTorsoWorld(joints);
-    drawJackedShoulderCapsWorld(joints);
+    drawJackedTorsoWorld(jackedJoints);
+    drawJackedShoulderCapsWorld(jackedJoints);
     if (!p.hideArms) {
-      if (frontIsRight) drawJackedArmWorld("right", joints);
-      else drawJackedArmWorld("left", joints);
+      if (frontIsRight) drawJackedArmWorld("right", jackedJoints);
+      else drawJackedArmWorld("left", jackedJoints);
     }
   } else if (effectiveSkin === "styled") {
     const shoulderHalf = 19 * S;
@@ -1188,6 +1161,43 @@ export function drawBoardCharacterToCanvas(
   } else if (!p.hideArms && p.forceHandOpen && p.actionType === "explainGesture") {
     drawOpenHand(lArmA, lForeA);
     drawOpenHand(rArmA, rForeA);
+  }
+
+  if (p.sequenceRenderer === "trenchCoatReveal") {
+    const slimArmJoints = (armA: number, foreA: number) => {
+      const elbow = addP({ x: 0, y: shoulderY }, armVector(armA, armLen));
+      return { elbow, hand: addP(elbow, armVector(foreA, armLen)) };
+    };
+    const left = slimArmJoints(lArmA, lForeA);
+    const right = slimArmJoints(rArmA, rForeA);
+    drawTrenchCoatPropToCanvas(ctx, {
+      progress: p.sequenceProgress ?? 0,
+      revealImage: p.sequenceRevealImage ?? null,
+      torsoLength: torsoLen,
+      strokeWidth: lw,
+      physique,
+      joints: jackedJoints
+        ? {
+            hip: jackedJoints.hipP,
+            torsoTop: jackedJoints.neckP,
+            leftShoulder: jackedJoints.shoulderL,
+            rightShoulder: jackedJoints.shoulderR,
+            leftElbow: jackedJoints.elbowL,
+            rightElbow: jackedJoints.elbowR,
+            leftHand: jackedJoints.handL,
+            rightHand: jackedJoints.handR,
+          }
+        : {
+            hip: { x: 0, y: 0 },
+            torsoTop: { x: 0, y: torsoTopY },
+            leftShoulder: { x: 0, y: shoulderY },
+            rightShoulder: { x: 0, y: shoulderY },
+            leftElbow: left.elbow,
+            rightElbow: right.elbow,
+            leftHand: left.hand,
+            rightHand: right.hand,
+          },
+    });
   }
 
   if (p.popcornAlpha && p.popcornAlpha > 0) {

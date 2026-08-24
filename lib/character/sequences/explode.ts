@@ -7,6 +7,6 @@ export const explodeSequence: SingleCharacterSequence = {
   renderer: "explode",
   id: "explode",
   name: "Explode",
-  description: "Anticipate, detonate in a comic blast, leave a crater, and despawn until the next action.",
+  description: "Instantly detonate in a brief comic blast, cut a crater into the surface, and despawn.",
   durationSeconds: EXPLODE_DURATION_SECONDS,
 };
