@@ -18,6 +18,24 @@
   padding: 20px 28px 0;
 }
 
+.stageMeta {
+  position: absolute;
+  z-index: 1;
+  top: 26px;
+  left: 34px;
+  display: grid;
+  gap: 4px;
+  pointer-events: none;
+  font: 700 14px/1.2 var(--font-geist-mono), monospace;
+}
+
+.stageEyebrow {
+  color: rgba(42, 42, 42, 0.52);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
 .canvas {
   display: block;
   width: 100%;
@@ -37,7 +55,8 @@
 
 .transport,
 .characterRow,
-.readouts {
+.readouts,
+.beatStrip {
   display: grid;
   gap: 8px;
   align-items: end;
@@ -54,6 +73,43 @@
 .readouts {
   grid-template-columns: 1fr 1fr;
   align-items: stretch;
+}
+
+.beatStrip {
+  grid-template-columns: repeat(8, minmax(72px, 1fr));
+  align-items: stretch;
+}
+
+.beatButton {
+  min-height: 38px;
+  border: 1px solid rgba(42, 42, 42, 0.35);
+  border-radius: 2px;
+  color: rgba(42, 42, 42, 0.72);
+  background: rgba(255, 253, 245, 0.68);
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 7px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.beatButton span {
+  width: 18px;
+  height: 18px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  display: inline-grid;
+  place-items: center;
+  font-size: 9px;
+}
+
+.beatButtonActive {
+  border-color: var(--ink);
+  color: var(--ink);
+  background: #c8f135;
+  font-weight: 800;
 }
 
 .label {
@@ -142,6 +198,7 @@
   .transport .label:first-child,
   .transport .label:nth-last-child(2) { grid-column: 1 / -1; }
   .characterRow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .beatStrip { grid-template-columns: repeat(4, minmax(72px, 1fr)); }
   .charName { grid-column: 1 / -1; }
   .readouts { grid-template-columns: 1fr; }
   .poseGrid { grid-template-columns: repeat(3, minmax(70px, 1fr)); }

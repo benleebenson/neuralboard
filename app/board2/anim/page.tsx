@@ -4,7 +4,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { CharacterEntity, LocalInputAdapter, previewEntityActionPose } from "@/lib/character/entity";
 import { drawCharacterSkeletonOverlayToCanvas, type BoardCharPoseResult } from "@/lib/character/board-renderer";
-import { characterSequences, sampleSequenceWithMomentum } from "@/lib/character/sequences";
+import {
+  drawTrenchCoatRevealToCanvas,
+  sampleTrenchCoatReveal,
+  TRENCH_COAT_REVEAL_BEATS,
+  TRENCH_COAT_REVEAL_DURATION,
+} from "@/lib/character/trench-coat-reveal";
 import { STREAM_ACTION_TYPES, type CharacterSkin } from "@/lib/stream";
 import { DEFAULT_POSE, sampleAnimation, starterAnimations, type Pose } from "@/lib/characterAnimations";
 import styles from "./anim.module.css";
@@ -31,14 +36,18 @@ type CharacterControls = {
 type MoveOption = {
   id: string;
   label: string;
-  group: "Character moves" | "Authored clips" | "Two-character sequences";
+  group: "Featured sequence" | "Character moves" | "Authored clips";
   duration: number;
-  kind: "action" | "authored" | "sequence";
+  kind: "trench" | "action" | "authored";
   key: string;
 };
 
 const authoredAnimations = starterAnimations("harness");
 const moveOptions: MoveOption[] = [
+  {
+    id: "featured:trench-coat-reveal", label: "Trench coat reveal", group: "Featured sequence",
+    duration: TRENCH_COAT_REVEAL_DURATION, kind: "trench", key: "trenchCoatReveal",
+  },
   ...STREAM_ACTION_TYPES.map((name) => ({
     id: `action:${name}`, label: name, group: "Character moves" as const,
     duration: SINGLE_MOVE_SECONDS[name] ?? 2, kind: "action" as const, key: name,
@@ -46,10 +55,6 @@ const moveOptions: MoveOption[] = [
   ...authoredAnimations.map((animation) => ({
     id: `authored:${animation.name}`, label: animation.name, group: "Authored clips" as const,
     duration: SINGLE_MOVE_SECONDS[animation.name] ?? 2, kind: "authored" as const, key: animation.name,
-  })),
-  ...characterSequences.map((sequence) => ({
-    id: `sequence:${sequence.id}`, label: sequence.name, group: "Two-character sequences" as const,
-    duration: sequence.durationSeconds, kind: "sequence" as const, key: sequence.id,
   })),
 ];
 
@@ -116,39 +121,19 @@ function CharacterControlRow({
 export default function AnimationHarnessPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const currentTimeRef = useRef(0);
-  const [selectedId, setSelectedId] = useState("sequence:knee-to-face");
+  const [selectedId, setSelectedId] = useState("featured:trench-coat-reveal");
   const [playing, setPlaying] = useState(true);
   const [loop, setLoop] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [currentTime, setCurrentTime] = useState(0);
-  const [characterA, setCharacterA] = useState<CharacterControls>({ x: -115, style: "stick", physique: "slim", facing: 1, skeleton: false });
+  const [characterA, setCharacterA] = useState<CharacterControls>({ x: 0, style: "stick", physique: "slim", facing: 1, skeleton: false });
   const [characterB, setCharacterB] = useState<CharacterControls>({ x: 115, style: "styled", physique: "slim", facing: -1, skeleton: false });
   const selected = moveOptions.find((option) => option.id === selectedId) ?? moveOptions[0];
   const progress = selected.duration > 0 ? Math.min(1, currentTime / selected.duration) : 0;
 
   const poses = useMemo(() => {
     const idleB = poseResult(DEFAULT_POSE, characterB.x, characterB.facing);
-    if (selected.kind === "sequence") {
-      const sequence = characterSequences.find((item) => item.id === selected.key) ?? characterSequences[0];
-      const direction: 1 | -1 = characterB.x === characterA.x ? characterA.facing : characterB.x > characterA.x ? 1 : -1;
-      const sample = sampleSequenceWithMomentum(sequence, progress, {
-        centerX: (characterA.x + characterB.x) / 2,
-        groundY: GROUND_Y,
-        direction,
-        distance: Math.max(1, Math.abs(characterB.x - characterA.x)),
-      });
-      const convert = (role: "attacker" | "victim") => {
-        const character = sample.characters[role];
-        return {
-          ...poseResult(character.pose, character.position.x, character.facing),
-          boardY: character.position.y,
-          sequenceShakeX: sample.shake.x,
-          sequenceShakeY: sample.shake.y,
-          ...(role === "attacker" ? { sequenceEffects: sample.effects } : {}),
-        };
-      };
-      return { a: convert("attacker"), b: convert("victim") };
-    }
+    if (selected.kind === "trench") return { a: poseResult(DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
     if (selected.kind === "authored") {
       const animation = authoredAnimations.find((item) => item.name === selected.key);
       return { a: poseResult(sampleAnimation(animation, progress) ?? DEFAULT_POSE, characterA.x, characterA.facing), b: idleB };
@@ -214,6 +199,15 @@ export default function AnimationHarnessPage() {
       ctx.lineWidth = 1.5;
       const groundScreenY = GROUND_Y + rect.height / 2;
       ctx.beginPath(); ctx.moveTo(32, groundScreenY); ctx.lineTo(rect.width - 32, groundScreenY); ctx.stroke();
+      if (selected.kind === "trench") {
+        drawTrenchCoatRevealToCanvas(ctx, {
+          x: characterA.x + rect.width / 2,
+          groundY: groundScreenY,
+          progress,
+          scale: Math.min(1.15, Math.max(0.82, (rect.height - 42) / 275)),
+        });
+        return;
+      }
       const makeEntity = (name: "A" | "B", controls: CharacterControls, pose: BoardCharPoseResult) => {
         const physique = controls.style === "jacked" ? "jacked" : controls.physique;
         const skin: CharacterSkin = controls.style === "styled" ? "styled" : "stick";
@@ -229,9 +223,9 @@ export default function AnimationHarnessPage() {
     const observer = new ResizeObserver(render);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [characterA, characterB, currentTime, poses, selected.key]);
+  }, [characterA, characterB, currentTime, poses, progress, selected.key, selected.kind]);
 
-  const grouped = ["Character moves", "Authored clips", "Two-character sequences"] as const;
+  const grouped = ["Featured sequence", "Character moves", "Authored clips"] as const;
   const selectMove = (id: string) => { setSelectedId(id); currentTimeRef.current = 0; setCurrentTime(0); setPlaying(true); };
   const togglePlaying = () => {
     if (playing) { setPlaying(false); return; }
@@ -241,9 +235,23 @@ export default function AnimationHarnessPage() {
     }
     setPlaying(true);
   };
+  const trenchSample = sampleTrenchCoatReveal(progress);
+  const jumpToBeat = (beatProgress: number) => {
+    const value = beatProgress * selected.duration;
+    currentTimeRef.current = value;
+    setCurrentTime(value);
+    setPlaying(false);
+  };
+  const poseKeys: Array<"a" | "b"> = selected.kind === "trench" ? ["a"] : ["a", "b"];
   return (
     <main className={styles.page}>
-      <section className={styles.stage} aria-label="Animation preview stage"><canvas ref={canvasRef} className={styles.canvas} /></section>
+      <section className={styles.stage} aria-label="Animation preview stage">
+        <div className={styles.stageMeta} aria-live="polite">
+          <span className={styles.stageEyebrow}>8-frame study</span>
+          <strong>{selected.kind === "trench" ? trenchSample.beatLabel : selected.label}</strong>
+        </div>
+        <canvas ref={canvasRef} className={styles.canvas} />
+      </section>
       <section className={styles.controls} aria-label="Animation controls">
         <div className={styles.transport}>
           <label className={styles.label}>Move
@@ -261,10 +269,25 @@ export default function AnimationHarnessPage() {
           </label>
           <div className={styles.time}>{currentTime.toFixed(3)} / {selected.duration.toFixed(2)}s</div>
         </div>
+        {selected.kind === "trench" && (
+          <div className={styles.beatStrip} aria-label="Trench coat keyframes">
+            {TRENCH_COAT_REVEAL_BEATS.map((beat, index) => (
+              <button
+                type="button"
+                key={beat.label}
+                className={`${styles.beatButton} ${trenchSample.beatIndex === index ? styles.beatButtonActive : ""}`}
+                aria-pressed={trenchSample.beatIndex === index}
+                onClick={() => jumpToBeat(beat.t)}
+              >
+                <span>{index + 1}</span>{beat.shortLabel}
+              </button>
+            ))}
+          </div>
+        )}
         <CharacterControlRow name="A" value={characterA} onChange={setCharacterA} />
-        <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />
+        {selected.kind !== "trench" && <CharacterControlRow name="B" value={characterB} onChange={setCharacterB} />}
         <div className={styles.readouts}>
-          {(["a", "b"] as const).map((key) => <div className={styles.posePanel} key={key}><div className={styles.poseTitle}>Character {key.toUpperCase()} pose</div><div className={styles.poseGrid}>{poseReadout(poses[key]).map(([name, value]) => <span key={name}>{name} {Number(value).toFixed(3)}</span>)}</div></div>)}
+          {poseKeys.map((key) => <div className={styles.posePanel} key={key}><div className={styles.poseTitle}>Character {key.toUpperCase()} pose</div><div className={styles.poseGrid}>{poseReadout(poses[key]).map(([name, value]) => <span key={name}>{name} {Number(value).toFixed(3)}</span>)}</div></div>)}
         </div>
         <div className={styles.hint}>← / → steps one 60 fps frame</div>
       </section>
