@@ -179,6 +179,13 @@ import {
 } from "@/lib/board2/focus-camera";
 import { buildSerpentinePanPath } from "@/lib/board2/pan-camera";
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
+import {
+  AUTO_BUILD_IMAGE_RETRY_DELAY_MS,
+  describeImageSkip,
+  describeImageSuccess,
+  requestAutoBuildImage,
+  type AutoBuildFoundImage,
+} from "@/lib/board2/auto-build-images";
 import { fitMediaDimensions } from "@/lib/board2/media-sizing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import {
@@ -464,13 +471,37 @@ type AutoNarrationImageSegment = TranscriptSegment & {
   topicEndTime?: number;
   topicIndex?: number;
 };
-type BrowserFoundImage = {
-  dataUrl: string;
-  sourceUrl: string;
-  width: number;
-  height: number;
-  source: "google" | "bing" | "openverse";
+type BrowserFoundImage = AutoBuildFoundImage;
+type AutoBuildImageUpdate = {
+  slot: number;
+  tone: "working" | "success" | "warning";
+  message: string;
 };
+
+function AutoBuildImageProgress({ updates, active, compact = false }: {
+  updates: AutoBuildImageUpdate[];
+  active: boolean;
+  compact?: boolean;
+}) {
+  if (!updates.length) return null;
+  return (
+    <details open={active} style={{ marginTop: compact ? 5 : 0, fontSize: compact ? 8 : 9, lineHeight: 1.4 }}>
+      <summary style={{ cursor: "pointer", fontWeight: 700 }}>
+        Image search details ({updates.filter((update) => update.tone === "success").length}/{updates.length} found)
+      </summary>
+      <div style={{ maxHeight: compact ? 90 : 130, overflowY: "auto", marginTop: 4 }}>
+        {updates.map((update) => (
+          <div
+            key={update.slot}
+            style={{ color: update.tone === "success" ? "#496700" : update.tone === "warning" ? "#a14d00" : "#6a6a6a" }}
+          >
+            {update.tone === "success" ? "✓" : update.tone === "warning" ? "⚠" : "…"} {update.message}
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
 type SpeechBubbleCue = TranscriptSegment & { index: number };
 type SpeechBubbleAnchor = { x: number; y: number; facing: 1 | -1; radius?: number };
 type SpeechBubbleMediaTarget = { x: number; y: number; width: number; height: number };
@@ -4801,6 +4832,7 @@ export default function Board2Page() {
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
+  const [autoBuildImageUpdates, setAutoBuildImageUpdates] = useState<AutoBuildImageUpdate[]>([]);
   const [autoBuildCancelled, setAutoBuildCancelled] = useState(false);
   const [autoBuildSource, setAutoBuildSource] = useState<string | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
@@ -9053,6 +9085,7 @@ export default function Board2Page() {
     autoBuildAbortRef.current = controller;
     setAutoBuildError(null);
     setAutoBuildSummary(null);
+    setAutoBuildImageUpdates([]);
     setAutoBuildPlanDetails(null);
     setAutoBuildCancelled(false);
     setAutoBuildPhase(autoStyleConditioning ? "Reading starred boards…" : "Compiling narration…");
@@ -9215,27 +9248,33 @@ export default function Board2Page() {
       const skipped: Array<{ index: number; query: string; reason: string }> = [];
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
-        setAutoBuildPhase(`Finding images (${index + 1}/${segments.length})…`);
+        const slot = index + 1;
+        const updateSlot = (update: AutoBuildImageUpdate) => {
+          setAutoBuildImageUpdates((previous) => [
+            ...previous.filter((item) => item.slot !== update.slot),
+            update,
+          ].sort((a, b) => a.slot - b.slot));
+        };
         try {
-          const imageResponse = await fetch("/api/board2/find-images", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
+          const result = await requestAutoBuildImage({
+            query: segment.query,
             signal: controller.signal,
-            body: JSON.stringify({ query: segment.query, count: 1 }),
+            onAttempt: (attempt) => {
+              const retry = attempt > 1 ? " (retry 2/2)" : "";
+              setAutoBuildPhase(`Finding images ${slot}/${segments.length}${retry} — this can take several minutes`);
+              updateSlot({ slot, tone: "working", message: `Slot ${slot}: searching${retry}` });
+            },
+            onRetry: (error) => {
+              const retryReason = describeImageSkip(slot, error)
+                .replace(/ after 2 attempts, skipped$/, "");
+              updateSlot({
+                slot,
+                tone: "warning",
+                message: `${retryReason}; retrying in ${AUTO_BUILD_IMAGE_RETRY_DELAY_MS / 1_000}s`,
+              });
+            },
           });
-          const imageData = await imageResponse.json().catch(() => null) as {
-            error?: string;
-            code?: string;
-            images?: BrowserFoundImage[];
-          } | null;
-          if (!imageResponse.ok) {
-            throw new Error(imageData?.error || `Image search failed (${imageResponse.status})`);
-          }
-          const image = imageData?.images?.find((candidate) =>
-            candidate?.dataUrl?.startsWith("data:image/") && candidate.width > 0 && candidate.height > 0 &&
-            (candidate.source === "google" || candidate.source === "bing" || candidate.source === "openverse")
-          );
-          if (!image) throw new Error("No source returned a usable image");
+          const image = result.image;
           const sourceBlob = dataUrlToBlob(image.dataUrl);
           const previewBlob = await createImagePreviewBlob(sourceBlob);
           const imageMetadata = {
@@ -9245,11 +9284,13 @@ export default function Board2Page() {
             source: image.source,
           };
           found.push({ segment, image: imageMetadata, sourceBlob, previewBlob });
+          updateSlot({ slot, tone: "success", message: describeImageSuccess(slot, result) });
         } catch (error) {
           if (isAbortError(error)) throw error;
-          const reason = error instanceof Error ? error.message : "Image search failed";
+          const reason = describeImageSkip(slot, error);
           skipped.push({ index, query: segment.query, reason });
-          console.warn(`[board2:auto-build] Skipping image slot ${index + 1}/${segments.length} for “${segment.query}”: ${reason}`);
+          updateSlot({ slot, tone: "warning", message: reason });
+          console.warn(`[board2:auto-build] ${reason} for “${segment.query}”`);
         }
       }
 
@@ -9421,7 +9462,7 @@ export default function Board2Page() {
           ? " No training examples starred — used default planning."
           : " Style conditioning was off.";
       const skippedSlots = skipped.length
-        ? ` Skipped: ${skipped.map(({ index, query }) => `#${index + 1} “${query}”`).join(", ")}.`
+        ? ` Skipped: ${skipped.map(({ index, query, reason }) => `#${index + 1} “${query}” (${reason.replace(/^Slot \d+: /, "")})`).join(", ")}.`
         : "";
       setAutoBuildSummary(`${summary}${styleSummary}${skippedSlots}`);
       setToast(summary);
@@ -17330,6 +17371,7 @@ export default function Board2Page() {
                               : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
                       </div>
                       {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
+                      <AutoBuildImageProgress updates={autoBuildImageUpdates} active={!!autoBuildPhase} />
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
                       {autoBuildCancelled && !autoBuildPhase && <div style={{ fontSize: 10, color: "#8a6200" }}>⚠ Auto-build cancelled</div>}
                       {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
@@ -18777,6 +18819,7 @@ export default function Board2Page() {
                   {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
                 </button>
                 {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", marginTop: 5, color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
+                <AutoBuildImageProgress updates={autoBuildImageUpdates} active={!!autoBuildPhase} compact />
                 {autoBuildError && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
                 )}

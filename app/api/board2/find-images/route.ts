@@ -3,7 +3,11 @@ import { getServerSession } from "next-auth";
 import { authOptions, isUserPro } from "@/lib/auth";
 
 export const runtime = "nodejs";
-export const maxDuration = 150;
+// The linked Vercel project allows 300-second Fluid Compute invocations. Leave
+// 20 seconds for auth, response parsing, and serialization around the bridge.
+export const maxDuration = 300;
+
+const BRIDGE_REQUEST_TIMEOUT_MS = 280_000;
 
 type BridgeImage = {
   dataUrl: string;
@@ -13,6 +17,12 @@ type BridgeImage = {
   source: "google" | "bing" | "openverse";
 };
 
+type BridgeFailure = {
+  source: "google" | "bing" | "openverse";
+  code: string;
+  message: string;
+};
+
 function isBridgeImage(value: unknown): value is BridgeImage {
   if (!value || typeof value !== "object") return false;
   const image = value as Partial<BridgeImage>;
@@ -20,6 +30,13 @@ function isBridgeImage(value: unknown): value is BridgeImage {
     typeof image.sourceUrl === "string" && /^https?:\/\//.test(image.sourceUrl) &&
     Number.isFinite(image.width) && Number.isFinite(image.height) &&
     (image.source === "google" || image.source === "bing" || image.source === "openverse");
+}
+
+function isBridgeFailure(value: unknown): value is BridgeFailure {
+  if (!value || typeof value !== "object") return false;
+  const failure = value as Partial<BridgeFailure>;
+  return (failure.source === "google" || failure.source === "bing" || failure.source === "openverse") &&
+    typeof failure.code === "string" && typeof failure.message === "string";
 }
 
 export async function POST(req: NextRequest) {
@@ -54,7 +71,7 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({ query, count }),
       cache: "no-store",
-      signal: AbortSignal.timeout(140_000),
+      signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
     });
     const data: unknown = await bridgeResponse.json().catch(() => null);
     if (!bridgeResponse.ok) {
@@ -69,10 +86,18 @@ export async function POST(req: NextRequest) {
     const images = data && typeof data === "object" && "images" in data && Array.isArray((data as { images: unknown }).images)
       ? (data as { images: unknown[] }).images.filter(isBridgeImage).slice(0, count)
       : [];
-    return NextResponse.json({ ok: true, query, images });
+    const failures = data && typeof data === "object" && "failures" in data && Array.isArray((data as { failures: unknown }).failures)
+      ? (data as { failures: unknown[] }).failures.filter(isBridgeFailure)
+      : [];
+    return NextResponse.json({ ok: true, query, images, failures });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Image finder request failed";
     const timeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
-    return NextResponse.json({ error: timeout ? "Image finder timed out" : message }, { status: timeout ? 504 : 500 });
+    return NextResponse.json({
+      error: timeout
+        ? `Image finder bridge timed out after ${Math.round(BRIDGE_REQUEST_TIMEOUT_MS / 1_000)} seconds`
+        : `Image finder bridge request failed: ${message}`,
+      code: timeout ? "timeout" : "bridge_unreachable",
+    }, { status: timeout ? 504 : 502 });
   }
 }
