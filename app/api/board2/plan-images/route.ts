@@ -15,6 +15,14 @@ import {
   parseEditorialTopicOutline,
   parseEditorialTopicPlan,
 } from "@/lib/board2/editorial-image-plan";
+import {
+  describeAppliedStyle,
+  MAX_STYLE_EXEMPLARS_PER_REQUEST,
+  selectStyleExemplars,
+  STYLE_EXEMPLAR_TOKEN_BUDGET,
+  stylePacingSeconds,
+  type BoardStyleSummary,
+} from "@/lib/board2/style-exemplars";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -27,7 +35,21 @@ type PlanRequestBody = {
   segments?: unknown;
   durationSec?: unknown;
   secondsPerImage?: unknown;
+  styleConditioning?: unknown;
+  styleExemplars?: unknown;
 };
+
+function cleanStyleExemplars(value: unknown): BoardStyleSummary[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_STYLE_EXEMPLARS_PER_REQUEST).flatMap((candidate): BoardStyleSummary[] => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const summary = candidate as Partial<BoardStyleSummary>;
+    if (summary.schemaVersion !== 1 || !summary.board || !summary.pacing || !summary.imagery || !summary.topics || !summary.camera || !summary.characters || !summary.annotations) return [];
+    const serialized = JSON.stringify(candidate);
+    if (serialized.length > 12_000) return [];
+    return [JSON.parse(serialized) as BoardStyleSummary];
+  });
+}
 
 function cleanTranscriptSegments(value: unknown, durationSec: number): EditorialTranscriptSegment[] {
   if (!Array.isArray(value)) return [];
@@ -71,7 +93,16 @@ export async function POST(req: NextRequest) {
     }
 
     const segments = cleanTranscriptSegments(body.segments, durationSec);
-    const targetCount = editorialImageTargetCount(durationSec, secondsPerImage);
+    const styleConditioningRequested = body.styleConditioning !== false;
+    const availableStyleExemplars = styleConditioningRequested ? cleanStyleExemplars(body.styleExemplars) : [];
+    const styleSelection = selectStyleExemplars(availableStyleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET);
+    const styleExemplars = styleSelection.selected;
+    const styleConditioningApplied = styleConditioningRequested && styleExemplars.length > 0;
+    const effectiveSecondsPerImage = styleConditioningApplied
+      ? stylePacingSeconds(styleExemplars, secondsPerImage)
+      : secondsPerImage;
+    const targetCount = editorialImageTargetCount(durationSec, effectiveSecondsPerImage);
+    const styleNote = styleConditioningApplied ? describeAppliedStyle(styleExemplars, effectiveSecondsPerImage) : null;
     type Usage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     const aggregateUsage: Required<Usage> = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     const callPlanner = async (prompt: { system: string; user: string }, maxCompletionTokens: number) => {
@@ -111,7 +142,7 @@ export async function POST(req: NextRequest) {
     let topicOutline: EditorialTopicOutline[] = [];
     let plannerCallCount = 0;
     if (chunks.length > 1) {
-      const outlinePrompt = buildEditorialTopicOutlinePrompt({ transcript, segments, durationSec });
+      const outlinePrompt = buildEditorialTopicOutlinePrompt({ transcript, segments, durationSec, styleExemplars });
       const outlineText = await callPlanner(outlinePrompt, 2400);
       plannerCallCount += 1;
       topicOutline = parseEditorialTopicOutline(outlineText, durationSec);
@@ -126,8 +157,9 @@ export async function POST(req: NextRequest) {
         transcript,
         segments: windowSegments,
         durationSec,
-        secondsPerImage,
+        secondsPerImage: effectiveSecondsPerImage,
         targetCount: chunk.targetCount,
+        styleExemplars,
         ...(chunks.length > 1 ? { planningWindow: { ...chunk, topicOutline } } : {}),
       });
       const responseText = await callPlanner(prompt, Math.min(12_000, Math.max(1200, chunk.targetCount * 240)));
@@ -189,6 +221,18 @@ export async function POST(req: NextRequest) {
       chunkCount: chunks.length,
       plannerCallCount,
       maxImagesPerCall: MAX_EDITORIAL_IMAGES_PER_CALL,
+      style: {
+        requested: styleConditioningRequested,
+        applied: styleConditioningApplied,
+        availableCount: availableStyleExemplars.length,
+        exemplarCount: styleExemplars.length,
+        exemplarTokenBudget: STYLE_EXEMPLAR_TOKEN_BUDGET,
+        approximateExemplarTokens: styleSelection.approximateTokens,
+        selection: "most-recent-first",
+        effectiveSecondsPerImage,
+        note: styleNote,
+        fallback: styleConditioningRequested && !styleConditioningApplied ? "zero-starred" : null,
+      },
       topics,
       plan,
     });

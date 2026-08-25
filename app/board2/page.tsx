@@ -15,7 +15,12 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
+import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
+import {
+  selectStyleExemplars,
+  STYLE_EXEMPLAR_TOKEN_BUDGET,
+  type BoardStyleSummary,
+} from "@/lib/board2/style-exemplars";
 import {
   STREAM_FPS,
   HOST_STREAM_SKIN,
@@ -428,6 +433,7 @@ type Clip = {
   searchQuery?: string;
   imagePlanReason?: string;
   imagePlanModel?: string;
+  imagePlanStyleNote?: string;
   autoTopicId?: string;
   autoTopicTitle?: string;
   autoTopicStartTime?: number;
@@ -4779,6 +4785,19 @@ export default function Board2Page() {
   const [lipSyncMessage, setLipSyncMessage] = useState<OperationMessage | null>(null);
   const [gestureGenerationMessage, setGestureGenerationMessage] = useState<OperationMessage | null>(null);
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
+  const [autoStyleConditioning, setAutoStyleConditioning] = useState(true);
+  const [styleExemplars, setStyleExemplars] = useState<BoardStyleSummary[]>([]);
+  const [styleExemplarsLoaded, setStyleExemplarsLoaded] = useState(false);
+  const selectedStyleExemplarCount = useMemo(
+    () => selectStyleExemplars(styleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET).selected.length,
+    [styleExemplars],
+  );
+  const [autoBuildPlanDetails, setAutoBuildPlanDetails] = useState<{
+    styleNote: string | null;
+    styleExemplarCount: number;
+    effectiveSecondsPerImage: number;
+    images: Array<{ query: string; reason: string; startTime: number }>;
+  } | null>(null);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
@@ -6149,6 +6168,24 @@ export default function Board2Page() {
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
+  const refreshStyleExemplars = useCallback(async (): Promise<BoardStyleSummary[]> => {
+    try {
+      const directory = await getBoardsDirectory({ prompt: false, write: false });
+      const summaries = directory ? await loadStarredBoardStyleSummaries(directory) : [];
+      setStyleExemplars(summaries);
+      return summaries;
+    } catch (error) {
+      console.warn("[board2:style] Could not read starred board summaries", error);
+      setStyleExemplars([]);
+      return [];
+    } finally {
+      setStyleExemplarsLoaded(true);
+    }
+  }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refreshStyleExemplars(), 0);
+    return () => window.clearTimeout(timer);
+  }, [refreshStyleExemplars]);
   useEffect(() => {
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
@@ -9016,11 +9053,19 @@ export default function Board2Page() {
     autoBuildAbortRef.current = controller;
     setAutoBuildError(null);
     setAutoBuildSummary(null);
+    setAutoBuildPlanDetails(null);
     setAutoBuildCancelled(false);
-    setAutoBuildPhase("Compiling narration…");
+    setAutoBuildPhase(autoStyleConditioning ? "Reading starred boards…" : "Compiling narration…");
     setDownloadToasts((prev) => [...prev, { id: toastId, title: "Auto-build narration images", status: "downloading" }]);
     try {
       await waitForUiPaint();
+      const buildStyleExemplars = autoStyleConditioning ? await refreshStyleExemplars() : [];
+      const buildStyleSelection = selectStyleExemplars(buildStyleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET);
+      controller.signal.throwIfAborted();
+      let appliedStyleNote: string | null = null;
+      let appliedStyleExemplarCount = 0;
+      let effectivePlanSecondsPerImage = autoImageSeconds;
+      setAutoBuildPhase("Compiling narration…");
       const narrationStart = narrationClips[0].startTime;
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
       const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
@@ -9043,7 +9088,9 @@ export default function Board2Page() {
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
       const keywordFallbackSegments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
       let segments = keywordFallbackSegments;
-      setAutoBuildPhase(`Planning images (0/${keywordFallbackSegments.length})…`);
+      setAutoBuildPhase(autoStyleConditioning && buildStyleSelection.selected.length
+        ? `Planning in your style from ${buildStyleSelection.selected.length} starred boards…`
+        : `Planning images (0/${keywordFallbackSegments.length})…`);
       try {
         const planResponse = await fetch("/api/board2/plan-images", {
           method: "POST",
@@ -9054,6 +9101,8 @@ export default function Board2Page() {
             segments: transcriptSegments,
             durationSec: transcriptionDuration,
             secondsPerImage: autoImageSeconds,
+            styleConditioning: autoStyleConditioning,
+            styleExemplars: buildStyleExemplars,
           }),
         });
         const planData = await planResponse.json().catch(() => null) as {
@@ -9062,6 +9111,14 @@ export default function Board2Page() {
           targetCount?: number;
           chunkCount?: number;
           plannerCallCount?: number;
+          style?: {
+            applied?: boolean;
+            availableCount?: number;
+            exemplarCount?: number;
+            effectiveSecondsPerImage?: number;
+            note?: string | null;
+            fallback?: string | null;
+          };
           plan?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
           topics?: Array<{
             topicTitle?: unknown;
@@ -9073,6 +9130,9 @@ export default function Board2Page() {
         if (!planResponse.ok) {
           throw new Error(planData?.error || `Editorial planner failed (${planResponse.status})`);
         }
+        appliedStyleExemplarCount = planData?.style?.applied ? Number(planData.style.exemplarCount) || 0 : 0;
+        appliedStyleNote = typeof planData?.style?.note === "string" ? planData.style.note : null;
+        effectivePlanSecondsPerImage = Number(planData?.style?.effectiveSecondsPerImage) || autoImageSeconds;
         setAutoBuildPhase(`Planning images (${Number(planData?.targetCount) || keywordFallbackSegments.length}/${Number(planData?.targetCount) || keywordFallbackSegments.length})…`);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
         const parsePlanImages = (items: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }> | undefined) => Array.isArray(items)
@@ -9116,6 +9176,12 @@ export default function Board2Page() {
               topicIndex: 0,
             }));
         if (!editorialPlan.length) throw new Error("Editorial planner returned no usable images");
+        setAutoBuildPlanDetails({
+          styleNote: appliedStyleNote,
+          styleExemplarCount: appliedStyleExemplarCount,
+          effectiveSecondsPerImage: effectivePlanSecondsPerImage,
+          images: editorialPlan.map((item) => ({ query: item.query, reason: item.reason, startTime: item.startTime })),
+        });
         segments = editorialPlan.map((item, index) => {
           const end = editorialPlan[index + 1]?.startTime ?? transcriptionDuration;
           return {
@@ -9299,6 +9365,7 @@ export default function Board2Page() {
           searchQuery: segment.query,
           imagePlanReason: segment.reason,
           imagePlanModel: segment.planModel,
+          imagePlanStyleNote: appliedStyleNote ?? undefined,
           autoTopicId: segment.topicId ?? "topic-0",
           autoTopicTitle: segment.topicTitle ?? "Narration Overview",
           autoTopicStartTime: segment.topicStartTime,
@@ -9348,10 +9415,15 @@ export default function Board2Page() {
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
       const unavailable = segments.length - autoClips.length;
       const summary = `Placed ${autoClips.length}/${segments.length} images (${unavailable} unavailable).`;
+      const styleSummary = appliedStyleExemplarCount
+        ? ` Planned in your style from ${appliedStyleExemplarCount} starred board${appliedStyleExemplarCount === 1 ? "" : "s"}${appliedStyleNote ? ` — ${appliedStyleNote}` : "."}`
+        : autoStyleConditioning
+          ? " No training examples starred — used default planning."
+          : " Style conditioning was off.";
       const skippedSlots = skipped.length
         ? ` Skipped: ${skipped.map(({ index, query }) => `#${index + 1} “${query}”`).join(", ")}.`
         : "";
-      setAutoBuildSummary(`${summary}${skippedSlots}`);
+      setAutoBuildSummary(`${summary}${styleSummary}${skippedSlots}`);
       setToast(summary);
     } catch (error) {
       if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -17244,10 +17316,30 @@ export default function Board2Page() {
                           /> sec
                         </label>
                       </div>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, cursor: "pointer" }}>
+                        <input type="checkbox" checked={autoStyleConditioning} disabled={!!autoBuildPhase} onChange={(event) => setAutoStyleConditioning(event.target.checked)} />
+                        Use my starred-board style
+                      </label>
+                      <div style={{ fontSize: 9, lineHeight: 1.35, color: autoStyleConditioning && selectedStyleExemplarCount ? "#496700" : "#6a6a6a" }}>
+                        {!autoStyleConditioning
+                          ? "Style conditioning off — using default planning."
+                          : !styleExemplarsLoaded
+                            ? "Checking the Board Library for training examples…"
+                            : selectedStyleExemplarCount
+                              ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
+                              : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
+                      </div>
                       {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
                       {autoBuildCancelled && !autoBuildPhase && <div style={{ fontSize: 10, color: "#8a6200" }}>⚠ Auto-build cancelled</div>}
                       {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
+                      {autoBuildPlanDetails && !autoBuildPhase && (
+                        <details style={{ fontSize: 9, lineHeight: 1.4 }}>
+                          <summary style={{ cursor: "pointer", fontWeight: 700 }}>Why these images?</summary>
+                          {autoBuildPlanDetails.styleNote && <div style={{ margin: "5px 0", color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
+                          {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 5 }}><b>{index + 1}. {item.startTime.toFixed(1)}s — {item.query}</b><br />{item.reason}</div>)}
+                        </details>
+                      )}
                       {!autoBuildPhase && <div style={{ fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
@@ -18654,6 +18746,19 @@ export default function Board2Page() {
                     sec
                   </label>
                 </div>
+                <label style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, fontSize: 9, color: "#6a4b00", cursor: "pointer" }}>
+                  <input type="checkbox" checked={autoStyleConditioning} disabled={!!autoBuildPhase} onChange={(event) => setAutoStyleConditioning(event.target.checked)} />
+                  Use my starred-board style
+                </label>
+                <div style={{ marginBottom: 6, fontSize: 8, lineHeight: 1.35, color: autoStyleConditioning && selectedStyleExemplarCount ? "#496700" : "#6a6a6a" }}>
+                  {!autoStyleConditioning
+                    ? "Style conditioning off — using default planning."
+                    : !styleExemplarsLoaded
+                      ? "Checking the Board Library for training examples…"
+                      : selectedStyleExemplarCount
+                        ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
+                        : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
+                </div>
                 <button
                   onClick={() => void autoBuildFromNarration()}
                   disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
@@ -18680,6 +18785,13 @@ export default function Board2Page() {
                 )}
                 {autoBuildSummary && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>
+                )}
+                {autoBuildPlanDetails && !autoBuildPhase && (
+                  <details style={{ marginTop: 5, fontSize: 8, lineHeight: 1.4 }}>
+                    <summary style={{ cursor: "pointer", fontWeight: 700 }}>Why these images?</summary>
+                    {autoBuildPlanDetails.styleNote && <div style={{ marginTop: 4, color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
+                    {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 5 }}><b>{index + 1}. {item.startTime.toFixed(1)}s — {item.query}</b><br />{item.reason}</div>)}
+                  </details>
                 )}
                 {!autoBuildPhase && <div style={{ marginTop: 5, fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
               </div>
@@ -20702,6 +20814,13 @@ export default function Board2Page() {
                 {selectedClip.type === "narration" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#5a1530", background: NARRATION_COLOR, padding: "3px 6px", border: "1px solid rgba(180,80,130,0.35)" }}>
                     Audio-only clip — plays during export
+                  </div>
+                )}
+                {selectedClip.imagePlanReason && (
+                  <div style={{ fontSize: 9, fontFamily: "monospace", lineHeight: 1.45, color: "#4a4100", background: "#fff7d6", padding: "6px 7px", border: "1px solid rgba(122,91,0,0.35)" }}>
+                    <b>Why this image:</b> {selectedClip.imagePlanReason}
+                    {selectedClip.searchQuery && <div style={{ marginTop: 3, color: "#6a6a6a" }}><b>Query:</b> {selectedClip.searchQuery}</div>}
+                    {selectedClip.imagePlanStyleNote && <div style={{ marginTop: 3, color: "#496700" }}>{selectedClip.imagePlanStyleNote}</div>}
                   </div>
                 )}
 

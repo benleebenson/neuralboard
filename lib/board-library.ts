@@ -1,4 +1,5 @@
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
+import { extractBoardStyleSummary, type BoardStyleSummary } from "@/lib/board2/style-exemplars";
 
 export const BOARD_LIBRARY_PENDING_FILE = "nb_board_library_pending_file";
 const DB_NAME = "neuralboard-library";
@@ -20,6 +21,7 @@ export type BoardLibraryEntry = {
   file: File;
   meta: BoardLibraryMeta;
   thumbnailDataUri?: string;
+  styleSummary?: BoardStyleSummary;
 };
 export type NbpManifest = {
   schemaVersion?: number;
@@ -38,6 +40,8 @@ type PermissionDirectoryHandle = FileSystemDirectoryHandle & {
   requestPermission(options: { mode: "read" | "readwrite" }): Promise<PermissionState>;
   entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
 };
+
+const styleSummaryCache = new Map<string, BoardStyleSummary>();
 
 function openHandleDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -127,12 +131,24 @@ export async function listBoards(handle: FileSystemDirectoryHandle): Promise<Boa
     try {
       const file = await (child as FileSystemFileHandle).getFile();
       const { manifest } = readNbpManifest(new Uint8Array(await file.arrayBuffer()));
-      entries.push({ fileName, file, meta: normalizeMeta(manifest, file), thumbnailDataUri: manifest.snapshot?.thumbnailDataUri });
+      const meta = normalizeMeta(manifest, file);
+      const cacheKey = `${fileName}:${file.lastModified}:${file.size}`;
+      let styleSummary: BoardStyleSummary | undefined;
+      if (meta.trainingExample) {
+        styleSummary = styleSummaryCache.get(cacheKey) ?? extractBoardStyleSummary(manifest);
+        styleSummaryCache.set(cacheKey, styleSummary);
+      }
+      entries.push({ fileName, file, meta, thumbnailDataUri: manifest.snapshot?.thumbnailDataUri, styleSummary });
     } catch {
       // Ignore malformed files: the chosen folder may contain unrelated downloads.
     }
   }
   return entries.sort((a, b) => b.meta.modifiedAt.localeCompare(a.meta.modifiedAt));
+}
+
+export async function loadStarredBoardStyleSummaries(handle: FileSystemDirectoryHandle): Promise<BoardStyleSummary[]> {
+  const entries = await listBoards(handle);
+  return entries.flatMap((entry) => entry.meta.trainingExample && entry.styleSummary ? [entry.styleSummary] : []);
 }
 
 export async function writeBoardFile(handle: FileSystemDirectoryHandle, fileName: string, bytes: Uint8Array): Promise<void> {
