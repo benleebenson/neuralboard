@@ -8,7 +8,7 @@ export type Expression = "neutral" | "disgruntled";
 
 export const EXPLAINER_SOURCE = { width: 1536, height: 2048, artworkTop: 549, artworkBottom: 1422 } as const;
 export const EXPLAINER_SCALE = STREAM_CHARACTER_GEOMETRY.characterHeight / (EXPLAINER_SOURCE.artworkBottom - EXPLAINER_SOURCE.artworkTop);
-export const EXPLAINER_MOUTH_ANCHOR = { x: 738, y: 781, headRadiusPx: 144 } as const;
+export const EXPLAINER_MOUTH_ANCHOR = { x: 743, y: 776, headRadiusPx: 134 } as const;
 
 type PoseName = "neutral_arms_down" | "self_hand_chest" | "point_up" | "thinking" | "shrug" | "arms_crossed";
 const POSE_FILE: Record<Gesture, PoseName> = {

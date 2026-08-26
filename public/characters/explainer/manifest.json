@@ -86,10 +86,10 @@
       "y": 232
     },
     "canvas": {
-      "x": 738,
-      "y": 781
+      "x": 743,
+      "y": 776
     },
-    "headRadiusPx": 144,
+    "headRadiusPx": 134,
     "note": "measured face-local mouth position"
   },
   "expressions": [
