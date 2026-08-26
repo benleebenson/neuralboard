@@ -180,6 +180,14 @@ import {
 import { buildSerpentinePanPath } from "@/lib/board2/pan-camera";
 import { buildNarrationLockedImageWindows } from "@/lib/board2/auto-build-timing";
 import {
+  AUTO_BUILD_OUTRO_DURATION_SECONDS,
+  DEFAULT_OUTRO_TEXT,
+  loadOutroSettings,
+  placeOutroCard,
+  saveOutroSettings,
+  type PersistedOutroImage,
+} from "@/lib/board2/outro-settings";
+import {
   AUTO_BUILD_IMAGE_RETRY_DELAY_MS,
   describeImageSkip,
   describeImageSuccess,
@@ -446,6 +454,7 @@ type Clip = {
   autoTopicStartTime?: number;
   autoTopicEndTime?: number;
   autoLayoutSeed?: number;
+  autoRole?: "outro";
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -472,6 +481,7 @@ type AutoNarrationImageSegment = TranscriptSegment & {
   topicIndex?: number;
 };
 type BrowserFoundImage = AutoBuildFoundImage;
+type ConfiguredOutroImage = PersistedOutroImage & { url: string };
 type AutoBuildImageUpdate = {
   slot: number;
   tone: "working" | "success" | "warning";
@@ -1194,11 +1204,13 @@ type Annotation = {
   arrowEndX?: number;
   arrowEndY?: number;
   highlightStyle?: "rect" | "underline" | "curlyBrace";
+  opacity?: number;
   points?: Array<{ x: number; y: number; pressure?: number }>;  // pen, in board space
   emoji?: string;                              // emoji
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
   autoLayoutSeed?: number;
+  autoRole?: "outro";
 };
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
@@ -2150,7 +2162,7 @@ function drawAnnotationsToCanvas(
       const style = ann.highlightStyle ?? "rect";
       if (style === "rect") {
         ctx.save();
-        ctx.globalAlpha = 0.3;
+        ctx.globalAlpha = ann.opacity ?? 0.3;
         ctx.fillStyle = ann.color;
         ctx.fillRect(sx, sy, bw, bh);
         ctx.globalAlpha = 1;
@@ -4817,6 +4829,11 @@ export default function Board2Page() {
   const [gestureGenerationMessage, setGestureGenerationMessage] = useState<OperationMessage | null>(null);
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
   const [autoStyleConditioning, setAutoStyleConditioning] = useState(true);
+  const [appendOutro, setAppendOutro] = useState(true);
+  const [outroText, setOutroText] = useState(DEFAULT_OUTRO_TEXT);
+  const [outroImage, setOutroImage] = useState<ConfiguredOutroImage | null>(null);
+  const [outroSettingsLoaded, setOutroSettingsLoaded] = useState(false);
+  const [outroSettingsStatus, setOutroSettingsStatus] = useState<string | null>(null);
   const [styleExemplars, setStyleExemplars] = useState<BoardStyleSummary[]>([]);
   const [styleExemplarsLoaded, setStyleExemplarsLoaded] = useState(false);
   const selectedStyleExemplarCount = useMemo(
@@ -5172,6 +5189,9 @@ export default function Board2Page() {
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
   const autoBuildAbortRef = useRef<AbortController | null>(null);
+  const outroImageRef = useRef<ConfiguredOutroImage | null>(null);
+  const outroTextRef = useRef(DEFAULT_OUTRO_TEXT);
+  const outroSettingsSaveTimerRef = useRef<number | null>(null);
   const lipSyncAbortRef = useRef<AbortController | null>(null);
   const narrationTranscriptionAbortRef = useRef<AbortController | null>(null);
   const cameraGenerationRunRef = useRef(0);
@@ -5999,6 +6019,34 @@ export default function Board2Page() {
     playBazookaKnockoutPendingRef.current.delete(guestId);
     playGuestBazookaVisualImpactsRef.current.delete(guestId);
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadOutroSettings()
+      .then((settings) => {
+        if (cancelled) return;
+        const configuredImage = settings.image
+          ? { ...settings.image, url: URL.createObjectURL(settings.image.blob) }
+          : null;
+        outroImageRef.current = configuredImage;
+        outroTextRef.current = settings.text;
+        setOutroImage(configuredImage);
+        setOutroText(settings.text);
+        setOutroSettingsLoaded(true);
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        console.warn("[board2:outro] Could not load persistent settings", error);
+        setOutroSettingsStatus("Outro settings could not be loaded");
+        setOutroSettingsLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+      if (outroSettingsSaveTimerRef.current) window.clearTimeout(outroSettingsSaveTimerRef.current);
+      const image = outroImageRef.current;
+      if (image?.url.startsWith("blob:")) URL.revokeObjectURL(image.url);
+    };
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
@@ -9066,6 +9114,78 @@ export default function Board2Page() {
     }
   }
 
+  function persistCurrentOutroSettings(delayMs = 0) {
+    if (outroSettingsSaveTimerRef.current) window.clearTimeout(outroSettingsSaveTimerRef.current);
+    outroSettingsSaveTimerRef.current = window.setTimeout(() => {
+      outroSettingsSaveTimerRef.current = null;
+      const configured = outroImageRef.current;
+      void saveOutroSettings({
+        text: outroTextRef.current,
+        image: configured ? {
+          blob: configured.blob,
+          name: configured.name,
+          width: configured.width,
+          height: configured.height,
+        } : null,
+      }).then(() => setOutroSettingsStatus("Saved for future auto-builds"))
+        .catch((error) => {
+          console.warn("[board2:outro] Could not save persistent settings", error);
+          setOutroSettingsStatus("Could not save outro settings");
+        });
+    }, delayMs);
+  }
+
+  function updateOutroText(nextText: string) {
+    setOutroText(nextText);
+    outroTextRef.current = nextText;
+    setOutroSettingsStatus(null);
+    persistCurrentOutroSettings(250);
+  }
+
+  async function handleOutroImageUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setOutroSettingsStatus("Choose an image file");
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    try {
+      const dimensions = await new Promise<{ width: number; height: number }>((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+        image.onerror = () => reject(new Error("Could not read that image"));
+        image.src = url;
+      });
+      const previous = outroImageRef.current;
+      const configured: ConfiguredOutroImage = {
+        blob: file,
+        name: file.name,
+        width: dimensions.width,
+        height: dimensions.height,
+        url,
+      };
+      outroImageRef.current = configured;
+      setOutroImage(configured);
+      setOutroSettingsStatus(null);
+      persistCurrentOutroSettings();
+      if (previous?.url.startsWith("blob:")) URL.revokeObjectURL(previous.url);
+    } catch (error) {
+      URL.revokeObjectURL(url);
+      setOutroSettingsStatus(error instanceof Error ? error.message : "Could not read that image");
+    }
+  }
+
+  function clearOutroImage() {
+    const previous = outroImageRef.current;
+    outroImageRef.current = null;
+    setOutroImage(null);
+    setOutroSettingsStatus(null);
+    persistCurrentOutroSettings();
+    if (previous?.url.startsWith("blob:")) URL.revokeObjectURL(previous.url);
+  }
+
   async function autoBuildFromNarration() {
     if (autoBuildPhase) return;
     const narrationClips = clipsRef.current
@@ -9076,6 +9196,8 @@ export default function Board2Page() {
       setToast("Add narration before auto-building");
       return;
     }
+    const buildOutroImage = appendOutro ? outroImageRef.current : null;
+    const buildOutroText = (outroTextRef.current.trim() || DEFAULT_OUTRO_TEXT).slice(0, 160);
 
     const toastId = generateId();
     const createdBlobUrls: string[] = [];
@@ -9325,7 +9447,7 @@ export default function Board2Page() {
         }]),
       ).values()).sort((a, b) => a.topicIndex - b.topicIndex);
       const requestedBoardSize = organicBoardSizeForImageCount(mediaItems.length, BOARD_W, BOARD_H);
-      const layoutBoardDimensions = {
+      let layoutBoardDimensions = {
         width: Math.max(boardDimensionsRef.current.width, requestedBoardSize.width),
         height: Math.max(boardDimensionsRef.current.height, requestedBoardSize.height),
       };
@@ -9416,18 +9538,118 @@ export default function Board2Page() {
         nextClips.push(clip);
         return clip;
       });
+      let outroClip: Clip | null = null;
+      if (buildOutroImage) {
+        const placement = placeOutroCard(
+          nextClips.flatMap((clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
+            ? [{ x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH }]
+            : []),
+          { width: buildOutroImage.width, height: buildOutroImage.height },
+          layoutBoardDimensions,
+        );
+        layoutBoardDimensions = { width: placement.boardWidth, height: placement.boardHeight };
+        boardDimensionsRef.current = layoutBoardDimensions;
+        setBoardDimensions(layoutBoardDimensions);
+
+        const outroUrl = URL.createObjectURL(buildOutroImage.blob);
+        const outroPreviewBlob = await createImagePreviewBlob(buildOutroImage.blob);
+        const outroPreviewUrl = outroPreviewBlob === buildOutroImage.blob
+          ? outroUrl
+          : URL.createObjectURL(outroPreviewBlob);
+        createdBlobUrls.push(outroUrl);
+        if (outroPreviewUrl !== outroUrl) createdBlobUrls.push(outroPreviewUrl);
+        const outroId = generateId();
+        const outroStartTime = Math.max(
+          narrationEnd,
+          ...autoClips.map((clip) => clip.startTime + clip.duration),
+        );
+        outroClip = {
+          id: outroId,
+          type: "image",
+          name: `Outro — ${buildOutroImage.name}`,
+          sourceUrl: outroUrl,
+          sourceBlob: buildOutroImage.blob,
+          previewUrl: outroPreviewUrl,
+          source: "auto",
+          startTime: outroStartTime,
+          duration: AUTO_BUILD_OUTRO_DURATION_SECONDS,
+          layer: freeLayerAtTime(nextClips, outroStartTime, AUTO_BUILD_OUTRO_DURATION_SECONDS, outroId, 1),
+          boardX: placement.x,
+          boardY: placement.y,
+          boardW: placement.width,
+          boardH: placement.height,
+          holdFraction: 1,
+          featured: true,
+          autoTopicId: "auto-outro",
+          autoTopicTitle: "Outro",
+          autoTopicStartTime: outroStartTime,
+          autoTopicEndTime: outroStartTime + AUTO_BUILD_OUTRO_DURATION_SECONDS,
+          autoLayoutSeed: layoutSeed,
+          autoRole: "outro",
+        };
+        nextClips.push(outroClip);
+        setMediaLibrary((prev) => [...prev, {
+          id: outroId,
+          name: outroClip!.name,
+          type: "image",
+          url: outroUrl,
+          blob: buildOutroImage.blob,
+          source: "auto",
+        }]);
+
+        const bandHeight = Math.max(96, Math.round(placement.height * 0.2));
+        const bandY = placement.y + placement.height - bandHeight - Math.round(placement.height * 0.045);
+        const annotationX = placement.x + Math.round(placement.width * 0.045);
+        const annotationWidth = placement.width - Math.round(placement.width * 0.09);
+        setAnnotations((prev) => [...prev,
+          {
+            id: generateId(),
+            type: "highlight",
+            boardX: annotationX,
+            boardY: bandY,
+            boardW: annotationWidth,
+            boardH: bandHeight,
+            color: "#111111",
+            highlightStyle: "rect",
+            opacity: 0.68,
+            source: "auto",
+            autoRole: "outro",
+          },
+          {
+            id: generateId(),
+            type: "text",
+            boardX: annotationX + Math.round(placement.width * 0.025),
+            boardY: bandY + Math.round(bandHeight * 0.08),
+            boardW: annotationWidth - Math.round(placement.width * 0.05),
+            boardH: bandHeight,
+            color: "#fffdf5",
+            text: buildOutroText,
+            textAlign: "center",
+            fontFamily: "Caveat",
+            fontSize: Math.round(clamp(
+              annotationWidth / Math.max(12, buildOutroText.length * 0.52),
+              36,
+              Math.min(82, bandHeight * 0.62),
+            )),
+            fontWeight: "bold",
+            source: "auto",
+            autoRole: "outro",
+          },
+        ]);
+      }
       clipsRef.current = nextClips;
       setClips(nextClips);
       setAutoBuildSource(generatedBoardSourceSignature(nextClips));
-      setClipSelection(autoClips.map((clip) => clip.id));
+      setClipSelection([...autoClips, ...(outroClip ? [outroClip] : [])].map((clip) => clip.id));
       placed = true;
 
-      if (autoClips.length) {
+      const cameraClips = [...autoClips, ...(outroClip ? [outroClip] : [])];
+      if (cameraClips.length) {
         setAutoBuildPhase("Generating camera…");
         const W = canvasWRef.current;
         const H = canvasHRef.current;
         const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
-          clips: autoClips.map((clip) => ({
+          clips: cameraClips.map((clip) => ({
             id: clip.id,
             startTime: clip.startTime,
             duration: clip.duration,
@@ -9443,7 +9665,9 @@ export default function Board2Page() {
           canvasHeight: H,
           boardWidth: layoutBoardDimensions.width,
           imageFocusRatio: FOCUS_FILL_RATIO,
-        });
+        }).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
+          ? { ...keyframe, autoRole: "outro" as const }
+          : keyframe);
         cameraKeyframesRef.current = generatedCamera;
         setCameraKeyframes(generatedCamera);
         setKeyframesOutOfDate(false);
@@ -9456,6 +9680,7 @@ export default function Board2Page() {
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
       const unavailable = segments.length - autoClips.length;
       const summary = `Placed ${autoClips.length}/${segments.length} images (${unavailable} unavailable).`;
+      const outroSummary = outroClip ? ` Outro appended for ${AUTO_BUILD_OUTRO_DURATION_SECONDS.toFixed(1)}s.` : "";
       const styleSummary = appliedStyleExemplarCount
         ? ` Planned in your style from ${appliedStyleExemplarCount} starred board${appliedStyleExemplarCount === 1 ? "" : "s"}${appliedStyleNote ? ` — ${appliedStyleNote}` : "."}`
         : autoStyleConditioning
@@ -9464,7 +9689,7 @@ export default function Board2Page() {
       const skippedSlots = skipped.length
         ? ` Skipped: ${skipped.map(({ index, query, reason }) => `#${index + 1} “${query}” (${reason.replace(/^Slot \d+: /, "")})`).join(", ")}.`
         : "";
-      setAutoBuildSummary(`${summary}${styleSummary}${skippedSlots}`);
+      setAutoBuildSummary(`${summary}${outroSummary}${styleSummary}${skippedSlots}`);
       setToast(summary);
     } catch (error) {
       if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
@@ -12713,6 +12938,11 @@ export default function Board2Page() {
         canvasHeight: canvasHRef.current,
         boardWidth: boardDimensionsRef.current.width,
         imageFocusRatio: FOCUS_FILL_RATIO,
+      }).map((keyframe) => {
+        const outro = topicAwareClips.find((clip) => clip.autoRole === "outro");
+        return outro && keyframe.time >= outro.startTime
+          ? { ...keyframe, autoRole: "outro" as const }
+          : keyframe;
       });
       if (generated.length) {
         setCameraKeyframes(generated);
@@ -16195,6 +16425,65 @@ export default function Board2Page() {
 
   // ─── Download toast stack (bottom-right, stacked) ──────────────────────────
 
+  function renderOutroAutoBuildOptions(compact = false) {
+    return (
+      <div data-outro-settings style={{ marginBottom: compact ? 6 : 8 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, fontSize: compact ? 9 : 10, color: "#6a4b00", cursor: "pointer" }}>
+          <input
+            data-append-outro-toggle
+            type="checkbox"
+            checked={appendOutro}
+            disabled={!!autoBuildPhase}
+            onChange={(event) => setAppendOutro(event.target.checked)}
+          />
+          Append outro card
+          <span style={{ color: "#8a7200" }}>({AUTO_BUILD_OUTRO_DURATION_SECONDS.toFixed(1)}s)</span>
+        </label>
+        <details data-outro-configuration style={{ fontSize: compact ? 8 : 9, color: "#5f4a0a" }}>
+          <summary style={{ cursor: "pointer", fontWeight: 700 }}>
+            Outro settings · {outroImage ? outroImage.name : "no image configured"}
+          </summary>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 7, padding: 7, border: "1px dashed rgba(122,91,0,.5)", background: "rgba(255,255,255,.55)" }}>
+            <label style={{ ...miniButton, display: "block", position: "relative", overflow: "hidden", textAlign: "center", cursor: outroSettingsLoaded && !autoBuildPhase ? "pointer" : "not-allowed" }}>
+              {outroImage ? "Replace outro image" : "Choose outro image"}
+              <input
+                data-outro-image-input
+                aria-label="Choose outro image"
+                type="file"
+                accept="image/*"
+                disabled={!outroSettingsLoaded || !!autoBuildPhase}
+                onChange={(event) => void handleOutroImageUpload(event)}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "inherit" }}
+              />
+            </label>
+            {outroImage && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+                <span data-outro-image-name style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{outroImage.name}</span>
+                <button data-clear-outro-image type="button" onClick={clearOutroImage} disabled={!!autoBuildPhase} style={{ ...miniButton, padding: "2px 6px", color: "#a32916", borderColor: "#a32916" }}>Clear</button>
+              </div>
+            )}
+            <label style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <span style={{ fontWeight: 700 }}>Outro text</span>
+              <input
+                data-outro-text-input
+                type="text"
+                maxLength={160}
+                value={outroText}
+                disabled={!outroSettingsLoaded || !!autoBuildPhase}
+                onChange={(event) => updateOutroText(event.target.value)}
+                onBlur={() => persistCurrentOutroSettings()}
+                style={{ width: "100%", boxSizing: "border-box", padding: "5px 6px", border: "1px solid #7a5b00", background: "#fff", fontFamily: "'Caveat', cursive", fontSize: compact ? 14 : 16, fontWeight: 700 }}
+              />
+            </label>
+            <div data-outro-settings-status style={{ color: outroSettingsStatus?.startsWith("Could") ? "#a32916" : "#6a6a6a", lineHeight: 1.35 }}>
+              {outroSettingsStatus ?? (outroSettingsLoaded ? "Saved in this browser for every future auto-build." : "Loading saved outro…")}
+            </div>
+          </div>
+        </details>
+      </div>
+    );
+  }
+
   function renderDownloadToasts() {
     if (downloadToasts.length === 0) return null;
     return (
@@ -17370,6 +17659,7 @@ export default function Board2Page() {
                               ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
                               : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
                       </div>
+                      {renderOutroAutoBuildOptions()}
                       {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
                       <AutoBuildImageProgress updates={autoBuildImageUpdates} active={!!autoBuildPhase} />
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
@@ -18060,7 +18350,10 @@ export default function Board2Page() {
           frameSurfaceBlocks: timelineBlocks.filter((block) => block.type === "image" || block.type === "video"),
           characterZoomBlocks: timelineBlocks.filter((block) => block.type === "characterFocus"),
         },
-        keyframes: cameraKeyframesRef.current.map((keyframe) => ({ ...keyframe, source: "manual" as const })),
+        keyframes: cameraKeyframesRef.current.map((keyframe) => ({
+          ...keyframe,
+          source: keyframe.autoRole === "outro" ? "autoDerived" as const : "manual" as const,
+        })),
         resolvedTrack: resolvedCameraTrack,
       },
       characters: {
@@ -18801,6 +19094,7 @@ export default function Board2Page() {
                         ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
                         : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
                 </div>
+                {renderOutroAutoBuildOptions(true)}
                 <button
                   onClick={() => void autoBuildFromNarration()}
                   disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
