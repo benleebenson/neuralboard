@@ -22,6 +22,14 @@ import {
   type BoardStyleSummary,
 } from "@/lib/board2/style-exemplars";
 import {
+  buildPhraseCaptionTrack,
+  drawScreenSpaceCaption,
+  isCaptionTrack,
+  type CaptionCue,
+  type CaptionFontSize,
+  type CaptionPosition,
+} from "@/lib/board2/captions";
+import {
   STREAM_FPS,
   HOST_STREAM_SKIN,
   GuestCharacterFrame,
@@ -189,11 +197,27 @@ import {
 } from "@/lib/board2/outro-settings";
 import {
   AUTO_BUILD_IMAGE_RETRY_DELAY_MS,
+  AutoBuildImageSearchError,
   describeImageSkip,
   describeImageSuccess,
   requestAutoBuildImage,
   type AutoBuildFoundImage,
 } from "@/lib/board2/auto-build-images";
+import {
+  AUTO_BUILD_PROGRESS_STORAGE_KEY,
+  autoBuildPercent,
+  autoBuildRemainingMs,
+  autoBuildSourceCounts,
+  completedAutoBuildSlots,
+  createAutoBuildProgress,
+  formatAutoBuildDuration,
+  humanizeAutoBuildFailure,
+  parseStoredAutoBuildProgress,
+  type AutoBuildPhase,
+  type AutoBuildProgress,
+  type AutoBuildProgressSlot,
+} from "@/lib/board2/auto-build-progress";
+import { checkBridgeHealth } from "@/lib/board2/bridge-health";
 import { fitMediaDimensions } from "@/lib/board2/media-sizing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
 import {
@@ -297,11 +321,10 @@ async function postTranscriptionAudio(audio: Blob, filename: string, signal?: Ab
   const response = await fetch("/api/board2/transcribe-audio", { method: "POST", body: form, signal });
   const data = await response.json().catch(() => null) as TranscriptionApiResponse | null;
   if (!response.ok) {
-    throw new Error(
-      data?.error || (response.status === 413
-        ? "Transcription upload was rejected as too large"
-        : `Transcription failed (${response.status})`),
-    );
+    const reason = data?.error || (response.status === 413
+      ? "upload was rejected as too large"
+      : response.statusText || "request failed");
+    throw new Error(`Transcription failed (${response.status}) — ${reason}`);
   }
   return data ?? {};
 }
@@ -482,34 +505,139 @@ type AutoNarrationImageSegment = TranscriptSegment & {
 };
 type BrowserFoundImage = AutoBuildFoundImage;
 type ConfiguredOutroImage = PersistedOutroImage & { url: string };
-type AutoBuildImageUpdate = {
-  slot: number;
-  tone: "working" | "success" | "warning";
-  message: string;
-};
+let activeAutoBuildController: AbortController | null = null;
 
-function AutoBuildImageProgress({ updates, active, compact = false }: {
-  updates: AutoBuildImageUpdate[];
-  active: boolean;
-  compact?: boolean;
+function AutoBuildProgressPanel({
+  progress,
+  onCancel,
+  onDismiss,
+  onRetryFailed,
+}: {
+  progress: AutoBuildProgress;
+  onCancel: () => void;
+  onDismiss: () => void;
+  onRetryFailed: () => void;
 }) {
-  if (!updates.length) return null;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (progress.status !== "running") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [progress.status, progress.buildId]);
+
+  const percent = autoBuildPercent(progress);
+  const elapsedMs = (progress.completedAt ?? now) - progress.startedAt;
+  const remainingMs = autoBuildRemainingMs(progress, now);
+  const completedSlots = completedAutoBuildSlots(progress);
+  const foundSlots = progress.slots.filter((slot) => slot.status === "found").length;
+  const failedSlots = progress.slots.filter((slot) => slot.status === "failed").length;
+  const sourceCounts = autoBuildSourceCounts(progress);
+  const terminal = progress.status !== "running";
+  const accent = progress.status === "failure" ? "#a32916"
+    : progress.status === "partial" || progress.status === "cancelled" ? "#a14d00"
+      : "#496700";
+  const slotIcon: Record<AutoBuildProgressSlot["status"], string> = {
+    pending: "○",
+    searching: "…",
+    retrying: "↻",
+    found: "✓",
+    failed: "✕",
+  };
+
   return (
-    <details open={active} style={{ marginTop: compact ? 5 : 0, fontSize: compact ? 8 : 9, lineHeight: 1.4 }}>
-      <summary style={{ cursor: "pointer", fontWeight: 700 }}>
-        Image search details ({updates.filter((update) => update.tone === "success").length}/{updates.length} found)
-      </summary>
-      <div style={{ maxHeight: compact ? 90 : 130, overflowY: "auto", marginTop: 4 }}>
-        {updates.map((update) => (
-          <div
-            key={update.slot}
-            style={{ color: update.tone === "success" ? "#496700" : update.tone === "warning" ? "#a14d00" : "#6a6a6a" }}
-          >
-            {update.tone === "success" ? "✓" : update.tone === "warning" ? "⚠" : "…"} {update.message}
+    <aside
+      data-auto-build-progress
+      data-auto-build-status={progress.status}
+      data-auto-build-phase={progress.phase}
+      data-auto-build-percent={percent}
+      role="status"
+      aria-live="polite"
+      style={{
+        position: "fixed",
+        top: "max(12px, env(safe-area-inset-top))",
+        right: "max(12px, env(safe-area-inset-right))",
+        zIndex: 1600,
+        width: "min(420px, calc(100vw - 24px))",
+        maxHeight: "calc(100dvh - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom))",
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        border: "2px solid #2a2a2a",
+        borderRadius: 7,
+        background: "rgba(255,253,245,.98)",
+        boxShadow: "5px 5px 0 rgba(42,42,42,.85)",
+        fontFamily: "monospace",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "11px 12px 8px" }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 10, letterSpacing: 1, fontWeight: 700, color: terminal ? accent : "#6a6a6a" }}>
+            {progress.status === "running" ? "AUTO-BUILD RUNNING" : `AUTO-BUILD ${progress.status.toUpperCase()}`}
           </div>
-        ))}
+          <div style={{ marginTop: 4, fontSize: 12, lineHeight: 1.35, fontWeight: 700, color: terminal ? accent : "#2a2a2a" }}>
+            {terminal ? progress.summary ?? progress.error ?? progress.detail : progress.detail}
+          </div>
+        </div>
+        {terminal && <button type="button" aria-label="Dismiss auto-build progress" onClick={onDismiss} style={{ ...miniButton, fontSize: 14 }}>×</button>}
       </div>
-    </details>
+
+      <div style={{ padding: "0 12px 9px" }}>
+        <div role="progressbar" aria-label="Auto-build progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} style={{ height: 12, overflow: "hidden", border: "1.5px solid #2a2a2a", borderRadius: 3, background: "#e5e0d3" }}>
+          <div data-auto-build-progress-fill style={{ width: `${percent}%`, height: "100%", background: terminal ? accent : "#c8f135", transition: "width 240ms ease" }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 5, fontSize: 9, color: "#555" }}>
+          <span title="Auto-build keeps running if you switch tabs — this timer may lag a few seconds while the tab is in the background.">{percent.toFixed(percent % 1 ? 1 : 0)}% · {formatAutoBuildDuration(elapsedMs)} elapsed</span>
+          <span>{remainingMs !== null ? `~${formatAutoBuildDuration(remainingMs)} remaining` : progress.slots.length ? `${completedSlots}/${progress.slots.length} slots complete` : "Working…"}</span>
+        </div>
+      </div>
+
+      {progress.warnings.length > 0 && (
+        <div style={{ margin: "0 12px 8px", padding: "6px 8px", border: "1px solid #a14d00", background: "#fff0c7", color: "#744000", fontSize: 9, lineHeight: 1.4 }}>
+          {progress.warnings.map((warning, index) => <div key={`${index}:${warning}`}>⚠ {warning}</div>)}
+        </div>
+      )}
+
+      {progress.slots.length > 0 && (
+        <div style={{ minHeight: 0, overflowY: "auto", borderTop: "1px dashed rgba(42,42,42,.35)", borderBottom: "1px dashed rgba(42,42,42,.35)", padding: "5px 12px" }}>
+          {progress.slots.map((slot) => {
+            const detail = slot.status === "found"
+              ? `found · ${slot.source}${slot.reason ? ` — ${slot.reason}` : ""}`
+              : slot.status === "failed"
+                ? `failed — ${slot.reason ?? "unknown error"}`
+                : slot.status === "retrying"
+                  ? `retrying${slot.reason ? ` — ${slot.reason}` : ""}`
+                  : slot.status === "searching"
+                    ? `searching${slot.attempt && slot.attempt > 1 ? ` · attempt ${slot.attempt}/2` : ""}`
+                    : "pending";
+            const color = slot.status === "found" ? "#496700" : slot.status === "failed" ? "#a32916" : slot.status === "retrying" ? "#a14d00" : "#555";
+            return (
+              <div key={slot.index} data-auto-build-slot={slot.index + 1} data-auto-build-slot-state={slot.status} data-auto-build-slot-source={slot.source} style={{ display: "grid", gridTemplateColumns: "18px minmax(0, 1fr)", gap: 4, padding: "4px 0", fontSize: 9, lineHeight: 1.35, color }}>
+                <span aria-hidden="true">{slotIcon[slot.status]}</span>
+                <div>
+                  <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 700 }}>Slot {slot.index + 1}: {slot.query}</div>
+                  <div>{detail}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {terminal && progress.slots.length > 0 && (
+        <div style={{ padding: "7px 12px 0", fontSize: 9, color: "#555" }}>
+          Sources: google {sourceCounts.google} · bing {sourceCounts.bing} · openverse {sourceCounts.openverse} · found {foundSlots}/{progress.slots.length}
+        </div>
+      )}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "9px 12px 11px" }}>
+        {progress.status === "running" && <button type="button" onClick={onCancel} style={{ ...miniButton, padding: "5px 10px", color: "#a32916", borderColor: "#a32916", fontWeight: 700 }}>Cancel auto-build</button>}
+        {progress.status === "partial" && failedSlots > 0 && (
+          <button type="button" onClick={onRetryFailed} style={{ ...miniButton, padding: "5px 10px", fontWeight: 700 }}>
+            Retry {failedSlots} failed slot{failedSlots === 1 ? "" : "s"}
+          </button>
+        )}
+        {progress.status !== "running" && <button type="button" onClick={onDismiss} style={{ ...miniButton, padding: "5px 10px", fontWeight: 700 }}>Dismiss</button>}
+      </div>
+    </aside>
   );
 }
 type SpeechBubbleCue = TranscriptSegment & { index: number };
@@ -4827,6 +4955,14 @@ export default function Board2Page() {
   const [lipSyncPhase, setLipSyncPhase] = useState<string | null>(null);
   const [lipSyncMessage, setLipSyncMessage] = useState<OperationMessage | null>(null);
   const [gestureGenerationMessage, setGestureGenerationMessage] = useState<OperationMessage | null>(null);
+  const [captionTrack, setCaptionTrack] = useState<CaptionCue[]>([]);
+  const [captionTrackSource, setCaptionTrackSource] = useState<string | null>(null);
+  const [captionsEnabled, setCaptionsEnabled] = useState(false);
+  const [captionFontSize, setCaptionFontSize] = useState<CaptionFontSize>("medium");
+  const [captionPosition, setCaptionPosition] = useState<CaptionPosition>("lower");
+  const [captionGenerationStatus, setCaptionGenerationStatus] = useState<"idle" | "generating">("idle");
+  const [captionGenerationPhase, setCaptionGenerationPhase] = useState<string | null>(null);
+  const [captionGenerationMessage, setCaptionGenerationMessage] = useState<OperationMessage | null>(null);
   const [autoImageSeconds, setAutoImageSeconds] = useState(4);
   const [autoStyleConditioning, setAutoStyleConditioning] = useState(true);
   const [appendOutro, setAppendOutro] = useState(true);
@@ -4849,9 +4985,20 @@ export default function Board2Page() {
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
-  const [autoBuildImageUpdates, setAutoBuildImageUpdates] = useState<AutoBuildImageUpdate[]>([]);
+  const [autoBuildProgress, setAutoBuildProgress] = useState<AutoBuildProgress | null>(null);
+  const autoBuildProgressRef = useRef<AutoBuildProgress | null>(null);
   const [autoBuildCancelled, setAutoBuildCancelled] = useState(false);
   const [autoBuildSource, setAutoBuildSource] = useState<string | null>(null);
+  const [bridgeStatus, setBridgeStatus] = useState<"unknown" | "checking" | "online" | "offline">("unknown");
+  const [bridgeStatusDetail, setBridgeStatusDetail] = useState<string | null>(null);
+  const autoBuildRetryContextRef = useRef<{
+    segments: AutoNarrationImageSegment[];
+    narrationStart: number;
+    transcriptionDuration: number;
+    appliedStyleNote: string | null;
+    layoutSeed: number;
+    clipIdBySegmentIndex: Map<number, string>;
+  } | null>(null);
   const [boardZoom, setBoardZoom] = useState(0.18);
   const [boardPan, setBoardPan] = useState({ x: 20, y: 20 });
   const [boardDimensions, setBoardDimensions] = useState({ width: BOARD_W, height: BOARD_H });
@@ -5101,6 +5248,7 @@ export default function Board2Page() {
   const currentNarrationGestureSource = useMemo(() => narrationGestureSourceSignature(clips), [clips]);
   const narrationGestureTrackIsCurrent = narrationGestureTrack.length > 0 && narrationGestureTrackSource === currentNarrationGestureSource;
   const narrationSpeechTracksAreCurrent = narrationVisemeTrackIsCurrent && narrationGestureTrackIsCurrent;
+  const captionTrackIsCurrent = captionTrack.length > 0 && captionTrackSource === currentNarrationVisemeSource;
   const currentGeneratedBoardSource = useMemo(() => generatedBoardSourceSignature(clips), [clips]);
   const generatedDuration = Math.max(
     0,
@@ -5193,6 +5341,7 @@ export default function Board2Page() {
   const outroTextRef = useRef(DEFAULT_OUTRO_TEXT);
   const outroSettingsSaveTimerRef = useRef<number | null>(null);
   const lipSyncAbortRef = useRef<AbortController | null>(null);
+  const captionGenerationAbortRef = useRef<AbortController | null>(null);
   const narrationTranscriptionAbortRef = useRef<AbortController | null>(null);
   const cameraGenerationRunRef = useRef(0);
   const annotationAbortRef = useRef<AbortController | null>(null);
@@ -5294,6 +5443,11 @@ export default function Board2Page() {
   const narrationVisemeTrackSourceRef = useRef<string | null>(null);
   const narrationGestureTrackRef = useRef<GestureTrackPoint[]>([]);
   const narrationGestureTrackSourceRef = useRef<string | null>(null);
+  const captionTrackRef = useRef<CaptionCue[]>([]);
+  const captionTrackSourceRef = useRef<string | null>(null);
+  const captionsEnabledRef = useRef(false);
+  const captionFontSizeRef = useRef<CaptionFontSize>("medium");
+  const captionPositionRef = useRef<CaptionPosition>("lower");
   const gesturePlaybackDebugRef = useRef<{
     active: boolean;
     generated: number;
@@ -6021,6 +6175,85 @@ export default function Board2Page() {
     setStreamGuests((current) => current.filter((guest) => guest.guestId !== guestId));
   }, []);
 
+  const commitAutoBuildProgress = useCallback((
+    update: AutoBuildProgress | null | ((current: AutoBuildProgress) => AutoBuildProgress),
+  ): AutoBuildProgress | null => {
+    const current = autoBuildProgressRef.current;
+    const next = typeof update === "function"
+      ? current ? update(current) : null
+      : update;
+    autoBuildProgressRef.current = next;
+    setAutoBuildProgress(next);
+    try {
+      if (next) sessionStorage.setItem(AUTO_BUILD_PROGRESS_STORAGE_KEY, JSON.stringify(next));
+      else sessionStorage.removeItem(AUTO_BUILD_PROGRESS_STORAGE_KEY);
+    } catch {}
+    return next;
+  }, []);
+
+  const dismissAutoBuildProgress = useCallback(() => {
+    if (autoBuildProgressRef.current?.status === "running") return;
+    commitAutoBuildProgress(null);
+  }, [commitAutoBuildProgress]);
+
+  useEffect(() => {
+    const restore = () => {
+      let stored: AutoBuildProgress | null = null;
+      try {
+        stored = parseStoredAutoBuildProgress(sessionStorage.getItem(AUTO_BUILD_PROGRESS_STORAGE_KEY));
+      } catch {}
+      if (!stored) return;
+      if (stored.status === "running" && !activeAutoBuildController) {
+        stored = {
+          ...stored,
+          status: "failure",
+          detail: "Auto-build interrupted",
+          error: "Auto-build was interrupted by a page reload. Start it again.",
+          summary: "Auto-build was interrupted by a page reload. Start it again.",
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+        try { sessionStorage.setItem(AUTO_BUILD_PROGRESS_STORAGE_KEY, JSON.stringify(stored)); } catch {}
+      }
+      const current = autoBuildProgressRef.current;
+      if (!current || stored.buildId !== current.buildId || stored.updatedAt > current.updatedAt) {
+        autoBuildProgressRef.current = stored;
+        setAutoBuildProgress(stored);
+        setAutoBuildPhase(stored.status === "running" ? stored.detail : null);
+      }
+    };
+    restore();
+    const timer = window.setInterval(restore, 1_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const updateProgressSlot = useCallback((index: number, update: Partial<AutoBuildProgressSlot>) => {
+    commitAutoBuildProgress((current) => ({
+      ...current,
+      slots: current.slots.map((slot) => slot.index === index ? { ...slot, ...update } : slot),
+      updatedAt: Date.now(),
+    }));
+  }, [commitAutoBuildProgress]);
+
+  // Lip sync and YouTube search/download also depend on this same Mac-mini bridge, so its status
+  // is polled independently of any particular auto-build run and surfaced as a standing indicator.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      setBridgeStatus((current) => current === "unknown" ? "checking" : current);
+      const result = await checkBridgeHealth().catch(() => ({ ok: false, error: "Bridge health check failed" }));
+      if (cancelled) return;
+      setBridgeStatus(result.ok ? "online" : "offline");
+      setBridgeStatusDetail(result.ok ? null : result.error ?? "Bridge unreachable");
+    };
+    poll();
+    const timer = window.setInterval(poll, 45_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void loadOutroSettings()
@@ -6054,6 +6287,11 @@ export default function Board2Page() {
   useEffect(() => { narrationVisemeTrackSourceRef.current = narrationVisemeTrackSource; }, [narrationVisemeTrackSource]);
   useEffect(() => { narrationGestureTrackRef.current = narrationGestureTrack; }, [narrationGestureTrack]);
   useEffect(() => { narrationGestureTrackSourceRef.current = narrationGestureTrackSource; }, [narrationGestureTrackSource]);
+  useEffect(() => { captionTrackRef.current = captionTrack; }, [captionTrack]);
+  useEffect(() => { captionTrackSourceRef.current = captionTrackSource; }, [captionTrackSource]);
+  useEffect(() => { captionsEnabledRef.current = captionsEnabled; }, [captionsEnabled]);
+  useEffect(() => { captionFontSizeRef.current = captionFontSize; }, [captionFontSize]);
+  useEffect(() => { captionPositionRef.current = captionPosition; }, [captionPosition]);
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
@@ -6248,7 +6486,7 @@ export default function Board2Page() {
   useEffect(() => { liveCameraModeRef.current = liveCameraMode; }, [liveCameraMode]);
   useEffect(() => { liveHeldCommandRef.current = liveHeldCommand; }, [liveHeldCommand]);
   useEffect(() => { characterAddModeRef.current = characterAddMode; }, [characterAddMode]);
-  const refreshStyleExemplars = useCallback(async (): Promise<BoardStyleSummary[]> => {
+  const refreshStyleExemplars = useCallback(async (onError?: (error: unknown) => void): Promise<BoardStyleSummary[]> => {
     try {
       const directory = await getBoardsDirectory({ prompt: false, write: false });
       const summaries = directory ? await loadStarredBoardStyleSummaries(directory) : [];
@@ -6256,6 +6494,7 @@ export default function Board2Page() {
       return summaries;
     } catch (error) {
       console.warn("[board2:style] Could not read starred board summaries", error);
+      onError?.(error);
       setStyleExemplars([]);
       return [];
     } finally {
@@ -7291,6 +7530,18 @@ export default function Board2Page() {
     ctx.restore();
     const mediaBubbleTarget = narrationMediaBubbleTarget(time, currentClips, cam, sf, W, H);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor, mediaBubbleTarget);
+    const captionSourceIsCurrent = captionTrackSourceRef.current === narrationVisemeSourceSignature(currentClips);
+    if (captionsEnabledRef.current && captionSourceIsCurrent) {
+      drawScreenSpaceCaption(
+        ctx,
+        time,
+        captionTrackRef.current,
+        W,
+        H,
+        captionFontSizeRef.current,
+        captionPositionRef.current,
+      );
+    }
   // Cache accessors are component-local and intentionally read the latest refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawStreamGuestsToCtx, editorCameraAtTime]);
@@ -7991,7 +8242,19 @@ export default function Board2Page() {
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
 
-  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [playhead, clips, annotations, canvasAspect, isPlaying, drawFrame]);
+  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [
+    playhead,
+    clips,
+    annotations,
+    canvasAspect,
+    captionsEnabled,
+    captionFontSize,
+    captionPosition,
+    captionTrack,
+    captionTrackSource,
+    isPlaying,
+    drawFrame,
+  ]);
 
   // ─ Media loading ──────────────────────────────────────────────────────────
 
@@ -9187,7 +9450,7 @@ export default function Board2Page() {
   }
 
   async function autoBuildFromNarration() {
-    if (autoBuildPhase) return;
+    if (autoBuildPhase || autoBuildProgressRef.current?.status === "running") return;
     const narrationClips = clipsRef.current
       .filter((clip) => clip.type === "narration")
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
@@ -9205,30 +9468,72 @@ export default function Board2Page() {
     const controller = new AbortController();
     autoBuildAbortRef.current?.abort();
     autoBuildAbortRef.current = controller;
+    activeAutoBuildController?.abort();
+    activeAutoBuildController = controller;
+    let currentAutoBuildPhase: AutoBuildPhase = "preparing";
+    const startedAt = Date.now();
+    const initialProgress = createAutoBuildProgress(toastId, startedAt);
+    initialProgress.detail = autoStyleConditioning ? "Reading starred boards…" : "Compiling narration…";
+    initialProgress.phaseTotal = autoStyleConditioning ? 2 : 1;
+    commitAutoBuildProgress(initialProgress);
+    const reportProgress = (
+      phase: AutoBuildPhase,
+      detail: string,
+      phaseCompleted = 0,
+      phaseTotal = 1,
+      extra: Partial<AutoBuildProgress> = {},
+    ) => {
+      currentAutoBuildPhase = phase;
+      setAutoBuildPhase(detail);
+      commitAutoBuildProgress((current) => ({
+        ...current,
+        ...extra,
+        status: "running",
+        phase,
+        detail,
+        phaseCompleted,
+        phaseTotal: Math.max(1, phaseTotal),
+        updatedAt: Date.now(),
+      }));
+    };
     setAutoBuildError(null);
     setAutoBuildSummary(null);
-    setAutoBuildImageUpdates([]);
     setAutoBuildPlanDetails(null);
     setAutoBuildCancelled(false);
-    setAutoBuildPhase(autoStyleConditioning ? "Reading starred boards…" : "Compiling narration…");
+    setAutoBuildPhase(initialProgress.detail);
     setDownloadToasts((prev) => [...prev, { id: toastId, title: "Auto-build narration images", status: "downloading" }]);
     try {
+      reportProgress("preparing", "Checking image finder bridge…", 0, autoStyleConditioning ? 2 : 1);
+      const bridgeHealth = await checkBridgeHealth(controller.signal);
+      if (!bridgeHealth.ok) {
+        setBridgeStatus("offline");
+        setBridgeStatusDetail(bridgeHealth.error ?? "Bridge unreachable");
+        throw new Error("Bridge unreachable — is the Mac mini awake and the tunnel running?");
+      }
+      setBridgeStatus("online");
+      setBridgeStatusDetail(null);
       await waitForUiPaint();
-      const buildStyleExemplars = autoStyleConditioning ? await refreshStyleExemplars() : [];
+      const buildStyleExemplars = autoStyleConditioning ? await refreshStyleExemplars(() => {
+        commitAutoBuildProgress((current) => ({
+          ...current,
+          warnings: [...current.warnings, "Could not read starred boards; continuing with default planning."],
+          updatedAt: Date.now(),
+        }));
+      }) : [];
       const buildStyleSelection = selectStyleExemplars(buildStyleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET);
       controller.signal.throwIfAborted();
       let appliedStyleNote: string | null = null;
       let appliedStyleExemplarCount = 0;
       let effectivePlanSecondsPerImage = autoImageSeconds;
-      setAutoBuildPhase("Compiling narration…");
+      reportProgress("preparing", "Compiling narration…", autoStyleConditioning ? 1 : 0, autoStyleConditioning ? 2 : 1);
       const narrationStart = narrationClips[0].startTime;
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
       const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
       const audio = await compileNarrationToBlob(narrationClips);
       controller.signal.throwIfAborted();
-      setAutoBuildPhase("Transcribing narration…");
+      reportProgress("transcribing", "Transcribing narration…", 0, 1);
       const transcriptData = await transcribeAudioBlob(audio, "narration.wav", (current, total) => {
-        if (total > 1) setAutoBuildPhase(`Transcribing (${current}/${total})…`);
+        reportProgress("transcribing", `Transcribing narration… (chunk ${current}/${total})`, Math.max(0, current - 1), total);
       }, controller.signal);
       const transcript = transcriptData.transcript.trim();
       if (!transcript) throw new Error("No spoken narration was detected");
@@ -9243,9 +9548,9 @@ export default function Board2Page() {
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
       const keywordFallbackSegments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
       let segments = keywordFallbackSegments;
-      setAutoBuildPhase(autoStyleConditioning && buildStyleSelection.selected.length
-        ? `Planning in your style from ${buildStyleSelection.selected.length} starred boards…`
-        : `Planning images (0/${keywordFallbackSegments.length})…`);
+      reportProgress("planning", autoStyleConditioning && buildStyleSelection.selected.length
+        ? `Planning images… (LLM · ${buildStyleSelection.selected.length} starred boards)`
+        : "Planning images… (LLM)", 0, 1);
       try {
         const planResponse = await fetch("/api/board2/plan-images", {
           method: "POST",
@@ -9288,7 +9593,7 @@ export default function Board2Page() {
         appliedStyleExemplarCount = planData?.style?.applied ? Number(planData.style.exemplarCount) || 0 : 0;
         appliedStyleNote = typeof planData?.style?.note === "string" ? planData.style.note : null;
         effectivePlanSecondsPerImage = Number(planData?.style?.effectiveSecondsPerImage) || autoImageSeconds;
-        setAutoBuildPhase(`Planning images (${Number(planData?.targetCount) || keywordFallbackSegments.length}/${Number(planData?.targetCount) || keywordFallbackSegments.length})…`);
+        reportProgress("planning", `Planning images… (LLM · ${Number(planData?.targetCount) || keywordFallbackSegments.length} slots)`, 1, 1);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
         const parsePlanImages = (items: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }> | undefined) => Array.isArray(items)
           ? items.flatMap((item) => {
@@ -9358,41 +9663,56 @@ export default function Board2Page() {
         // The previous deterministic planner remains the safety net for malformed model output,
         // missing configuration, timeouts, and transient OpenAI failures.
         console.warn("[board2:auto-build] Editorial image planning failed; using keyword fallback", plannerError);
-        setAutoBuildPhase("Using keyword fallback…");
+        const plannerMessage = plannerError instanceof Error ? plannerError.message : "OpenAI planning error";
+        commitAutoBuildProgress((current) => ({
+          ...current,
+          warnings: [...current.warnings, `Planning failed — ${plannerMessage}. Using keyword fallback.`],
+          updatedAt: Date.now(),
+        }));
+        reportProgress("planning", "Planning failed — using keyword fallback…", 1, 1);
       }
 
+      const findingStartedAt = Date.now();
+      reportProgress("finding", `Finding images 0/${segments.length} — this can take several minutes`, 0, segments.length, {
+        findingStartedAt,
+        slots: segments.map((segment, index) => ({
+          index,
+          query: segment.query,
+          status: "pending" as const,
+        })),
+      });
+
       const found: Array<{
+        originalIndex: number;
         segment: AutoNarrationImageSegment;
         image: Omit<BrowserFoundImage, "dataUrl">;
         sourceBlob: Blob;
         previewBlob: Blob;
       }> = [];
-      const skipped: Array<{ index: number; query: string; reason: string }> = [];
+      const skipped: Array<{ index: number; query: string; reason: string; code?: string }> = [];
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
         const slot = index + 1;
-        const updateSlot = (update: AutoBuildImageUpdate) => {
-          setAutoBuildImageUpdates((previous) => [
-            ...previous.filter((item) => item.slot !== update.slot),
-            update,
-          ].sort((a, b) => a.slot - b.slot));
-        };
         try {
           const result = await requestAutoBuildImage({
             query: segment.query,
             signal: controller.signal,
             onAttempt: (attempt) => {
               const retry = attempt > 1 ? " (retry 2/2)" : "";
-              setAutoBuildPhase(`Finding images ${slot}/${segments.length}${retry} — this can take several minutes`);
-              updateSlot({ slot, tone: "working", message: `Slot ${slot}: searching${retry}` });
+              reportProgress("finding", `Finding images ${slot}/${segments.length}${retry} — this can take several minutes`, index, segments.length);
+              updateProgressSlot(index, {
+                status: attempt > 1 ? "retrying" : "searching",
+                attempt,
+                startedAt: autoBuildProgressRef.current?.slots[index]?.startedAt ?? Date.now(),
+                reason: attempt > 1 ? "retrying after the first attempt failed" : undefined,
+              });
             },
             onRetry: (error) => {
               const retryReason = describeImageSkip(slot, error)
                 .replace(/ after 2 attempts, skipped$/, "");
-              updateSlot({
-                slot,
-                tone: "warning",
-                message: `${retryReason}; retrying in ${AUTO_BUILD_IMAGE_RETRY_DELAY_MS / 1_000}s`,
+              updateProgressSlot(index, {
+                status: "retrying",
+                reason: `${retryReason.replace(/^Slot \d+: /, "")}; retrying in ${AUTO_BUILD_IMAGE_RETRY_DELAY_MS / 1_000}s`,
               });
             },
           });
@@ -9405,19 +9725,39 @@ export default function Board2Page() {
             height: image.height,
             source: image.source,
           };
-          found.push({ segment, image: imageMetadata, sourceBlob, previewBlob });
-          updateSlot({ slot, tone: "success", message: describeImageSuccess(slot, result) });
+          found.push({ originalIndex: index, segment, image: imageMetadata, sourceBlob, previewBlob });
+          const successReason = result.failures.length || result.attempt > 1
+            ? describeImageSuccess(slot, result).replace(/^Slot \d+: /, "")
+            : undefined;
+          updateProgressSlot(index, {
+            status: "found",
+            source: image.source,
+            reason: successReason,
+            attempt: result.attempt,
+            completedAt: Date.now(),
+          });
+          reportProgress("finding", `Finding images ${slot}/${segments.length} — this can take several minutes`, index + 1, segments.length);
         } catch (error) {
           if (isAbortError(error)) throw error;
-          const reason = describeImageSkip(slot, error);
-          skipped.push({ index, query: segment.query, reason });
-          updateSlot({ slot, tone: "warning", message: reason });
-          console.warn(`[board2:auto-build] ${reason} for “${segment.query}”`);
+          const described = describeImageSkip(slot, error);
+          const reason = described.replace(/^Slot \d+: /, "").replace(/, skipped$/, "");
+          const code = error instanceof AutoBuildImageSearchError ? error.code : undefined;
+          skipped.push({ index, query: segment.query, reason, code });
+          updateProgressSlot(index, { status: "failed", reason, completedAt: Date.now() });
+          reportProgress("finding", `Finding images ${slot}/${segments.length} — this can take several minutes`, index + 1, segments.length);
+          console.warn(`[board2:auto-build] ${described} for “${segment.query}”`);
         }
       }
 
-      setAutoBuildPhase("Placing…");
-      const mediaItems = found.map(({ segment, image, sourceBlob, previewBlob }, index) => {
+      if (!found.length) {
+        if (skipped.some((slot) => slot.code === "bridge_unreachable")) {
+          throw new Error("Bridge unreachable — is the Mac mini awake and the tunnel running?");
+        }
+        throw new Error("No images were found from Google, Bing, or Openverse.");
+      }
+
+      reportProgress("placing", "Placing images…", 0, 1);
+      const mediaItems = found.map(({ originalIndex, segment, image, sourceBlob, previewBlob }, index) => {
         const url = URL.createObjectURL(sourceBlob);
         const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
         createdBlobUrls.push(url);
@@ -9428,10 +9768,10 @@ export default function Board2Page() {
           image,
           sourceBlob,
           previewUrl,
+          originalIndex,
           index,
         };
       });
-      setMediaLibrary((prev) => [...prev, ...mediaItems.map(({ item }) => item)]);
 
       const layoutSeed = stableOrganicLayoutSeed(JSON.stringify({
         transcript,
@@ -9491,13 +9831,15 @@ export default function Board2Page() {
         autoTopicId: topic.id,
         autoLayoutSeed: layoutSeed,
       }));
-      setAnnotations((prev) => [...prev, ...autoTopicAnnotations]);
       const nextClips = [...clipsRef.current];
       const timingByMediaId = new Map(buildNarrationLockedImageWindows(
         mediaItems.map(({ item, segment }) => ({ id: item.id, startTime: segment.start })),
         narrationStart,
         transcriptionDuration,
       ).map((timing) => [timing.id, timing]));
+      // Built into a plain array (rather than committed to state as each clip is derived) so a
+      // thrown invariant below leaves no orphaned media-library entries or topic-label annotations
+      // referencing clips that were never created.
       const autoClips: Clip[] = mediaItems.map(({ item, segment, image, sourceBlob, previewUrl }) => {
         const placement = placementByMediaId.get(item.id);
         if (!placement) throw new Error(`Organic placement missing for ${item.name}`);
@@ -9539,6 +9881,8 @@ export default function Board2Page() {
         return clip;
       });
       let outroClip: Clip | null = null;
+      let outroMediaItem: MediaItem | null = null;
+      const outroAnnotations: Annotation[] = [];
       if (buildOutroImage) {
         const placement = placeOutroCard(
           nextClips.flatMap((clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
@@ -9588,20 +9932,20 @@ export default function Board2Page() {
           autoRole: "outro",
         };
         nextClips.push(outroClip);
-        setMediaLibrary((prev) => [...prev, {
+        outroMediaItem = {
           id: outroId,
-          name: outroClip!.name,
+          name: outroClip.name,
           type: "image",
           url: outroUrl,
           blob: buildOutroImage.blob,
           source: "auto",
-        }]);
+        };
 
         const bandHeight = Math.max(96, Math.round(placement.height * 0.2));
         const bandY = placement.y + placement.height - bandHeight - Math.round(placement.height * 0.045);
         const annotationX = placement.x + Math.round(placement.width * 0.045);
         const annotationWidth = placement.width - Math.round(placement.width * 0.09);
-        setAnnotations((prev) => [...prev,
+        outroAnnotations.push(
           {
             id: generateId(),
             type: "highlight",
@@ -9635,51 +9979,83 @@ export default function Board2Page() {
             source: "auto",
             autoRole: "outro",
           },
-        ]);
+        );
       }
+      setMediaLibrary((prev) => [
+        ...prev,
+        ...mediaItems.map(({ item }) => item),
+        ...(outroMediaItem ? [outroMediaItem] : []),
+      ]);
+      setAnnotations((prev) => [...prev, ...autoTopicAnnotations, ...outroAnnotations]);
       clipsRef.current = nextClips;
       setClips(nextClips);
       setAutoBuildSource(generatedBoardSourceSignature(nextClips));
       setClipSelection([...autoClips, ...(outroClip ? [outroClip] : [])].map((clip) => clip.id));
       placed = true;
+      autoBuildRetryContextRef.current = {
+        segments,
+        narrationStart,
+        transcriptionDuration,
+        appliedStyleNote,
+        layoutSeed,
+        clipIdBySegmentIndex: new Map(mediaItems.map(({ originalIndex }, i) => [originalIndex, autoClips[i].id])),
+      };
 
+      // The images are already placed on the board at this point (placed = true), so a failure
+      // generating the camera path is downgraded to a warning rather than failing the whole
+      // build — the owner would otherwise see "auto-build failed" despite the images being there.
+      let cameraWarning: string | null = null;
       const cameraClips = [...autoClips, ...(outroClip ? [outroClip] : [])];
       if (cameraClips.length) {
-        setAutoBuildPhase("Generating camera…");
-        const W = canvasWRef.current;
-        const H = canvasHRef.current;
-        const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
-          clips: cameraClips.map((clip) => ({
-            id: clip.id,
-            startTime: clip.startTime,
-            duration: clip.duration,
-            holdFraction: clip.holdFraction,
-            boardX: clip.boardX!,
-            boardY: clip.boardY!,
-            boardW: clip.boardW!,
-            boardH: clip.boardH!,
-            topicId: clip.autoTopicId,
-          })),
-          topicBounds: placedTopics.map((topic) => ({ topicId: topic.id, ...topic.bounds })),
-          canvasWidth: W,
-          canvasHeight: H,
-          boardWidth: layoutBoardDimensions.width,
-          imageFocusRatio: FOCUS_FILL_RATIO,
-        }).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
-          ? { ...keyframe, autoRole: "outro" as const }
-          : keyframe);
-        cameraKeyframesRef.current = generatedCamera;
-        setCameraKeyframes(generatedCamera);
-        setKeyframesOutOfDate(false);
-        setShowCharacter(false);
-        setShowCharacter2(false);
-        drawFrameRef.current(playheadRef.current);
+        reportProgress("camera", "Generating camera…", 0, 1);
+        try {
+          const W = canvasWRef.current;
+          const H = canvasHRef.current;
+          const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
+            clips: cameraClips.map((clip) => ({
+              id: clip.id,
+              startTime: clip.startTime,
+              duration: clip.duration,
+              holdFraction: clip.holdFraction,
+              boardX: clip.boardX!,
+              boardY: clip.boardY!,
+              boardW: clip.boardW!,
+              boardH: clip.boardH!,
+              topicId: clip.autoTopicId,
+            })),
+            topicBounds: placedTopics.map((topic) => ({ topicId: topic.id, ...topic.bounds })),
+            canvasWidth: W,
+            canvasHeight: H,
+            boardWidth: layoutBoardDimensions.width,
+            imageFocusRatio: FOCUS_FILL_RATIO,
+          }).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
+            ? { ...keyframe, autoRole: "outro" as const }
+            : keyframe);
+          if (!generatedCamera.length) throw new Error("no camera keyframes were generated");
+          cameraKeyframesRef.current = generatedCamera;
+          setCameraKeyframes(generatedCamera);
+          setKeyframesOutOfDate(false);
+          setShowCharacter(false);
+          setShowCharacter2(false);
+          drawFrameRef.current(playheadRef.current);
+        } catch (cameraError) {
+          if (isAbortError(cameraError)) throw cameraError;
+          const cameraMessage = cameraError instanceof Error ? cameraError.message : "camera generation failed";
+          cameraWarning = `Camera generation failed (${cameraMessage}) — images are placed; use "Regenerate camera" to retry.`;
+          setKeyframesOutOfDate(true);
+          console.warn("[board2:auto-build] Camera generation failed after placement", cameraError);
+        }
       }
+
+      reportProgress("camera", "Generating camera…", 1, 1);
 
       setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "done" } : toast));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
       const unavailable = segments.length - autoClips.length;
-      const summary = `Placed ${autoClips.length}/${segments.length} images (${unavailable} unavailable).`;
+      const elapsed = Date.now() - startedAt;
+      const summary = unavailable
+        ? `Built ${autoClips.length}/${segments.length} — ${unavailable} slot${unavailable === 1 ? "" : "s"} unavailable in ${formatAutoBuildDuration(elapsed)}`
+        : `Built ${autoClips.length}/${segments.length} images in ${formatAutoBuildDuration(elapsed)}`;
       const outroSummary = outroClip ? ` Outro appended for ${AUTO_BUILD_OUTRO_DURATION_SECONDS.toFixed(1)}s.` : "";
       const styleSummary = appliedStyleExemplarCount
         ? ` Planned in your style from ${appliedStyleExemplarCount} starred board${appliedStyleExemplarCount === 1 ? "" : "s"}${appliedStyleNote ? ` — ${appliedStyleNote}` : "."}`
@@ -9689,32 +10065,342 @@ export default function Board2Page() {
       const skippedSlots = skipped.length
         ? ` Skipped: ${skipped.map(({ index, query, reason }) => `#${index + 1} “${query}” (${reason.replace(/^Slot \d+: /, "")})`).join(", ")}.`
         : "";
-      setAutoBuildSummary(`${summary}${outroSummary}${styleSummary}${skippedSlots}`);
+      const cameraNote = cameraWarning ? ` ⚠ ${cameraWarning}` : "";
+      setAutoBuildSummary(`${summary}${outroSummary}${styleSummary}${skippedSlots}${cameraNote}`);
+      commitAutoBuildProgress((current) => ({
+        ...current,
+        status: unavailable || cameraWarning ? "partial" : "success",
+        detail: summary,
+        summary,
+        phase: "camera",
+        phaseCompleted: 1,
+        phaseTotal: 1,
+        warnings: cameraWarning ? [...current.warnings, cameraWarning] : current.warnings,
+        completedAt: Date.now(),
+        updatedAt: Date.now(),
+      }));
       setToast(summary);
     } catch (error) {
       if (!placed) createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
       if (isAbortError(error)) {
-        const message = "Auto-build cancelled";
+        const elapsed = Date.now() - startedAt;
+        const message = `Auto-build cancelled after ${formatAutoBuildDuration(elapsed)}`;
         setAutoBuildSummary(null);
         setAutoBuildError(null);
         setAutoBuildCancelled(true);
+        commitAutoBuildProgress((current) => ({
+          ...current,
+          status: "cancelled",
+          detail: message,
+          summary: message,
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+        }));
         setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
         setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2500);
         return;
       }
-      const message = error instanceof Error ? error.message : "Could not auto-build the narration draft";
+      const message = humanizeAutoBuildFailure(currentAutoBuildPhase, error);
       setAutoBuildSummary(null);
       setAutoBuildError(message);
+      commitAutoBuildProgress((current) => ({
+        ...current,
+        status: "failure",
+        detail: message,
+        error: message,
+        summary: message,
+        completedAt: Date.now(),
+        updatedAt: Date.now(),
+      }));
       setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
       setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 6000);
     } finally {
       if (autoBuildAbortRef.current === controller) autoBuildAbortRef.current = null;
+      if (activeAutoBuildController === controller) activeAutoBuildController = null;
       setAutoBuildPhase(null);
     }
   }
 
   function cancelAutoBuild() {
+    const controller = autoBuildAbortRef.current ?? activeAutoBuildController;
+    if (!controller) return;
+    commitAutoBuildProgress((current) => ({
+      ...current,
+      detail: "Cancelling auto-build…",
+      updatedAt: Date.now(),
+    }));
+    controller.abort();
+  }
+
+  async function retryFailedAutoBuildSlots() {
+    const ctx = autoBuildRetryContextRef.current;
+    const progress = autoBuildProgressRef.current;
+    if (!ctx || !progress || progress.status !== "partial" || autoBuildProgressRef.current?.status === "running") return;
+    const failedIndices = progress.slots.filter((slot) => slot.status === "failed").map((slot) => slot.index);
+    if (!failedIndices.length) return;
+
+    const toastId = generateId();
+    const controller = new AbortController();
     autoBuildAbortRef.current?.abort();
+    autoBuildAbortRef.current = controller;
+    activeAutoBuildController?.abort();
+    activeAutoBuildController = controller;
+    const startedAt = Date.now();
+    const retryLabel = `${failedIndices.length} failed slot${failedIndices.length === 1 ? "" : "s"}`;
+    setDownloadToasts((prev) => [...prev, { id: toastId, title: `Retrying ${retryLabel}`, status: "downloading" }]);
+    setAutoBuildPhase(`Retrying ${retryLabel}…`);
+    commitAutoBuildProgress((current) => ({
+      ...current,
+      status: "running",
+      phase: "finding",
+      detail: `Retrying ${retryLabel}…`,
+      phaseCompleted: 0,
+      phaseTotal: failedIndices.length,
+      findingStartedAt: Date.now(),
+      updatedAt: Date.now(),
+      slots: current.slots.map((slot) => failedIndices.includes(slot.index)
+        ? { ...slot, status: "pending" as const, reason: undefined, attempt: undefined }
+        : slot),
+    }));
+
+    const createdBlobUrls: string[] = [];
+    type RetryFound = {
+      originalIndex: number;
+      segment: AutoNarrationImageSegment;
+      image: Omit<BrowserFoundImage, "dataUrl">;
+      sourceBlob: Blob;
+      previewBlob: Blob;
+    };
+    const found: RetryFound[] = [];
+    const stillFailed: Array<{ index: number; reason: string }> = [];
+
+    try {
+      for (let i = 0; i < failedIndices.length; i++) {
+        const originalIndex = failedIndices[i];
+        const segment = ctx.segments[originalIndex];
+        const slot = originalIndex + 1;
+        try {
+          const result = await requestAutoBuildImage({
+            query: segment.query,
+            signal: controller.signal,
+            onAttempt: (attempt) => {
+              const retry = attempt > 1 ? " (retry 2/2)" : "";
+              commitAutoBuildProgress((current) => ({
+                ...current,
+                detail: `Retrying slot ${slot}${retry} (${i + 1}/${failedIndices.length})…`,
+                phaseCompleted: i,
+                updatedAt: Date.now(),
+              }));
+              updateProgressSlot(originalIndex, {
+                status: attempt > 1 ? "retrying" : "searching",
+                attempt,
+                startedAt: Date.now(),
+                reason: attempt > 1 ? "retrying after the first attempt failed" : undefined,
+              });
+            },
+            onRetry: (error) => {
+              const retryReason = describeImageSkip(slot, error).replace(/ after 2 attempts, skipped$/, "");
+              updateProgressSlot(originalIndex, {
+                status: "retrying",
+                reason: `${retryReason.replace(/^Slot \d+: /, "")}; retrying in ${AUTO_BUILD_IMAGE_RETRY_DELAY_MS / 1_000}s`,
+              });
+            },
+          });
+          const image = result.image;
+          const sourceBlob = dataUrlToBlob(image.dataUrl);
+          const previewBlob = await createImagePreviewBlob(sourceBlob);
+          found.push({
+            originalIndex,
+            segment,
+            image: { sourceUrl: image.sourceUrl, width: image.width, height: image.height, source: image.source },
+            sourceBlob,
+            previewBlob,
+          });
+          updateProgressSlot(originalIndex, { status: "found", source: image.source, reason: undefined, attempt: result.attempt, completedAt: Date.now() });
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          const described = describeImageSkip(slot, error);
+          const reason = described.replace(/^Slot \d+: /, "").replace(/, skipped$/, "");
+          stillFailed.push({ index: originalIndex, reason });
+          updateProgressSlot(originalIndex, { status: "failed", reason, completedAt: Date.now() });
+        }
+        commitAutoBuildProgress((current) => ({ ...current, phaseCompleted: i + 1, updatedAt: Date.now() }));
+      }
+
+      if (!found.length) {
+        const message = `Retry found no new images for ${retryLabel}.`;
+        commitAutoBuildProgress((current) => ({
+          ...current,
+          status: "partial",
+          detail: current.summary ?? message,
+          warnings: [...current.warnings, message],
+          updatedAt: Date.now(),
+        }));
+        setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
+        setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 4000);
+        setToast(message);
+        return;
+      }
+
+      const mediaItems = found.map(({ originalIndex, segment, image, sourceBlob, previewBlob }) => {
+        const url = URL.createObjectURL(sourceBlob);
+        const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
+        createdBlobUrls.push(url);
+        if (previewUrl !== url) createdBlobUrls.push(previewUrl);
+        return { item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url }, segment, image, sourceBlob, previewUrl, originalIndex };
+      });
+
+      // Group the newly-found images by topic and place them avoiding every currently-occupied
+      // board rect. They land as a fresh cluster rather than being woven back into the original
+      // topic's cluster — acceptable for a recovery path, though visually the topic can end up
+      // split across two areas of the board.
+      const byTopic = new Map<string, typeof mediaItems>();
+      for (const mediaItem of mediaItems) {
+        const topicId = mediaItem.segment.topicId ?? "topic-0";
+        byTopic.set(topicId, [...(byTopic.get(topicId) ?? []), mediaItem]);
+      }
+      const topicDefsForRetry = Array.from(byTopic.entries()).map(([topicId, items]) => {
+        const first = items[0].segment;
+        return {
+          id: topicId,
+          title: first.topicTitle ?? "Narration Overview",
+          startTime: first.topicStartTime ?? 0,
+          endTime: first.topicEndTime ?? ctx.transcriptionDuration,
+          topicIndex: first.topicIndex ?? 0,
+          images: items.map(({ item, image, segment }) => ({ id: item.id, width: image.width, height: image.height, startTime: segment.start })),
+        };
+      });
+      const placedTopics = layoutOrganicTopicClusters({
+        boardWidth: boardDimensionsRef.current.width,
+        boardHeight: boardDimensionsRef.current.height,
+        seed: ctx.layoutSeed,
+        occupied: clipsRef.current.flatMap((clip) =>
+          clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
+            ? [{ x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH }]
+            : []),
+        topics: topicDefsForRetry,
+      });
+      const placementByMediaId = new Map(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image])));
+
+      // Recompute narration-locked windows across every placed image from this build (existing +
+      // newly-retried) so durations stay contiguous — this must include the already-placed clips,
+      // not just the retried subset (see buildNarrationLockedImageWindows's contract).
+      const allMoments: Array<{ id: string; startTime: number }> = [];
+      for (let index = 0; index < ctx.segments.length; index++) {
+        const retryItem = mediaItems.find((mediaItem) => mediaItem.originalIndex === index);
+        const existingClipId = ctx.clipIdBySegmentIndex.get(index);
+        if (retryItem) allMoments.push({ id: retryItem.item.id, startTime: ctx.segments[index].start });
+        else if (existingClipId) allMoments.push({ id: existingClipId, startTime: ctx.segments[index].start });
+      }
+      const windows = buildNarrationLockedImageWindows(allMoments, ctx.narrationStart, ctx.transcriptionDuration);
+      const windowById = new Map(windows.map((timingWindow) => [timingWindow.id, timingWindow]));
+
+      const newClips: Clip[] = [];
+      for (const mediaItem of mediaItems) {
+        const placement = placementByMediaId.get(mediaItem.item.id);
+        const timing = windowById.get(mediaItem.item.id);
+        if (!placement || !timing) continue;
+        const id = generateId();
+        newClips.push({
+          id,
+          type: "image",
+          name: mediaItem.item.name,
+          sourceUrl: mediaItem.item.url,
+          sourceBlob: mediaItem.sourceBlob,
+          previewUrl: mediaItem.previewUrl,
+          source: "auto",
+          startTime: timing.startTime,
+          duration: timing.duration,
+          layer: freeLayerAtTime(clipsRef.current, timing.startTime, timing.duration, id, 1),
+          boardX: placement.x,
+          boardY: placement.y,
+          boardW: placement.width,
+          boardH: placement.height,
+          holdFraction: 0.7,
+          featured: true,
+          provenance: "browserFound",
+          sourceAttributionUrl: mediaItem.image.sourceUrl,
+          imageSearchSource: mediaItem.image.source,
+          searchQuery: mediaItem.segment.query,
+          imagePlanReason: mediaItem.segment.reason,
+          imagePlanModel: mediaItem.segment.planModel,
+          imagePlanStyleNote: ctx.appliedStyleNote ?? undefined,
+          autoTopicId: mediaItem.segment.topicId ?? "topic-0",
+          autoTopicTitle: mediaItem.segment.topicTitle ?? "Narration Overview",
+          autoTopicStartTime: mediaItem.segment.topicStartTime,
+          autoTopicEndTime: mediaItem.segment.topicEndTime,
+          autoLayoutSeed: ctx.layoutSeed,
+        });
+        ctx.clipIdBySegmentIndex.set(mediaItem.originalIndex, id);
+      }
+
+      setMediaLibrary((prev) => [...prev, ...mediaItems.map(({ item }) => item)]);
+      const updatedClips = clipsRef.current.map((clip) => {
+        const timingWindow = windowById.get(clip.id);
+        if (!timingWindow || (timingWindow.startTime === clip.startTime && timingWindow.duration === clip.duration)) return clip;
+        return { ...clip, startTime: timingWindow.startTime, duration: timingWindow.duration };
+      });
+      const nextClips = [...updatedClips, ...newClips];
+      clipsRef.current = nextClips;
+      setClips(nextClips);
+      setClipSelection([...selectedClipIdsRef.current, ...newClips.map((clip) => clip.id)]);
+      setKeyframesOutOfDate(true);
+
+      const remainingFailed = stillFailed.length;
+      const elapsed = Date.now() - startedAt;
+      const message = remainingFailed
+        ? `Retry recovered ${found.length}/${failedIndices.length} slots in ${formatAutoBuildDuration(elapsed)} — ${remainingFailed} still unavailable.`
+        : `Retry recovered all ${found.length} failed slot${found.length === 1 ? "" : "s"} in ${formatAutoBuildDuration(elapsed)}.`;
+      setAutoBuildSummary(message);
+      setToast(`${message} Camera is stale — regenerate it to include the new images.`);
+      commitAutoBuildProgress((current) => {
+        const anyFailed = current.slots.some((slot) => slot.status === "failed");
+        return {
+          ...current,
+          status: anyFailed ? "partial" : "success",
+          phase: "finding",
+          detail: message,
+          summary: message,
+          warnings: [...current.warnings, message, "Camera is stale — regenerate it to include the new images."],
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+      });
+      setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "done" } : toast));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2200);
+    } catch (error) {
+      createdBlobUrls.forEach((url) => URL.revokeObjectURL(url));
+      // Any failed slot re-armed to "pending" at the top of this function that never got a chance
+      // to run (cancelled, or a thrown error partway through the loop) must not be left stuck in a
+      // non-terminal per-slot state once the overall build settles back into "partial".
+      const revertStuckSlots = (current: AutoBuildProgress, reason: string): AutoBuildProgress => ({
+        ...current,
+        slots: current.slots.map((slot) => failedIndices.includes(slot.index) && slot.status !== "found" && slot.status !== "failed"
+          ? { ...slot, status: "failed" as const, reason }
+          : slot),
+      });
+      if (isAbortError(error)) {
+        const message = "Retry cancelled";
+        commitAutoBuildProgress((current) => ({ ...revertStuckSlots(current, "retry cancelled"), status: "partial", detail: current.summary ?? message, updatedAt: Date.now() }));
+        setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
+        setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 2500);
+        return;
+      }
+      const message = humanizeAutoBuildFailure("finding", error);
+      commitAutoBuildProgress((current) => ({
+        ...revertStuckSlots(current, message),
+        status: "partial",
+        detail: current.summary ?? message,
+        warnings: [...current.warnings, `Retry failed — ${message}`],
+        updatedAt: Date.now(),
+      }));
+      setDownloadToasts((prev) => prev.map((toast) => toast.id === toastId ? { ...toast, status: "error", error: message } : toast));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((toast) => toast.id !== toastId)), 6000);
+    } finally {
+      if (autoBuildAbortRef.current === controller) autoBuildAbortRef.current = null;
+      if (activeAutoBuildController === controller) activeAutoBuildController = null;
+      setAutoBuildPhase(null);
+    }
   }
 
   async function generateNarrationLipSync() {
@@ -9922,8 +10608,79 @@ export default function Board2Page() {
     }
   }
 
+  async function generateNarrationCaptions() {
+    if (captionGenerationStatus === "generating") return;
+    const sourceClips = clipsRef.current
+      .filter((clip) => clip.type === "narration" && !clip.muted && (clip.volume ?? 1) > 0)
+      .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
+    if (!sourceClips.length) {
+      setToast(clipsRef.current.some((clip) => clip.type === "narration")
+        ? "Unmute narration before generating captions"
+        : "Add narration before generating captions");
+      return;
+    }
+
+    const sourceSignature = narrationVisemeSourceSignature(clipsRef.current);
+    const timelineOffset = sourceClips[0].startTime;
+    const controller = new AbortController();
+    captionGenerationAbortRef.current?.abort();
+    captionGenerationAbortRef.current = controller;
+    setCaptionGenerationStatus("generating");
+    setCaptionGenerationMessage(null);
+    setCaptionGenerationPhase("Compiling narration…");
+    try {
+      await waitForUiPaint();
+      const narration = await compileNarrationToBlob(sourceClips);
+      controller.signal.throwIfAborted();
+      setCaptionGenerationPhase("Transcribing narration…");
+      const transcription = await transcribeAudioBlob(
+        narration,
+        "narration-captions.wav",
+        (current, total) => setCaptionGenerationPhase(total > 1
+          ? `Transcribing chunk ${current}/${total}…`
+          : "Transcribing narration…"),
+        controller.signal,
+      );
+      controller.signal.throwIfAborted();
+      setCaptionGenerationPhase("Building phrases…");
+      await waitForUiPaint();
+      const track = buildPhraseCaptionTrack(transcription.segments, timelineOffset);
+      if (!track.length) throw new Error("The narration did not contain any transcribable speech");
+      if (narrationVisemeSourceSignature(clipsRef.current) !== sourceSignature) {
+        throw new Error("Narration changed during transcription. Generate captions again.");
+      }
+      captionTrackRef.current = track;
+      captionTrackSourceRef.current = sourceSignature;
+      captionsEnabledRef.current = true;
+      setCaptionTrack(track);
+      setCaptionTrackSource(sourceSignature);
+      setCaptionsEnabled(true);
+      setCaptionGenerationMessage({
+        kind: "success",
+        text: `Captions generated — ${track.length} phrase${track.length === 1 ? "" : "s"}`,
+      });
+      setToast(`Captions ready — ${track.length} phrase${track.length === 1 ? "" : "s"}`);
+      drawFrameRef.current(playheadRef.current);
+    } catch (error) {
+      const cancelled = isAbortError(error);
+      const message = cancelled
+        ? "Caption generation cancelled"
+        : `Caption generation failed — ${error instanceof Error ? error.message : "unknown error"}`;
+      setCaptionGenerationMessage({ kind: cancelled ? "cancelled" : "error", text: message });
+      setToast(message);
+    } finally {
+      if (captionGenerationAbortRef.current === controller) captionGenerationAbortRef.current = null;
+      setCaptionGenerationStatus("idle");
+      setCaptionGenerationPhase(null);
+    }
+  }
+
   function cancelNarrationLipSync() {
     lipSyncAbortRef.current?.abort();
+  }
+
+  function cancelNarrationCaptions() {
+    captionGenerationAbortRef.current?.abort();
   }
 
   function setNarrationSpeechBubbles(clip: Clip, enabled: boolean) {
@@ -17626,6 +18383,20 @@ export default function Board2Page() {
                       >
                         ↑  Upload audio / mp4
                       </button>
+                      <div data-caption-mobile-controls style={{ display: "flex", flexDirection: "column", gap: 6, padding: 8, border: "1.5px dashed #56627a", background: "#f3f6ff" }}>
+                        <button
+                          type="button"
+                          onClick={() => void generateNarrationCaptions()}
+                          disabled={captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration")}
+                          style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "9px 12px", fontSize: 12, opacity: captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1 }}
+                        >
+                          {captionGenerationStatus === "generating" ? `⟳ ${captionGenerationPhase ?? "Generating captions…"}` : captionTrack.length ? "↻ Regenerate captions" : "Generate captions"}
+                        </button>
+                        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
+                          <input type="checkbox" checked={captionsEnabled} onChange={(event) => { captionsEnabledRef.current = event.target.checked; setCaptionsEnabled(event.target.checked); }} />
+                          Show captions · {captionTrackIsCurrent ? `${captionTrack.length} phrases ready` : captionTrack.length ? "stale" : "none"}
+                        </label>
+                      </div>
                       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                         <button
                           onClick={() => void autoBuildFromNarration()}
@@ -17661,7 +18432,6 @@ export default function Board2Page() {
                       </div>
                       {renderOutroAutoBuildOptions()}
                       {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
-                      <AutoBuildImageProgress updates={autoBuildImageUpdates} active={!!autoBuildPhase} />
                       {autoBuildError && !autoBuildPhase && <div style={{ fontSize: 10, color: "#a32916" }}>✗ {autoBuildError}</div>}
                       {autoBuildCancelled && !autoBuildPhase && <div style={{ fontSize: 10, color: "#8a6200" }}>⚠ Auto-build cancelled</div>}
                       {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
@@ -18341,6 +19111,14 @@ export default function Board2Page() {
         gestureTrack: savedGestureTrack,
         gestureTrackFingerprint: savedGestureTrack.length ? currentGestureSource : null,
         smartGestures,
+        captions: {
+          enabled: captionsEnabledRef.current,
+          fontSize: captionFontSizeRef.current,
+          position: captionPositionRef.current,
+          track: captionTrackRef.current,
+          trackFingerprint: captionTrackSourceRef.current,
+          source: "autoDerived" as const,
+        },
       },
       camera: {
         mode: cameraMode,
@@ -18508,6 +19286,7 @@ export default function Board2Page() {
         narrationGestureTrack: rawManifest.narration?.gestureTrack ?? [],
         narrationGestureTrackSource: rawManifest.narration?.gestureTrackFingerprint ?? null,
         smartGestures: rawManifest.narration?.smartGestures === true,
+        captions: rawManifest.narration?.captions,
         customZoomDurationSeconds: rawManifest.timeline?.customZoomDurationSeconds,
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
       } : rawManifest;
@@ -18613,6 +19392,28 @@ export default function Board2Page() {
       narrationGestureTrackRef.current = loadedGestureTrack;
       narrationGestureTrackSourceRef.current = loadedGestureSource;
       setSmartGestures(manifest.smartGestures === true);
+      const loadedCaptions = manifest.captions && typeof manifest.captions === "object"
+        ? manifest.captions as Record<string, unknown>
+        : null;
+      const loadedCaptionTrack = isCaptionTrack(loadedCaptions?.track) ? loadedCaptions.track : [];
+      const loadedCaptionSource = typeof loadedCaptions?.trackFingerprint === "string"
+        ? loadedCaptions.trackFingerprint
+        : null;
+      const loadedCaptionFontSize: CaptionFontSize = loadedCaptions?.fontSize === "small" || loadedCaptions?.fontSize === "large"
+        ? loadedCaptions.fontSize
+        : "medium";
+      const loadedCaptionPosition: CaptionPosition = loadedCaptions?.position === "upper" ? "upper" : "lower";
+      const loadedCaptionsEnabled = loadedCaptions?.enabled === true;
+      captionTrackRef.current = loadedCaptionTrack;
+      captionTrackSourceRef.current = loadedCaptionSource;
+      captionsEnabledRef.current = loadedCaptionsEnabled;
+      captionFontSizeRef.current = loadedCaptionFontSize;
+      captionPositionRef.current = loadedCaptionPosition;
+      setCaptionTrack(loadedCaptionTrack);
+      setCaptionTrackSource(loadedCaptionSource);
+      setCaptionsEnabled(loadedCaptionsEnabled);
+      setCaptionFontSize(loadedCaptionFontSize);
+      setCaptionPosition(loadedCaptionPosition);
       const loadedCustomZoomDuration = normalizeCustomZoomDuration(manifest.customZoomDurationSeconds);
       customZoomDurationRef.current = loadedCustomZoomDuration;
       setCustomZoomDuration(loadedCustomZoomDuration);
@@ -18905,6 +19706,15 @@ export default function Board2Page() {
         }
       `}</style>
 
+      {autoBuildProgress && (
+        <AutoBuildProgressPanel
+          progress={autoBuildProgress}
+          onCancel={cancelAutoBuild}
+          onDismiss={dismissAutoBuildProgress}
+          onRetryFailed={() => { void retryFailedAutoBuildSlots(); }}
+        />
+      )}
+
       {/* ── Header ── */}
       <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
@@ -18935,6 +19745,23 @@ export default function Board2Page() {
               Camera: {keyframesOutOfDate ? "⚠ stale" : cameraKeyframes.length ? `✓ ${cameraKeyframes.length} keyframes` : "none"}
             </span>
             {cameraGenerationMessage?.kind === "error" && <span style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9, fontFamily: "monospace", color: "#a32916" }}>✗ {cameraGenerationMessage.text}</span>}
+            <span
+              role="status"
+              aria-live="polite"
+              title={bridgeStatus === "offline"
+                ? (bridgeStatusDetail ?? "Bridge unreachable — is the Mac mini awake and the tunnel running?")
+                : "Mac-mini image finder bridge — also used by lip sync and YouTube search/download"}
+              style={{
+                fontSize: 9,
+                fontFamily: "monospace",
+                color: bridgeStatus === "online" ? "#496700" : bridgeStatus === "offline" ? "#a32916" : "#6a6a6a",
+                border: "1px solid currentColor",
+                padding: "2px 5px",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Bridge: {bridgeStatus === "online" ? "● online" : bridgeStatus === "offline" ? "● offline" : bridgeStatus === "checking" ? "… checking" : "○ unknown"}
+            </span>
           </div>
           {LIVE_FEATURES_ENABLED && (
             <ProGated featureName="Play Mode">
@@ -19063,6 +19890,32 @@ export default function Board2Page() {
                 style={{ display: "none" }}
                 onChange={handleNarrationUpload}
               />
+              <div data-caption-quick-controls style={{ width: "100%", display: "flex", flexDirection: "column", gap: 5, padding: 7, boxSizing: "border-box", border: "1.5px dashed #56627a", background: "#f3f6ff" }}>
+                <div style={{ display: "flex", gap: 5 }}>
+                  <button
+                    type="button"
+                    onClick={() => void generateNarrationCaptions()}
+                    disabled={captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration")}
+                    style={{ ...miniButton, flex: 1, fontWeight: 700, opacity: captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1 }}
+                  >
+                    {captionGenerationStatus === "generating" ? `⟳ ${captionGenerationPhase ?? "Generating captions…"}` : captionTrack.length ? "↻ Regenerate captions" : "Generate captions"}
+                  </button>
+                  {captionGenerationStatus === "generating" && <button type="button" onClick={cancelNarrationCaptions} style={{ ...miniButton, color: "#a32916", borderColor: "#a32916" }}>Cancel</button>}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 9 }}>
+                  <span style={{ color: captionTrackIsCurrent ? "#496700" : captionTrack.length ? "#a14d00" : "#6a6a6a" }}>
+                    {captionTrackIsCurrent ? `✓ ${captionTrack.length} caption phrases` : captionTrack.length ? "⚠ Captions stale — regenerate" : "No caption track"}
+                  </span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <input
+                      type="checkbox"
+                      checked={captionsEnabled}
+                      onChange={(event) => { captionsEnabledRef.current = event.target.checked; setCaptionsEnabled(event.target.checked); }}
+                    />
+                    Show
+                  </label>
+                </div>
+              </div>
               <div style={{ width: "100%", border: "1.5px dashed #7a5b00", background: "#fff7d6", padding: 8, boxSizing: "border-box" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
                   <span style={{ fontSize: 9, fontWeight: 700, color: "#6a4b00", textTransform: "uppercase", letterSpacing: 0.6 }}>Image draft pace</span>
@@ -19113,7 +19966,6 @@ export default function Board2Page() {
                   {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
                 </button>
                 {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", marginTop: 5, color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
-                <AutoBuildImageProgress updates={autoBuildImageUpdates} active={!!autoBuildPhase} compact />
                 {autoBuildError && !autoBuildPhase && (
                   <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
                 )}
@@ -20820,6 +21672,75 @@ export default function Board2Page() {
                           {lipSyncPhase && <span style={{ color: "#1a6fd4" }}>⟳ {lipSyncPhase}</span>}
                           {lipSyncMessage && <span style={{ color: lipSyncMessage.kind === "success" ? "#496700" : lipSyncMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{lipSyncMessage.kind === "error" ? "✗ " : lipSyncMessage.kind === "success" ? "✓ " : "⚠ "}{lipSyncMessage.text}</span>}
                           {gestureGenerationMessage && <span style={{ color: gestureGenerationMessage.kind === "success" ? "#496700" : gestureGenerationMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{gestureGenerationMessage.kind === "success" ? "✓ " : "⚠ "}{gestureGenerationMessage.text}</span>}
+                        </div>
+                      </div>
+                      <div data-caption-controls style={{ display: "flex", flexDirection: "column", gap: 6, padding: 6, border: "1px solid rgba(42,42,42,0.22)", background: captionTrackIsCurrent ? "#f0ffe0" : "transparent" }}>
+                        <div style={{ display: "flex", gap: 5 }}>
+                          <button
+                            type="button"
+                            onClick={() => void generateNarrationCaptions()}
+                            disabled={captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration")}
+                            style={{ ...miniButton, flex: 1, background: captionTrackIsCurrent ? "#c8f135" : "transparent", opacity: captionGenerationStatus === "generating" || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1, fontWeight: 700 }}
+                          >
+                            {captionGenerationStatus === "generating"
+                              ? `⟳ ${captionGenerationPhase ?? "Generating…"}`
+                              : captionTrack.length ? "↻ Regenerate captions" : "Generate captions"}
+                          </button>
+                          {captionGenerationStatus === "generating" && (
+                            <button type="button" onClick={cancelNarrationCaptions} style={{ ...miniButton, color: "#a32916", borderColor: "#a32916" }}>Cancel</button>
+                          )}
+                        </div>
+                        <label style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "monospace", fontSize: 10 }}>
+                          <input
+                            data-caption-enabled-toggle
+                            type="checkbox"
+                            checked={captionsEnabled}
+                            onChange={(event) => {
+                              captionsEnabledRef.current = event.target.checked;
+                              setCaptionsEnabled(event.target.checked);
+                            }}
+                          />
+                          Show captions
+                        </label>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <label style={{ display: "flex", flex: 1, alignItems: "center", gap: 4, fontFamily: "monospace", fontSize: 9 }}>
+                            Size
+                            <select
+                              value={captionFontSize}
+                              onChange={(event) => {
+                                const value = event.target.value as CaptionFontSize;
+                                captionFontSizeRef.current = value;
+                                setCaptionFontSize(value);
+                              }}
+                              style={{ flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 9, border: "1px solid #2a2a2a", background: "#fffdf4" }}
+                            >
+                              <option value="small">Small</option>
+                              <option value="medium">Medium</option>
+                              <option value="large">Large</option>
+                            </select>
+                          </label>
+                          <label style={{ display: "flex", flex: 1, alignItems: "center", gap: 4, fontFamily: "monospace", fontSize: 9 }}>
+                            Position
+                            <select
+                              value={captionPosition}
+                              onChange={(event) => {
+                                const value = event.target.value as CaptionPosition;
+                                captionPositionRef.current = value;
+                                setCaptionPosition(value);
+                              }}
+                              style={{ flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 9, border: "1px solid #2a2a2a", background: "#fffdf4" }}
+                            >
+                              <option value="lower">Lower</option>
+                              <option value="upper">Upper</option>
+                            </select>
+                          </label>
+                        </div>
+                        <div role="status" aria-live="polite" style={{ display: "flex", flexDirection: "column", gap: 2, fontFamily: "monospace", fontSize: 9, lineHeight: 1.35 }}>
+                          <span style={{ color: captionTrackIsCurrent ? "#496700" : captionTrack.length ? "#a14d00" : "#6a6a6a" }}>
+                            Captions: {captionTrackIsCurrent ? `✓ ${captionTrack.length} phrases` : captionTrack.length ? "⚠ stale (narration changed — regenerate)" : "none"}
+                          </span>
+                          {captionGenerationPhase && <span style={{ color: "#1a6fd4" }}>⟳ {captionGenerationPhase}</span>}
+                          {captionGenerationMessage && <span style={{ color: captionGenerationMessage.kind === "success" ? "#496700" : captionGenerationMessage.kind === "error" ? "#a32916" : "#8a6200" }}>{captionGenerationMessage.kind === "error" ? "✗ " : captionGenerationMessage.kind === "success" ? "✓ " : "⚠ "}{captionGenerationMessage.text}</span>}
                         </div>
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
