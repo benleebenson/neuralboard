@@ -220,6 +220,7 @@ import {
 import { checkBridgeHealth } from "@/lib/board2/bridge-health";
 import { fitMediaDimensions } from "@/lib/board2/media-sizing";
 import { boardRectIntersectsCameraFrame } from "@/lib/board2/viewport-culling";
+import { placeSpeechBubbleInFrame } from "@/lib/board2/speech-bubble-placement";
 import {
   BOARD_SNAPSHOT_LONG_EDGE,
   DEFAULT_EXPORT_FPS,
@@ -1038,37 +1039,14 @@ function drawFloatingNarrationBubble(
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 2.1)));
   const boxH = Math.max(fontSize * 2.65, lines.length * lineHeight + fontSize * 1.5);
-  const fallbackTarget = {
-    x: width * 0.08,
-    y: height * 0.1,
-    width: width * 0.84,
-    height: height * 0.82,
-  };
-  const target = mediaTarget ?? fallbackTarget;
-  const placements = [
-    { x: 0.22, y: 0.22 },
-    { x: 0.79, y: 0.43 },
-    { x: 0.36, y: 0.78 },
-    { x: 0.73, y: 0.22 },
-    { x: 0.2, y: 0.55 },
-    { x: 0.72, y: 0.76 },
-  ];
-  let placementIndex = Math.floor(seededRandom(`${clip.id}:${cue.index}:floating-position`) * placements.length);
-  if (cue.index > 0) {
-    const previousIndex = Math.floor(seededRandom(`${clip.id}:${cue.index - 1}:floating-position`) * placements.length);
-    if (placementIndex === previousIndex) placementIndex = (placementIndex + 1 + cue.index % 2) % placements.length;
-  }
-  const placement = placements[placementIndex];
-  const safeLeft = Math.max(fontSize * 0.6, width * 0.025);
-  const safeRight = width - safeLeft;
-  // Keep floating captions below phone camera cutouts and social-video top chrome.
-  const safeTop = Math.max(fontSize * 1.8, height * 0.1);
-  const safeBottom = height - Math.max(fontSize * 0.8, height * 0.055);
+  const placementSeed = seededRandom(`${clip.id}:${cue.index}:floating-position`);
   const phase = seededRandom(`${clip.id}:${cue.index}:floating-phase`) * Math.PI * 2;
   const sourceTime = (clip.sourceOffsetSec ?? 0) + (time - clip.startTime);
-  const hoverY = Math.sin((sourceTime - cue.start) * Math.PI * 0.9 + phase) * fontSize * 0.09;
-  const centerX = clamp(target.x + target.width * placement.x, safeLeft + boxW / 2, safeRight - boxW / 2);
-  const centerY = clamp(target.y + target.height * placement.y + hoverY, safeTop + boxH / 2, safeBottom - boxH / 2);
+  const hoverAmplitude = fontSize * 0.09;
+  const placement = placeSpeechBubbleInFrame(width, height, boxW, boxH + hoverAmplitude * 2, mediaTarget, null, placementSeed);
+  const hoverY = Math.sin((sourceTime - cue.start) * Math.PI * 0.9 + phase) * hoverAmplitude;
+  const centerX = placement.x + placement.width / 2;
+  const centerY = placement.y + placement.height / 2 + hoverY;
   const x = centerX - boxW / 2;
   const y = centerY - boxH / 2;
   const radius = boxH / 2;
@@ -1130,7 +1108,6 @@ function drawNarrationSpeechBubble(
   }
   const head = anchor;
   const sideSeed = seededRandom(`${clip.id}:${cue.index}:${cue.text}`);
-  const side = sideSeed < 0.5 ? -head.facing : head.facing;
   const fontSize = clamp(Math.round(width * 0.022), 15, 27);
   const maxWidth = clamp(width * 0.32, 170, 310);
   ctx.save();
@@ -1147,10 +1124,9 @@ function drawNarrationSpeechBubble(
   const lineHeight = fontSize * 1.08;
   const boxW = Math.min(maxWidth, Math.max(fontSize * 7, ...lines.map((item) => ctx.measureText(item).width + fontSize * 1.8)));
   const boxH = Math.max(fontSize * 2.5, lines.length * lineHeight + fontSize * 1.35);
-  const centerX = head.x + side * fontSize * (4.7 + sideSeed * 0.9);
-  const centerY = head.y - fontSize * (4.65 + seededRandom(`${clip.id}:${cue.index}:bubble-y`) * 0.75);
-  const x = clamp(centerX - boxW / 2, fontSize * 0.5, width - boxW - fontSize * 0.5);
-  const y = clamp(centerY - boxH / 2, fontSize * 0.4, height - boxH - fontSize * 1.1);
+  const placement = placeSpeechBubbleInFrame(width, height, boxW, boxH, mediaTarget, head, sideSeed);
+  const x = placement.x;
+  const y = placement.y;
   const radius = Math.min(boxH * 0.42, fontSize * 1.5);
   const tailBase = clamp(head.x, x + fontSize * 1.4, x + boxW - fontSize * 1.4);
   const tailTip = speechBubbleTailTip(head, x + boxW / 2, y + boxH / 2, fontSize);
