@@ -24,6 +24,12 @@ body {
   overscroll-behavior: none;
 }
 
+@media (max-width: 700px) {
+  .main-section-page-header { flex-direction: row !important; align-items: center !important; }
+  .main-section-page-header > div:first-child { min-width: 0; }
+  .main-section-page-header p { display: none; }
+}
+
 body {
   background: var(--background);
   color: var(--foreground);

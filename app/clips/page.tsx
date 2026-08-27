@@ -8,6 +8,7 @@ import { mergeTranscriptionChunks, TRANSCRIPTION_CHUNK_CONTEXT_SECONDS, TRANSCRI
 import { planLipSyncChunks } from "@/lib/character/lipsync";
 import { saveClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import type { ClipSuggestion } from "@/lib/clip-finder/selection";
+import { MainSectionNav } from "@/app/components/MainSectionNav";
 
 const MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 type Phase = "idle" | "preparing" | "transcribing" | "analyzing" | "done" | "error";
@@ -71,7 +72,7 @@ export default function ClipsPage() {
   }
   const active = clips.filter((clip) => !clip.dismissed); const elapsed = startedAt ? Math.floor((now - startedAt) / 1000) : 0;
   return <main className={styles.page}><div className={styles.shell}>
-    <header className={styles.header}><div><h1 className={styles.title}>Clip Finder</h1><p className={styles.sub}>Upload a full podcast, find the moments that stand alone, trim them precisely, then build a Neural Board video. Audio stays in your browser except for ~60-second transcription chunks.</p></div><a className={styles.link} href="/board2">← Board 2</a></header>
+    <header className={`${styles.header} main-section-page-header`}><div><h1 className={styles.title}>Clip Finder</h1><p className={styles.sub}>Upload a full podcast, find the moments that stand alone, trim them precisely, then build a Neural Board video. Audio stays in your browser except for ~60-second transcription chunks.</p></div><MainSectionNav active="clips" /></header>
     <section className={styles.drop}><input ref={inputRef} hidden type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/x-m4a,.mp3,.wav,.m4a" onChange={(e) => { const chosen = e.target.files?.[0]; e.target.value = ""; if (chosen) void handleFile(chosen); }} /><button className={styles.button} onClick={() => inputRef.current?.click()}>Choose podcast audio</button><p>{file ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB` : "MP3, WAV, or M4A · up to 1.5 GiB"}</p></section>
     {phase !== "idle" && <section className={styles.progress}><div className={styles.progressTop}><span>{detail || error}</span><span>{elapsed}s elapsed</span></div><div className={styles.track}><div className={styles.fill} style={{ width: `${percent}%` }} /></div><div className={styles.controls}>{(phase === "preparing" || phase === "transcribing" || phase === "analyzing") && <button className={`${styles.fine} ${styles.danger}`} onClick={() => controllerRef.current?.abort()}>Cancel</button>}{transcription && phase !== "preparing" && phase !== "transcribing" && phase !== "analyzing" && <button className={styles.fine} onClick={() => void reanalyze()}>Re-analyze cached transcript</button>}</div>{error && <p style={{color:"#a32916"}}>{error}</p>}</section>}
     <section className={styles.cards}>{active.map((clip) => <ClipCard key={clip.id} clip={clip} duration={buffer?.duration ?? 0} peaks={peaks} sourceUrl={sourceUrl} transcript={transcription?.segments ?? []} onChange={(patch) => updateClip(clip.id, patch)} onDismiss={() => updateClip(clip.id, { dismissed: true })} onBuild={() => void build(clip)} building={buildingId === clip.id} />)}</section>

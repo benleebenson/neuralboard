@@ -6,6 +6,7 @@ import rough from "roughjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ProGated } from "@/app/components/ProGated";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
+import { MainSectionNav } from "@/app/components/MainSectionNav";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
 import {
@@ -18339,6 +18340,11 @@ export default function Board2Page() {
 
               {mobileDrawer === "media" && (
                 <>
+                  <nav aria-label="Main sections" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 7, marginBottom: 14 }}>
+                    <a href="/board2" aria-current="page" style={{ ...sketchButton, padding: "9px 5px", fontSize: 10, textAlign: "center", textDecoration: "none", background: "#c8f135" }}>✎ Board</a>
+                    <a href="/clips" style={{ ...sketchButton, padding: "9px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>✂ Clips</a>
+                    <a href="/board2/library" style={{ ...sketchButton, padding: "9px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>▦ Library</a>
+                  </nav>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     <label style={{ ...sketchButton, position: "relative", display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box", overflow: "hidden" }}>
@@ -19782,8 +19788,7 @@ export default function Board2Page() {
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => { setBoardMode(true); setAnnotationToolbarOpen(true); }} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Show only the editable board">⛶ Board Mode</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
-          <a href="/board2/library" style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, color: "#2a2a2a", textDecoration: "none" }}>▦ Library</a>
-          <span style={{ ...navLinkStyle, color: "#2a2a2a", fontWeight: 700 }}>Board</span>
+          <MainSectionNav active="board" desktopOnly />
           {session?.user ? (
             <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
           ) : (
@@ -19808,6 +19813,8 @@ export default function Board2Page() {
           <button onClick={() => { void exportBoardImage(); setMobileEditorMenuOpen(false); }} disabled={isExporting || isExportingBoardImage} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isExporting || isExportingBoardImage ? .45 : 1 }}>▣ Board image</button>
           <button onClick={() => setSnapshotIncludeCharacter((value) => !value)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: snapshotIncludeCharacter ? "#c8f135" : "#fffdf5" }}>{snapshotIncludeCharacter ? "✓ Character" : "○ Character"}</button>
           <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>▶ YouTube</button>
+          <a href="/board2" aria-current="page" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none", background: "#c8f135" }}>✎ Board</a>
+          <a href="/clips" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>✂ Clips</a>
           <a href="/board2/library" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>▦ Library</a>
           <button onClick={() => setMobileEditorMenuOpen(false)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>✕ Close</button>
         </div>
@@ -23697,13 +23704,6 @@ const headerStyle: React.CSSProperties = {
   borderBottom: "1.5px dashed #2a2a2a",
   background: "rgba(255,253,245,0.75)",
   flexShrink: 0,
-};
-
-const navLinkStyle: React.CSSProperties = {
-  fontSize: 11,
-  color: "#6a6a6a",
-  fontFamily: "monospace",
-  textDecoration: "none",
 };
 
 const panelLabelStyle: React.CSSProperties = {

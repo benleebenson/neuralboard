@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -11,6 +10,7 @@ import {
   supportsBoardDirectory,
   updateTrainingFlag,
 } from "@/lib/board-library";
+import { MainSectionNav } from "@/app/components/MainSectionNav";
 
 function formatDuration(seconds: number): string {
   const rounded = Math.max(0, Math.round(seconds));
@@ -94,8 +94,8 @@ export default function BoardLibraryPage() {
           <div style={{ fontSize: 11, letterSpacing: 2, textTransform: "uppercase", color: "#777" }}>Neuralboard</div>
           <h1 style={{ margin: "5px 0 0", fontFamily: "Georgia, serif", fontSize: 34 }}>Board Library</h1>
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
-          <Link href="/board2" style={buttonStyle}>← Editor</Link>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <MainSectionNav active="library" />
           <button onClick={chooseFolder} style={{ ...buttonStyle, background: "#c8f135" }}>{directory ? "Change folder" : "Choose boards folder"}</button>
         </div>
       </header>
