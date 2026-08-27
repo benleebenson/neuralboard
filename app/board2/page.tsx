@@ -16,6 +16,7 @@ import {
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
+import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import {
   selectStyleExemplars,
   STYLE_EXEMPLAR_TOKEN_BUDGET,
@@ -5313,6 +5314,7 @@ export default function Board2Page() {
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
   const autoBuildAbortRef = useRef<AbortController | null>(null);
+  const clipImportStartedRef = useRef(false);
   const outroImageRef = useRef<ConfiguredOutroImage | null>(null);
   const outroTextRef = useRef(DEFAULT_OUTRO_TEXT);
   const outroSettingsSaveTimerRef = useRef<number | null>(null);
@@ -9425,9 +9427,9 @@ export default function Board2Page() {
     if (previous?.url.startsWith("blob:")) URL.revokeObjectURL(previous.url);
   }
 
-  async function autoBuildFromNarration() {
+  async function autoBuildFromNarration(supplied?: { narrationClips: Clip[]; transcription: ClipBoardHandoff }) {
     if (autoBuildPhase || autoBuildProgressRef.current?.status === "running") return;
-    const narrationClips = clipsRef.current
+    const narrationClips = (supplied?.narrationClips ?? clipsRef.current)
       .filter((clip) => clip.type === "narration")
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
     if (!narrationClips.length) {
@@ -9505,12 +9507,18 @@ export default function Board2Page() {
       const narrationStart = narrationClips[0].startTime;
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
       const compiledDuration = Math.max(0.1, narrationEnd - narrationStart);
-      const audio = await compileNarrationToBlob(narrationClips);
-      controller.signal.throwIfAborted();
-      reportProgress("transcribing", "Transcribing narration…", 0, 1);
-      const transcriptData = await transcribeAudioBlob(audio, "narration.wav", (current, total) => {
-        reportProgress("transcribing", `Transcribing narration… (chunk ${current}/${total})`, Math.max(0, current - 1), total);
-      }, controller.signal);
+      const transcriptData = supplied ? {
+        transcript: supplied.transcription.transcript,
+        durationSec: supplied.transcription.durationSec,
+        segments: supplied.transcription.segments,
+      } : await (async () => {
+        const audio = await compileNarrationToBlob(narrationClips);
+        controller.signal.throwIfAborted();
+        reportProgress("transcribing", "Transcribing narration…", 0, 1);
+        return transcribeAudioBlob(audio, "narration.wav", (current, total) => {
+          reportProgress("transcribing", `Transcribing narration… (chunk ${current}/${total})`, Math.max(0, current - 1), total);
+        }, controller.signal);
+      })();
       const transcript = transcriptData.transcript.trim();
       if (!transcript) throw new Error("No spoken narration was detected");
       let transcriptSegments: TranscriptSegment[] = Array.isArray(transcriptData.segments)
@@ -10096,6 +10104,33 @@ export default function Board2Page() {
       setAutoBuildPhase(null);
     }
   }
+
+  useEffect(() => {
+    if (clipImportStartedRef.current) return;
+    const id = new URLSearchParams(window.location.search).get("clipImport");
+    if (!id) return;
+    clipImportStartedRef.current = true;
+    void takeClipBoardHandoff(id).then(async (handoff) => {
+      if (!handoff) throw new Error("The Clip Finder handoff expired or was already opened");
+      const sourceUrl = URL.createObjectURL(handoff.audio);
+      const waveform = await generateNarrationWaveform(sourceUrl).catch(() => undefined);
+      const clip: Clip = {
+        id: generateId(), type: "narration", name: handoff.name.slice(0, 40), sourceUrl,
+        audioBlob: handoff.audio, startTime: 0, duration: handoff.durationSec, waveform,
+        transcriptSegments: handoff.segments,
+      };
+      clipsRef.current = [...clipsRef.current, clip];
+      setClips(clipsRef.current);
+      setToast("Clip imported — starting auto-build…");
+      window.history.replaceState({}, "", "/board2");
+      await autoBuildFromNarration({ narrationClips: [clip], transcription: handoff });
+    }).catch((error) => {
+      setAutoBuildError(error instanceof Error ? error.message : "Could not import the selected clip");
+      setToast("Clip import failed");
+    });
+  // This one-shot import intentionally runs only on initial mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function cancelAutoBuild() {
     const controller = autoBuildAbortRef.current ?? activeAutoBuildController;
