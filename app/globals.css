@@ -23,7 +23,6 @@ html,
 body {
   overscroll-behavior: none;
 }
-
 @media (max-width: 700px) {
   .main-section-page-header { flex-direction: row !important; align-items: center !important; }
   .main-section-page-header > div:first-child { min-width: 0; }
@@ -34,4 +33,24 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* next/image's fill geometry inside the hand-framed Public Board image cards. */
+[class*="imagePost"] > img {
+  inset: 12px 12px 56px !important;
+  width: calc(100% - 24px) !important;
+  height: calc(100% - 68px) !important;
+}
+
+[class*="imagePost"] > div:not([class*="postName"]) {
+  position: absolute;
+  z-index: 2;
+  left: 14px;
+  right: 14px;
+  bottom: 29px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  background: rgb(255 253 245 / 88%);
+  font: 14px "Patrick Hand", cursive;
 }

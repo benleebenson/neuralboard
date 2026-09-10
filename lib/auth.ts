@@ -1,8 +1,8 @@
 import { NextAuthOptions, Session } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import { upsertUser, getSubscriptionStatus } from "./supabase";
-
-export const ADMIN_EMAIL = "bbtvhq@gmail.com";
+import { ADMIN_EMAIL } from "./admin";
+export { ADMIN_EMAIL } from "./admin";
 
 export const authOptions: NextAuthOptions = {
   providers: [

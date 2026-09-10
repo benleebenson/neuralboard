@@ -3,12 +3,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import styles from "./clips.module.css";
+import projectStyles from "./project-save.module.css";
 import { audioBufferSegmentToMonoWav, waveformPeaks } from "@/lib/audio/browser-audio";
 import { mergeTranscriptionChunks, TRANSCRIPTION_CHUNK_CONTEXT_SECONDS, TRANSCRIPTION_CHUNK_SECONDS, type MergedTranscription, type TranscriptSegment, type TranscriptionChunk } from "@/lib/audio/transcription";
 import { planLipSyncChunks } from "@/lib/character/lipsync";
 import { saveClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import type { ClipSuggestion } from "@/lib/clip-finder/selection";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
+import { audioBufferSegmentToOpusWebm } from "@/lib/audio/clip-opus";
+import { cloudFetch, type CloudProject } from "@/lib/projects";
 
 const MAX_SOURCE_BYTES = 1536 * 1024 * 1024;
 type Phase = "idle" | "preparing" | "transcribing" | "analyzing" | "done" | "error";
@@ -30,6 +33,8 @@ export default function ClipsPage() {
   const [clips, setClips] = useState<ReviewClip[]>([]); const [phase, setPhase] = useState<Phase>("idle"); const [detail, setDetail] = useState(""); const [percent, setPercent] = useState(0); const [error, setError] = useState("");
   const [startedAt, setStartedAt] = useState(0); const [now, setNow] = useState(0); const [buildingId, setBuildingId] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
+  const [projects, setProjects] = useState<CloudProject[]>([]); const [projectId, setProjectId] = useState(""); const [projectName, setProjectName] = useState("");
+  const [savingProject, setSavingProject] = useState(false); const [savePercent, setSavePercent] = useState(0); const [cloudMessage, setCloudMessage] = useState("");
   const sourceUrlRef = useRef("");
   useEffect(() => { if (!startedAt || phase === "idle" || phase === "done" || phase === "error") return; const id = window.setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, [startedAt, phase]);
   useEffect(() => () => { if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current); }, []);
@@ -64,6 +69,27 @@ export default function ClipsPage() {
   }
 
   async function reanalyze() { if (!transcription) return; const controller = new AbortController(); controllerRef.current = controller; setStartedAt(Date.now()); setError(""); try { await analyze(transcription, controller.signal); } catch (e) { setError(e instanceof Error ? e.message : "Analysis failed"); setPhase("error"); } }
+  useEffect(() => { if (phase !== "done") return; void cloudFetch("/api/projects").then((response) => response.json()).then(setProjects).catch((e) => setCloudMessage(e instanceof Error ? e.message : "Could not load cloud projects")); }, [phase]);
+  async function saveToProject() {
+    if (!buffer || !transcription || !file || !active.length) return;
+    setSavingProject(true); setSavePercent(1); setCloudMessage("");
+    try {
+      let targetId = projectId;
+      if (!targetId) {
+        const name = projectName.trim(); if (!name) throw new Error("Name the new project or choose an existing one");
+        const created = await cloudFetch("/api/projects", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, sourceAudioName: file.name, sourceAudioType: file.type, sourceAudioSize: file.size, sourceAudioDuration: buffer.duration }) });
+        const project = await created.json() as CloudProject; targetId = project.id; setProjectId(project.id); setProjects((current) => [project, ...current]);
+      }
+      for (let index = 0; index < active.length; index++) {
+        const clip = active[index]; setCloudMessage(`Compressing clip ${index + 1}/${active.length}…`);
+        const audio = await audioBufferSegmentToOpusWebm(buffer, clip.startTime, clip.endTime - clip.startTime);
+        const form = new FormData(); form.append("audio", audio, `${clip.id}.webm`); form.append("title", clip.title); form.append("startTime", String(clip.startTime)); form.append("endTime", String(clip.endTime)); form.append("transcript", transcriptInRange(transcription.segments, clip.startTime, clip.endTime) || clip.transcript); form.append("reason", clip.reason);
+        setCloudMessage(`Uploading clip ${index + 1}/${active.length}…`); await cloudFetch(`/api/projects/${targetId}/clips`, { method: "POST", body: form }); setSavePercent(Math.round((index + 1) / active.length * 100));
+      }
+      setCloudMessage(`Saved ${active.length} clip${active.length === 1 ? "" : "s"} to the project.`);
+    } catch (e) { setCloudMessage(`${e instanceof Error ? e.message : "Project upload failed"}. Local results are still here.`); }
+    finally { setSavingProject(false); }
+  }
   function updateClip(id: string, patch: Partial<ReviewClip>) { setClips((current) => current.map((clip) => clip.id === id ? { ...clip, ...patch } : clip)); }
   async function build(clip: ReviewClip) {
     if (!buffer || !transcription) return; setBuildingId(clip.id);
@@ -75,6 +101,7 @@ export default function ClipsPage() {
     <header className={`${styles.header} main-section-page-header`}><div><h1 className={styles.title}>Clip Finder</h1><p className={styles.sub}>Upload a full podcast, find the moments that stand alone, trim them precisely, then build a Neural Board video. Audio stays in your browser except for ~60-second transcription chunks.</p></div><MainSectionNav active="clips" /></header>
     <section className={styles.drop}><input ref={inputRef} hidden type="file" accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/x-m4a,.mp3,.wav,.m4a" onChange={(e) => { const chosen = e.target.files?.[0]; e.target.value = ""; if (chosen) void handleFile(chosen); }} /><button className={styles.button} onClick={() => inputRef.current?.click()}>Choose podcast audio</button><p>{file ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} MB` : "MP3, WAV, or M4A · up to 1.5 GiB"}</p></section>
     {phase !== "idle" && <section className={styles.progress}><div className={styles.progressTop}><span>{detail || error}</span><span>{elapsed}s elapsed</span></div><div className={styles.track}><div className={styles.fill} style={{ width: `${percent}%` }} /></div><div className={styles.controls}>{(phase === "preparing" || phase === "transcribing" || phase === "analyzing") && <button className={`${styles.fine} ${styles.danger}`} onClick={() => controllerRef.current?.abort()}>Cancel</button>}{transcription && phase !== "preparing" && phase !== "transcribing" && phase !== "analyzing" && <button className={styles.fine} onClick={() => void reanalyze()}>Re-analyze cached transcript</button>}</div>{error && <p style={{color:"#a32916"}}>{error}</p>}</section>}
+    {phase === "done" && active.length > 0 && <section className={projectStyles.box}><h2>Save clips to a cloud project</h2><p>Keep the local analysis here, and sync compressed clip audio and transcripts across devices.</p><div className={projectStyles.fields}><select value={projectId} onChange={(e) => setProjectId(e.target.value)} disabled={savingProject}><option value="">New project…</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>{!projectId && <input value={projectName} onChange={(e) => setProjectName(e.target.value)} placeholder="Project name, e.g. Marcus A episode" maxLength={160}/>}<button className={styles.button} disabled={savingProject} onClick={() => void saveToProject()}>{savingProject ? "Saving…" : `Save ${active.length} clips`}</button></div>{(savingProject || savePercent > 0) && <div className={styles.track}><div className={styles.fill} style={{ width: `${savePercent}%` }} /></div>}{cloudMessage && <p className={projectStyles.message}>{cloudMessage}</p>}</section>}
     <section className={styles.cards}>{active.map((clip) => <ClipCard key={clip.id} clip={clip} duration={buffer?.duration ?? 0} peaks={peaks} sourceUrl={sourceUrl} transcript={transcription?.segments ?? []} onChange={(patch) => updateClip(clip.id, patch)} onDismiss={() => updateClip(clip.id, { dismissed: true })} onBuild={() => void build(clip)} building={buildingId === clip.id} />)}</section>
     {phase === "done" && !active.length && <p className={styles.empty}>No clips remain. Re-analyze to restore suggestions.</p>}
   </div></main>;

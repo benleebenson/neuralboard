@@ -7,4 +7,5 @@
 .trigger{width:34px;height:34px;padding:0;border:1.5px solid #2a2a2a;background:#fffdf5;color:#2a2a2a;box-shadow:2px 2px 0 #2a2a2a;font:800 17px/1 var(--font-geist-mono),monospace;cursor:pointer}
 .menu{position:absolute;right:0;top:calc(100% + 7px);z-index:300;display:grid;min-width:170px;padding:7px;gap:5px;border:2px solid #2a2a2a;border-radius:7px;background:#fffdf5;box-shadow:3px 3px 0 #2a2a2a}
 .menu .link{padding:10px 11px;font-size:12px}
+.badge{display:grid;place-items:center;min-width:17px;height:17px;padding:0 4px;border-radius:99px;background:#cc2200;color:white;font-size:9px}.moderate{position:absolute;right:0;top:calc(100% + 8px);font:10px var(--font-geist-mono),monospace;color:#9f1d0d;white-space:nowrap}
 @media(max-width:767px),(pointer:coarse){.desktop{display:none}.mobile{display:block}.desktopOnly{display:none}}

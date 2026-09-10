@@ -18,6 +18,8 @@ import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
+import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
+import { layoutUploadedImageBatch } from "@/lib/board2/batch-media-layout";
 import {
   selectStyleExemplars,
   STYLE_EXEMPLAR_TOKEN_BUDGET,
@@ -4995,8 +4997,6 @@ export default function Board2Page() {
   // ── Mobile ──
   const [isMobile, setIsMobile] = useState(false);
   const [isPortrait, setIsPortrait] = useState(false);
-  const [boardMode, setBoardMode] = useState(false);
-  const boardModeInitializedRef = useRef(false);
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
   const [mobileEditorMenuOpen, setMobileEditorMenuOpen] = useState(false);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
@@ -5586,6 +5586,19 @@ export default function Board2Page() {
     const minY = Math.min(...placed.map((c) => c.boardY!));
     const maxY = Math.max(...placed.map((c) => c.boardY! + c.boardH!));
     return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  }, []);
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("projectImages");
+    if (!id) return;
+    void takeProjectImageHandoff(id).then(async (images) => {
+      if (!images.length) throw new Error("The project image handoff expired or was already opened");
+      for (const image of images) await ingestMediaFile(image.blob, image.name);
+      window.history.replaceState({}, "", "/board2");
+      setToast(`${images.length} project image${images.length === 1 ? "" : "s"} placed on the board`);
+    }).catch((error) => setToast(error instanceof Error ? error.message : "Could not import project images"));
+  // This one-shot import intentionally runs only on initial mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const livePoseFor = useCallback((id: CharacterId, wallMs = performance.now()): CharPoseResult => {
@@ -6631,18 +6644,6 @@ export default function Board2Page() {
       const mobile = window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches;
       setIsMobile(mobile);
       setIsPortrait(window.innerHeight > window.innerWidth);
-      if (!boardModeInitializedRef.current) {
-        boardModeInitializedRef.current = true;
-        if (mobile) {
-          setMobileDesktopOverride(true);
-          setBoardMode(true);
-          setAnnotationToolbarOpen(true);
-          // iPadOS commonly identifies itself as Macintosh while exposing multi-touch.
-          const ipad = /iPad/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
-          setStylusOnly(ipad);
-          stylusOnlyRef.current = ipad;
-        }
-      }
     };
     check();
     window.addEventListener("resize", check);
@@ -10865,7 +10866,45 @@ export default function Board2Page() {
   async function handleMediaUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? []);
     e.target.value = "";
-    for (const file of files) {
+    e.currentTarget.blur();
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+    const otherFiles = files.filter((file) => !file.type.startsWith("image/"));
+    if (imageFiles.length > 1) {
+      setToast(`Preparing ${imageFiles.length} images…`);
+      const items: MediaItem[] = [];
+      for (let offset = 0; offset < imageFiles.length; offset += 4) {
+        const group = imageFiles.slice(offset, offset + 4);
+        const decoded = await Promise.all(group.map(async (file) => {
+          const url = URL.createObjectURL(file);
+          await decodeImageForPlacement(url);
+          return { id: generateId(), name: file.name, type: "image" as const, url, blob: file };
+        }));
+        items.push(...decoded);
+        setToast(`Preparing images… ${Math.min(offset + group.length, imageFiles.length)}/${imageFiles.length}`);
+      }
+      const sizes = items.map((item) => {
+        const natural = getMediaDimensions(item.url, "image");
+        const fitted = fitMediaDimensions(natural.w, natural.h, 520, 390);
+        return { id: item.id, width: fitted.w, height: fitted.h };
+      });
+      const existingBottom = clipsRef.current.reduce((bottom, clip) => clip.boardY !== undefined && clip.boardH !== undefined ? Math.max(bottom, clip.boardY + clip.boardH) : bottom, 0);
+      const layout = layoutUploadedImageBatch({ images: sizes, boardWidth: boardDimensionsRef.current.width, boardHeight: boardDimensionsRef.current.height, existingBottom });
+      const itemById = new Map(items.map((item) => [item.id, item]));
+      const newClips: Clip[] = layout.placements.map((placement) => {
+        const item = itemById.get(placement.id)!;
+        return { id: item.id, mediaId: item.id, featured: false, type: "image", name: item.name, sourceUrl: item.url, sourceBlob: item.blob, startTime: 0, duration: 4, layer: 1, boardX: placement.x, boardY: placement.y, boardW: placement.width, boardH: placement.height, source: "manual" };
+      });
+      boardDimensionsRef.current = { width: layout.boardWidth, height: layout.boardHeight };
+      setBoardDimensions(boardDimensionsRef.current);
+      setMediaLibrary((current) => [...current, ...items]);
+      setClips((current) => [...current, ...newClips]);
+      clipsRef.current = [...clipsRef.current, ...newClips];
+      setClipSelection(newClips.map((clip) => clip.id));
+      setToast(`${newClips.length} images arranged on the board`);
+    } else if (imageFiles[0]) {
+      await ingestMediaFile(imageFiles[0], imageFiles[0].name);
+    }
+    for (const file of otherFiles) {
       await ingestMediaFile(file, file.name);
     }
   }
@@ -16805,8 +16844,10 @@ export default function Board2Page() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-	      const tag = (e.target as HTMLElement).tagName;
-	      const inInput = tag === "INPUT" || tag === "TEXTAREA";
+	      const target = e.target as HTMLElement;
+	      const tag = target.tagName;
+	      const inputType = target instanceof HTMLInputElement ? target.type : "";
+	      const inInput = tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable || (tag === "INPUT" && !["file", "button", "checkbox", "radio", "range"].includes(inputType));
 	      if (playModeRef.current && !inInput) {
           if (e.code === "Escape" && pendingMediaPlacementsRef.current.length > 0) {
             e.preventDefault();
@@ -17178,7 +17219,7 @@ export default function Board2Page() {
     if (g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
       if (g.hitClipId) {
         setClipSelection([g.hitClipId]);
-        if (!boardMode) setMobileDrawer("props");
+        setMobileDrawer("props");
       } else if (g.hitAnnotationId) {
         setAnnotationSelection([g.hitAnnotationId]);
       } else {
@@ -19710,7 +19751,7 @@ export default function Board2Page() {
   }
 
   return (
-    <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: boardMode ? "100dvh" : pageStyle.height, minHeight: boardMode ? "100dvh" : pageStyle.minHeight }}>
+    <div data-board2-exporting={isExporting || undefined} style={pageStyle}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
@@ -19733,7 +19774,7 @@ export default function Board2Page() {
       )}
 
       {/* ── Header ── */}
-      <header style={{ ...headerStyle, display: boardMode ? "none" : headerStyle.display, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
+      <header style={{ ...headerStyle, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
           {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
@@ -19741,7 +19782,6 @@ export default function Board2Page() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
           {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
-          {isMobile && <button onClick={() => { setBoardMode(true); setAnnotationToolbarOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...miniButton, minWidth: isPortrait ? 70 : 58, height: isPortrait ? 36 : 28, padding: "0 6px", background: "#fffdf5", fontSize: isPortrait ? 9 : 8 }}>⛶ Board</button>}
           {!isMobile && <>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
@@ -19786,7 +19826,6 @@ export default function Board2Page() {
             </ProGated>
           )}
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
-          <button onClick={() => { setBoardMode(true); setAnnotationToolbarOpen(true); }} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Show only the editable board">⛶ Board Mode</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <MainSectionNav active="board" desktopOnly />
           {session?.user ? (
@@ -19803,7 +19842,7 @@ export default function Board2Page() {
         </div>
       </header>
 
-      {isMobile && !boardMode && mobileEditorMenuOpen && (
+      {isMobile && mobileEditorMenuOpen && (
         <div style={{ position: "fixed", top: isPortrait ? "calc(max(44px, env(safe-area-inset-top) + 44px))" : "calc(max(34px, env(safe-area-inset-top) + 34px))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
@@ -19827,7 +19866,7 @@ export default function Board2Page() {
         <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
-          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode || isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <label style={{ ...sketchButton, position: "relative", display: "block", textAlign: "center", boxSizing: "border-box", overflow: "hidden" }}>
               ↑ Upload media
@@ -20089,7 +20128,7 @@ export default function Board2Page() {
               data-board-drop-target
               data-board-drop-active={isBoardDropActive ? "true" : undefined}
               style={{
-                position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: boardMode || isMobile ? "none" : undefined,
+                position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: isMobile ? "none" : undefined,
                 boxShadow: isBoardDropActive
                   ? "inset 0 0 0 3px rgba(46,143,255,.8), inset 0 0 0 9999px rgba(46,143,255,.06)"
                   : undefined,
@@ -20101,26 +20140,11 @@ export default function Board2Page() {
               onDragEnd={resetBoardDropIndicator}
               onDrop={(e) => { void handleBoardFileDrop(e); }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
-              onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
-              onPointerMove={boardMode || isMobile ? handleMobileBoardPointerMove : undefined}
-              onPointerUp={boardMode || isMobile ? handleMobileBoardPointerUp : undefined}
-              onPointerCancel={boardMode || isMobile ? handleMobileBoardPointerUp : undefined}
+              onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
+              onPointerMove={isMobile ? handleMobileBoardPointerMove : undefined}
+              onPointerUp={isMobile ? handleMobileBoardPointerUp : undefined}
+              onPointerCancel={isMobile ? handleMobileBoardPointerUp : undefined}
             >
-              {boardMode && <button type="button" aria-label="Exit Board Mode" onClick={() => setBoardMode(false)} style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", right: "max(10px, env(safe-area-inset-right))", zIndex: 100, width: 48, height: 48, border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.94)", fontSize: 20, touchAction: "manipulation" }}>✕</button>}
-              {boardMode && (
-                <div style={{ position: "fixed", top: "max(10px, env(safe-area-inset-top))", left: "max(10px, env(safe-area-inset-left))", zIndex: 100 }}>
-                  {renderCustomZoomControls(true)}
-                </div>
-              )}
-              {boardMode && <canvas ref={penOverlayRef} aria-hidden="true" style={{ position: "absolute", inset: 0, zIndex: 95, pointerEvents: "none" }} />}
-              {boardMode && mobileLongPressClipId && (
-                <div onPointerDown={(e) => e.stopPropagation()} onClick={() => setMobileLongPressClipId(null)} style={{ position: "fixed", inset: 0, zIndex: 120, background: "rgba(0,0,0,.25)", display: "flex", alignItems: "flex-end", justifyContent: "center", padding: "16px max(16px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))" }}>
-                  <div onClick={(e) => e.stopPropagation()} style={{ width: "min(420px, 100%)", background: "#fffdf5", border: "2px solid #2a2a2a", borderRadius: 12, overflow: "hidden", boxShadow: "4px 4px 0 #2a2a2a" }}>
-                    <button type="button" onClick={() => { const id = mobileLongPressClipId; setClips((prev) => { const target = prev.find((clip) => clip.id === id); return target ? [...prev.filter((clip) => clip.id !== id), target] : prev; }); setMobileLongPressClipId(null); }} style={{ width: "100%", minHeight: 54, border: 0, borderBottom: "1px solid rgba(42,42,42,.15)", background: "transparent", fontFamily: "monospace", fontSize: 14 }}>Bring forward</button>
-                    <button type="button" onClick={() => { deleteBoardMedia(mobileLongPressClipId); setMobileLongPressClipId(null); }} style={{ width: "100%", minHeight: 54, border: 0, background: "transparent", color: "#cc2200", fontFamily: "monospace", fontSize: 14 }}>Delete from board…</button>
-                  </div>
-                </div>
-              )}
               {pendingMediaPlacement && (
                 <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
                   <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
@@ -20139,7 +20163,7 @@ export default function Board2Page() {
                   border: "1.5px solid #2a2a2a",
                   boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
                 }}
-                onPointerDown={(e) => { if (boardMode || (isMobile && e.pointerType !== "mouse")) handleMobileBoardPointerDown(e); else handleBoardSurfacePointerDown(e); }}
+                onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else handleBoardSurfacePointerDown(e); }}
               >
                 {boardMarquee && (() => {
                   const x = Math.min(boardMarquee.startX, boardMarquee.currentX) * boardZoom;
@@ -20172,7 +20196,7 @@ export default function Board2Page() {
                         pointerEvents: clip.type === "customZoom" ? "none" : undefined,
                         zIndex: clip.type === "customZoom" ? 0 : 1,
                       }}
-                      onPointerDown={(e) => { if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
+                      onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
                         {clip.needsRedownload ? (
@@ -20219,7 +20243,7 @@ export default function Board2Page() {
                                 edge === "bottom" ? { left: 0, right: 0, bottom: -6, height: 12 } :
                                                     { top: 0, bottom: 0, left: -6, width: 12 }),
                           }}
-                          onPointerDown={(e) => { if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
+                          onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                         />
                       ))}
                       {isSel && (["nw", "ne", "sw", "se"] as const).map((corner) => (
@@ -20227,16 +20251,16 @@ export default function Board2Page() {
                           key={corner}
                           style={{
                             position: "absolute",
-                            width: boardMode ? 44 : BOARD_RESIZE_PX,
-                            height: boardMode ? 44 : BOARD_RESIZE_PX,
+                            width: BOARD_RESIZE_PX,
+                            height: BOARD_RESIZE_PX,
                             background: "#ff5e3a",
                             border: "1.5px solid #fff",
                             cursor: (corner === "nw" || corner === "se") ? "nwse-resize" : "nesw-resize",
                             zIndex: 10,
-                            ...(corner === "nw" ? { left: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), top: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
-                                corner === "ne" ? { right: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), top: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
-                                corner === "sw" ? { left: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), bottom: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) } :
-                                                 { right: -(boardMode ? 22 : BOARD_RESIZE_PX / 2), bottom: -(boardMode ? 22 : BOARD_RESIZE_PX / 2) }),
+                            ...(corner === "nw" ? { left: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
+                                corner === "ne" ? { right: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
+                                corner === "sw" ? { left: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 } :
+                                                 { right: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 }),
                           }}
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
@@ -20248,7 +20272,7 @@ export default function Board2Page() {
                           title="Delete from board"
                           onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => { e.stopPropagation(); deleteBoardMedia(clip.id); }}
-                          style={{ position: "absolute", left: "50%", top: boardMode || isMobile ? -52 : -30, transform: "translateX(-50%)", width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: boardMode || isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                          style={{ position: "absolute", left: "50%", top: isMobile ? -52 : -30, transform: "translateX(-50%)", width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
                         >✕</button>
                       )}
                     </div>
@@ -20457,7 +20481,7 @@ export default function Board2Page() {
                       }}
                       onPointerDown={(e) => {
                         if (annotationTool !== "pointer") return;
-                        if ((boardMode || isMobile) && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>);
+                        if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>);
                         else handleAnnotationPointerDown(e, ann);
                       }}
                     >
@@ -20556,7 +20580,7 @@ export default function Board2Page() {
                           title="Delete annotation"
                           onPointerDown={(e) => e.stopPropagation()}
                           onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
-                          style={{ position: "absolute", left: "50%", top: boardMode || isMobile ? -52 : -30, transform: "translateX(-50%)", width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: boardMode || isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                          style={{ position: "absolute", left: "50%", top: isMobile ? -52 : -30, transform: "translateX(-50%)", width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
                         >✕</button>
                       )}
                     </div>
@@ -20566,7 +20590,7 @@ export default function Board2Page() {
                 {/* Glass pane — captures all pointer events for annotation drawing */}
                 {annotationTool !== "pointer" && !isSpaceDown && !editingAnnotationId && (
                   <div
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair", touchAction: boardMode ? "none" : undefined }}
+                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair" }}
                     onPointerDown={handleAnnotationGlassPointerDown}
                   />
                 )}
@@ -20609,7 +20633,7 @@ export default function Board2Page() {
               </div>
 
               {/* Annotation toolbar — collapsible, Pro gated */}
-              <div style={{ position: "absolute", top: boardMode ? "max(8px, env(safe-area-inset-top))" : 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: boardMode || isMobile ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
+              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: isMobile ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
                 <ProGated featureName="Annotation tools">
                   <>
                     <button
@@ -20623,7 +20647,7 @@ export default function Board2Page() {
                       }}
                       style={{
                         fontFamily: "monospace", fontSize: 10, fontWeight: 700,
-                        padding: boardMode || isMobile ? "10px 14px" : "5px 12px", minHeight: boardMode || isMobile ? 44 : undefined, border: "1.5px solid #2a2a2a",
+                        padding: isMobile ? "10px 14px" : "5px 12px", minHeight: isMobile ? 44 : undefined, border: "1.5px solid #2a2a2a",
                         background: annotationToolbarOpen ? "#2a2a2a" : "#fffdf5",
                         color: annotationToolbarOpen ? "#c8f135" : "#2a2a2a",
                         cursor: "pointer", boxShadow: "2px 2px 4px rgba(0,0,0,0.18)",
@@ -20638,11 +20662,11 @@ export default function Board2Page() {
                         background: "#fffdf5",
                         border: "1.5px solid #2a2a2a",
                         boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
-                        padding: boardMode || isMobile ? "6px 8px" : "4px 8px",
+                        padding: isMobile ? "6px 8px" : "4px 8px",
                         whiteSpace: "nowrap",
                         position: "relative",
-                        maxWidth: boardMode || isMobile ? "100%" : undefined,
-                        overflowX: boardMode || isMobile ? "auto" : undefined,
+                        maxWidth: isMobile ? "100%" : undefined,
+                        overflowX: isMobile ? "auto" : undefined,
                       }}>
                         {/* Tool buttons */}
                         {([
@@ -20666,7 +20690,7 @@ export default function Board2Page() {
                               else setEmojiPickerOpen(false);
                             }}
                             style={{
-                              width: boardMode || isMobile ? 44 : 28, height: boardMode || isMobile ? 44 : 28, minWidth: boardMode || isMobile ? 44 : undefined, border: "none", padding: 0,
+                              width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, minWidth: isMobile ? 44 : undefined, border: "none", padding: 0,
                               outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
                               background: annotationTool === id ? "#2a2a2a" : "transparent",
                               color: annotationTool === id ? "#fff" : "#2a2a2a",
@@ -20683,11 +20707,11 @@ export default function Board2Page() {
                           <>
                             <div style={{ width: 1, height: 28, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
                             {(["marker", "pen", "fine"] as const).map((preset) => (
-                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 48 : 38, minHeight: boardMode || isMobile ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
+                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: isMobile ? 48 : 38, minHeight: isMobile ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
                             ))}
-                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 72 : 58, minHeight: boardMode || isMobile ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
-                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: boardMode || isMobile ? 48 : 34, minHeight: boardMode || isMobile ? 44 : 28 }} title="Undo last stroke">↶</button>
-                            <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: boardMode ? 58 : 42, minHeight: boardMode ? 44 : 28, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
+                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: isMobile ? 72 : 58, minHeight: isMobile ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
+                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: isMobile ? 48 : 34, minHeight: isMobile ? 44 : 28 }} title="Undo last stroke">↶</button>
+                            <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: isMobile ? 58 : 42, minHeight: isMobile ? 44 : 28, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
                           </>
                         )}
 
@@ -21274,7 +21298,7 @@ export default function Board2Page() {
           </div>
 
           {/* ── Right: properties panel (no keyframes) ── */}
-          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: boardMode || isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <div style={panelLabelStyle}>Properties</div>
               <button
@@ -22294,7 +22318,7 @@ export default function Board2Page() {
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: boardMode ? "none" : "flex", flexDirection: "column" }}>
+        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
           <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 5 : 8, padding: isMobile ? "3px max(6px, env(safe-area-inset-left))" : "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap", overflowX: isMobile ? "auto" : "visible" }}>
