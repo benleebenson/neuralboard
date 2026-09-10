@@ -129,6 +129,7 @@ import {
   assertSingleActiveNarrationSource,
   exclusiveNarrationSegments,
   narrationResyncTarget,
+  narrationTimelineTimeFromMedia,
   shouldResumeNarrationPlayback,
 } from "@/lib/board2/narration-playback";
 import {
@@ -6287,7 +6288,8 @@ export default function Board2Page() {
   useEffect(() => { selectedClipIdsRef.current = selectedClipIds; }, [selectedClipIds]);
   useEffect(() => { selectedAnnotationIdsRef.current = selectedAnnotationIds; }, [selectedAnnotationIds]);
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
-  useEffect(() => { playheadRef.current = playhead; }, [playhead]);
+  // playheadRef is the authoritative playback clock. Every explicit seek updates state and this
+  // ref together; copying throttled React state back into it here would rewind live playback.
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => { previewVisibleRef.current = previewVisible; }, [previewVisible]);
   useEffect(() => {
@@ -8141,7 +8143,20 @@ export default function Board2Page() {
     const now = performance.now();
     if (lastRafTimeRef.current !== null) {
       const dt = (now - lastRafTimeRef.current) / 1000;
-      const next = playheadRef.current + dt;
+      const previous = playheadRef.current;
+      let next = previous + dt;
+      // Start/maintain narration at the wall-clock candidate, then let the audio element's media
+      // clock own the timeline while it is actually playing. This keeps the red line, blocks, and
+      // heard narration on one clock instead of allowing requestAnimationFrame drift.
+      syncNarrationAudioAtTime(next);
+      const narrationClip = activeNarrationClipAtTime(next);
+      const narrationElement = narrationClip ? activeNarrationRef.current.get(narrationClip.id) : null;
+      if (
+        narrationClip && narrationElement && !narrationElement.paused &&
+        !narrationElement.ended && !narrationElement.seeking && narrationElement.readyState >= 2
+      ) {
+        next = narrationTimelineTimeFromMedia(narrationClip, narrationElement.currentTime);
+      }
       const maxEnd = currentPlaybackDuration(clipsRef.current);
       if (next >= maxEnd) {
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
@@ -8171,7 +8186,8 @@ export default function Board2Page() {
     const t = playheadRef.current;
     evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
     // Narration has one owner at every timeline instant, including when duplicate clips overlap.
-    // This shared ownership rule also drives the export schedule below.
+    // This shared ownership rule also drives the export schedule below. The second sync handles a
+    // media-clock sample that crossed a clip boundary during this animation frame.
     syncNarrationAudioAtTime(t);
     if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
       lastEditorFrameTimeRef.current = now;
@@ -16944,7 +16960,6 @@ export default function Board2Page() {
         if (boardContainerRef.current) boardContainerRef.current.style.cursor = "grab";
         if (!inInput) {
           e.preventDefault();
-          if (!customZoomDrawModeRef.current && !e.repeat) togglePlay();
         }
         return;
       }

@@ -23,6 +23,18 @@ export type NarrationPlaybackSegment = {
   sourceOffsetSec: number;
 };
 
+/** Maps an HTMLAudioElement media clock back onto the board timeline. */
+export function narrationTimelineTimeFromMedia(
+  source: NarrationTimelineSource,
+  mediaTime: number,
+): number {
+  const startTime = Math.max(0, source.startTime);
+  const endTime = startTime + Math.max(0, source.duration);
+  if (!Number.isFinite(mediaTime)) return startTime;
+  const timelineTime = source.startTime + mediaTime - Math.max(0, source.sourceOffsetSec ?? 0);
+  return Math.min(endTime, Math.max(startTime, timelineTime));
+}
+
 /**
  * Continuous narration is positioned once when playback starts. During that uninterrupted run,
  * only resume a genuinely paused source; replaying an ended element restarts it from zero.
