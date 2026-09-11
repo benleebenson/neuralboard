@@ -4889,7 +4889,105 @@ function poseAllowsSpeechBubble(pose: CharPoseResult): boolean {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+type BoardWorkspaceStatus = {
+  id: string;
+  name: string;
+  isExporting: boolean;
+  exportProgress: number;
+  hasContent: boolean;
+};
+
+function createBoardWorkspace(index: number): BoardWorkspaceStatus {
+  return {
+    id: index === 1 ? "board-workspace-1" : `board-workspace-${Date.now()}-${index}`,
+    name: index === 1 ? "My Board" : `Board ${index}`,
+    isExporting: false,
+    exportProgress: 0,
+    hasContent: false,
+  };
+}
+
 export default function Board2Page() {
+  const nextWorkspaceIndexRef = useRef(2);
+  const [workspaces, setWorkspaces] = useState<BoardWorkspaceStatus[]>(() => [createBoardWorkspace(1)]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
+
+  const updateWorkspace = useCallback((status: BoardWorkspaceStatus) => {
+    setWorkspaces((current) => current.map((workspace) => {
+      if (workspace.id !== status.id) return workspace;
+      if (
+        workspace.name === status.name && workspace.isExporting === status.isExporting &&
+        workspace.exportProgress === status.exportProgress && workspace.hasContent === status.hasContent
+      ) return workspace;
+      return status;
+    }));
+  }, []);
+
+  const addWorkspace = useCallback(() => {
+    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++);
+    setWorkspaces((current) => [...current, next]);
+    setActiveWorkspaceId(next.id);
+  }, []);
+
+  const closeWorkspace = useCallback((workspaceId: string) => {
+    const closingIndex = workspaces.findIndex((workspace) => workspace.id === workspaceId);
+    const closing = workspaces[closingIndex];
+    if (!closing || closing.isExporting || workspaces.length === 1) return;
+    if (closing.hasContent && !window.confirm(`Close “${closing.name}”? Unsaved changes in this tab will be lost.`)) return;
+    const remaining = workspaces.filter((workspace) => workspace.id !== workspaceId);
+    setWorkspaces(remaining);
+    if (activeWorkspaceId === workspaceId) {
+      setActiveWorkspaceId(remaining[Math.min(closingIndex, remaining.length - 1)].id);
+    }
+  }, [activeWorkspaceId, workspaces]);
+
+  return (
+    <div style={{ height: "100dvh", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "#e8e2d5" }}>
+      <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
+        {workspaces.map((workspace) => {
+          const active = workspace.id === activeWorkspaceId;
+          const percent = Math.max(0, Math.min(100, Math.round(workspace.exportProgress * 100)));
+          return (
+            <div key={workspace.id} style={{ position: "relative", minWidth: 150, maxWidth: 230, display: "flex", alignItems: "center", border: "1.5px solid #2a2a2a", borderBottom: active ? "1.5px solid #fffdf5" : "1.5px solid #2a2a2a", background: active ? "#fffdf5" : "#eee8dc", transform: active ? "translateY(1.5px)" : undefined }}>
+              <button type="button" onClick={() => setActiveWorkspaceId(workspace.id)} title={workspace.name} style={{ minWidth: 0, flex: 1, height: "100%", padding: "0 8px", border: 0, background: "transparent", color: "#2a2a2a", cursor: "pointer", textAlign: "left", fontFamily: "monospace", fontSize: 10, fontWeight: active ? 800 : 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {workspace.isExporting ? `● Exporting ${percent}% · ` : ""}{workspace.name}
+              </button>
+              {workspaces.length > 1 && (
+                <button type="button" aria-label={`Close ${workspace.name}`} title={workspace.isExporting ? "An exporting board cannot be closed" : `Close ${workspace.name}`} disabled={workspace.isExporting} onClick={() => closeWorkspace(workspace.id)} style={{ width: 28, height: "100%", padding: 0, border: 0, background: "transparent", color: workspace.isExporting ? "#9a6500" : "#6a6a6a", cursor: workspace.isExporting ? "not-allowed" : "pointer", fontSize: 13 }}>×</button>
+              )}
+              {workspace.isExporting && <span aria-hidden="true" style={{ position: "absolute", left: 0, right: `${100 - percent}%`, bottom: 0, height: 2, background: "#7da300", pointerEvents: "none" }} />}
+            </div>
+          );
+        })}
+        <button type="button" onClick={addWorkspace} aria-label="Open a new board tab" title="New board" style={{ width: 34, minWidth: 34, border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 18 }}>+</button>
+      </nav>
+      <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
+        {workspaces.map((workspace) => (
+          <div key={workspace.id} aria-hidden={workspace.id !== activeWorkspaceId} style={{ position: "absolute", inset: 0, display: workspace.id === activeWorkspaceId ? "block" : "none" }}>
+            <Board2Editor
+              workspaceId={workspace.id}
+              isWorkspaceActive={workspace.id === activeWorkspaceId}
+              initialName={workspace.name}
+              onWorkspaceStatus={updateWorkspace}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Board2Editor({
+  workspaceId,
+  isWorkspaceActive,
+  initialName,
+  onWorkspaceStatus,
+}: {
+  workspaceId: string;
+  isWorkspaceActive: boolean;
+  initialName: string;
+  onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
+}) {
   const { data: session } = useSession();
 
   const [clips, setClips] = useState<Clip[]>([]);
@@ -5004,7 +5102,7 @@ export default function Board2Page() {
 
   // ── Save / Load ──
   const [saveModalOpen, setSaveModalOpen] = useState(false);
-  const [saveName, setSaveName] = useState("My Board");
+  const [saveName, setSaveName] = useState(initialName);
   const [isSaving, setIsSaving] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isExportingBoardData, setIsExportingBoardData] = useState(false);
@@ -6290,7 +6388,14 @@ export default function Board2Page() {
   useEffect(() => { mutedLayersRef.current = mutedLayers; }, [mutedLayers]);
   // playheadRef is the authoritative playback clock. Every explicit seek updates state and this
   // ref together; copying throttled React state back into it here would rewind live playback.
+  useEffect(() => {
+    onWorkspaceStatus({ id: workspaceId, name: saveName.trim() || "Untitled Board", isExporting, exportProgress, hasContent: clips.length > 0 || annotations.length > 0 });
+  }, [annotations.length, clips.length, exportProgress, isExporting, onWorkspaceStatus, saveName, workspaceId]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => {
+    if (isWorkspaceActive || !isPlayingRef.current) return;
+    seekEditorPlayback(playheadRef.current);
+  });
   useEffect(() => { previewVisibleRef.current = previewVisible; }, [previewVisible]);
   useEffect(() => {
     ambientVideoEnabledRef.current = ambientVideoEnabled;
@@ -6707,6 +6812,7 @@ export default function Board2Page() {
     };
     const tapCommands = new Set<LiveCommandKey>(["dance", "pullUps", "mirrorCheck", "sitAndWatch", "emote", "stop"]);
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!isWorkspaceActive) return;
       if (isTyping(e.target)) return;
       if (e.key === "1" || e.key === "2" || e.key === "Tab") {
         e.preventDefault();
@@ -6732,6 +6838,7 @@ export default function Board2Page() {
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
+      if (!isWorkspaceActive) return;
       if (isTyping(e.target)) return;
       const cmd = keyToCommand(e.key);
       if (cmd && liveHeldCommandRef.current === cmd) setLiveHeldCommand(null);
@@ -6742,7 +6849,7 @@ export default function Board2Page() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [liveControlEnabled, issueLiveAction, resetLiveRuntimeFor, toggleLiveCameraMode]);
+  }, [isWorkspaceActive, liveControlEnabled, issueLiveAction, resetLiveRuntimeFor, toggleLiveCameraMode]);
 
   useEffect(() => {
     if (!liveControlEnabled) {
@@ -8576,6 +8683,7 @@ export default function Board2Page() {
             imageHeight: h,
             boardWidth: boardDimensionsRef.current.width,
             boardHeight: boardDimensionsRef.current.height,
+            constrainToBoard: false,
           })
         : findBoardPosForNewMedia(prev, w, h);
       return [
@@ -16860,6 +16968,7 @@ export default function Board2Page() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+	      if (!isWorkspaceActive) return;
 	      const target = e.target as HTMLElement;
 	      const tag = target.tagName;
 	      const inputType = target instanceof HTMLInputElement ? target.type : "";
@@ -16997,6 +17106,7 @@ export default function Board2Page() {
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
+	      if (!isWorkspaceActive) return;
       playHeldKeysRef.current.delete(e.code);
       if (e.code === "Space") {
         isSpaceDownRef.current = false;
@@ -17018,6 +17128,7 @@ export default function Board2Page() {
   // Cmd/Ctrl+V after the user chooses "Copy image" in another browser tab.
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
+      if (!isWorkspaceActive) return;
       const tag = (e.target as HTMLElement)?.tagName;
       const inInput = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable;
       if (inInput) return;
@@ -18035,7 +18146,7 @@ export default function Board2Page() {
           data-board-drop-target
           data-board-drop-active={isBoardDropActive ? "true" : undefined}
           style={{
-            flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0,
+            flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0, background: BOARD_SURFACE_COLOR,
             boxShadow: isBoardDropActive
               ? "inset 0 0 0 3px rgba(46,143,255,.8), inset 0 0 0 9999px rgba(46,143,255,.06)"
               : undefined,
@@ -18051,7 +18162,7 @@ export default function Board2Page() {
           onPointerCancel={handleMobileBoardPointerUp}
         >
           {/* Board surface */}
-          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: boardDimensions.width * boardZoom, height: boardDimensions.height * boardZoom, background: BOARD_SURFACE_COLOR, border: "1.5px dashed rgba(42,42,42,0.2)" }}>
+          <div style={{ position: "absolute", left: boardPan.x, top: boardPan.y, width: boardDimensions.width * boardZoom, height: boardDimensions.height * boardZoom }}>
             {visibleBoardClips.map((clip) => {
               const isSel = clip.id === selectedClipId;
               return (
@@ -19766,7 +19877,7 @@ export default function Board2Page() {
   }
 
   return (
-    <div data-board2-exporting={isExporting || undefined} style={pageStyle}>
+    <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
@@ -20135,7 +20246,7 @@ export default function Board2Page() {
           </div>
 
           {/* ── Center: board (primary) + preview overlay ── */}
-          <div style={{ flex: 1, minWidth: 0, position: "relative", overflow: "hidden", background: "rgba(20,20,20,0.06)" }}>
+          <div style={{ flex: 1, minWidth: 0, position: "relative", overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
 
             {/* Board container — fills the whole center */}
             <div
@@ -20155,7 +20266,11 @@ export default function Board2Page() {
               onDragEnd={resetBoardDropIndicator}
               onDrop={(e) => { void handleBoardFileDrop(e); }}
               onPointerDownCapture={handleBoardPlacementPointerDownCapture}
-              onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else handleBoardPointerDown(e); }}
+              onPointerDown={(e) => {
+                if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e);
+                else if (isSpaceDownRef.current) handleBoardPointerDown(e);
+                else handleBoardSurfacePointerDown(e);
+              }}
               onPointerMove={isMobile ? handleMobileBoardPointerMove : undefined}
               onPointerUp={isMobile ? handleMobileBoardPointerUp : undefined}
               onPointerCancel={isMobile ? handleMobileBoardPointerUp : undefined}
@@ -20174,9 +20289,7 @@ export default function Board2Page() {
                   top: boardPan.y,
                   width: boardDimensions.width * boardZoom,
                   height: boardDimensions.height * boardZoom,
-                  background: BOARD_SURFACE_COLOR,
-                  border: "1.5px solid #2a2a2a",
-                  boxShadow: "4px 4px 18px rgba(42,42,42,0.3)",
+                  background: "transparent",
                 }}
                 onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else handleBoardSurfacePointerDown(e); }}
               >

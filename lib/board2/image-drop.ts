@@ -27,12 +27,16 @@ export function centeredBoardDropPosition(options: {
   imageHeight: number;
   boardWidth: number;
   boardHeight: number;
+  constrainToBoard?: boolean;
 }): { boardX: number; boardY: number } {
+  const boardX = options.dropX - options.imageWidth / 2;
+  const boardY = options.dropY - options.imageHeight / 2;
+  if (options.constrainToBoard === false) return { boardX, boardY };
   const maxX = Math.max(0, options.boardWidth - options.imageWidth);
   const maxY = Math.max(0, options.boardHeight - options.imageHeight);
   return {
-    boardX: Math.min(maxX, Math.max(0, options.dropX - options.imageWidth / 2)),
-    boardY: Math.min(maxY, Math.max(0, options.dropY - options.imageHeight / 2)),
+    boardX: Math.min(maxX, Math.max(0, boardX)),
+    boardY: Math.min(maxY, Math.max(0, boardY)),
   };
 }
 
