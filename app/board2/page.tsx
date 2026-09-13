@@ -291,12 +291,11 @@ type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | 
 const BOARD_TOUCH_DRAG_THRESHOLD_PX = 8;
 const BOARD_TOUCH_TAP_MAX_MS = 350;
 
-// Experimental only. The MediaRecorder path remains the production default until all three
-// deterministic-export regressions are fixed and verified end to end:
-// 1. the camera track is not sampled correctly per frame, producing a static camera;
-// 2. the encoded audio track is missing from the final mux;
-// 3. the save-picker writable-stream target can close with a 0-byte file.
-const DETERMINISTIC_EXPORT_ENABLED = process.env.NEXT_PUBLIC_DETERMINISTIC_EXPORT === "1";
+// Offline export is the production default. Every output frame is sampled from an explicit
+// timeline timestamp, so browser RAF throttling or a sleeping display can delay the job without
+// turning the delay into repeated frames or skipped camera keyframes. Keep the MediaRecorder path
+// as an explicit compatibility fallback for browsers without a usable WebCodecs implementation.
+const DETERMINISTIC_EXPORT_ENABLED = process.env.NEXT_PUBLIC_DETERMINISTIC_EXPORT !== "0";
 const EXPORT_BITRATE_OPTIONS_MBPS = [8, 12, 20, 32] as const;
 const DEFAULT_EXPORT_BITRATE_MBPS = 20;
 
@@ -12659,6 +12658,15 @@ function Board2Editor({
     };
   }
 
+  function clientToCustomZoomBoardPoint(clientX: number, clientY: number) {
+    const point = clientToBoardPoint(clientX, clientY);
+    const dimensions = boardDimensionsRef.current;
+    return {
+      x: clamp(point.x, 0, dimensions.width),
+      y: clamp(point.y, 0, dimensions.height),
+    };
+  }
+
   function rectsIntersect(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
     return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
   }
@@ -13340,7 +13348,7 @@ function Board2Editor({
       return;
     }
 
-    const start = clientToBoardPoint(e.clientX, e.clientY);
+    const start = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
     customZoomGestureRef.current = {
       type: "draw",
       pointerId: e.pointerId,
@@ -13391,7 +13399,7 @@ function Board2Editor({
       return;
     }
 
-    const point = clientToBoardPoint(e.clientX, e.clientY);
+    const point = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
     setCustomZoomDrawPreview({
       startX: gesture.startX,
       startY: gesture.startY,
@@ -13417,7 +13425,7 @@ function Board2Editor({
     setCustomZoomDrawPreview(null);
     if (!customZoomContinuousRef.current) disarmCustomZoomDrawMode();
     if (cancelled) return;
-    const end = clientToBoardPoint(e.clientX, e.clientY);
+    const end = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
     const minBX = Math.min(gesture.startX, end.x), maxBX = Math.max(gesture.startX, end.x);
     const minBY = Math.min(gesture.startY, end.y), maxBY = Math.max(gesture.startY, end.y);
     const bw = maxBX - minBX, bh = maxBY - minBY;
@@ -20727,8 +20735,19 @@ function Board2Editor({
                 {customZoomDrawMode && (
                   <div
                     aria-label="Custom Zoom drawing surface"
+                    data-custom-zoom-board-width={boardDimensions.width}
+                    data-custom-zoom-board-height={boardDimensions.height}
                     title="Drag to draw a zoom region · Space-drag or middle-drag to pan · Two fingers pan and pinch · Esc exits"
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: isSpaceDown ? "grab" : "crosshair", touchAction: "none" }}
+                    style={{
+                      position: "absolute",
+                      left: 0,
+                      top: 0,
+                      width: boardDimensions.width * boardZoom,
+                      height: boardDimensions.height * boardZoom,
+                      zIndex: 10,
+                      cursor: isSpaceDown ? "grab" : "crosshair",
+                      touchAction: "none",
+                    }}
                     onPointerDown={handleCustomZoomGlassPointerDown}
                     onPointerMove={handleCustomZoomGlassPointerMove}
                     onPointerUp={(event) => finishCustomZoomGlassPointer(event)}
