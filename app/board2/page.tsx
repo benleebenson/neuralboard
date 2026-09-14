@@ -513,6 +513,7 @@ type LibraryAsset = {
   source: string | null;
   created_at: string;
 };
+type ImageRegion = { label: string; x: number; y: number; width: number; height: number; note: string };
 type AutoNarrationImageSegment = TranscriptSegment & {
   query: string;
   reason?: string;
@@ -5074,6 +5075,13 @@ function Board2Editor({
   const [libraryFilter, setLibraryFilter] = useState<"all" | "image" | "youtube">("all");
   const [librarySearch, setLibrarySearch] = useState("");
   const [libraryLoadedOnce, setLibraryLoadedOnce] = useState(false);
+  const [smartPanClipId, setSmartPanClipId] = useState<string | null>(null);
+  const [smartPanLoading, setSmartPanLoading] = useState(false);
+  const [smartPanError, setSmartPanError] = useState<string | null>(null);
+  const [smartPanRegions, setSmartPanRegions] = useState<ImageRegion[]>([]);
+  const [smartPanStartIndex, setSmartPanStartIndex] = useState(0);
+  const [smartPanEndIndex, setSmartPanEndIndex] = useState(1);
+  const [smartPanUpgradeOpen, setSmartPanUpgradeOpen] = useState(false);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
   const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
@@ -18534,6 +18542,190 @@ function Board2Editor({
     );
   }
 
+  // Smart Pan: GPT-4o vision picks 2-4 semantic regions on a placed image, then a two-keyframe
+  // camera move is written directly into cameraKeyframes for that clip's time range — reusing the
+  // same rect-to-camera math characterFocus already applies to a whole clip (cameraForFocusRect),
+  // just applied to a sub-rect of the image instead.
+  async function analyzeImageRegions(imageUrl: string, narrativeContext?: string): Promise<ImageRegion[]> {
+    const res = await fetch("/api/board2/analyze-image-regions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageUrl, narrativeContext }),
+    });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => null) as { regions?: ImageRegion[] } | null;
+    return Array.isArray(data?.regions) ? data.regions : [];
+  }
+
+  // GPT-4o vision can't fetch a blob: URL (tab-scoped) — re-rasterize it as a data URL instead.
+  async function blobUrlToDataUrl(url: string): Promise<string> {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth || 1;
+    canvas.height = img.naturalHeight || 1;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Could not create canvas context");
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL("image/jpeg", 0.85);
+  }
+
+  async function resolveImageUrlForVision(clip: Clip): Promise<string> {
+    if (clip.sourceAttributionUrl?.startsWith("http")) return clip.sourceAttributionUrl;
+    if (clip.sourceUrl?.startsWith("http")) return clip.sourceUrl;
+    return blobUrlToDataUrl(clip.sourceUrl);
+  }
+
+  function requireProForSmartPan(): boolean {
+    if (!session?.user) { signIn("google", { callbackUrl: "/board2" }); return false; }
+    if (!isProUser) { setSmartPanUpgradeOpen(true); return false; }
+    return true;
+  }
+
+  async function handleSmartPanClick(clip: Clip) {
+    if (clip.type !== "image") return;
+    if (!requireProForSmartPan()) return;
+    setSmartPanClipId(clip.id);
+    setSmartPanLoading(true);
+    setSmartPanError(null);
+    setSmartPanRegions([]);
+    try {
+      const imageUrl = await resolveImageUrlForVision(clip);
+      const narrativeContext = clip.imagePlanReason ?? clip.searchQuery;
+      const regions = await analyzeImageRegions(imageUrl, narrativeContext);
+      if (regions.length < 2) {
+        setSmartPanError(regions.length ? "Only found one distinct region — need at least 2 to pan between." : "No distinct regions found in this image.");
+        return;
+      }
+      setSmartPanRegions(regions);
+      setSmartPanStartIndex(0);
+      setSmartPanEndIndex(1);
+    } catch (error) {
+      setSmartPanError(error instanceof Error ? error.message : "Image analysis failed");
+    } finally {
+      setSmartPanLoading(false);
+    }
+  }
+
+  function applySmartPan(clip: Clip, startRegion: ImageRegion, endRegion: ImageRegion) {
+    if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) {
+      setToast("This clip isn't placed on the board yet");
+      return;
+    }
+    const boardX = clip.boardX, boardY = clip.boardY, boardW = clip.boardW, boardH = clip.boardH;
+    const toBoardRect = (region: ImageRegion) => ({
+      x: boardX + region.x * boardW,
+      y: boardY + region.y * boardH,
+      width: Math.max(1, region.width * boardW),
+      height: Math.max(1, region.height * boardH),
+    });
+    const W = canvasWRef.current, H = canvasHRef.current, boardWidth = boardDimensionsRef.current.width;
+    const startCam = cameraForFocusRect(toBoardRect(startRegion), W, H, boardWidth);
+    const endCam = cameraForFocusRect(toBoardRect(endRegion), W, H, boardWidth);
+    const startTime = clip.startTime;
+    const endTime = clip.startTime + clip.duration;
+    setCameraKeyframes((prev) => {
+      // Drop any keyframes this clip already owned so re-running Smart Pan (or a different
+      // region pair) replaces them cleanly instead of layering on top.
+      const kept = prev.filter((kf) => kf.time <= startTime - 0.001 || kf.time >= endTime + 0.001);
+      const next = [
+        ...kept,
+        { ...startCam, time: startTime, easing: "ease-in-out" as const },
+        { ...endCam, time: endTime, easing: "ease-in-out" as const },
+      ].sort((a, b) => a.time - b.time);
+      cameraKeyframesRef.current = next;
+      return next;
+    });
+    drawFrameRef.current(playheadRef.current);
+    setToast(`Smart Pan applied: ${startRegion.label} → ${endRegion.label}`);
+    setSmartPanClipId(null);
+    setSmartPanRegions([]);
+  }
+
+  function closeSmartPanModal() {
+    setSmartPanClipId(null);
+    setSmartPanRegions([]);
+    setSmartPanError(null);
+    setSmartPanLoading(false);
+  }
+
+  function renderSmartPanModal() {
+    const clip = smartPanClipId ? clipsRef.current.find((c) => c.id === smartPanClipId) ?? null : null;
+    return (
+      <>
+        {smartPanClipId && (
+          <div
+            role="dialog"
+            aria-label="Smart Pan"
+            onClick={(event) => { if (event.target === event.currentTarget) closeSmartPanModal(); }}
+            style={{ position: "fixed", inset: 0, zIndex: 2100, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <div style={{ background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", width: 420, maxWidth: "92vw", fontFamily: "monospace", overflow: "hidden" }}>
+              <style>{`@keyframes nbsmartpanspin { to { transform: rotate(360deg); } }`}</style>
+              <div style={{ padding: "10px 16px", borderBottom: "1.5px solid #2a2a2a", display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>✨ SMART PAN</span>
+                <button onClick={closeSmartPanModal} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+              </div>
+              <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+                {smartPanLoading && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6a6a6a" }}>
+                    <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2px solid rgba(42,42,42,0.15)", borderTopColor: "#2a2a2a", animation: "nbsmartpanspin 0.8s linear infinite" }} />
+                    Analyzing image…
+                  </div>
+                )}
+                {smartPanError && (
+                  <div style={{ fontSize: 11, color: "#a32916", border: "1.5px solid #a32916", background: "#fff5f2", padding: 8 }}>✗ {smartPanError}</div>
+                )}
+                {!smartPanLoading && clip && smartPanRegions.length >= 2 && (
+                  <>
+                    <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.5 }}>
+                      Pan the camera across this image between two regions, timed to this clip ({formatClipMMSS(clip.startTime)}–{formatClipMMSS(clip.startTime + clip.duration)}).
+                    </div>
+                    <label>
+                      <div style={{ fontSize: 9, color: "#aaa", marginBottom: 3, textTransform: "uppercase", letterSpacing: 1 }}>From</div>
+                      <select
+                        value={smartPanStartIndex}
+                        onChange={(event) => setSmartPanStartIndex(Number(event.target.value))}
+                        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, padding: "6px 8px", border: "1.5px solid #2a2a2a" }}
+                      >
+                        {smartPanRegions.map((region, index) => <option key={index} value={index}>{region.label}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      <div style={{ fontSize: 9, color: "#aaa", marginBottom: 3, textTransform: "uppercase", letterSpacing: 1 }}>To</div>
+                      <select
+                        value={smartPanEndIndex}
+                        onChange={(event) => setSmartPanEndIndex(Number(event.target.value))}
+                        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, padding: "6px 8px", border: "1.5px solid #2a2a2a" }}
+                      >
+                        {smartPanRegions.map((region, index) => <option key={index} value={index}>{region.label}</option>)}
+                      </select>
+                    </label>
+                    {smartPanRegions[smartPanEndIndex]?.note && (
+                      <div style={{ fontSize: 9, color: "#6a6a6a", lineHeight: 1.4 }}>{smartPanRegions[smartPanEndIndex].note}</div>
+                    )}
+                    <button
+                      onClick={() => applySmartPan(clip, smartPanRegions[smartPanStartIndex], smartPanRegions[smartPanEndIndex])}
+                      disabled={smartPanStartIndex === smartPanEndIndex}
+                      style={{ ...sketchButton, background: "#c8f135", fontWeight: 700, padding: "8px 0", opacity: smartPanStartIndex === smartPanEndIndex ? 0.5 : 1 }}
+                    >
+                      Apply Pan
+                    </button>
+                    {smartPanStartIndex === smartPanEndIndex && (
+                      <div style={{ fontSize: 9, color: "#a14d00" }}>Pick two different regions.</div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {smartPanUpgradeOpen && <UpgradeModal featureName="Smart Pan" onClose={() => setSmartPanUpgradeOpen(false)} />}
+      </>
+    );
+  }
+
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
   if (playMode) {
@@ -19361,6 +19553,16 @@ function Board2Editor({
                         />
                       </div>
                     )}
+                    {selectedClip.type === "image" && (
+                      <button
+                        type="button"
+                        onClick={() => void handleSmartPanClick(selectedClip)}
+                        disabled={smartPanLoading}
+                        style={{ ...sketchButton, width: "100%", padding: "10px 14px", fontSize: 13, background: "#e4cfff", opacity: smartPanLoading ? 0.6 : 1 }}
+                      >
+                        ✨ Smart Pan
+                      </button>
+                    )}
                     {selectedClip.type === "characterFocus" && (
                       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
@@ -19689,6 +19891,7 @@ function Board2Editor({
         {renderImagePreviewModal()}
         {renderClipsPanel()}
         {renderLibraryPanel()}
+        {renderSmartPanModal()}
 
         {/* ── Save modal ── */}
         {saveModalOpen && (
@@ -23053,6 +23256,17 @@ function Board2Editor({
                     </div>
                   </div>
                 )}
+                {selectedClip.type === "image" && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSmartPanClick(selectedClip)}
+                    disabled={smartPanLoading}
+                    title="Find semantic regions in this image and pan the camera between two of them"
+                    style={{ ...sketchButton, width: "100%", padding: "6px 10px", fontSize: 11, fontWeight: 700, background: "#e4cfff", opacity: smartPanLoading ? 0.6 : 1 }}
+                  >
+                    ✨ Smart Pan
+                  </button>
+                )}
                 {selectedClip.type === "characterFocus" && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
@@ -24419,6 +24633,7 @@ function Board2Editor({
       {renderImagePreviewModal()}
       {renderClipsPanel()}
       {renderLibraryPanel()}
+      {renderSmartPanModal()}
 
       {/* Save modal */}
       {saveModalOpen && (
