@@ -1,5 +1,25 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+// ── Tables ───────────────────────────────────────────────────────────
+// nb_users      — one row per email; subscription/Stripe state, last_seen.
+// nb_events     — event log: login | transcribe | render | download.
+// nb_api_costs  — per-call API cost tracking (Whisper, GPT-4o-mini, Serper, Claude, ...).
+// nb_assets     — images/YouTube clips a user has placed on a board, kept for reuse in the
+//                 board2 Library panel. Schema (see supabase-schema.sql for the runnable SQL):
+//                   id uuid primary key default gen_random_uuid()
+//                   email text not null
+//                   type text not null              -- 'image' | 'youtube'
+//                   url text                        -- image src; null for youtube
+//                   thumbnail_url text               -- image src, or youtube mqdefault thumbnail
+//                   youtube_id text                  -- youtube only
+//                   yt_start numeric                 -- youtube only, seconds
+//                   yt_end numeric                   -- youtube only, seconds
+//                   label text                        -- optional display name/caption
+//                   source text                       -- 'auto-build' | 'manual' | 'top5' | ...
+//                   created_at timestamptz default now()
+//                 Deduped per email via a unique index on (email, url) for images and
+//                 (email, youtube_id, yt_start, yt_end) for youtube — see saveAsset() below.
+
 let supabaseClient: SupabaseClient | null = null;
 
 export function getSupabase(): SupabaseClient {
@@ -164,5 +184,52 @@ export async function getRecentApiCosts(limit = 200) {
     .select("*")
     .order("created_at", { ascending: false })
     .limit(limit);
+  return data ?? [];
+}
+
+// ── Asset library ───────────────────────────────────────────────────
+
+export type AssetType = "image" | "youtube";
+
+export type AssetInput = {
+  type: AssetType;
+  url?: string | null;
+  thumbnailUrl?: string | null;
+  youtubeId?: string | null;
+  ytStart?: number | null;
+  ytEnd?: number | null;
+  label?: string | null;
+  source?: string | null;
+};
+
+// Deduped per email: images on (email, url), YouTube clips on (email, youtube_id, yt_start,
+// yt_end) — see the plain (non-partial) unique indexes in supabase-schema.sql. Postgres never
+// treats NULL as equal to NULL in a unique index, so image rows (youtube_id/yt_start/yt_end all
+// null) never collide under the youtube index and vice versa — one upsert call covers both types.
+export async function saveAsset(email: string, asset: AssetInput) {
+  const supabase = getSupabase();
+  const row = {
+    email,
+    type: asset.type,
+    url: asset.url ?? null,
+    thumbnail_url: asset.thumbnailUrl ?? null,
+    youtube_id: asset.youtubeId ?? null,
+    yt_start: asset.ytStart ?? null,
+    yt_end: asset.ytEnd ?? null,
+    label: asset.label ?? null,
+    source: asset.source ?? null,
+  };
+  const onConflict = asset.type === "image" ? "email,url" : "email,youtube_id,yt_start,yt_end";
+  const { data, error } = await supabase.from("nb_assets").upsert(row, { onConflict }).select().single();
+  if (error) throw error;
+  return data;
+}
+
+export async function listAssets(email: string, type?: AssetType, limit = 200) {
+  const supabase = getSupabase();
+  let query = supabase.from("nb_assets").select("*").eq("email", email).order("created_at", { ascending: false }).limit(limit);
+  if (type) query = query.eq("type", type);
+  const { data, error } = await query;
+  if (error) throw error;
   return data ?? [];
 }

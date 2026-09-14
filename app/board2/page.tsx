@@ -500,6 +500,18 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 
 type TranscriptSegment = { start: number; end: number; text: string };
 type IdentifiedClip = { id: string; title: string; startSec: number; endSec: number; hook: string };
+type LibraryAsset = {
+  id: string;
+  type: "image" | "youtube";
+  url: string | null;
+  thumbnail_url: string | null;
+  youtube_id: string | null;
+  yt_start: number | null;
+  yt_end: number | null;
+  label: string | null;
+  source: string | null;
+  created_at: string;
+};
 type AutoNarrationImageSegment = TranscriptSegment & {
   query: string;
   reason?: string;
@@ -5040,6 +5052,13 @@ function Board2Editor({
   const [clipEditInputs, setClipEditInputs] = useState<Map<string, { start: string; end: string }>>(new Map());
   const [exportingClipId, setExportingClipId] = useState<string | null>(null);
   const [clipsUpgradeOpen, setClipsUpgradeOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [libraryFilter, setLibraryFilter] = useState<"all" | "image" | "youtube">("all");
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [libraryLoadedOnce, setLibraryLoadedOnce] = useState(false);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
   const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
@@ -5414,6 +5433,7 @@ function Board2Editor({
   const boardDropDepthRef = useRef(0);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const clipsRef = useRef<Clip[]>(clips);
+  const savedAssetIdsRef = useRef<Set<string>>(new Set());
   const selectedClipIdsRef = useRef<string[]>([]);
   const selectedAnnotationIdsRef = useRef<string[]>([]);
   const mutedLayersRef = useRef<Record<number, boolean>>({});
@@ -6405,6 +6425,41 @@ function Board2Editor({
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  // Asset library: fire-and-forget save of every board-placed image/YouTube clip so it can be
+  // reused from the Library panel later. A single effect over `clips` (rather than instrumenting
+  // every clip-creation call site — manual upload, auto-build, Top 5, Neural Search, YouTube
+  // download, project load, duplicate, undo/redo...) catches every current and future path clips
+  // reach the board by. Dedup is by clip id client-side (savedAssetIdsRef) and by (email, url) /
+  // (email, youtube_id, yt_start, yt_end) server-side, so re-saving an already-known asset is a
+  // harmless no-op upsert. Locally uploaded images (blob: sourceUrl) are skipped — the URL would
+  // already be dead by the time a future board tried to reuse it.
+  useEffect(() => {
+    const email = session?.user?.email;
+    if (!email) return;
+    for (const clip of clips) {
+      if (clip.boardX === undefined || savedAssetIdsRef.current.has(clip.id)) continue;
+      // sourceUrl is usually a tab-scoped blob: URL (the downloaded bytes); sourceAttributionUrl,
+      // when set, is the original external image URL and is what a future board can still load.
+      const stableImageUrl = clip.sourceAttributionUrl?.startsWith("http")
+        ? clip.sourceAttributionUrl
+        : clip.sourceUrl?.startsWith("http") ? clip.sourceUrl : null;
+      if (clip.type === "image" && stableImageUrl) {
+        savedAssetIdsRef.current.add(clip.id);
+        void fetch("/api/board2/assets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "image", url: stableImageUrl, thumbnailUrl: stableImageUrl, label: clip.name, source: clip.source ?? "manual" }),
+        }).catch(() => {});
+      } else if (clip.type === "video" && clip.youtubeId) {
+        savedAssetIdsRef.current.add(clip.id);
+        void fetch("/api/board2/assets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "youtube", youtubeId: clip.youtubeId, ytStart: clip.ytStart, ytEnd: clip.ytEnd, label: clip.name, source: clip.source ?? "manual" }),
+        }).catch(() => {});
+      }
+    }
+  }, [clips, session?.user?.email]);
   useEffect(() => { narrationVisemeTrackRef.current = narrationVisemeTrack; }, [narrationVisemeTrack]);
   useEffect(() => { narrationVisemeTrackSourceRef.current = narrationVisemeTrackSource; }, [narrationVisemeTrackSource]);
   useEffect(() => { narrationGestureTrackRef.current = narrationGestureTrack; }, [narrationGestureTrack]);
@@ -12498,6 +12553,7 @@ function Board2Editor({
           startTime: 0, duration: 4, layer: 1,
           boardX: ph.boardX, boardY: ph.boardY, boardW: w, boardH: h,
           sourceBlob: blob,
+          sourceAttributionUrl: ph.imageUrl,
           source: "neuralSearch" as const,
         },
       ]);
@@ -18146,6 +18202,267 @@ function Board2Editor({
     );
   }
 
+  // Asset Library: browse past boards' placed images/YouTube clips and drop one onto this board.
+  async function fetchLibraryAssets() {
+    if (!session?.user?.email) return;
+    setLibraryLoading(true);
+    setLibraryError(null);
+    try {
+      const res = await fetch("/api/board2/assets");
+      const data = await res.json().catch(() => null) as { assets?: LibraryAsset[]; error?: string } | null;
+      if (!res.ok) throw new Error(data?.error || `Failed to load library (${res.status})`);
+      setLibraryAssets(Array.isArray(data?.assets) ? data.assets : []);
+      setLibraryLoadedOnce(true);
+    } catch (error) {
+      setLibraryError(error instanceof Error ? error.message : "Failed to load library");
+    } finally {
+      setLibraryLoading(false);
+    }
+  }
+
+  function openLibraryPanel() {
+    setLibraryOpen(true);
+    if (session?.user?.email && !libraryLoadedOnce) void fetchLibraryAssets();
+  }
+
+  // Mirrors commitImagePlaceholder (Neural Search "Add to Board"): proxy-download so arbitrary
+  // external image hosts don't hit browser CORS, then drop a real image Clip at the board center.
+  async function addLibraryImageToBoard(asset: LibraryAsset) {
+    const sourceUrl = asset.url;
+    if (!sourceUrl) return;
+    const toastId = generateId();
+    setDownloadToasts((prev) => [...prev, { id: toastId, title: asset.label || "Image", status: "downloading" }]);
+    try {
+      const res = await fetch(`/api/proxy-image?url=${encodeURIComponent(sourceUrl)}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Fetch failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      await decodeImageForPlacement(blobUrl);
+      const { w, h } = getMediaDimensions(blobUrl, "image");
+      const clipId = generateId();
+      const { camX, camY } = getVisibleBoardCenter();
+      setClips((prev) => {
+        const pos = centeredBoardDropPosition({
+          dropX: camX, dropY: camY, imageWidth: w, imageHeight: h,
+          boardWidth: boardDimensionsRef.current.width, boardHeight: boardDimensionsRef.current.height,
+          constrainToBoard: false,
+        });
+        return [...prev, {
+          id: clipId, mediaId: clipId, featured: false as const,
+          type: "image" as const, name: (asset.label || "Image").slice(0, 40), sourceUrl: blobUrl,
+          startTime: 0, duration: 4, layer: 1,
+          boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
+          sourceBlob: blob,
+          sourceAttributionUrl: sourceUrl,
+          source: "manual" as const,
+        }];
+      });
+      selectionSurfaceRef.current = "board";
+      setClipSelection([clipId]);
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 2000);
+      setToast("Image added to the board — select it to add to the timeline");
+      setLibraryOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to add image";
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "error", error: message } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 5000);
+    }
+  }
+
+  // Mirrors handleYtConfirm's non-play-mode branch: re-download through the Railway yt-dlp
+  // backend (a library row only keeps the youtubeId/trim, not the video bytes) and place it.
+  async function addLibraryYoutubeToBoard(asset: LibraryAsset) {
+    const youtubeId = asset.youtube_id;
+    if (!youtubeId) return;
+    const start = asset.yt_start ?? 0;
+    const end = asset.yt_end && asset.yt_end > start ? asset.yt_end : start + 10;
+    const title = (asset.label || "YouTube clip").slice(0, 40);
+    const toastId = generateId();
+    setDownloadToasts((prev) => [...prev, { id: toastId, title, status: "downloading" }]);
+    try {
+      const dlRes = await fetch("/api/ytdl", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: youtubeId, start, end }),
+      });
+      if (!dlRes.ok) {
+        const err = await dlRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(err.error || `Download failed (${dlRes.status})`);
+      }
+      const blob = await dlRes.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const clipDuration = end - start;
+      const rawMeta = await getVideoMeta(blobUrl);
+      const scale = rawMeta.w > 0 && rawMeta.h > 0 ? Math.min(1, 800 / rawMeta.w, 600 / rawMeta.h) : 1;
+      const meta = {
+        w: rawMeta.w > 0 ? Math.round(rawMeta.w * scale) : 800,
+        h: rawMeta.h > 0 ? Math.round(rawMeta.h * scale) : 450,
+        sourceDurationSec: rawMeta.duration > 0 ? rawMeta.duration : clipDuration,
+      };
+      if (meta.w > 0 && !videoDimsRef.current.has(blobUrl)) {
+        videoDimsRef.current.set(blobUrl, { w: meta.w, h: meta.h });
+      }
+      const clipId = generateId();
+      createVideoElement(clipId, blobUrl);
+      setClips((prev) => {
+        const placement = resolveManualTimelineInsertion(prev, playheadRef.current, clipDuration);
+        const pos = findBoardPosForNewMedia(prev, meta.w, meta.h);
+        return [...prev, {
+          id: clipId, type: "video" as const, name: title, sourceUrl: blobUrl,
+          startTime: placement.startTime, duration: clipDuration, layer: placement.layer,
+          boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
+          sourceDurationSec: meta.sourceDurationSec,
+          sourceBlob: blob,
+          youtubeId, ytStart: start, ytEnd: end,
+          source: "manual" as const,
+        }];
+      });
+      setSelectedClipId(clipId);
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "done" } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 2000);
+      setLibraryOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Download failed";
+      setDownloadToasts((prev) => prev.map((t) => t.id === toastId ? { ...t, status: "error", error: message } : t));
+      setTimeout(() => setDownloadToasts((prev) => prev.filter((t) => t.id !== toastId)), 5000);
+    }
+  }
+
+  function renderLibraryPanel() {
+    const isSignedIn = !!session?.user?.email;
+    const query = librarySearch.trim().toLowerCase();
+    const filteredAssets = libraryAssets.filter((asset) => {
+      if (libraryFilter !== "all" && asset.type !== libraryFilter) return false;
+      if (!query) return true;
+      return (asset.label ?? "").toLowerCase().includes(query)
+        || (asset.url ?? "").toLowerCase().includes(query)
+        || (asset.youtube_id ?? "").toLowerCase().includes(query);
+    });
+    return (
+      <>
+        {libraryOpen && (
+          <div
+            role="dialog"
+            aria-label="Library"
+            onClick={(event) => { if (event.target === event.currentTarget) setLibraryOpen(false); }}
+            style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(0,0,0,0.4)", display: "flex", justifyContent: "flex-end" }}
+          >
+            <div
+              style={{
+                width: "min(460px, 100vw)", height: "100%", background: "#fffdf5",
+                borderLeft: "2px solid #2a2a2a", boxShadow: "-4px 0 0 rgba(42,42,42,0.15)",
+                display: "flex", flexDirection: "column", fontFamily: "monospace",
+              }}
+            >
+              <style>{`@keyframes nblibspin { to { transform: rotate(360deg); } }`}</style>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", flexShrink: 0 }}>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>📚 ASSET LIBRARY</span>
+                {isSignedIn && (
+                  <button
+                    onClick={() => void fetchLibraryAssets()}
+                    disabled={libraryLoading}
+                    style={{ ...miniButton, marginLeft: "auto", opacity: libraryLoading ? 0.5 : 1 }}
+                  >
+                    {libraryLoading ? "⟳" : "↻ Refresh"}
+                  </button>
+                )}
+                <button onClick={() => setLibraryOpen(false)} style={{ ...miniButton, padding: "3px 8px", fontSize: 15, marginLeft: isSignedIn ? 0 : "auto" }}>×</button>
+              </div>
+
+              {isSignedIn && (
+                <div style={{ padding: "10px 14px", borderBottom: "1.5px solid rgba(42,42,42,0.2)", display: "flex", flexDirection: "column", gap: 8, flexShrink: 0 }}>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {(["all", "image", "youtube"] as const).map((f) => (
+                      <button
+                        key={f}
+                        onClick={() => setLibraryFilter(f)}
+                        style={{ ...miniButton, flex: 1, background: libraryFilter === f ? "#2a2a2a" : "transparent", color: libraryFilter === f ? "#fff" : "#2a2a2a" }}
+                      >
+                        {f === "all" ? "All" : f === "image" ? "Images" : "Videos"}
+                      </button>
+                    ))}
+                  </div>
+                  <input
+                    type="text"
+                    value={librarySearch}
+                    onChange={(event) => setLibrarySearch(event.target.value)}
+                    placeholder="Search by label or URL…"
+                    style={{ width: "100%", fontFamily: "monospace", fontSize: 12, padding: "6px 8px", border: "1.5px solid #2a2a2a", boxSizing: "border-box" }}
+                  />
+                </div>
+              )}
+
+              <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
+                {!isSignedIn && (
+                  <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.6 }}>
+                    Sign in to save and access your library.
+                    <div style={{ marginTop: 10 }}>
+                      <button onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, padding: "6px 12px", fontSize: 11, fontWeight: 700 }}>
+                        Sign in →
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {isSignedIn && libraryError && (
+                  <div style={{ fontSize: 11, color: "#a32916", border: "1.5px solid #a32916", background: "#fff5f2", padding: 8, marginBottom: 10 }}>✗ {libraryError}</div>
+                )}
+                {isSignedIn && libraryLoading && libraryAssets.length === 0 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6a6a6a" }}>
+                    <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2px solid rgba(42,42,42,0.15)", borderTopColor: "#2a2a2a", animation: "nblibspin 0.8s linear infinite" }} />
+                    Loading your library…
+                  </div>
+                )}
+                {isSignedIn && !libraryLoading && libraryLoadedOnce && filteredAssets.length === 0 && (
+                  <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.6 }}>
+                    {libraryAssets.length === 0
+                      ? "Assets from your past boards will appear here."
+                      : "No assets match that filter/search."}
+                  </div>
+                )}
+                {isSignedIn && filteredAssets.length > 0 && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: 8 }}>
+                    {filteredAssets.map((asset) => {
+                      const thumb = asset.type === "youtube"
+                        ? asset.thumbnail_url || (asset.youtube_id ? `https://img.youtube.com/vi/${asset.youtube_id}/mqdefault.jpg` : "")
+                        : asset.thumbnail_url || asset.url || "";
+                      return (
+                        <button
+                          key={asset.id}
+                          onClick={() => void (asset.type === "image" ? addLibraryImageToBoard(asset) : addLibraryYoutubeToBoard(asset))}
+                          title={asset.label || asset.url || asset.youtube_id || ""}
+                          style={{
+                            position: "relative", padding: 0, border: "1.5px solid rgba(42,42,42,0.3)",
+                            background: "#000", cursor: "pointer", aspectRatio: "1 / 1", overflow: "hidden",
+                          }}
+                        >
+                          {thumb
+                            ? <img src={thumb} alt={asset.label ?? ""} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                            : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#6a6a6a", fontSize: 24 }}>{asset.type === "youtube" ? "▶" : "🖼"}</div>}
+                          {asset.type === "youtube" && (
+                            <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, color: "#fff", textShadow: "0 1px 4px rgba(0,0,0,0.6)" }}>▶</span>
+                          )}
+                          {asset.label && (
+                            <span style={{ position: "absolute", left: 0, right: 0, bottom: 0, padding: "3px 5px", fontSize: 9, color: "#fff", background: "rgba(0,0,0,0.55)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "left" }}>
+                              {asset.label}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  }
+
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
   if (playMode) {
@@ -19300,6 +19617,7 @@ function Board2Editor({
         {renderTop5Modal()}
         {renderImagePreviewModal()}
         {renderClipsPanel()}
+        {renderLibraryPanel()}
 
         {/* ── Save modal ── */}
         {saveModalOpen && (
@@ -20280,6 +20598,7 @@ function Board2Editor({
           {clips.some((clip) => clip.type === "narration") && (
             <button onClick={() => { setClipsPanelOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>🎬 AI Clips</button>
           )}
+          <button onClick={() => { openLibraryPanel(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📚 Assets</button>
           <button onClick={() => setSnapshotIncludeCharacter((value) => !value)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: snapshotIncludeCharacter ? "#c8f135" : "#fffdf5" }}>{snapshotIncludeCharacter ? "✓ Character" : "○ Character"}</button>
           <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>▶ YouTube</button>
           <a href="/board2" aria-current="page" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none", background: "#c8f135" }}>✎ Board</a>
@@ -22835,6 +23154,13 @@ function Board2Editor({
                 </button>
               )}
               <button
+                onClick={openLibraryPanel}
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: libraryOpen ? "#2a2a2a" : undefined, color: libraryOpen ? "#fff" : undefined }}
+                title="Browse and reuse images/YouTube clips from your past boards"
+              >
+                📚 Assets
+              </button>
+              <button
                 onClick={() => void exportBoardImage()}
                 disabled={isExporting || isExportingBoardImage}
                 title={`Export the entire board as a ${BOARD_SNAPSHOT_LONG_EDGE}px-long-edge PNG`}
@@ -24021,6 +24347,7 @@ function Board2Editor({
       {renderTop5Modal()}
       {renderImagePreviewModal()}
       {renderClipsPanel()}
+      {renderLibraryPanel()}
 
       {/* Save modal */}
       {saveModalOpen && (
