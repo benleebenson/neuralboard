@@ -26,6 +26,7 @@ import {
   STYLE_EXEMPLAR_TOKEN_BUDGET,
   type BoardStyleSummary,
 } from "@/lib/board2/style-exemplars";
+import type { CharacterRosterEntry } from "@/lib/board2/editorial-image-plan";
 import {
   buildPhraseCaptionTrack,
   drawScreenSpaceCaption,
@@ -521,6 +522,20 @@ type AutoNarrationImageSegment = TranscriptSegment & {
   topicStartTime?: number;
   topicEndTime?: number;
   topicIndex?: number;
+  characterName?: string;
+  characterCallback?: boolean;
+  reactionShot?: boolean;
+  sentiment?: string;
+};
+// Shape of one raw image entry as returned by /api/board2/plan-images, before validation.
+type PlanImageItem = {
+  query?: unknown;
+  startTime?: unknown;
+  reason?: unknown;
+  characterName?: unknown;
+  characterCallback?: unknown;
+  reactionShot?: unknown;
+  sentiment?: unknown;
 };
 type BrowserFoundImage = AutoBuildFoundImage;
 type ConfiguredOutroImage = PersistedOutroImage & { url: string };
@@ -5111,6 +5126,7 @@ function Board2Editor({
     effectiveSecondsPerImage: number;
     images: Array<{ query: string; reason: string; startTime: number }>;
   } | null>(null);
+  const [autoBuildCharacters, setAutoBuildCharacters] = useState<CharacterRosterEntry[]>([]);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
   const [autoBuildError, setAutoBuildError] = useState<string | null>(null);
   const [autoBuildSummary, setAutoBuildSummary] = useState<string | null>(null);
@@ -9744,6 +9760,31 @@ function Board2Editor({
       if (!transcriptSegments.length) transcriptSegments = [{ start: 0, end: transcriptionDuration, text: transcript }];
       const keywordFallbackSegments = buildAutoNarrationSegments(transcriptSegments, transcriptionDuration, autoImageSeconds);
       let segments = keywordFallbackSegments;
+
+      reportProgress("preparing", "Identifying characters…", 0, 1);
+      let buildCharacters: CharacterRosterEntry[] = [];
+      try {
+        const timedTranscriptForCharacters = transcriptSegments
+          .map((segment) => `[${segment.start.toFixed(2)}s-${segment.end.toFixed(2)}s] ${segment.text}`)
+          .join("\n");
+        const charactersResponse = await fetch("/api/board2/extract-characters", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({ transcript: timedTranscriptForCharacters }),
+        });
+        const charactersData = await charactersResponse.json().catch(() => null) as { characters?: CharacterRosterEntry[]; error?: string } | null;
+        if (charactersResponse.ok && Array.isArray(charactersData?.characters)) {
+          buildCharacters = charactersData.characters;
+        }
+      } catch (charactersError) {
+        if (isAbortError(charactersError)) throw charactersError;
+        // Character continuity is an enhancement, not a hard requirement — fall through to
+        // planning with an empty roster rather than failing the whole auto-build.
+        console.warn("[board2:auto-build] Character extraction failed; continuing without a roster", charactersError);
+      }
+      setAutoBuildCharacters(buildCharacters);
+
       reportProgress("planning", autoStyleConditioning && buildStyleSelection.selected.length
         ? `Planning images… (LLM · ${buildStyleSelection.selected.length} starred boards)`
         : "Planning images… (LLM)", 0, 1);
@@ -9759,6 +9800,7 @@ function Board2Editor({
             secondsPerImage: autoImageSeconds,
             styleConditioning: autoStyleConditioning,
             styleExemplars: buildStyleExemplars,
+            characters: buildCharacters,
           }),
         });
         const planData = await planResponse.json().catch(() => null) as {
@@ -9775,12 +9817,12 @@ function Board2Editor({
             note?: string | null;
             fallback?: string | null;
           };
-          plan?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
+          plan?: Array<PlanImageItem>;
           topics?: Array<{
             topicTitle?: unknown;
             startTime?: unknown;
             endTime?: unknown;
-            images?: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }>;
+            images?: Array<PlanImageItem>;
           }>;
         } | null;
         if (!planResponse.ok) {
@@ -9791,14 +9833,19 @@ function Board2Editor({
         effectivePlanSecondsPerImage = Number(planData?.style?.effectiveSecondsPerImage) || autoImageSeconds;
         reportProgress("planning", `Planning images… (LLM · ${Number(planData?.targetCount) || keywordFallbackSegments.length} slots)`, 1, 1);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
-        const parsePlanImages = (items: Array<{ query?: unknown; startTime?: unknown; reason?: unknown }> | undefined) => Array.isArray(items)
+        const parsePlanImages = (items: Array<PlanImageItem> | undefined) => Array.isArray(items)
           ? items.flatMap((item) => {
               const query = typeof item.query === "string" ? item.query.trim() : "";
               const startTime = Number(item.startTime);
               const reason = typeof item.reason === "string" ? item.reason.trim() : "";
-              return query && reason && Number.isFinite(startTime)
-                ? [{ query, startTime: clamp(startTime, 0, Math.max(0, transcriptionDuration - 0.1)), reason }]
-                : [];
+              const characterName = typeof item.characterName === "string" ? item.characterName.trim() : "";
+              if (!(query && reason && Number.isFinite(startTime))) return [];
+              return [{
+                query, startTime: clamp(startTime, 0, Math.max(0, transcriptionDuration - 0.1)), reason,
+                ...(characterName ? { characterName, characterCallback: item.characterCallback === true } : {}),
+                ...(item.reactionShot === true ? { reactionShot: true } : {}),
+                ...(typeof item.sentiment === "string" ? { sentiment: item.sentiment } : {}),
+              }];
             }).sort((a, b) => a.startTime - b.startTime)
           : [];
         const rawTopics = Array.isArray(planData?.topics) ? planData.topics : [];
@@ -9852,6 +9899,10 @@ function Board2Editor({
             topicStartTime: item.topicStartTime,
             topicEndTime: item.topicEndTime,
             topicIndex: item.topicIndex,
+            characterName: item.characterName,
+            characterCallback: item.characterCallback,
+            reactionShot: item.reactionShot,
+            sentiment: item.sentiment,
           };
         });
       } catch (plannerError) {
@@ -9886,9 +9937,26 @@ function Board2Editor({
         previewBlob: Blob;
       }> = [];
       const skipped: Array<{ index: number; query: string; reason: string; code?: string }> = [];
+      // Character continuity: the first non-callback resolution for a name is cached here and
+      // reused verbatim (no bridge round trip) for every later slot the planner flagged
+      // characterCallback for — giving that character one consistent "face" across the board.
+      const characterImageMap = new Map<string, { image: Omit<BrowserFoundImage, "dataUrl">; sourceBlob: Blob; previewBlob: Blob }>();
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
         const slot = index + 1;
+        if (segment.characterCallback && segment.characterName && characterImageMap.has(segment.characterName)) {
+          const cached = characterImageMap.get(segment.characterName)!;
+          found.push({ originalIndex: index, segment, image: cached.image, sourceBlob: cached.sourceBlob, previewBlob: cached.previewBlob });
+          updateProgressSlot(index, {
+            status: "found",
+            source: cached.image.source,
+            reason: `Reused ${segment.characterName}'s established image`,
+            attempt: 1,
+            completedAt: Date.now(),
+          });
+          reportProgress("finding", `Finding images ${slot}/${segments.length} — this can take several minutes`, index + 1, segments.length);
+          continue;
+        }
         try {
           const result = await requestAutoBuildImage({
             query: segment.query,
@@ -9922,6 +9990,9 @@ function Board2Editor({
             source: image.source,
           };
           found.push({ originalIndex: index, segment, image: imageMetadata, sourceBlob, previewBlob });
+          if (segment.characterName && !characterImageMap.has(segment.characterName)) {
+            characterImageMap.set(segment.characterName, { image: imageMetadata, sourceBlob, previewBlob });
+          }
           const successReason = result.failures.length || result.attempt > 1
             ? describeImageSuccess(slot, result).replace(/^Slot \d+: /, "")
             : undefined;

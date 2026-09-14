@@ -10,6 +10,7 @@ import {
   editorialImageTargetCount,
   IMPLICIT_EDITORIAL_TOPIC_TITLE,
   MAX_EDITORIAL_IMAGES_PER_CALL,
+  type CharacterRosterEntry,
   type EditorialTopicOutline,
   type EditorialTranscriptSegment,
   parseEditorialTopicOutline,
@@ -37,7 +38,27 @@ type PlanRequestBody = {
   secondsPerImage?: unknown;
   styleConditioning?: unknown;
   styleExemplars?: unknown;
+  characters?: unknown;
 };
+
+function cleanCharacters(value: unknown): CharacterRosterEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw): CharacterRosterEntry[] => {
+    if (!raw || typeof raw !== "object") return [];
+    const row = raw as Record<string, unknown>;
+    const name = typeof row.name === "string" ? row.name.trim().slice(0, 80) : "";
+    const description = typeof row.description === "string" ? row.description.trim().slice(0, 300) : "";
+    if (!name || !description) return [];
+    const mentionsNum = Number(row.mentions);
+    const firstMentionNum = Number(row.firstMentionTime);
+    return [{
+      name,
+      description,
+      mentions: Number.isFinite(mentionsNum) && mentionsNum > 0 ? Math.round(mentionsNum) : 1,
+      firstMentionTime: Number.isFinite(firstMentionNum) ? firstMentionNum : null,
+    }];
+  }).slice(0, 30);
+}
 
 function cleanStyleExemplars(value: unknown): BoardStyleSummary[] {
   if (!Array.isArray(value)) return [];
@@ -93,6 +114,7 @@ export async function POST(req: NextRequest) {
     }
 
     const segments = cleanTranscriptSegments(body.segments, durationSec);
+    const characters = cleanCharacters(body.characters);
     const styleConditioningRequested = body.styleConditioning !== false;
     const availableStyleExemplars = styleConditioningRequested ? cleanStyleExemplars(body.styleExemplars) : [];
     const styleSelection = selectStyleExemplars(availableStyleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET);
@@ -160,6 +182,7 @@ export async function POST(req: NextRequest) {
         secondsPerImage: effectiveSecondsPerImage,
         targetCount: chunk.targetCount,
         styleExemplars,
+        characters,
         ...(chunks.length > 1 ? { planningWindow: { ...chunk, topicOutline } } : {}),
       });
       const responseText = await callPlanner(prompt, Math.min(12_000, Math.max(1200, chunk.targetCount * 240)));
@@ -232,6 +255,10 @@ export async function POST(req: NextRequest) {
         effectiveSecondsPerImage,
         note: styleNote,
         fallback: styleConditioningRequested && !styleConditioningApplied ? "zero-starred" : null,
+      },
+      characters: {
+        count: characters.length,
+        callbackCount: plan.filter((image) => image.characterCallback).length,
       },
       topics,
       plan,
