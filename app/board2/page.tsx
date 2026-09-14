@@ -8908,7 +8908,7 @@ function Board2Editor({
     );
     const clip: Clip = {
       id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
-      startTime: placement.startTime, duration, holdFraction: 0.65, layer: placement.layer,
+      startTime: placement.startTime, duration, holdFraction: 0.25, layer: placement.layer,
       boardX: Math.round(boardX), boardY: Math.round(boardY),
       boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
     };
