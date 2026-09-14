@@ -10,7 +10,7 @@ const PRO_FEATURES = [
   "All future Pro features",
 ];
 
-function UpgradeModal({ featureName, onClose }: { featureName: string; onClose: () => void }) {
+export function UpgradeModal({ featureName, onClose }: { featureName: string; onClose: () => void }) {
   const [working, setWorking] = useState(false);
 
   async function handleUpgrade() {

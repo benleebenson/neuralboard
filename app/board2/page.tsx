@@ -4,7 +4,8 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useSession, signIn } from "next-auth/react";
 import rough from "roughjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
-import { ProGated } from "@/app/components/ProGated";
+import { ProGated, UpgradeModal } from "@/app/components/ProGated";
+import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
@@ -498,6 +499,7 @@ function isFeaturedTimelineClip(clip: Clip): boolean {
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
+type IdentifiedClip = { id: string; title: string; startSec: number; endSec: number; hook: string };
 type AutoNarrationImageSegment = TranscriptSegment & {
   query: string;
   reason?: string;
@@ -1845,6 +1847,27 @@ function formatTime(sec: number): string {
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return `${m}:${s.toFixed(1).padStart(4, "0")}`;
+}
+
+// M:SS text-input round trip shared by clip-trim UIs (mirrors the mobile Top 5 trim pattern).
+function formatClipMMSS(sec: number): string {
+  const safe = Math.max(0, Math.round(sec));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function parseClipMMSS(str: string): number | null {
+  const s = str.trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const m = s.match(/^(\d+):(\d+)$/);
+  if (m) {
+    const secs = parseInt(m[2], 10);
+    if (secs >= 60) return null;
+    return parseInt(m[1], 10) * 60 + secs;
+  }
+  return null;
 }
 
 // Bakes the face-crop oval into a standalone transparent PNG so the modal preview and the
@@ -4988,6 +5011,7 @@ function Board2Editor({
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
 }) {
   const { data: session } = useSession();
+  const { isPro: isProUser } = useIsPro();
 
   const [clips, setClips] = useState<Clip[]>([]);
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
@@ -5008,6 +5032,14 @@ function Board2Editor({
   const [exportStatus, setExportStatus] = useState<OfflineExportStatus | null>(null);
   const [isExportingBoardImage, setIsExportingBoardImage] = useState(false);
   const [snapshotIncludeCharacter, setSnapshotIncludeCharacter] = useState(true);
+  const [clipsPanelOpen, setClipsPanelOpen] = useState(false);
+  const [identifiedClips, setIdentifiedClips] = useState<IdentifiedClip[]>([]);
+  const [clipsLoading, setClipsLoading] = useState(false);
+  const [clipsError, setClipsError] = useState<string | null>(null);
+  const [clipEdits, setClipEdits] = useState<Map<string, { startSec: number; endSec: number }>>(new Map());
+  const [clipEditInputs, setClipEditInputs] = useState<Map<string, { start: string; end: string }>>(new Map());
+  const [exportingClipId, setExportingClipId] = useState<string | null>(null);
+  const [clipsUpgradeOpen, setClipsUpgradeOpen] = useState(false);
   const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
   const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
@@ -10905,6 +10937,119 @@ function Board2Editor({
     narrationTranscriptionAbortRef.current?.abort();
   }
 
+  // AI Clips: identify highlight windows from the board's narration transcript, then export any
+  // one of them as a standalone 9:16 clip. Reuses the per-clip Whisper transcript already captured
+  // by transcribeNarrationWithWhisper (clip.transcriptSegments) rather than re-transcribing.
+  function narrationClipsWithTranscript(currentClips: Clip[]): Clip[] {
+    return currentClips
+      .filter((c) => c.type === "narration" && !!c.transcriptSegments?.length)
+      .sort((a, b) => a.startTime - b.startTime);
+  }
+
+  function buildTimestampedNarrationTranscript(currentClips: Clip[]): string {
+    const lines: Array<{ start: number; end: number; text: string }> = [];
+    for (const clip of narrationClipsWithTranscript(currentClips)) {
+      const clipStart = clip.startTime;
+      const clipEnd = clip.startTime + clip.duration;
+      // transcriptSegments are timestamped against the source audio file, not the board timeline —
+      // shift by the clip's timeline position minus whatever leading trim was applied (sourceOffsetSec),
+      // the same mapping narrationVisemeAt/activeNarrationBubble use to place cues on the timeline.
+      const offset = clip.startTime - (clip.sourceOffsetSec ?? 0);
+      for (const segment of clip.transcriptSegments ?? []) {
+        const text = segment.text.trim();
+        if (!text) continue;
+        const start = Math.max(clipStart, offset + segment.start);
+        const end = Math.min(clipEnd, offset + segment.end);
+        if (end <= start) continue;
+        lines.push({ start, end, text });
+      }
+    }
+    lines.sort((a, b) => a.start - b.start);
+    return lines.map((line) => `[${line.start.toFixed(2)}s-${line.end.toFixed(2)}s] ${line.text}`).join("\n");
+  }
+
+  function requireProForClips(): boolean {
+    if (!session?.user) { signIn("google", { callbackUrl: "/board2" }); return false; }
+    if (!isProUser) { setClipsUpgradeOpen(true); return false; }
+    return true;
+  }
+
+  async function identifyClips() {
+    if (clipsLoading) return;
+    const currentClips = clipsRef.current;
+    const transcript = buildTimestampedNarrationTranscript(currentClips);
+    if (!transcript) {
+      setClipsError("Transcribe your narration with Whisper first (select the narration clip, then Transcribe), then try again.");
+      return;
+    }
+    const durationSeconds = currentPlaybackDuration(currentClips);
+    setClipsLoading(true);
+    setClipsError(null);
+    try {
+      const res = await fetch("/api/board2/identify-clips", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript, durationSeconds, count: 5 }),
+      });
+      const data = await res.json().catch(() => null) as { clips?: IdentifiedClip[]; error?: string } | null;
+      if (!res.ok) throw new Error(data?.error || `Clip identification failed (${res.status})`);
+      const found = Array.isArray(data?.clips) ? data.clips : [];
+      setIdentifiedClips(found);
+      const edits = new Map<string, { startSec: number; endSec: number }>();
+      const inputs = new Map<string, { start: string; end: string }>();
+      for (const clip of found) {
+        edits.set(clip.id, { startSec: clip.startSec, endSec: clip.endSec });
+        inputs.set(clip.id, { start: formatClipMMSS(clip.startSec), end: formatClipMMSS(clip.endSec) });
+      }
+      setClipEdits(edits);
+      setClipEditInputs(inputs);
+      if (!found.length) setClipsError("No strong standalone clips were found in this narration.");
+    } catch (error) {
+      setClipsError(error instanceof Error ? error.message : "Clip identification failed");
+    } finally {
+      setClipsLoading(false);
+    }
+  }
+
+  function handleIdentifyClipsClick() {
+    if (!requireProForClips()) return;
+    void identifyClips();
+  }
+
+  function getClipTimes(clip: IdentifiedClip): { startSec: number; endSec: number } {
+    return clipEdits.get(clip.id) ?? { startSec: clip.startSec, endSec: clip.endSec };
+  }
+
+  function updateClipEditInput(clipId: string, field: "start" | "end", value: string) {
+    setClipEditInputs((prev) => {
+      const next = new Map(prev);
+      const current = next.get(clipId) ?? { start: "0:00", end: "0:00" };
+      next.set(clipId, { ...current, [field]: value });
+      return next;
+    });
+    const parsed = parseClipMMSS(value);
+    if (parsed === null) return;
+    setClipEdits((prev) => {
+      const next = new Map(prev);
+      const base = identifiedClips.find((c) => c.id === clipId);
+      const current = next.get(clipId) ?? { startSec: base?.startSec ?? 0, endSec: base?.endSec ?? 0 };
+      next.set(clipId, field === "start" ? { ...current, startSec: parsed } : { ...current, endSec: parsed });
+      return next;
+    });
+  }
+
+  function commitClipEditInput(clipId: string, field: "start" | "end") {
+    setClipEditInputs((prev) => {
+      const current = prev.get(clipId);
+      if (!current) return prev;
+      const parsed = parseClipMMSS(current[field]);
+      if (parsed === null) return prev;
+      const next = new Map(prev);
+      next.set(clipId, { ...current, [field]: formatClipMMSS(parsed) });
+      return next;
+    });
+  }
+
   function setNarrationSpeechGestures(clip: Clip, enabled: boolean) {
     if (clip.type !== "narration") return;
     const owner = activeCharacterIdRef.current;
@@ -14635,7 +14780,10 @@ function Board2Editor({
     }
   }
 
-  async function startRealtimeExport() {
+  // Shared by the full-board Export button and clip export (exportClip): with no options this
+  // renders the entire timeline at the editor's own aspect, exactly as before the clip-export
+  // range/aspect/filename overrides were added.
+  async function runRealtimeExport(opts: { startSec?: number; endSec?: number; aspect?: "16:9" | "9:16"; filenameBase?: string } = {}) {
     if (isExportingRef.current) return;
     if (isRecordingRef.current) { setToast("Stop recording before exporting"); return; }
     if (clips.length === 0) { alert("No clips to export"); return; }
@@ -14666,8 +14814,11 @@ function Board2Editor({
       isExportingRef.current = false;
       return;
     }
-    const { width: W, height: H } = exportOutputDimensions(exportQuality, canvasAspect);
-    const totalFrames = exportFrameCount(totalDur, exportFps);
+    const rangeStart = clamp(opts.startSec ?? 0, 0, totalDur);
+    const rangeEnd = clamp(opts.endSec ?? totalDur, rangeStart + 0.1, totalDur);
+    const dur = rangeEnd - rangeStart;
+    const { width: W, height: H } = exportOutputDimensions(exportQuality, opts.aspect ?? canvasAspect);
+    const totalFrames = exportFrameCount(dur, exportFps);
     const exportCanvas = document.createElement("canvas");
     exportCanvas.width = W;
     exportCanvas.height = H;
@@ -14861,23 +15012,29 @@ function Board2Editor({
           for (const segment of narrationSegments) {
             const item = narrationById.get(segment.clipId);
             if (!item) continue;
+            const visibleStart = Math.max(segment.startTime, rangeStart);
+            const visibleEnd = Math.min(segment.startTime + segment.duration, rangeEnd);
+            if (visibleEnd <= visibleStart) continue;
             scheduleSource(
               item.clip,
               item.buffer,
-              segment.startTime,
-              segment.sourceOffsetSec,
-              segment.duration,
+              visibleStart - rangeStart,
+              segment.sourceOffsetSec + (visibleStart - segment.startTime),
+              visibleEnd - visibleStart,
               `export-narration-${segment.clipId}-${segment.startTime.toFixed(3)}`,
             );
           }
           for (const { clip, buffer } of audioBuffers) {
             if (clip.type === "narration") continue;
+            const visibleStart = Math.max(clip.startTime, rangeStart);
+            const visibleEnd = Math.min(clip.startTime + clip.duration, rangeEnd);
+            if (visibleEnd <= visibleStart) continue;
             scheduleSource(
               clip,
               buffer,
-              clip.startTime,
-              clip.sourceOffsetSec ?? 0,
-              clip.duration,
+              visibleStart - rangeStart,
+              (clip.sourceOffsetSec ?? 0) + (visibleStart - clip.startTime),
+              visibleEnd - visibleStart,
               `export-video-${clip.id}`,
             );
           }
@@ -14892,19 +15049,20 @@ function Board2Editor({
             return;
           }
           const elapsed = (wallNow - exportWallStart) / 1000;
-          if (elapsed >= totalDur) {
+          if (elapsed >= dur) {
             if (recorder.state !== "inactive") recorder.stop();
             return;
           }
+          const timelineTime = rangeStart + elapsed;
 
           // requestAnimationFrame is commonly 60–120 Hz. Rendering only when the selected export
           // cadence is due avoids doing 2–4× redundant canvas work at 30 fps.
           if (elapsed + 0.001 >= nextFrameTime) {
-            evaluateVideoPlaybackStates(elapsed, currentClips, currentCameraKeyframes, W, H, {
+            evaluateVideoPlaybackStates(timelineTime, currentClips, currentCameraKeyframes, W, H, {
               force: renderedFrames === 0,
               audioMode: "silent",
             });
-            renderToCtx(exportCtx, elapsed, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "realtime-export");
+            renderToCtx(exportCtx, timelineTime, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "realtime-export");
             renderedFrames++;
             nextFrameTime += 1 / exportFps;
             if (nextFrameTime < elapsed) nextFrameTime = elapsed + 1 / exportFps;
@@ -14917,10 +15075,10 @@ function Board2Editor({
               stage: "frames",
               frame: renderedFrames,
               totalFrames,
-              etaSeconds: Math.max(0, totalDur - elapsed),
+              etaSeconds: Math.max(0, dur - elapsed),
               detail: `Recording real-time video… ${renderedFrames.toLocaleString()} / ${totalFrames.toLocaleString()} frames (${Math.max(0, expectedSoFar - renderedFrames)} late)`,
             });
-            setExportProgress(Math.min(0.995, elapsed / totalDur));
+            setExportProgress(Math.min(0.995, elapsed / dur));
           }
           exportRafRef.current = requestAnimationFrame(exportFrame);
         };
@@ -14936,7 +15094,8 @@ function Board2Editor({
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
         anchor.href = url;
-        anchor.download = blob.type.includes("mp4") ? "board2-export.mp4" : "board2-export.webm";
+        const ext = blob.type.includes("mp4") ? "mp4" : "webm";
+        anchor.download = opts.filenameBase ? `${opts.filenameBase}.${ext}` : `board2-export.${ext}`;
         document.body.appendChild(anchor);
         anchor.click();
         anchor.remove();
@@ -14980,6 +15139,32 @@ function Board2Editor({
       setExportProgress(0);
       setExportStatus(null);
       drawFrameRef.current(playheadRef.current);
+    }
+  }
+
+  async function startRealtimeExport() {
+    await runRealtimeExport({});
+  }
+
+  function slugifyClipTitle(title: string): string {
+    return title.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "clip";
+  }
+
+  async function exportClip(clip: IdentifiedClip) {
+    if (!requireProForClips()) return;
+    if (isExportingRef.current) { setToast("An export is already running"); return; }
+    const times = getClipTimes(clip);
+    if (times.endSec - times.startSec < 1) { setToast("Clip must be at least 1 second long"); return; }
+    setExportingClipId(clip.id);
+    try {
+      await runRealtimeExport({
+        startSec: times.startSec,
+        endSec: times.endSec,
+        aspect: "9:16",
+        filenameBase: `clip-${slugifyClipTitle(clip.title)}-${Math.round(times.startSec)}s`,
+      });
+    } finally {
+      setExportingClipId(null);
     }
   }
 
@@ -17854,6 +18039,113 @@ function Board2Editor({
     );
   }
 
+  function renderClipsPanel() {
+    const hasNarration = clips.some((clip) => clip.type === "narration");
+    return (
+      <>
+        {clipsPanelOpen && (
+          <div
+            role="dialog"
+            aria-label="AI Clips"
+            onClick={(event) => { if (event.target === event.currentTarget) setClipsPanelOpen(false); }}
+            style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(0,0,0,0.4)", display: "flex", justifyContent: "flex-end" }}
+          >
+            <div
+              style={{
+                width: "min(400px, 100vw)", height: "100%", background: "#fffdf5",
+                borderLeft: "2px solid #2a2a2a", boxShadow: "-4px 0 0 rgba(42,42,42,0.15)",
+                display: "flex", flexDirection: "column", fontFamily: "monospace",
+              }}
+            >
+              <style>{`@keyframes nbclipspin { to { transform: rotate(360deg); } }`}</style>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", flexShrink: 0 }}>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>🎬 AI CLIPS</span>
+                <button
+                  onClick={handleIdentifyClipsClick}
+                  disabled={clipsLoading || !hasNarration}
+                  style={{ ...sketchButton, marginLeft: "auto", padding: "5px 10px", fontSize: 11, fontWeight: 700, background: "#c8f135", opacity: clipsLoading || !hasNarration ? 0.5 : 1 }}
+                >
+                  {clipsLoading ? "⟳ Identifying…" : identifiedClips.length ? "↻ Re-identify" : "✨ Identify Clips"}
+                </button>
+                <button onClick={() => setClipsPanelOpen(false)} style={{ ...miniButton, padding: "3px 8px", fontSize: 15 }}>×</button>
+              </div>
+
+              <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+                {!hasNarration && (
+                  <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.5 }}>
+                    Add a narration track to the board, then come back here to find highlight clips in it.
+                  </div>
+                )}
+                {hasNarration && clipsError && (
+                  <div style={{ fontSize: 11, color: "#a32916", border: "1.5px solid #a32916", background: "#fff5f2", padding: 8 }}>✗ {clipsError}</div>
+                )}
+                {clipsLoading && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6a6a6a" }}>
+                    <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2px solid rgba(42,42,42,0.15)", borderTopColor: "#2a2a2a", animation: "nbclipspin 0.8s linear infinite" }} />
+                    Analyzing narration for standalone moments…
+                  </div>
+                )}
+                {!clipsLoading && hasNarration && !identifiedClips.length && !clipsError && (
+                  <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.5 }}>
+                    Hit “Identify Clips” to have AI find the best 20–90s standalone moments in your narration.
+                  </div>
+                )}
+                {identifiedClips.map((clip) => {
+                  const times = getClipTimes(clip);
+                  const inputs = clipEditInputs.get(clip.id) ?? { start: formatClipMMSS(times.startSec), end: formatClipMMSS(times.endSec) };
+                  const isExportingThis = exportingClipId === clip.id;
+                  const clipDur = Math.max(0, times.endSec - times.startSec);
+                  return (
+                    <div key={clip.id} style={{ border: "1.5px solid rgba(42,42,42,0.3)", background: "#fff", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12 }}>{clip.title}</div>
+                      <div style={{ fontSize: 10, color: "#6a6a6a", lineHeight: 1.4 }}>{clip.hook}</div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: "#aaa", marginBottom: 2 }}>Start</div>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={inputs.start}
+                            onChange={(event) => updateClipEditInput(clip.id, "start", event.target.value)}
+                            onBlur={() => commitClipEditInput(clip.id, "start")}
+                            style={{ width: "100%", fontFamily: "monospace", fontSize: 13, padding: "5px 4px", border: "1.5px solid #2a2a2a", textAlign: "center", boxSizing: "border-box" }}
+                          />
+                        </div>
+                        <span style={{ color: "#aaa", fontSize: 12, paddingBottom: 6 }}>–</span>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: "#aaa", marginBottom: 2 }}>End</div>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={inputs.end}
+                            onChange={(event) => updateClipEditInput(clip.id, "end", event.target.value)}
+                            onBlur={() => commitClipEditInput(clip.id, "end")}
+                            style={{ width: "100%", fontFamily: "monospace", fontSize: 13, padding: "5px 4px", border: "1.5px solid #2a2a2a", textAlign: "center", boxSizing: "border-box" }}
+                          />
+                        </div>
+                        <span style={{ fontSize: 9, color: "#aaa", paddingBottom: 6, whiteSpace: "nowrap" }}>{clipDur.toFixed(0)}s</span>
+                      </div>
+                      <button
+                        onClick={() => void exportClip(clip)}
+                        disabled={isExporting}
+                        style={{ ...sketchButton, fontSize: 11, fontWeight: 700, padding: "7px 10px", background: isExportingThis ? "#ff5e3a" : "#2a2a2a", color: "#fff", opacity: isExporting && !isExportingThis ? 0.5 : 1 }}
+                      >
+                        {isExportingThis
+                          ? `⟳ Exporting… ${exportStatus?.stage === "frames" ? `${exportStatus.frame}/${exportStatus.totalFrames}` : "preparing"}`
+                          : "⬇ Export Clip (9:16)"}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+        {clipsUpgradeOpen && <UpgradeModal featureName="AI Clips" onClose={() => setClipsUpgradeOpen(false)} />}
+      </>
+    );
+  }
+
   // ─── Mobile early returns ─────────────────────────────────────────────────
 
   if (playMode) {
@@ -19007,6 +19299,7 @@ function Board2Editor({
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
         {renderImagePreviewModal()}
+        {renderClipsPanel()}
 
         {/* ── Save modal ── */}
         {saveModalOpen && (
@@ -19984,6 +20277,9 @@ function Board2Editor({
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { if (isExporting) cancelExport(); else void startExport(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>{isExporting ? "✕ Export" : "⬇ Export"}</button>
           <button onClick={() => { void exportBoardImage(); setMobileEditorMenuOpen(false); }} disabled={isExporting || isExportingBoardImage} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isExporting || isExportingBoardImage ? .45 : 1 }}>▣ Board image</button>
+          {clips.some((clip) => clip.type === "narration") && (
+            <button onClick={() => { setClipsPanelOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>🎬 AI Clips</button>
+          )}
           <button onClick={() => setSnapshotIncludeCharacter((value) => !value)} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: snapshotIncludeCharacter ? "#c8f135" : "#fffdf5" }}>{snapshotIncludeCharacter ? "✓ Character" : "○ Character"}</button>
           <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>▶ YouTube</button>
           <a href="/board2" aria-current="page" style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, textAlign: "center", textDecoration: "none", background: "#c8f135" }}>✎ Board</a>
@@ -22529,6 +22825,15 @@ function Board2Editor({
               >
                 {isExporting ? "✕ Cancel" : "⬇ Export"}
               </button>
+              {clips.some((clip) => clip.type === "narration") && (
+                <button
+                  onClick={() => setClipsPanelOpen(true)}
+                  style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: clipsPanelOpen ? "#2a2a2a" : undefined, color: clipsPanelOpen ? "#fff" : undefined }}
+                  title="Find highlight moments in the narration and export them as vertical clips"
+                >
+                  🎬 Clips
+                </button>
+              )}
               <button
                 onClick={() => void exportBoardImage()}
                 disabled={isExporting || isExportingBoardImage}
@@ -23715,6 +24020,7 @@ function Board2Editor({
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
       {renderImagePreviewModal()}
+      {renderClipsPanel()}
 
       {/* Save modal */}
       {saveModalOpen && (
