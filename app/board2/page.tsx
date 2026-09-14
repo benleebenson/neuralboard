@@ -18562,18 +18562,18 @@ function Board2Editor({
                         🏆  Top 5
                       </button>
                     </ProGated>}
+                    <button
+                      onClick={() => { narrationUploadRef.current?.click(); setMobileDrawer(null); }}
+                      style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
+                    >
+                      ↑  Upload audio / mp4
+                    </button>
                     <ProGated featureName="Narration Recording">
                       <button
                         onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
                         style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, background: isRecording ? "#ff5e3a" : "#2a2a2a", color: "#fff" }}
                       >
                         {isRecording ? "⏹  Stop narration" : "🎙  Record narration"}
-                      </button>
-                      <button
-                        onClick={() => { narrationUploadRef.current?.click(); setMobileDrawer(null); }}
-                        style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
-                      >
-                        ↑  Upload audio / mp4
                       </button>
                       <div data-caption-mobile-controls style={{ display: "flex", flexDirection: "column", gap: 6, padding: 8, border: "1.5px dashed #56627a", background: "#f3f6ff" }}>
                         <button
@@ -20054,6 +20054,20 @@ function Board2Editor({
               </button>
             </ProGated>}
 
+            <button
+              onClick={() => narrationUploadRef.current?.click()}
+              style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%" }}
+            >
+              ↑ Upload audio / mp4
+            </button>
+            <input
+              ref={narrationUploadRef}
+              type="file"
+              accept="audio/*,video/mp4,video/quicktime,video/webm"
+              style={{ display: "none" }}
+              onChange={handleNarrationUpload}
+            />
+
             <ProGated featureName="Narration Recording">
               <button
                 onClick={isRecording ? stopNarrationRecording : startNarrationRecording}
@@ -20068,19 +20082,6 @@ function Board2Editor({
                   <>⏹ Stop ({Math.floor(recElapsed / 60)}:{String(Math.floor(recElapsed % 60)).padStart(2, "0")})</>
                 ) : "🎙 Record Narration"}
               </button>
-              <button
-                onClick={() => narrationUploadRef.current?.click()}
-                style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%" }}
-              >
-                ↑ Upload audio / mp4
-              </button>
-              <input
-                ref={narrationUploadRef}
-                type="file"
-                accept="audio/*,video/mp4,video/quicktime,video/webm"
-                style={{ display: "none" }}
-                onChange={handleNarrationUpload}
-              />
               <div data-caption-quick-controls style={{ width: "100%", display: "flex", flexDirection: "column", gap: 5, padding: 7, boxSizing: "border-box", border: "1.5px dashed #56627a", background: "#f3f6ff" }}>
                 <div style={{ display: "flex", gap: 5 }}>
                   <button
