@@ -812,12 +812,13 @@ function narrationGestureSourceSignature(clips: readonly Clip[]): string {
 
 function generatedBoardSourceSignature(clips: readonly Clip[]): string {
   return JSON.stringify(clips
-    .filter((clip) => clip.type === "narration" || isFeaturedTimelineClip(clip) && clip.boardX !== undefined)
+    .filter((clip) => clip.type === "narration" || isFeaturedTimelineClip(clip) && (clip.boardX !== undefined || clip.type === "pan" || clip.type === "characterFocus"))
     .sort((a, b) => a.id.localeCompare(b.id))
     .map((clip) => [
       clip.id, clip.type, clip.startTime, clip.duration, clip.holdFraction ?? null,
       clip.boardX ?? null, clip.boardY ?? null, clip.boardW ?? null, clip.boardH ?? null,
       clip.muted ?? false, clip.volume ?? 1, clip.sourceOffsetSec ?? 0,
+      clip.focusCharacterId ?? null, clip.focusLeadInSeconds ?? null, clip.focusLeadOutSeconds ?? null,
     ]));
 }
 
@@ -14326,6 +14327,18 @@ function Board2Editor({
     setToast(`Camera keyframes generated: ${n} clip${n !== 1 ? "s" : ""} + frame-all — character re-synced`);
   }
 
+  // Camera framing is derived state. Debounce timeline/board edits so drag gestures can settle,
+  // then rebuild from the latest refs instead of asking the user to maintain it manually.
+  useEffect(() => {
+    if (!canGenerateCamera || isLoadingProject) return;
+    setKeyframesOutOfDate(true);
+    const timer = window.setTimeout(() => { void generateCameraKeyframes(); }, 400);
+    return () => window.clearTimeout(timer);
+    // generateCameraKeyframes intentionally reads the latest refs; its render identity must not
+    // retrigger this effect after the derived keyframes themselves are committed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentGeneratedBoardSource, canvasAspect, boardDimensions.width, boardDimensions.height, canGenerateCamera, isLoadingProject]);
+
   // ─ Divider drag (hold/transition split per clip) ──────────────────────────
 
   function handleDividerPointerDown(e: React.PointerEvent, clip: Clip) {
@@ -20802,7 +20815,7 @@ function Board2Editor({
         <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
           {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
           {!isMobile && <>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div aria-hidden="true" style={{ display: "none" }}>
             <button
               onClick={generateCameraKeyframes}
               disabled={!canGenerateCamera || !!cameraGenerationPhase}
@@ -22357,6 +22370,17 @@ function Board2Editor({
 
             {toolsPanelOpen && (
               <div data-tools-panel style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div style={panelLabelStyle}>Camera & services</div>
+                <span role="status" aria-live="polite" title={cameraGenerationMessage?.text} style={{ fontSize: 9, fontFamily: "monospace", color: keyframesOutOfDate ? "#a14d00" : cameraKeyframes.length ? "#496700" : "#6a6a6a", border: "1px solid currentColor", padding: "5px 7px" }}>
+                  Camera: {cameraGenerationPhase ? "updating…" : keyframesOutOfDate ? "update queued…" : cameraKeyframes.length ? `✓ ${cameraKeyframes.length} keyframes` : "none"}
+                </span>
+                <button type="button" onClick={() => void generateCameraKeyframes()} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "6px 9px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .5 }}>
+                  {cameraGenerationPhase ? "⟳ Updating camera…" : "⬡ Regenerate camera now"}
+                </button>
+                <span role="status" aria-live="polite" title={bridgeStatusDetail ?? undefined} style={{ fontSize: 9, fontFamily: "monospace", color: bridgeStatus === "online" ? "#496700" : bridgeStatus === "offline" ? "#a32916" : "#6a6a6a", border: "1px solid currentColor", padding: "5px 7px" }}>
+                  Bridge: {bridgeStatus === "online" ? "● online" : bridgeStatus === "offline" ? "● offline" : bridgeStatus === "checking" ? "… checking" : "○ unknown"}
+                </span>
+                <div style={{ height: 1, background: "rgba(42,42,42,.15)" }} />
                 <div style={panelLabelStyle}>Export settings</div>
                 <select aria-label="Export quality" value={exportQuality} disabled={isExporting} onChange={(event) => setExportQuality(event.target.value as ExportQuality)} style={{ ...miniButton, height: 30, background: "#fffdf5" }}>
                   {EXPORT_QUALITY_OPTIONS.map((quality) => {
