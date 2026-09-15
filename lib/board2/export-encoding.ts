@@ -82,7 +82,7 @@ function h264Candidate(
       latencyMode: "quality",
       avc: { format: "avc" },
     },
-    audioConfig: { codec: "mp4a.40.2", sampleRate: 48_000, numberOfChannels: 2, bitrate: 192_000 },
+    audioConfig: { codec: "mp4a.40.2", sampleRate: 48_000, numberOfChannels: 2, bitrate: 256_000 },
   };
 }
 
@@ -109,7 +109,7 @@ function vp9Candidate(
       hardwareAcceleration,
       latencyMode: "quality",
     },
-    audioConfig: { codec: "opus", sampleRate: 48_000, numberOfChannels: 2, bitrate: 192_000 },
+    audioConfig: { codec: "opus", sampleRate: 48_000, numberOfChannels: 2, bitrate: 256_000 },
   };
 }
 

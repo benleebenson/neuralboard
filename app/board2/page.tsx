@@ -21669,10 +21669,8 @@ function Board2Editor({
                 {BOARD_W}×{BOARD_H} · {Math.round(boardZoom * 100)}% · space+drag=pan · scroll=zoom
               </div>
 
-              {/* Annotation toolbar — collapsible, Pro gated */}
+              {/* Annotation toolbar — available to every board editor */}
               <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: isMobile ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
-                <ProGated featureName="Annotation tools">
-                  <>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -21897,8 +21895,6 @@ function Board2Editor({
                         )}
                       </div>
                     )}
-                  </>
-                </ProGated>
               </div>
 
               {/* Character toolbar — collapsible, Pro gated */}

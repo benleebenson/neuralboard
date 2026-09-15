@@ -78,13 +78,44 @@ export function formatExportEta(seconds: number): string {
   return `${secs}s remaining`;
 }
 
-function sampleAudioBuffer(buffer: AudioBuffer, channel: number, sourceFrame: number): number {
-  if (sourceFrame < 0 || sourceFrame >= buffer.length) return 0;
-  const data = buffer.getChannelData(Math.min(channel, buffer.numberOfChannels - 1));
-  const lower = Math.min(buffer.length - 1, Math.floor(sourceFrame));
-  const upper = Math.min(buffer.length - 1, lower + 1);
-  const mix = sourceFrame - lower;
-  return data[lower] + (data[upper] - data[lower]) * mix;
+async function renderOfflineAudioMix(
+  sources: readonly OfflineAudioSource[],
+  totalDuration: number,
+  sampleRate: number,
+  numberOfChannels: number,
+): Promise<AudioBuffer> {
+  const totalFrames = Math.max(1, Math.ceil(Math.max(0, totalDuration) * sampleRate));
+  const context = new OfflineAudioContext(numberOfChannels, totalFrames, sampleRate);
+  for (const item of sources) {
+    if (item.volume <= 0 || item.duration <= 0 || item.startTime >= totalDuration) continue;
+    const offset = Math.min(Math.max(0, item.sourceOffsetSec), Math.max(0, item.buffer.duration - 0.001));
+    const duration = Math.min(item.duration, totalDuration - item.startTime, item.buffer.duration - offset);
+    if (duration <= 0) continue;
+    const source = context.createBufferSource();
+    const gain = context.createGain();
+    source.buffer = item.buffer;
+    gain.gain.value = item.volume;
+    source.connect(gain).connect(context.destination);
+    source.start(Math.max(0, item.startTime), offset, duration);
+  }
+  const rendered = await context.startRendering();
+
+  // Web Audio mixes in floating point and may exceed full scale when narration and clip audio
+  // overlap. Scale the complete mix once instead of hard-clipping individual peaks, which creates
+  // the audible crackle that is especially obvious on speech.
+  let peak = 0;
+  for (let channel = 0; channel < rendered.numberOfChannels; channel++) {
+    const data = rendered.getChannelData(channel);
+    for (let index = 0; index < data.length; index++) peak = Math.max(peak, Math.abs(data[index]));
+  }
+  if (peak > 0.999) {
+    const scale = 0.999 / peak;
+    for (let channel = 0; channel < rendered.numberOfChannels; channel++) {
+      const data = rendered.getChannelData(channel);
+      for (let index = 0; index < data.length; index++) data[index] *= scale;
+    }
+  }
+  return rendered;
 }
 
 export async function encodeOfflineAudioTrack(options: {
@@ -101,31 +132,15 @@ export async function encodeOfflineAudioTrack(options: {
   const numberOfChannels = options.numberOfChannels ?? 2;
   const chunkFrames = options.chunkFrames ?? 1024;
   const totalFrames = Math.max(1, Math.ceil(Math.max(0, options.totalDuration) * sampleRate));
+  const rendered = await renderOfflineAudioMix(options.sources, options.totalDuration, sampleRate, numberOfChannels);
 
   for (let outputStart = 0; outputStart < totalFrames; outputStart += chunkFrames) {
     if (options.isCancelled?.()) throw new DOMException("Export cancelled", "AbortError");
     const frameCount = Math.min(chunkFrames, totalFrames - outputStart);
-    const blockStartTime = outputStart / sampleRate;
-    const blockEndTime = (outputStart + frameCount) / sampleRate;
-    const activeSources = options.sources.filter((source) =>
-      source.volume > 0 &&
-      source.startTime < blockEndTime &&
-      source.startTime + source.duration > blockStartTime
-    );
     const planar = new Float32Array(frameCount * numberOfChannels);
-
-    for (let frame = 0; frame < frameCount; frame++) {
-      const timelineTime = (outputStart + frame) / sampleRate;
-      for (const source of activeSources) {
-        const localTime = timelineTime - source.startTime;
-        if (localTime < 0 || localTime >= source.duration) continue;
-        const sourceFrame = (source.sourceOffsetSec + localTime) * source.buffer.sampleRate;
-        for (let channel = 0; channel < numberOfChannels; channel++) {
-          planar[channel * frameCount + frame] += sampleAudioBuffer(source.buffer, channel, sourceFrame) * source.volume;
-        }
-      }
+    for (let channel = 0; channel < numberOfChannels; channel++) {
+      planar.set(rendered.getChannelData(channel).subarray(outputStart, outputStart + frameCount), channel * frameCount);
     }
-    for (let index = 0; index < planar.length; index++) planar[index] = Math.max(-1, Math.min(1, planar[index]));
 
     const audioData = new AudioData({
       format: "f32-planar",
