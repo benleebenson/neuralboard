@@ -18558,7 +18558,7 @@ function Board2Editor({
   }
 
   // GPT-4o vision can't fetch a blob: URL (tab-scoped) — re-rasterize it as a data URL instead.
-  async function blobUrlToDataUrl(url: string): Promise<string> {
+  async function annotationBlobUrlToDataUrl(url: string): Promise<string> {
     const img = new Image();
     img.src = url;
     await img.decode();
@@ -18574,7 +18574,7 @@ function Board2Editor({
   async function resolveImageUrlForVision(clip: Clip): Promise<string> {
     if (clip.sourceAttributionUrl?.startsWith("http")) return clip.sourceAttributionUrl;
     if (clip.sourceUrl?.startsWith("http")) return clip.sourceUrl;
-    return blobUrlToDataUrl(clip.sourceUrl);
+    return annotationBlobUrlToDataUrl(clip.sourceUrl);
   }
 
   function requireProForSmartPan(): boolean {
@@ -21897,7 +21897,8 @@ function Board2Editor({
                     )}
               </div>
 
-              {/* Character toolbar — collapsible, Pro gated */}
+              {/* Legacy floating character launcher is intentionally not mounted. */}
+              {false && (
               <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 29, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, marginTop: annotationToolbarOpen ? 48 : 0 }}>
                 <ProGated featureName="Character">
                   <>
@@ -22105,6 +22106,7 @@ function Board2Editor({
                   </>
                 </ProGated>
               </div>
+              )}
 
               {/* Character placement overlay — captures board click when characterAddMode, start picking, or retargeting is set */}
               {activeCharacter.enabled && (characterStartPickId || (characterAddMode && characterAddMode !== "emote") || retargetCharActionId) && (
