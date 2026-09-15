@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation";
+import Board2Page from "./board2/page";
 
 export default function Home() {
-  redirect("/board2");
+  return <Board2Page />;
 }

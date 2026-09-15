@@ -5227,6 +5227,7 @@ function Board2Editor({
   const [characterAddMode, setCharacterAddMode] = useState<CharacterAddMode | null>(null);
   const [characterToolbarOpen, setCharacterToolbarOpen] = useState(false);
   const [characterPanelOpen, setCharacterPanelOpen] = useState(false);
+  const [toolsPanelOpen, setToolsPanelOpen] = useState(false);
   const [characterEmoji, setCharacterEmoji] = useState("🤔");
   const [characterEmojiPickerOpen, setCharacterEmojiPickerOpen] = useState(false);
   const [characterFace, setCharacterFace] = useState<CharacterFaceSettings | null>(null);
@@ -20797,7 +20798,6 @@ function Board2Editor({
         <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
           {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
-          {!isMobile && <span style={{ fontSize: 11, color: "#6a6a6a", letterSpacing: 1, fontFamily: "monospace" }}>/ BOARD 2.0</span>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
           {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
@@ -22336,16 +22336,53 @@ function Board2Editor({
           <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <div style={panelLabelStyle}>Properties</div>
-              <button
-                type="button"
-                onClick={openCharacterPanel}
-                style={{ ...miniButton, padding: "3px 7px", background: characterPanelOpen || !!selectedCharAction ? "#2a2a2a" : "transparent", color: characterPanelOpen || !!selectedCharAction ? CHARACTER_COLOR : "#2a2a2a" }}
-              >
-                Character
-              </button>
+              <div style={{ display: "flex", gap: 5 }}>
+                <button
+                  type="button"
+                  onClick={() => { setToolsPanelOpen(false); openCharacterPanel(); }}
+                  style={{ ...miniButton, padding: "3px 7px", background: !toolsPanelOpen && (characterPanelOpen || !!selectedCharAction) ? "#2a2a2a" : "transparent", color: !toolsPanelOpen && (characterPanelOpen || !!selectedCharAction) ? CHARACTER_COLOR : "#2a2a2a" }}
+                >
+                  Character
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={toolsPanelOpen}
+                  onClick={() => { setToolsPanelOpen((open) => !open); setCharacterPanelOpen(false); }}
+                  style={{ ...miniButton, padding: "3px 7px", background: toolsPanelOpen ? "#2a2a2a" : "transparent", color: toolsPanelOpen ? "#fff" : "#2a2a2a" }}
+                >
+                  🔧 Tools
+                </button>
+              </div>
             </div>
 
-            {(selectedCharAction || characterPanelOpen) && (() => {
+            {toolsPanelOpen && (
+              <div data-tools-panel style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div style={panelLabelStyle}>Export settings</div>
+                <select aria-label="Export quality" value={exportQuality} disabled={isExporting} onChange={(event) => setExportQuality(event.target.value as ExportQuality)} style={{ ...miniButton, height: 30, background: "#fffdf5" }}>
+                  {EXPORT_QUALITY_OPTIONS.map((quality) => {
+                    const dimensions = exportOutputDimensions(quality, canvasAspect);
+                    return <option key={quality} value={quality}>{quality} · {dimensions.width}×{dimensions.height}</option>;
+                  })}
+                </select>
+                <select aria-label="Export frame rate" value={exportFps} disabled={isExporting} onChange={(event) => setExportFps(Number(event.target.value) as (typeof SUPPORTED_EXPORT_FPS)[number])} style={{ ...miniButton, height: 30, background: "#fffdf5" }}>
+                  {SUPPORTED_EXPORT_FPS.map((fps) => <option key={fps} value={fps}>{fps} fps</option>)}
+                </select>
+                <select aria-label="Export bitrate" value={exportBitrateMbps} disabled={isExporting} onChange={(event) => setExportBitrateMbps(Number(event.target.value))} style={{ ...miniButton, height: 30, background: "#fffdf5" }}>
+                  {EXPORT_BITRATE_OPTIONS_MBPS.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} Mbps</option>)}
+                </select>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {(["16:9", "9:16"] as const).map((aspect) => <button key={aspect} type="button" onClick={() => handleCanvasAspectChange(aspect)} style={{ ...miniButton, flex: 1, background: canvasAspect === aspect ? "#2a2a2a" : "transparent", color: canvasAspect === aspect ? "#fff" : "#2a2a2a" }}>{aspect}</button>)}
+                </div>
+                <label title="Keep visible off-timeline videos looping silently while the camera passes them." style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 9, fontFamily: "monospace" }}><input type="checkbox" checked={ambientVideoEnabled} onChange={(event) => setAmbientVideoEnabled(event.target.checked)} /> Ambient video</label>
+                <div style={{ height: 1, background: "rgba(42,42,42,.15)" }} />
+                <button type="button" onClick={openLibraryPanel} style={{ ...sketchButton, padding: "6px 9px", fontSize: 10, background: libraryOpen ? "#2a2a2a" : undefined, color: libraryOpen ? "#fff" : undefined }}>📚 Assets</button>
+                <button type="button" onClick={() => void exportBoardImage()} disabled={isExporting || isExportingBoardImage} style={{ ...sketchButton, padding: "6px 9px", fontSize: 10, opacity: isExporting || isExportingBoardImage ? .5 : 1 }}>{isExportingBoardImage ? "Rendering image…" : "▣ Export board image"}</button>
+                <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}><input type="checkbox" checked={snapshotIncludeCharacter} onChange={(event) => setSnapshotIncludeCharacter(event.target.checked)} /> Include character in board image</label>
+                <button type="button" onClick={exportBoardData} disabled={isExportingBoardData} style={{ ...sketchButton, padding: "6px 9px", fontSize: 10, opacity: isExportingBoardData ? .5 : 1 }}>{isExportingBoardData ? "Exporting…" : "🧾 Board Data"}</button>
+              </div>
+            )}
+
+            {!toolsPanelOpen && (selectedCharAction || characterPanelOpen) && (() => {
               const selectedSequence = selectedCharAction?.sequenceId ? characterSequenceById[selectedCharAction.sequenceId] : undefined;
               const selectedIsTrenchReveal = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "trenchCoatReveal";
               const selectedIsExplode = selectedSequence?.kind === "single-canvas" && selectedSequence.renderer === "explode";
@@ -23075,7 +23112,7 @@ function Board2Editor({
               );
             })()}
 
-            {!(selectedCharAction || characterPanelOpen) && (() => {
+            {!toolsPanelOpen && !(selectedCharAction || characterPanelOpen) && (() => {
               const selectedAnnotation = annotations.find((a) => a.id === selectedAnnotationId) ?? null;
               if (selectedAnnotation) return (
                 <>
@@ -23120,7 +23157,7 @@ function Board2Editor({
               return null;
             })()}
 
-            {!(selectedCharAction || characterPanelOpen) && (!selectedClip ? (
+            {!toolsPanelOpen && !(selectedCharAction || characterPanelOpen) && (!selectedClip ? (
               !selectedAnnotationId ? (
                 <p style={{ fontSize: 10, color: "#9a9a9a", fontFamily: "monospace", lineHeight: 1.6, margin: 0 }}>
                   Select a clip or annotation to view its properties.
@@ -23396,7 +23433,7 @@ function Board2Editor({
                 value={exportQuality}
                 disabled={isExporting}
                 onChange={(event) => setExportQuality(event.target.value as ExportQuality)}
-                style={{ ...miniButton, height: 28, background: "#fffdf5" }}
+                style={{ display: "none" }}
               >
                 {EXPORT_QUALITY_OPTIONS.map((quality) => {
                   const dimensions = exportOutputDimensions(quality, canvasAspect);
@@ -23408,7 +23445,7 @@ function Board2Editor({
                 value={exportFps}
                 disabled={isExporting}
                 onChange={(event) => setExportFps(Number(event.target.value) as (typeof SUPPORTED_EXPORT_FPS)[number])}
-                style={{ ...miniButton, height: 28, background: "#fffdf5" }}
+                style={{ display: "none" }}
               >
                 {SUPPORTED_EXPORT_FPS.map((fps) => <option key={fps} value={fps}>{fps} fps</option>)}
               </select>
@@ -23417,7 +23454,7 @@ function Board2Editor({
                 value={exportBitrateMbps}
                 disabled={isExporting}
                 onChange={(event) => setExportBitrateMbps(Number(event.target.value))}
-                style={{ ...miniButton, height: 28, background: "#fffdf5" }}
+                style={{ display: "none" }}
               >
                 {EXPORT_BITRATE_OPTIONS_MBPS.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} Mbps</option>)}
               </select>
@@ -23438,7 +23475,7 @@ function Board2Editor({
               )}
               <button
                 onClick={openLibraryPanel}
-                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: libraryOpen ? "#2a2a2a" : undefined, color: libraryOpen ? "#fff" : undefined }}
+                style={{ display: "none" }}
                 title="Browse and reuse images/YouTube clips from your past boards"
               >
                 📚 Assets
@@ -23447,22 +23484,22 @@ function Board2Editor({
                 onClick={() => void exportBoardImage()}
                 disabled={isExporting || isExportingBoardImage}
                 title={`Export the entire board as a ${BOARD_SNAPSHOT_LONG_EDGE}px-long-edge PNG`}
-                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isExporting || isExportingBoardImage ? 0.5 : 1 }}
+                style={{ display: "none" }}
               >
                 {isExportingBoardImage ? "Rendering image…" : "▣ Export board image"}
               </button>
-              <label title="Include the character in full-board image exports" style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", whiteSpace: "nowrap" }}>
+              <label title="Include the character in full-board image exports" style={{ display: "none" }}>
                 <input type="checkbox" checked={snapshotIncludeCharacter} onChange={(event) => setSnapshotIncludeCharacter(event.target.checked)} /> character
               </label>
               <button
                 onClick={exportBoardData}
                 disabled={isExportingBoardData}
                 title="Export board data (.json) — the complete recipe of this board: clips, timing, camera, character choreography, and provenance"
-                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isExportingBoardData ? 0.5 : 1, cursor: isExportingBoardData ? "wait" : "pointer" }}
+                style={{ display: "none" }}
               >
                 {isExportingBoardData ? "…" : "🧾 Board Data"}
               </button>
-              <div style={{ display: "flex", gap: 3 }}>
+              <div style={{ display: "none" }}>
                 {(["16:9", "9:16"] as const).map((a) => (
                   <button
                     key={a}
@@ -23475,7 +23512,7 @@ function Board2Editor({
               </div>
               <label
                 title="Keep visible off-timeline videos looping silently while the camera passes them."
-                style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, fontFamily: "monospace", color: "#2a2a2a", whiteSpace: "nowrap", userSelect: "none" }}
+                style={{ display: "none" }}
               >
                 <input
                   type="checkbox"
