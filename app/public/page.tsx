@@ -1,24 +1,40 @@
 "use client";
-import Image from "next/image";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
-import { layoutPublicBoard } from "@/lib/public-board-layout";
-import { publicBoardFetch, type PublicBoardPost } from "@/lib/public-board";
+import { normalizeJoinCode } from "@/lib/joinable-board";
 import styles from "./public.module.css";
 
-type Camera={x:number;y:number;zoom:number};
-export default function PublicBoardPage(){
-  const [posts,setPosts]=useState<PublicBoardPost[]>([]);const [loading,setLoading]=useState(true);const [error,setError]=useState("");const [open,setOpen]=useState(false);const [text,setText]=useState("");const [name,setName]=useState("");const [image,setImage]=useState<File|null>(null);const [sending,setSending]=useState(false);const [confirmation,setConfirmation]=useState("");const [camera,setCamera]=useState<Camera>({x:0,y:0,zoom:.35});
-  const viewport=useRef<HTMLDivElement>(null);const cameraRef=useRef(camera);const pointers=useRef(new Map<number,{x:number;y:number}>());const gesture=useRef<{distance:number;zoom:number;centerX:number;centerY:number;worldX:number;worldY:number}|null>(null);const layout=useMemo(()=>layoutPublicBoard(posts),[posts]);
-  const updateCamera=useCallback((next:Camera)=>{const safe={x:next.x,y:next.y,zoom:Math.min(2.2,Math.max(.18,next.zoom))};cameraRef.current=safe;setCamera(safe)},[]);
-  useEffect(()=>{void publicBoardFetch("/api/public-board").then(r=>r.json()).then(setPosts).catch(e=>setError(e instanceof Error?e.message:"Could not load the board")).finally(()=>setLoading(false))},[]);
-  useEffect(()=>{const el=viewport.current;if(!el)return;const fit=Math.min(.8,Math.max(.2,Math.min(el.clientWidth/layout.width,el.clientHeight/layout.height)*1.7));updateCamera({zoom:fit,x:(el.clientWidth-layout.width*fit)/2,y:(el.clientHeight-layout.height*fit)/2})},[layout.width,layout.height,updateCamera]);
-  function pointerDown(e:React.PointerEvent){e.currentTarget.setPointerCapture(e.pointerId);pointers.current.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.current.size===2){const [a,b]=[...pointers.current.values()];const distance=Math.hypot(a.x-b.x,a.y-b.y);const cx=(a.x+b.x)/2,cy=(a.y+b.y)/2;gesture.current={distance,zoom:cameraRef.current.zoom,centerX:cx,centerY:cy,worldX:(cx-cameraRef.current.x)/cameraRef.current.zoom,worldY:(cy-cameraRef.current.y)/cameraRef.current.zoom}}}
-  function pointerMove(e:React.PointerEvent){const previous=pointers.current.get(e.pointerId);if(!previous)return;pointers.current.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pointers.current.size===1){updateCamera({...cameraRef.current,x:cameraRef.current.x+e.clientX-previous.x,y:cameraRef.current.y+e.clientY-previous.y})}else if(pointers.current.size===2&&gesture.current){const [a,b]=[...pointers.current.values()];const cx=(a.x+b.x)/2,cy=(a.y+b.y)/2;const zoom=gesture.current.zoom*Math.hypot(a.x-b.x,a.y-b.y)/Math.max(1,gesture.current.distance);updateCamera({zoom,x:cx-gesture.current.worldX*zoom,y:cy-gesture.current.worldY*zoom})}}
-  function pointerUp(e:React.PointerEvent){pointers.current.delete(e.pointerId);gesture.current=null}
-  function wheel(e:React.WheelEvent){e.preventDefault();const factor=Math.exp(-e.deltaY*.001);const zoom=Math.min(2.2,Math.max(.18,cameraRef.current.zoom*factor));updateCamera({zoom,x:e.clientX-(e.clientX-cameraRef.current.x)*zoom/cameraRef.current.zoom,y:e.clientY-(e.clientY-cameraRef.current.y)*zoom/cameraRef.current.zoom})}
-  async function submit(e:React.FormEvent){e.preventDefault();setSending(true);setError("");try{const form=new FormData();form.append("text",text);form.append("name",name);if(image)form.append("image",image,image.name);const response=await publicBoardFetch("/api/public-board",{method:"POST",body:form});const result=await response.json();setConfirmation(result.message);setText("");setName("");setImage(null)}catch(e){setError(e instanceof Error?e.message:"Could not submit your post")}finally{setSending(false)}}
-  return <main className={styles.page}><div className={styles.top}><div className={styles.brand}><h1>Public Board</h1><p>Ideas from the Neural Board community</p></div><div className={styles.topNav}><MainSectionNav active="public"/></div></div>{loading&&<div className={styles.loading}>Loading the board…</div>}{error&&!open&&<div className={styles.loading}>{error}</div>}
-    <div ref={viewport} className={styles.viewport} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onWheel={wheel}><div className={styles.board} style={{width:layout.width,height:layout.height,transform:`translate3d(${camera.x}px,${camera.y}px,0) scale(${camera.zoom})`}}>{layout.posts.map(post=><article key={post.id} className={`${styles.post} ${post.type==="image"?styles.imagePost:""}`} style={{left:post.x,top:post.y,width:post.width,height:post.height,transform:`rotate(${post.rotation}deg)`}}>{post.type==="image"?<Image draggable={false} unoptimized fill sizes="320px" src={`/api/public-board/image/${post.id}`} alt={post.text||"Community image"}/>:<div>{post.text}</div>}{post.type==="image"&&post.text?<div className={styles.caption}>{post.text}</div>:null}{post.name?<div className={styles.postName}>— {post.name}</div>:null}</article>)}{!loading&&!posts.length?<div className={styles.empty}>The board is waiting for its first idea.<br/>Leave yours below.</div>:null}</div></div><div className={styles.hint}>drag to explore · pinch or wheel to zoom</div><button className={styles.add} onClick={()=>{setOpen(true);setConfirmation("");setError("")}}>＋ Add to the board</button>
-    {open?<div className={styles.scrim} onPointerDown={e=>{if(e.target===e.currentTarget)setOpen(false)}}><form className={styles.sheet} onSubmit={submit}><div className={styles.sheetHead}><h2>Add to the board</h2><button type="button" className={styles.close} aria-label="Close" onClick={()=>setOpen(false)}>✕</button></div>{confirmation?<><p className={styles.message}>{confirmation}</p><button type="button" className={styles.submit} onClick={()=>setOpen(false)}>Back to the board</button></>:<><label className={styles.label}><span>Your idea</span><textarea maxLength={280} value={text} onChange={e=>setText(e.target.value)} placeholder="What should we build, explore, or talk about?"/><small className={styles.counter}>{text.length}/280</small></label><label className={styles.label}><span>Or add an image</span><input className={styles.file} type="file" accept="image/*" onChange={e=>setImage(e.target.files?.[0]??null)}/></label><label className={styles.label}><span>Your name (optional)</span><input type="text" maxLength={60} value={name} onChange={e=>setName(e.target.value)} placeholder="Name or @handle"/></label>{error?<p className={`${styles.message} ${styles.error}`}>{error}</p>:null}<button className={styles.submit} disabled={sending||(!text.trim()&&!image)}>{sending?"Sending…":"Submit for approval"}</button></>}</form></div>:null}</main>
+export default function JoinBoardPage() {
+  const router = useRouter();
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+
+  async function join(event: React.FormEvent) {
+    event.preventDefault();
+    const normalized = normalizeJoinCode(code);
+    if (normalized.length !== 6) { setError("Enter the six-character code shown on the other board."); return; }
+    setChecking(true); setError("");
+    try {
+      const response = await fetch(`/api/joinable-board?code=${normalized}`, { cache: "no-store" });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Could not join that board.");
+      router.push(`/?join=${normalized}`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not join that board."); }
+    finally { setChecking(false); }
+  }
+
+  return <main className={styles.joinPage}>
+    <div className={styles.joinNav}><MainSectionNav active="public" /></div>
+    <form className={styles.joinCard} onSubmit={join}>
+      <div className={styles.joinEyebrow}>Neural Board</div>
+      <h1>Join a board</h1>
+      <p>Enter the code shown on someone’s board to edit it together.</p>
+      <input autoFocus inputMode="text" autoCapitalize="characters" autoComplete="off" maxLength={6} aria-label="Board code" value={code} onChange={(event) => setCode(normalizeJoinCode(event.target.value))} placeholder="ABC123" />
+      {error && <div className={styles.joinError}>{error}</div>}
+      <button disabled={checking || code.length !== 6}>{checking ? "Checking…" : "Join board →"}</button>
+    </form>
+  </main>;
 }

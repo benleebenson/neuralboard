@@ -10,7 +10,7 @@ import styles from "./MainSectionNav.module.css";
 export type MainSection = "board" | "clips" | "projects" | "library" | "public";
 
 const sections: Array<{ id: MainSection; href: string; label: string; icon: string }> = [
-  { id: "public", href: "/public", label: "Public Board", icon: "◎" },
+  { id: "public", href: "/public", label: "Join Board", icon: "◎" },
   { id: "board", href: "/board2", label: "Board", icon: "✎" },
   { id: "clips", href: "/clips", label: "Clips", icon: "✂" },
   { id: "projects", href: "/projects", label: "Projects", icon: "☁" },

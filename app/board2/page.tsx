@@ -16,6 +16,7 @@ import {
   Muxer as WebMMuxer,
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
+import { normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
@@ -4959,6 +4960,8 @@ function createBoardWorkspace(index: number): BoardWorkspaceStatus {
 }
 
 export default function Board2Page() {
+  const [initialJoinCode, setInitialJoinCode] = useState("");
+  useEffect(() => { setInitialJoinCode(normalizeJoinCode(new URLSearchParams(window.location.search).get("join"))); }, []);
   const nextWorkspaceIndexRef = useRef(2);
   const [workspaces, setWorkspaces] = useState<BoardWorkspaceStatus[]>(() => [createBoardWorkspace(1)]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
@@ -5019,6 +5022,7 @@ export default function Board2Page() {
               workspaceId={workspace.id}
               isWorkspaceActive={workspace.id === activeWorkspaceId}
               initialName={workspace.name}
+              initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
               onWorkspaceStatus={updateWorkspace}
             />
           </div>
@@ -5032,15 +5036,24 @@ function Board2Editor({
   workspaceId,
   isWorkspaceActive,
   initialName,
+  initialJoinCode,
   onWorkspaceStatus,
 }: {
   workspaceId: string;
   isWorkspaceActive: boolean;
   initialName: string;
+  initialJoinCode: string;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
 }) {
   const { data: session } = useSession();
   const { isPro: isProUser } = useIsPro();
+
+  const [joinCode, setJoinCode] = useState("");
+  const [joinOwnerToken, setJoinOwnerToken] = useState("");
+  const [joinStatus, setJoinStatus] = useState<"idle" | "connecting" | "joined" | "error">("idle");
+  const joinVersionRef = useRef(0);
+  const joinLastSignatureRef = useRef("");
+  const joinWriteTimerRef = useRef<number | null>(null);
 
   const [clips, setClips] = useState<Clip[]>([]);
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
@@ -6451,6 +6464,78 @@ function Board2Editor({
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  const joinableSnapshot = useMemo<JoinableBoardState>(() => ({
+    clips: clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, previewUrl: _previewUrl, thumbnailBlobUrl: _thumbnailBlobUrl, ...clip }) => clip as unknown as Record<string, unknown>),
+    annotations: annotations as unknown as Array<Record<string, unknown>>,
+    boardDimensions,
+    cameraKeyframes: cameraKeyframes as unknown as Array<Record<string, unknown>>,
+    characterActions: characterActions as unknown as Array<Record<string, unknown>>,
+    characterActions2: characterActions2 as unknown as Array<Record<string, unknown>>,
+    showCharacter,
+    showCharacter2,
+    canvasAspect,
+  }), [annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2]);
+  const joinableSignature = useMemo(() => JSON.stringify(joinableSnapshot), [joinableSnapshot]);
+
+  const applyJoinableState = useCallback((state: JoinableBoardState, version: number) => {
+    const incomingClips = Array.isArray(state.clips) ? state.clips as unknown as Clip[] : [];
+    joinVersionRef.current = version;
+    joinLastSignatureRef.current = JSON.stringify(state);
+    clipsRef.current = incomingClips;
+    setClips(incomingClips);
+    setMediaLibrary(incomingClips.filter((clip) => (clip.type === "image" || clip.type === "video") && !!clip.sourceUrl).map((clip) => ({ id: clip.mediaId ?? clip.id, name: clip.name, type: clip.type as "image" | "video", url: clip.sourceUrl, duration: clip.duration })));
+    setAnnotations(Array.isArray(state.annotations) ? state.annotations as unknown as Annotation[] : []);
+    if (state.boardDimensions?.width >= BOARD_W && state.boardDimensions?.height >= BOARD_H) {
+      boardDimensionsRef.current = state.boardDimensions;
+      setBoardDimensions(state.boardDimensions);
+    }
+    if (Array.isArray(state.cameraKeyframes)) setCameraKeyframes(state.cameraKeyframes as unknown as CameraKeyframe[]);
+    if (Array.isArray(state.characterActions)) setCharacterActions(state.characterActions as unknown as CharacterAction[]);
+    if (Array.isArray(state.characterActions2)) setCharacterActions2(state.characterActions2 as unknown as CharacterAction[]);
+    if (typeof state.showCharacter === "boolean") setShowCharacter(state.showCharacter);
+    if (typeof state.showCharacter2 === "boolean") setShowCharacter2(state.showCharacter2);
+    if (state.canvasAspect === "16:9" || state.canvasAspect === "9:16") setCanvasAspect(state.canvasAspect);
+  }, []);
+
+  useEffect(() => {
+    if (!initialJoinCode || joinCode) return;
+    setJoinCode(initialJoinCode);
+    setJoinStatus("connecting");
+    if (isMobile) setMobileDesktopOverride(true);
+  }, [initialJoinCode, isMobile, joinCode]);
+
+  useEffect(() => {
+    if (!joinCode) return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const response = await fetch(`/api/joinable-board?code=${joinCode}`, { cache: "no-store" });
+        const result = await response.json() as { state?: JoinableBoardState; version?: number; error?: string };
+        if (!response.ok) throw new Error(result.error || "The shared board is unavailable.");
+        if (!cancelled && typeof result.version === "number" && result.version > joinVersionRef.current) applyJoinableState(result.state ?? { clips: [], annotations: [], boardDimensions: { width: BOARD_W, height: BOARD_H } }, result.version);
+        if (!cancelled) setJoinStatus("joined");
+      } catch (error) {
+        if (!cancelled) { setJoinStatus("error"); setToast(error instanceof Error ? error.message : "The shared board is unavailable."); }
+      }
+    };
+    void pull();
+    const timer = window.setInterval(() => { void pull(); }, 1200);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [applyJoinableState, joinCode]);
+
+  useEffect(() => {
+    if (!joinCode || joinStatus !== "joined" || joinableSignature === joinLastSignatureRef.current) return;
+    if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current);
+    joinWriteTimerRef.current = window.setTimeout(async () => {
+      const response = await fetch("/api/joinable-board", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, version: joinVersionRef.current, state: joinableSnapshot }) });
+      if (response.ok) {
+        const result = await response.json() as { version: number };
+        joinVersionRef.current = result.version;
+        joinLastSignatureRef.current = joinableSignature;
+      }
+    }, 450);
+    return () => { if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current); };
+  }, [joinCode, joinStatus, joinableSignature, joinableSnapshot]);
   // Asset library: fire-and-forget save of every board-placed image/YouTube clip so it can be
   // reused from the Library panel later. A single effect over `clips` (rather than instrumenting
   // every clip-creation call site — manual upload, auto-build, Top 5, Neural Search, YouTube
@@ -11206,11 +11291,22 @@ function Board2Editor({
 
   // ─ Media upload ───────────────────────────────────────────────────────────
 
+  async function uploadJoinableImage(file: File | Blob, name: string, code = joinCode): Promise<string> {
+    if (!code) return URL.createObjectURL(file);
+    const form = new FormData();
+    form.append("code", code);
+    form.append("file", file, name);
+    const response = await fetch("/api/joinable-board/media", { method: "POST", body: form });
+    const result = await response.json() as { url?: string; error?: string };
+    if (!response.ok || !result.url) throw new Error(result.error || "Could not share that image.");
+    return result.url;
+  }
+
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
   // in the media library, and places it on the board via addClipAndPlaceOnBoard.
   async function ingestMediaFile(file: File | Blob, name: string, center?: { x: number; y: number }) {
-    const url = URL.createObjectURL(file);
     const type: "image" | "video" = file.type.startsWith("video") ? "video" : "image";
+    const url = type === "image" && joinCode ? await uploadJoinableImage(file, name) : URL.createObjectURL(file);
     let duration: number | undefined;
     if (type === "video") {
       loadMedia(url, type);
@@ -11279,7 +11375,7 @@ function Board2Editor({
       for (let offset = 0; offset < imageFiles.length; offset += 4) {
         const group = imageFiles.slice(offset, offset + 4);
         const decoded = await Promise.all(group.map(async (file) => {
-          const url = URL.createObjectURL(file);
+          const url = joinCode ? await uploadJoinableImage(file, file.name) : URL.createObjectURL(file);
           await decodeImageForPlacement(url);
           return { id: generateId(), name: file.name, type: "image" as const, url, blob: file };
         }));
@@ -20783,6 +20879,50 @@ function Board2Editor({
     );
   }
 
+  async function makeBoardJoinable() {
+    if (!session?.user) { void signIn("google", { callbackUrl: "/board2" }); return; }
+    setJoinStatus("connecting");
+    try {
+      const response = await fetch("/api/joinable-board", { method: "POST" });
+      const result = await response.json() as { code?: string; token?: string; error?: string };
+      if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
+      const sharedClips: Clip[] = [];
+      for (const clip of clipsRef.current) {
+        if (clip.type === "image" && clip.sourceBlob?.size) {
+          const sourceUrl = await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code);
+          sharedClips.push({ ...clip, sourceUrl });
+        } else {
+          sharedClips.push(clip);
+        }
+      }
+      clipsRef.current = sharedClips;
+      setClips(sharedClips);
+      joinVersionRef.current = 0;
+      joinLastSignatureRef.current = "";
+      setJoinOwnerToken(result.token);
+      setJoinCode(result.code);
+      setJoinStatus("joined");
+      setToast(`Board join code: ${result.code}`);
+    } catch (error) {
+      setJoinStatus("error");
+      setToast(error instanceof Error ? error.message : "Could not make this board joinable.");
+    }
+  }
+
+  async function stopBoardJoinability() {
+    if (!joinOwnerToken) return;
+    const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, token: joinOwnerToken }) });
+    if (!response.ok) { const result = await response.json().catch(() => ({})) as { error?: string }; setToast(result.error || "Could not stop sharing."); return; }
+    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); joinVersionRef.current = 0; joinLastSignatureRef.current = "";
+    window.history.replaceState({}, "", window.location.pathname);
+    setToast("Board is no longer joinable");
+  }
+
+  async function copyJoinCode() {
+    await navigator.clipboard.writeText(joinCode);
+    setToast(`Copied join code ${joinCode}`);
+  }
+
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
@@ -20856,6 +20996,16 @@ function Board2Editor({
             <ProGated featureName="Play Mode">
               <button onClick={enterPlayMode} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }} title="Full-window direct character control">▶ Play</button>
             </ProGated>
+          )}
+          {!joinCode ? (
+            <button onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#a8d8ff", opacity: joinStatus === "connecting" ? .55 : 1 }} title="Let another device edit this board using a private code">
+              {joinStatus === "connecting" ? "Making joinable…" : "Make board joinable"}
+            </button>
+          ) : (
+            <span style={{ display: "flex", alignItems: "stretch", gap: 3 }}>
+              <button onClick={() => { void copyJoinCode(); }} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: joinStatus === "joined" ? "#c8f135" : "#ffe5a8", letterSpacing: 1 }} title="Copy this code">Code: {joinCode}</button>
+              {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
+            </span>
           )}
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
