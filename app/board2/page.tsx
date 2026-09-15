@@ -20904,7 +20904,7 @@ function Board2Editor({
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
-            <label style={{ ...sketchButton, position: "relative", display: "block", textAlign: "center", boxSizing: "border-box", overflow: "hidden" }}>
+            <label style={{ ...sketchButton, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 36, lineHeight: 1.2, textAlign: "center", boxSizing: "border-box", overflow: "hidden", flexShrink: 0 }}>
               ↑ Upload media
               <input
                 type="file"
@@ -21683,7 +21683,7 @@ function Board2Editor({
               </div>
 
               {/* Annotation toolbar — available to every board editor */}
-              <div style={{ position: "absolute", top: 8, left: "50%", transform: "translateX(-50%)", zIndex: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, maxWidth: isMobile ? "calc(100vw - 76px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
+              <div style={{ position: "absolute", top: 8, left: isMobile ? "max(8px, env(safe-area-inset-left))" : 8, zIndex: 30, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 4, maxWidth: isMobile ? "calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
