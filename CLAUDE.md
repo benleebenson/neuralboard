@@ -25,7 +25,7 @@ No test suite exists. Verify changes by running the dev server.
 | `SERPER_API_KEY` | Google Images search via Serper |
 | `RAILWAY_URL` + `NEXT_PUBLIC_RAILWAY_URL` | External Railway backend (video search + yt-dlp) |
 | `NEURALBOARD_PASSWORD` | Password header for Railway requests |
-| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `NEXT_PUBLIC_STRIPE_PRICE_ID` | Stripe subscriptions |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` | Stripe subscriptions |
 | `ANTHROPIC_API_KEY` | Claude (auto-picked up by `@anthropic-ai/sdk`) |
 
 ## Architecture

@@ -8,6 +8,7 @@ import { ProGated, UpgradeModal } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
+import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
 import {
@@ -5046,7 +5047,7 @@ function Board2Editor({
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
 }) {
   const { data: session } = useSession();
-  const { isPro: isProUser } = useIsPro();
+  const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
 
   const [joinCode, setJoinCode] = useState("");
   const [joinOwnerToken, setJoinOwnerToken] = useState("");
@@ -5186,6 +5187,7 @@ function Board2Editor({
   const [isPortrait, setIsPortrait] = useState(false);
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
   const [mobileEditorMenuOpen, setMobileEditorMenuOpen] = useState(false);
+  const [mobileAccountOpen, setMobileAccountOpen] = useState(false);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
   // ── Save / Load ──
@@ -12336,6 +12338,7 @@ function Board2Editor({
 
     return (
       <div style={{ position: "fixed", inset: 0, background: bg, fontFamily: "monospace", display: "flex", flexDirection: "column", height: "100dvh", overflow: "hidden" }}>
+        <CheckoutReturnNotice isPro={isProUser} />
         <style>{`
           @keyframes m5spin { to { transform: rotate(360deg); } }
           @media (orientation: landscape) {
@@ -12355,7 +12358,7 @@ function Board2Editor({
         <div className="m5-portrait-content" style={{ display: "flex", flexDirection: "column", height: "100dvh", paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
 
           {/* Header */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 16px", borderBottom: "1.5px dashed rgba(42,42,42,0.25)", flexShrink: 0 }}>
+          <div style={{ height: 44, boxSizing: "border-box", display: "flex", alignItems: "center", gap: 8, padding: "5px 10px", borderBottom: "1.5px dashed rgba(42,42,42,0.25)", flexShrink: 0 }}>
             <span style={{ fontFamily: "'Caveat', cursive", fontSize: 20, fontWeight: 700, color: ink, flex: 1 }}>
               Top {totalRanks} Builder
             </span>
@@ -12365,7 +12368,23 @@ function Board2Editor({
             >
               Desktop version
             </button>
+            <button
+              type="button"
+              aria-label="Open account menu"
+              aria-expanded={mobileAccountOpen}
+              onClick={() => setMobileAccountOpen((open) => !open)}
+              style={{ width: 34, height: 34, padding: 0, flexShrink: 0, border: "1.5px solid #2a2a2a", background: mobileAccountOpen ? "#2a2a2a" : "#fffdf5", color: mobileAccountOpen ? "#c8f135" : "#2a2a2a", font: "800 17px/1 monospace", cursor: "pointer" }}
+            >☰</button>
           </div>
+          {mobileAccountOpen && (
+            <div style={{ position: "fixed", top: "calc(max(44px, env(safe-area-inset-top) + 44px))", left: 8, right: 8, zIndex: 10000 }}>
+              {session?.user?.email ? (
+                <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setMobileAccountOpen(false)} />
+              ) : (
+                <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
+              )}
+            </div>
+          )}
 
           {/* ── Screen 1: Prompt ── */}
           {mobileTop5Screen === "prompt" && (
@@ -19058,6 +19077,26 @@ function Board2Editor({
   if (isMobile && !mobileDesktopOverride && !AI_FEATURES_ENABLED) {
     return (
       <div style={{ position: "fixed", inset: 0, background: BOARD_SURFACE_COLOR, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace", padding: 28, textAlign: "center" }}>
+        <CheckoutReturnNotice isPro={isProUser} />
+        <header style={{ position: "absolute", top: 0, left: 0, right: 0, height: isPortrait ? 44 : 34, boxSizing: "border-box", display: "flex", alignItems: "center", gap: 8, padding: isPortrait ? "5px 8px" : "2px 8px", borderBottom: "1.5px dashed rgba(42,42,42,0.3)", background: "rgba(255,253,245,.95)" }}>
+          <span style={{ flex: 1, textAlign: "left", fontFamily: "'Caveat', cursive", fontSize: isPortrait ? 20 : 17, fontWeight: 700 }}>Neural Board</span>
+          <button
+            type="button"
+            aria-label="Open account menu"
+            aria-expanded={mobileAccountOpen}
+            onClick={() => setMobileAccountOpen((open) => !open)}
+            style={{ width: isPortrait ? 34 : 30, height: isPortrait ? 34 : 28, padding: 0, border: "1.5px solid #2a2a2a", background: mobileAccountOpen ? "#2a2a2a" : "#fffdf5", color: mobileAccountOpen ? "#c8f135" : "#2a2a2a", font: "800 17px/1 monospace", cursor: "pointer" }}
+          >☰</button>
+        </header>
+        {mobileAccountOpen && (
+          <div style={{ position: "absolute", top: isPortrait ? 51 : 41, left: 8, right: 8, zIndex: 10, textAlign: "left" }}>
+            {session?.user?.email ? (
+              <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setMobileAccountOpen(false)} />
+            ) : (
+              <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
+            )}
+          </div>
+        )}
         <div style={{ fontSize: 17, fontWeight: 700, color: "#2a2a2a" }}>Open Neural Board on desktop</div>
         <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 10, lineHeight: 1.6 }}>The mobile AI flow is currently hidden while AI features are disabled.</div>
       </div>
@@ -19097,7 +19136,7 @@ function Board2Editor({
           <button
             onClick={() => setMobileDrawer((d) => d === "media" ? null : "media")}
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 19, fontFamily: "monospace", background: mobileDrawer === "media" ? "#2a2a2a" : "transparent", color: mobileDrawer === "media" ? "#c8f135" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
-          >≡</button>
+          >☰</button>
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, color: "#2a2a2a", flex: 1, minWidth: 0, lineHeight: 1, overflow: "hidden", whiteSpace: "nowrap" }}>Neural Board</span>
           <span style={{ fontFamily: "monospace", fontSize: 10, color: "#2a2a2a", letterSpacing: 0.5, border: "1px solid rgba(42,42,42,0.3)", padding: "2px 4px", background: "#fffdf5", flexShrink: 0 }}>
             {formatTime(playhead)}/{formatTime(timelineDuration)}
@@ -19129,6 +19168,7 @@ function Board2Editor({
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
           >💾</button>
         </header>
+        <CheckoutReturnNotice isPro={isProUser} />
 
         {/* ── Board ── */}
         <div
@@ -19502,6 +19542,18 @@ function Board2Editor({
                     <a href="/clips" style={{ ...sketchButton, padding: "9px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>✂ Clips</a>
                     <a href="/board2/library" style={{ ...sketchButton, padding: "9px 5px", fontSize: 10, textAlign: "center", textDecoration: "none" }}>▦ Library</a>
                   </nav>
+                  {session?.user?.email && (
+                    <div style={{ marginBottom: 14 }}>
+                      <AccountControl
+                        email={session.user.email}
+                        isPro={isProUser}
+                        isAdmin={isAdminUser}
+                        isProLoading={isProLoading}
+                        variant="inline"
+                        onAction={() => setMobileDrawer(null)}
+                      />
+                    </div>
+                  )}
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     <label style={{ ...sketchButton, position: "relative", display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box", overflow: "hidden" }}>
@@ -21010,8 +21062,8 @@ function Board2Editor({
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <MainSectionNav active="board" desktopOnly />
-          {session?.user ? (
-            <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
+          {session?.user?.email ? (
+            <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} />
           ) : (
             <button
               onClick={() => signIn("google", { callbackUrl: "/board2" })}
@@ -21023,9 +21075,20 @@ function Board2Editor({
           </>}
         </div>
       </header>
+      <CheckoutReturnNotice isPro={isProUser} />
 
       {isMobile && mobileEditorMenuOpen && (
         <div style={{ position: "fixed", top: isPortrait ? "calc(max(44px, env(safe-area-inset-top) + 44px))" : "calc(max(34px, env(safe-area-inset-top) + 34px))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
+          {session?.user?.email && (
+            <AccountControl
+              email={session.user.email}
+              isPro={isProUser}
+              isAdmin={isAdminUser}
+              isProLoading={isProLoading}
+              variant="inline"
+              onAction={() => setMobileEditorMenuOpen(false)}
+            />
+          )}
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>

@@ -24,21 +24,36 @@ export async function POST(req: NextRequest) {
     return (customer as Stripe.Customer).email ?? null;
   }
 
+  async function syncSubscription(sub: Stripe.Subscription, knownEmail?: string | null) {
+    const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer.id;
+    const email = knownEmail ?? await resolveEmail(customerId);
+    if (!email) throw new Error(`No user email found for Stripe customer ${customerId}`);
+    await updateSubscriptionByEmail(email, {
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: sub.id,
+      subscriptionStatus: sub.status,
+      subscriptionPeriodEnd: sub.items.data[0]?.current_period_end
+        ? new Date(sub.items.data[0].current_period_end * 1000)
+        : null,
+    });
+  }
+
   switch (event.type) {
+    case "checkout.session.completed": {
+      const checkout = event.data.object as Stripe.Checkout.Session;
+      const subscriptionId = typeof checkout.subscription === "string"
+        ? checkout.subscription
+        : checkout.subscription?.id;
+      if (checkout.mode === "subscription" && subscriptionId) {
+        const sub = await stripe.subscriptions.retrieve(subscriptionId);
+        await syncSubscription(sub, checkout.metadata?.email ?? checkout.customer_details?.email);
+      }
+      break;
+    }
     case "customer.subscription.created":
     case "customer.subscription.updated": {
       const sub = event.data.object as Stripe.Subscription;
-      const email = await resolveEmail(sub.customer as string);
-      if (email) {
-        await updateSubscriptionByEmail(email, {
-          stripeCustomerId: sub.customer as string,
-          stripeSubscriptionId: sub.id,
-          subscriptionStatus: sub.status,
-          subscriptionPeriodEnd: sub.items.data[0]?.current_period_end
-            ? new Date(sub.items.data[0].current_period_end * 1000)
-            : null,
-        });
-      }
+      await syncSubscription(sub);
       break;
     }
     case "customer.subscription.deleted": {

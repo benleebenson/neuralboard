@@ -1,12 +1,10 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { getStripe } from "@/lib/stripe";
 
-const APP_URL = process.env.NEXTAUTH_URL ?? "https://neuralboard-zeta.vercel.app";
-
-export async function POST() {
+export async function POST(req: NextRequest) {
   const stripe = getStripe();
   const supabase = getSupabase();
   const session = await getServerSession(authOptions);
@@ -26,7 +24,7 @@ export async function POST() {
 
   const portalSession = await stripe.billingPortal.sessions.create({
     customer: data.stripe_customer_id,
-    return_url: `${APP_URL}/upgrade`,
+    return_url: `${process.env.NEXTAUTH_URL ?? req.nextUrl.origin}/upgrade`,
   });
 
   return NextResponse.json({ url: portalSession.url });

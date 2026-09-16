@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useRef, useEffect, Fragment } from "react";
-import { useSession, signIn, signOut } from "next-auth/react";
+import { useSession, signIn } from "next-auth/react";
+import { AccountControl } from "@/app/components/AccountControl";
+import { ADMIN_EMAIL } from "@/lib/admin";
 
 type CameraMode = "default" | "closeup" | "pan-left" | "pan-right" | "pulse";
 
@@ -1941,16 +1943,8 @@ export default function BuilderPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <a href="/board2" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>Board</a>
-          {session?.user ? (
-            <>
-              <span style={{ fontSize: 11, color: "#6a6a6a", fontFamily: "monospace" }}>{session.user.email}</span>
-              {!isSubscribed && (
-                <a href="/upgrade" style={{ fontSize: 10, fontFamily: "monospace", color: "#2a2a2a", textDecoration: "none", border: "1px solid #2a2a2a", padding: "3px 8px", borderRadius: 3, letterSpacing: 0.5 }}>
-                  subscribe →
-                </a>
-              )}
-              <button onClick={() => signOut()} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign out</button>
-            </>
+          {session?.user?.email ? (
+            <AccountControl email={session.user.email} isPro={isSubscribed} isAdmin={session.user.email === ADMIN_EMAIL} />
           ) : (
             <button onClick={() => signIn("google", { callbackUrl: "/builder" })} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign in →</button>
           )}
@@ -2368,7 +2362,7 @@ export default function BuilderPage() {
                   : "You've used your free video."}
               </p>
               <a href="/upgrade" style={{ display: "inline-block", padding: "8px 16px", background: "#2a2a2a", color: "white", fontSize: 11, fontFamily: "monospace", fontWeight: 700, textDecoration: "none", letterSpacing: 0.5 }}>
-                Upgrade for $10/mo →
+                Upgrade to Pro →
               </a>
             </div>
           ) : error ? (

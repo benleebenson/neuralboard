@@ -115,7 +115,7 @@ export async function getSubscriptionStatus(email: string) {
     .eq("email", email)
     .single();
   const isActive =
-    data?.subscription_status === "active" &&
+    (data?.subscription_status === "active" || data?.subscription_status === "trialing") &&
     (!data.subscription_period_end || new Date(data.subscription_period_end) > new Date());
   return { isSubscribed: isActive, status: data?.subscription_status ?? null };
 }
@@ -136,16 +136,18 @@ export async function updateSubscriptionByEmail(
   if (updates.subscriptionStatus !== undefined) patch.subscription_status = updates.subscriptionStatus;
   if (updates.subscriptionPeriodEnd !== undefined)
     patch.subscription_period_end = updates.subscriptionPeriodEnd?.toISOString() ?? null;
-  await supabase.from("nb_users").upsert({ email, ...patch }, { onConflict: "email" });
+  const { error } = await supabase.from("nb_users").upsert({ email, ...patch }, { onConflict: "email" });
+  if (error) throw new Error(`Failed to update subscription for ${email}: ${error.message}`);
 }
 
 export async function findUserByStripeCustomerId(customerId: string) {
   const supabase = getSupabase();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("nb_users")
     .select("email")
     .eq("stripe_customer_id", customerId)
-    .single();
+    .maybeSingle();
+  if (error) throw new Error(`Failed to find Stripe customer ${customerId}: ${error.message}`);
   return data ?? null;
 }
 

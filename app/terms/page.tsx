@@ -31,7 +31,7 @@ export default function TermsPage() {
         </Section>
 
         <Section title="3. Subscription and Billing">
-          <p>Neural Board costs <strong>$10 per month</strong>, billed in advance on a recurring basis. Your subscription renews automatically each month until you cancel.</p>
+          <p>Neural Board Pro is billed monthly at the price shown before purchase in Stripe Checkout. Your subscription renews automatically each month until you cancel.</p>
           <p style={{ marginTop: 12 }}>You can cancel at any time from your account settings or by emailing bbtvhq@gmail.com. Cancellation stops future charges and takes effect at the end of your current billing period — you retain access through that date. We do not issue refunds for charges already made. See our <a href="/refund" style={{ color: "#2a2a2a" }}>Refund Policy</a> for details.</p>
           <p style={{ marginTop: 12 }}>Payments are processed by Stripe. We never see or store your card number.</p>
         </Section>

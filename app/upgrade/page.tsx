@@ -9,6 +9,28 @@ export default function UpgradePage() {
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
+  const [price, setPrice] = useState<string | null>(null);
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    const canceled = new URLSearchParams(window.location.search).get("canceled") === "1";
+    const canceledTimer = canceled
+      ? window.setTimeout(() => setMessage("Checkout canceled — you were not charged."), 0)
+      : null;
+    void fetch("/api/stripe/price")
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((data: { unitAmount?: number; currency?: string }) => {
+        if (typeof data.unitAmount !== "number" || !data.currency) return;
+        setPrice(new Intl.NumberFormat("en-US", {
+          style: "currency",
+          currency: data.currency.toUpperCase(),
+        }).format(data.unitAmount / 100));
+      })
+      .catch(() => {});
+    return () => {
+      if (canceledTimer !== null) window.clearTimeout(canceledTimer);
+    };
+  }, []);
 
   useEffect(() => {
     if (status === "loading") return;
@@ -22,19 +44,27 @@ export default function UpgradePage() {
   const isLoading = status === "loading" || (!!session && loading);
 
   async function handleCheckout() {
+    setMessage("");
     setWorking(true);
     const res = await fetch("/api/stripe/checkout", { method: "POST" });
     const data = await res.json();
     if (data.url) window.location.href = data.url;
-    else setWorking(false);
+    else {
+      setMessage(data.error ?? "Secure checkout is temporarily unavailable.");
+      setWorking(false);
+    }
   }
 
   async function handlePortal() {
+    setMessage("");
     setWorking(true);
     const res = await fetch("/api/stripe/portal", { method: "POST" });
     const data = await res.json();
     if (data.url) window.location.href = data.url;
-    else setWorking(false);
+    else {
+      setMessage(data.error ?? "The billing portal is temporarily unavailable.");
+      setWorking(false);
+    }
   }
 
   return (
@@ -50,7 +80,7 @@ export default function UpgradePage() {
 
         <div style={{ background: "white", border: "1.5px solid #2a2a2a", padding: 32, marginBottom: 24, boxShadow: "4px 4px 0 #2a2a2a" }}>
           <div style={{ fontSize: 48, fontWeight: 700, color: "#2a2a2a", textAlign: "center", marginBottom: 4, fontFamily: "'Caveat', cursive" }}>
-            $10<span style={{ fontSize: 18, fontWeight: 400 }}>/mo</span>
+            {price ?? "Pro"}<span style={{ fontSize: 18, fontWeight: 400 }}>{price ? "/mo" : " monthly"}</span>
           </div>
           <p style={{ fontSize: 11, color: "#6a6a6a", textAlign: "center", marginBottom: 28, letterSpacing: 0.5 }}>
             cancel anytime
@@ -58,15 +88,21 @@ export default function UpgradePage() {
           <ul style={{ listStyle: "none", padding: 0, margin: "0 0 28px", display: "flex", flexDirection: "column", gap: 10 }}>
             {[
               "Unlimited video exports",
-              "No length restrictions",
-              "AI board arrangement",
-              "All future features",
+              "AI clip finding and annotations",
+              "AI image planning and search",
+              "Smart camera and board tools",
             ].map((f) => (
               <li key={f} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, color: "#2a2a2a" }}>
                 <span style={{ color: "#c8f135", fontWeight: 700, fontSize: 16 }}>✓</span> {f}
               </li>
             ))}
           </ul>
+
+          {message && (
+            <div role="status" style={{ marginBottom: 14, padding: "9px 10px", border: "1.5px solid #2a2a2a", background: message.startsWith("Checkout canceled") ? "#fff3c4" : "#fff0ed", color: "#2a2a2a", fontSize: 11, lineHeight: 1.4 }}>
+              {message}
+            </div>
+          )}
 
           {isLoading ? (
             <div style={{ textAlign: "center", fontSize: 12, color: "#6a6a6a" }}>loading...</div>
@@ -85,7 +121,7 @@ export default function UpgradePage() {
             </div>
           ) : (
             <button onClick={handleCheckout} disabled={working} style={btnStyle}>
-              {working ? "redirecting..." : "Subscribe for $10/mo →"}
+              {working ? "redirecting..." : `Upgrade to Pro${price ? ` — ${price}/mo` : ""} →`}
             </button>
           )}
         </div>

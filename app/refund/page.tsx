@@ -19,7 +19,7 @@ export default function RefundPage() {
 
         <div style={{ background: "white", border: "1.5px solid #2a2a2a", padding: 32, marginBottom: 32, boxShadow: "4px 4px 0 #2a2a2a" }}>
           <p style={{ fontSize: 13, color: "#2a2a2a", lineHeight: 1.8, margin: 0 }}>
-            Neural Board is a <strong>$10/month subscription</strong>, billed in advance at the start of each billing period.
+            Neural Board Pro is a <strong>monthly subscription</strong>, billed at the price shown before purchase in Stripe Checkout and charged in advance at the start of each billing period.
           </p>
         </div>
 

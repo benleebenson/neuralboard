@@ -75,7 +75,7 @@ export function UpgradeModal({ featureName, onClose }: { featureName: string; on
               letterSpacing: 0.5, fontFamily: "'Courier New', monospace",
             }}
           >
-            {working ? "redirecting..." : "Upgrade to Pro — $10/mo →"}
+            {working ? "redirecting..." : "Upgrade to Pro →"}
           </button>
           <button
             onClick={onClose}
