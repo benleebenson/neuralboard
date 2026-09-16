@@ -78,6 +78,24 @@ export function formatExportEta(seconds: number): string {
   return `${secs}s remaining`;
 }
 
+const MAX_PENDING_AUDIO_ENCODES = 8;
+
+async function waitForAudioEncoderCapacity(encoder: AudioEncoder): Promise<void> {
+  while (encoder.encodeQueueSize > MAX_PENDING_AUDIO_ENCODES) {
+    await new Promise<void>((resolve) => {
+      const onDequeue = () => {
+        if (encoder.encodeQueueSize <= MAX_PENDING_AUDIO_ENCODES) {
+          encoder.removeEventListener("dequeue", onDequeue);
+          resolve();
+        }
+      };
+      encoder.addEventListener("dequeue", onDequeue);
+      // The queue can drain between the while check and listener registration.
+      onDequeue();
+    });
+  }
+}
+
 async function renderOfflineAudioMix(
   sources: readonly OfflineAudioSource[],
   totalDuration: number,
@@ -152,7 +170,11 @@ export async function encodeOfflineAudioTrack(options: {
     });
     options.encoder.encode(audioData);
     audioData.close();
-    if (options.encoder.encodeQueueSize > 8) await options.encoder.flush();
+    // `flush()` is a final-drain operation, not a backpressure primitive. Repeatedly flushing an
+    // AAC/Opus encoder can introduce codec boundaries (and audible gaps or warbling) throughout
+    // otherwise-continuous narration. Let dequeue events provide backpressure and flush once after
+    // this function returns, when the caller is ready to finalize the muxer.
+    await waitForAudioEncoderCapacity(options.encoder);
     const chunkIndex = Math.floor(outputStart / chunkFrames);
     if (chunkIndex % 64 === 0 || outputStart + frameCount === totalFrames) {
       options.onProgress?.((outputStart + frameCount) / totalFrames);
