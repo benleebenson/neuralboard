@@ -1305,6 +1305,18 @@ type OfflineExportStatus = {
   fallbackNotice?: string | null;
 };
 
+type BoardUndoSnapshot = {
+  clips: Clip[];
+  annotations: Annotation[];
+  cameraKeyframes: CameraKeyframe[];
+  characterActions: CharacterAction[];
+  characterActions2: CharacterAction[];
+  boardDimensions: { width: number; height: number };
+  canvasAspect: "16:9" | "9:16";
+  showCharacter: boolean;
+  showCharacter2: boolean;
+};
+
 type Board2PerformanceStats = {
   cache: PreviewCachePolicy & {
     hotCount: number;
@@ -5218,6 +5230,10 @@ function Board2Editor({
   const activePenPointerRef = useRef<number | null>(null);
   const activePenClientPointRef = useRef<{ x: number; y: number } | null>(null);
   const annotationUndoRef = useRef<Annotation[][]>([]);
+  const boardUndoHistoryRef = useRef<Array<{ signature: string; snapshot: BoardUndoSnapshot }>>([]);
+  const boardUndoTimerRef = useRef<number | null>(null);
+  const boardUndoApplyingSignatureRef = useRef<string | null>(null);
+  const [canUndoBoard, setCanUndoBoard] = useState(false);
 
   // ── Character ──
   const [showCharacter, setShowCharacter] = useState(false);
@@ -6626,6 +6642,95 @@ function Board2Editor({
   useEffect(() => { cameraKeyframesRef.current = cameraKeyframes; }, [cameraKeyframes]);
   useEffect(() => { pxPerSecRef.current = pxPerSec; }, [pxPerSec]);
   useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
+
+  const boardUndoSnapshot = useMemo<BoardUndoSnapshot>(() => ({
+    clips,
+    annotations,
+    cameraKeyframes,
+    characterActions,
+    characterActions2,
+    boardDimensions,
+    canvasAspect,
+    showCharacter,
+    showCharacter2,
+  }), [annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2]);
+  const boardUndoSignature = useMemo(() => JSON.stringify({
+    ...boardUndoSnapshot,
+    clips: boardUndoSnapshot.clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, ...clip }) => clip),
+  }), [boardUndoSnapshot]);
+
+  useEffect(() => {
+    if (boardUndoApplyingSignatureRef.current === boardUndoSignature) {
+      boardUndoApplyingSignatureRef.current = null;
+      return;
+    }
+    if (boardUndoTimerRef.current !== null) window.clearTimeout(boardUndoTimerRef.current);
+    if (boardUndoHistoryRef.current.length === 0) {
+      boardUndoHistoryRef.current = [{ signature: boardUndoSignature, snapshot: boardUndoSnapshot }];
+      return;
+    }
+    if (boardUndoHistoryRef.current.at(-1)?.signature !== boardUndoSignature) setCanUndoBoard(true);
+    boardUndoTimerRef.current = window.setTimeout(() => {
+      boardUndoTimerRef.current = null;
+      const history = boardUndoHistoryRef.current;
+      if (history.at(-1)?.signature === boardUndoSignature) return;
+      history.push({ signature: boardUndoSignature, snapshot: boardUndoSnapshot });
+      if (history.length > 50) history.shift();
+      setCanUndoBoard(history.length > 1);
+    }, 250);
+    return () => {
+      if (boardUndoTimerRef.current !== null) window.clearTimeout(boardUndoTimerRef.current);
+    };
+  }, [boardUndoSignature, boardUndoSnapshot]);
+
+  const undoBoard = useCallback(() => {
+    if (boardUndoTimerRef.current !== null) {
+      window.clearTimeout(boardUndoTimerRef.current);
+      boardUndoTimerRef.current = null;
+    }
+    const history = boardUndoHistoryRef.current;
+    if (history.length === 0) return;
+    if (history.at(-1)?.signature === boardUndoSignature) {
+      if (history.length < 2) return;
+      history.pop();
+    }
+    const target = history.at(-1);
+    if (!target) return;
+    boardUndoApplyingSignatureRef.current = target.signature;
+    clipsRef.current = target.snapshot.clips;
+    annotationsRef.current = target.snapshot.annotations;
+    cameraKeyframesRef.current = target.snapshot.cameraKeyframes;
+    characterActionsRef.current = target.snapshot.characterActions;
+    characterActions2Ref.current = target.snapshot.characterActions2;
+    boardDimensionsRef.current = target.snapshot.boardDimensions;
+    showCharacterRef.current = target.snapshot.showCharacter;
+    showCharacter2Ref.current = target.snapshot.showCharacter2;
+    setClips(target.snapshot.clips);
+    setAnnotations(target.snapshot.annotations);
+    setCameraKeyframes(target.snapshot.cameraKeyframes);
+    setCharacterActions(target.snapshot.characterActions);
+    setCharacterActions2(target.snapshot.characterActions2);
+    setBoardDimensions(target.snapshot.boardDimensions);
+    setCanvasAspect(target.snapshot.canvasAspect);
+    setShowCharacter(target.snapshot.showCharacter);
+    setShowCharacter2(target.snapshot.showCharacter2);
+    setClipSelection([]);
+    setAnnotationSelection([]);
+    setCanUndoBoard(history.length > 1);
+    setToast("Undid last board change");
+  }, [boardUndoSignature]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.key.toLowerCase() !== "z") return;
+      const target = event.target as HTMLElement | null;
+      if (target?.isContentEditable || target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT") return;
+      event.preventDefault();
+      undoBoard();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [undoBoard]);
   useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
   useEffect(() => { annotationColorRef.current = annotationColor; }, [annotationColor]);
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
@@ -9123,6 +9228,19 @@ function Board2Editor({
     }
     setClipSelection([id]);
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+  }
+
+  function clearCustomZoomBoxes() {
+    const customZoomIds = new Set(clipsRef.current.filter((clip) => clip.type === "customZoom").map((clip) => clip.id));
+    if (customZoomIds.size === 0) return;
+    const nextClips = clipsRef.current.filter((clip) => clip.type !== "customZoom");
+    clipsRef.current = nextClips;
+    setClips(nextClips);
+    setSelectedClipIds((current) => current.filter((id) => !customZoomIds.has(id)));
+    selectedClipIdsRef.current = selectedClipIdsRef.current.filter((id) => !customZoomIds.has(id));
+    setSelectedClipId((current) => current && customZoomIds.has(current) ? null : current);
+    if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
+    setToast(`Removed ${customZoomIds.size} custom zoom box${customZoomIds.size === 1 ? "" : "es"}`);
   }
 
   function adjustCustomZoomDuration(delta: number) {
@@ -13056,12 +13174,10 @@ function Board2Editor({
   }
 
   function clientToCustomZoomBoardPoint(clientX: number, clientY: number) {
-    const point = clientToBoardPoint(clientX, clientY);
-    const dimensions = boardDimensionsRef.current;
-    return {
-      x: clamp(point.x, 0, dimensions.width),
-      y: clamp(point.y, 0, dimensions.height),
-    };
+    // Custom zooms intentionally use the same unbounded board coordinate space as media
+    // placement. A user can frame anything visible in the workspace, including content beyond
+    // the original board rectangle after panning or expanding the composition.
+    return clientToBoardPoint(clientX, clientY);
   }
 
   function rectsIntersect(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
@@ -19152,6 +19268,20 @@ function Board2Editor({
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canGenerateCamera && !cameraGenerationPhase ? "pointer" : "not-allowed", opacity: canGenerateCamera ? 1 : 0.35, flexShrink: 0 }}
           >{cameraGenerationPhase ? "⟳" : "⬡"}</button>
           <button
+            onClick={undoBoard}
+            disabled={!canUndoBoard}
+            title="Undo last board change (Ctrl/⌘ Z)"
+            aria-label="Undo last board change"
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, background: "transparent", color: "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: canUndoBoard ? "pointer" : "not-allowed", opacity: canUndoBoard ? 1 : 0.35, flexShrink: 0 }}
+          >↶</button>
+          <button
+            onClick={clearCustomZoomBoxes}
+            disabled={!clips.some((clip) => clip.type === "customZoom")}
+            title="Remove all custom zoom boxes only"
+            aria-label="Remove all custom zoom boxes"
+            style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: "transparent", color: "#a32916", border: "1.5px solid #2a2a2a", cursor: clips.some((clip) => clip.type === "customZoom") ? "pointer" : "not-allowed", opacity: clips.some((clip) => clip.type === "customZoom") ? 1 : 0.35, flexShrink: 0 }}
+          >⌧</button>
+          <button
             onClick={isExporting ? cancelExport : startExport}
             title={isExporting ? "Cancel export" : "Export video"}
             style={{ width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, background: isExporting ? "#ff5e3a" : "transparent", color: isExporting ? "#fff" : "#2a2a2a", border: "1.5px solid #2a2a2a", cursor: "pointer", flexShrink: 0 }}
@@ -21093,6 +21223,8 @@ function Board2Editor({
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
+          <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
+          <button onClick={() => { clearCustomZoomBoxes(); setMobileEditorMenuOpen(false); }} disabled={!clips.some((clip) => clip.type === "customZoom")} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: clips.some((clip) => clip.type === "customZoom") ? 1 : .45 }}>⌧ Clear zoom boxes</button>
           <button onClick={() => { if (isExporting) cancelExport(); else void startExport(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>{isExporting ? "✕ Export" : "⬇ Export"}</button>
           <button onClick={() => { void exportBoardImage(); setMobileEditorMenuOpen(false); }} disabled={isExporting || isExportingBoardImage} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isExporting || isExportingBoardImage ? .45 : 1 }}>▣ Board image</button>
           {clips.some((clip) => clip.type === "narration") && (
@@ -21856,10 +21988,13 @@ function Board2Editor({
                     title="Drag to draw a zoom region · Space-drag or middle-drag to pan · Two fingers pan and pinch · Esc exits"
                     style={{
                       position: "absolute",
-                      left: 0,
-                      top: 0,
-                      width: boardDimensions.width * boardZoom,
-                      height: boardDimensions.height * boardZoom,
+                      // This element lives inside the panned board surface. Negating that offset
+                      // makes the drawing glass cover the complete visible editor viewport rather
+                      // than only the initially-sized board rectangle.
+                      left: -boardPan.x,
+                      top: -boardPan.y,
+                      width: boardViewportSize.width,
+                      height: boardViewportSize.height,
                       zIndex: 10,
                       cursor: isSpaceDown ? "grab" : "crosshair",
                       touchAction: "none",
@@ -23695,6 +23830,18 @@ function Board2Editor({
               >
                 {EXPORT_BITRATE_OPTIONS_MBPS.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} Mbps</option>)}
               </select>
+              <button
+                onClick={undoBoard}
+                disabled={!canUndoBoard}
+                title="Undo the last board change (Ctrl/⌘ Z)"
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: canUndoBoard ? 1 : 0.4, cursor: canUndoBoard ? "pointer" : "not-allowed" }}
+              >↶ Undo</button>
+              <button
+                onClick={clearCustomZoomBoxes}
+                disabled={!clips.some((clip) => clip.type === "customZoom")}
+                title="Remove every custom drawn zoom box and leave all other board content untouched"
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, color: "#a32916", opacity: clips.some((clip) => clip.type === "customZoom") ? 1 : 0.4, cursor: clips.some((clip) => clip.type === "customZoom") ? "pointer" : "not-allowed" }}
+              >⌧ Clear zoom boxes</button>
               <button
                 onClick={isExporting ? cancelExport : startExport}
                 style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: isExporting ? "#ff5e3a" : "#c8f135", color: isExporting ? "#fff" : "#2a2a2a" }}
