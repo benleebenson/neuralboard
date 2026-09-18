@@ -11,10 +11,10 @@ export type MainSection = "board" | "clips" | "projects" | "library" | "public";
 
 const sections: Array<{ id: MainSection; href: string; label: string; icon: string }> = [
   { id: "public", href: "/public", label: "Join Board", icon: "◎" },
-  { id: "board", href: "/board2", label: "Board", icon: "✎" },
+  { id: "board", href: "/board2?mobileEditor=1", label: "Board", icon: "✎" },
   { id: "clips", href: "/clips", label: "Clips", icon: "✂" },
   { id: "projects", href: "/projects", label: "Projects", icon: "☁" },
-  { id: "library", href: "/board2/library", label: "Library", icon: "▦" },
+  { id: "library", href: "/board2/library?tab=assets&curate=1", label: "Library", icon: "▦" },
 ];
 
 export function MainSectionNav({ active, desktopOnly = false }: { active: MainSection; desktopOnly?: boolean }) {

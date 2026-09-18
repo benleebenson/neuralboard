@@ -7085,7 +7085,14 @@ function Board2Editor({
   useEffect(() => {
     const check = () => {
       const mobile = window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches;
+      const params = new URLSearchParams(window.location.search);
+      const mobileEditorRequested = params.get("mobileEditor") === "1" || !!params.get("join");
+      if (mobile && !mobileEditorRequested) {
+        window.location.replace("/board2/library?tab=assets&curate=1");
+        return;
+      }
       setIsMobile(mobile);
+      if (mobile && mobileEditorRequested) setMobileDesktopOverride(true);
       setIsPortrait(window.innerHeight > window.innerWidth);
     };
     check();
@@ -19497,37 +19504,6 @@ function Board2Editor({
 	      </div>
 	    );
 	  }
-
-  // Mobile Top 5 Tinder flow — takes over the entire mobile experience.
-  // mobileDesktopOverride lets the user escape to the desktop UI.
-  if (isMobile && !mobileDesktopOverride && !AI_FEATURES_ENABLED) {
-    return (
-      <div style={{ position: "fixed", inset: 0, background: BOARD_SURFACE_COLOR, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "monospace", padding: 28, textAlign: "center" }}>
-        <CheckoutReturnNotice isPro={isProUser} />
-        <header style={{ position: "absolute", top: 0, left: 0, right: 0, height: isPortrait ? 44 : 34, boxSizing: "border-box", display: "flex", alignItems: "center", gap: 8, padding: isPortrait ? "5px 8px" : "2px 8px", borderBottom: "1.5px dashed rgba(42,42,42,0.3)", background: "rgba(255,253,245,.95)" }}>
-          <span style={{ flex: 1, textAlign: "left", fontFamily: "'Caveat', cursive", fontSize: isPortrait ? 20 : 17, fontWeight: 700 }}>Neural Board</span>
-          <button
-            type="button"
-            aria-label="Open account menu"
-            aria-expanded={mobileAccountOpen}
-            onClick={() => setMobileAccountOpen((open) => !open)}
-            style={{ width: isPortrait ? 34 : 30, height: isPortrait ? 34 : 28, padding: 0, border: "1.5px solid #2a2a2a", background: mobileAccountOpen ? "#2a2a2a" : "#fffdf5", color: mobileAccountOpen ? "#c8f135" : "#2a2a2a", font: "800 17px/1 monospace", cursor: "pointer" }}
-          >☰</button>
-        </header>
-        {mobileAccountOpen && (
-          <div style={{ position: "absolute", top: isPortrait ? 51 : 41, left: 8, right: 8, zIndex: 10, textAlign: "left" }}>
-            {session?.user?.email ? (
-              <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setMobileAccountOpen(false)} />
-            ) : (
-              <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
-            )}
-          </div>
-        )}
-        <div style={{ fontSize: 17, fontWeight: 700, color: "#2a2a2a" }}>Open Neural Board on desktop</div>
-        <div style={{ fontSize: 11, color: "#6a6a6a", marginTop: 10, lineHeight: 1.6 }}>The mobile AI flow is currently hidden while AI features are disabled.</div>
-      </div>
-    );
-  }
 
   if (isMobile && !mobileDesktopOverride) {
     return renderMobileTop5Flow();

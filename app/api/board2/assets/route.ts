@@ -71,10 +71,17 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const requestId = randomUUID().slice(0, 8);
+  let stage = "authentication";
   const session = await getServerSession(authOptions);
-  if (!session?.user?.email) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!session?.user?.email) {
+    console.warn("[asset-save] rejected", { requestId, stage, reason: "unauthorized" });
+    return NextResponse.json({ error: "Unauthorized", stage, requestId }, { status: 401 });
+  }
   const email = session.user.email;
   try {
+    console.info("[asset-save] request received", { requestId, email, contentType: req.headers.get("content-type") });
+    stage = "request parsing";
     const contentType = req.headers.get("content-type") ?? "";
     let inputBytes: Buffer | null = null;
     let label = "Library image";
@@ -107,23 +114,49 @@ export async function POST(req: NextRequest) {
       if (!response.ok) throw new Error(`Could not download image (${response.status})`);
       inputBytes = Buffer.from(await response.arrayBuffer());
     }
+    stage = "image compression";
     const compressed = await sharp(inputBytes!).rotate().resize({ width: 1800, height: 1800, fit: "inside", withoutEnlargement: true }).webp({ quality: 82 }).toBuffer();
+    console.info("[asset-save] image compressed", { requestId, inputBytes: inputBytes!.byteLength, outputBytes: compressed.byteLength });
+    stage = "AI description";
     const description = await describeImage(compressed, label);
     const vector = await embedding(description);
     const storagePath = `${encodeURIComponent(email)}/${randomUUID()}.webp`;
     const supabase = getSupabase();
-    const { error: uploadError } = await supabase.storage.from("asset-library").upload(storagePath, compressed, { contentType: "image/webp", upsert: false });
+    stage = "Supabase Storage upload";
+    let { error: uploadError } = await supabase.storage.from("asset-library").upload(storagePath, compressed, { contentType: "image/webp", upsert: false });
+    if (uploadError && /bucket.*not found/i.test(uploadError.message)) {
+      console.warn("[asset-save] bucket missing; creating it", { requestId });
+      stage = "Supabase Storage bucket creation";
+      const { error: bucketError } = await supabase.storage.createBucket("asset-library", {
+        public: false,
+        fileSizeLimit: 5 * 1024 * 1024,
+        allowedMimeTypes: ["image/webp", "image/jpeg", "image/png"],
+      });
+      if (bucketError && !/already exists/i.test(bucketError.message)) throw bucketError;
+      stage = "Supabase Storage upload retry";
+      ({ error: uploadError } = await supabase.storage.from("asset-library").upload(storagePath, compressed, { contentType: "image/webp", upsert: false }));
+    }
     if (uploadError) throw uploadError;
+    console.info("[asset-save] storage upload complete", { requestId, storagePath });
     try {
+      stage = "Supabase nb_assets row insert";
       const asset = await saveAsset(email, { type: "image", url: remoteUrl, thumbnailUrl: remoteUrl, label, source, description, embedding: vector, storagePath });
+      console.info("[asset-save] database row complete", { requestId, assetId: asset.id });
+      stage = "signed URL creation";
       const { data } = await supabase.storage.from("asset-library").createSignedUrl(storagePath, 3600);
-      return NextResponse.json({ asset: { ...asset, url: data?.signedUrl, thumbnail_url: data?.signedUrl } });
+      console.info("[asset-save] complete", { requestId, assetId: asset.id });
+      return NextResponse.json({ asset: { ...asset, url: data?.signedUrl, thumbnail_url: data?.signedUrl }, requestId });
     } catch (error) {
       await supabase.storage.from("asset-library").remove([storagePath]);
       throw error;
     }
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Failed to save asset" }, { status: 500 });
+    const rawMessage = error instanceof Error ? error.message : "Failed to save asset";
+    const migrationHint = /bucket.*not found|nb_assets|storage_path|description|embedding|is_intro|schema cache/i.test(rawMessage)
+      ? " The asset-library Supabase migration may not be applied."
+      : "";
+    console.error("[asset-save] failed", { requestId, stage, error: rawMessage });
+    return NextResponse.json({ error: `${rawMessage}${migrationHint}`, stage, requestId }, { status: 500 });
   }
 }
 
