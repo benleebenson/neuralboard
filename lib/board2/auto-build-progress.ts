@@ -78,6 +78,7 @@ export function autoBuildSourceCounts(progress: AutoBuildProgress): Record<Image
     google: progress.slots.filter((slot) => slot.status === "found" && slot.source === "google").length,
     bing: progress.slots.filter((slot) => slot.status === "found" && slot.source === "bing").length,
     openverse: progress.slots.filter((slot) => slot.status === "found" && slot.source === "openverse").length,
+    library: progress.slots.filter((slot) => slot.status === "found" && slot.source === "library").length,
   };
 }
 

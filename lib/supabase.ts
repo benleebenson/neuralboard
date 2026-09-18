@@ -202,6 +202,10 @@ export type AssetInput = {
   ytEnd?: number | null;
   label?: string | null;
   source?: string | null;
+  description?: string | null;
+  embedding?: number[] | null;
+  storagePath?: string | null;
+  isIntro?: boolean;
 };
 
 // Deduped per email: images on (email, url), YouTube clips on (email, youtube_id, yt_start,
@@ -220,9 +224,22 @@ export async function saveAsset(email: string, asset: AssetInput) {
     yt_end: asset.ytEnd ?? null,
     label: asset.label ?? null,
     source: asset.source ?? null,
+    description: asset.description ?? null,
+    embedding: asset.embedding ?? null,
+    storage_path: asset.storagePath ?? null,
+    is_intro: asset.isIntro ?? false,
   };
-  const onConflict = asset.type === "image" ? "email,url" : "email,youtube_id,yt_start,yt_end";
+  const onConflict = asset.storagePath ? "email,storage_path" : asset.type === "image" ? "email,url" : "email,youtube_id,yt_start,yt_end";
   const { data, error } = await supabase.from("nb_assets").upsert(row, { onConflict }).select().single();
+  if (error) throw error;
+  return data;
+}
+
+export async function setIntroAsset(email: string, id: string) {
+  const supabase = getSupabase();
+  const { error: clearError } = await supabase.from("nb_assets").update({ is_intro: false }).eq("email", email).eq("type", "image");
+  if (clearError) throw clearError;
+  const { data, error } = await supabase.from("nb_assets").update({ is_intro: true }).eq("email", email).eq("id", id).eq("type", "image").select().single();
   if (error) throw error;
   return data;
 }

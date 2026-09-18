@@ -17,9 +17,7 @@ type ClipInfo = {
   sourceUrl?: string;
 };
 
-const SYSTEM_PROMPT = `You are an art director creating annotations for a video mood board. The user has placed images and videos on a 4000×3000 canvas and recorded a narration. Your job is to generate sketch-style annotations that visually emphasize key ideas from the narration relative to the board layout.
-
-BOARD: 4000×3000px. All coordinates must stay within these bounds (boardX: 0–4000, boardY: 0–3000).
+const SYSTEM_PROMPT = `You are an art director creating annotations for a video mood board. The user has placed images and videos on a board and recorded a narration. Your job is to generate sketch-style annotations that visually emphasize key ideas from the narration relative to the supplied board layout. Respect the exact board dimensions in the user message.
 
 ANNOTATION TYPES AND HOW TO USE THEM:
 - "text": Handwritten labels overlaid on the board.
@@ -34,16 +32,14 @@ ANNOTATION TYPES AND HOW TO USE THEM:
   - emoji field: choose from this set only: 🤔 ⭐ 🎯 ❗ 💡 🔥 ✨ 📈 📉 ⚠️ ❓ 💬 👀 🚀 ❤️ ✅ ❌ 🌍 🧠 🎨 🏆 💎 🔑 📌 🎬 📊 💰 🔍 🤝 🌟 💥 🎤 📣 🌈 ⏰ 🎁
 
 ANNOTATION STRATEGY:
-1. Analyze the narration for: key claims, named entities, statistics, comparisons, emphasis.
-2. Generate 5–10 annotations total — scale to narration length.
-3. Use a MIX of types. A good board has 1–2 bold title texts, 2–3 arrows connecting related clips, 1–2 circles around important clips, 0–1 highlights, and optionally 0–2 emojis for the single most striking idea.
-4. Dramatic titles (Permanent Marker, 100–140px, red or orange) for the board's main theme.
-5. Smaller Caveat/Architects Daughter labels for individual clips.
-6. Arrows should connect clips whose topics are mentioned together in the narration.
-7. Circles should surround the 1–2 clips most central to the narration.
-8. Place labels slightly above or beside images — avoid fully covering them.
-9. Spread annotations across the board; don't cluster everything in one corner.
-10. Only use emojis when they add clear visual meaning — a 💡 near a key insight, 🔥 near something exciting, ⚠️ near a risk. Do NOT emoji-spam.
+1. Read the WHOLE transcript first and identify its thesis, argument, emotional arc, and strongest evidence. An annotation must serve that whole argument, not merely paraphrase the nearest sentence.
+2. Quality beats density. Return 0–8 annotations and SKIP any moment where there is nothing genuinely useful to add. Never fill a quota.
+3. Balance a few big-picture thesis/framing annotations with specific high-value callouts.
+4. Pull meaningful content: for songs use a short key lyric supplied by the transcript; for psychology use a real, attributable quote from the thinker only when known and relevant (and place it by that person's image); for an argument state its central claim. Never fabricate quotations.
+5. Use a MIX of types only where useful. Emoji are sparse (normally 0–3): 🤔 for a genuine question, ✅/❌ for a real contrast, or one emotionally precise mark—not decoration.
+6. Mark at most 2 especially strong text or emoji annotations as cameraBeat=true so the camera can punch in on the quote/mark. Supply narrationTime at the spoken moment it supports.
+7. Dramatic titles (Permanent Marker, 100–140px, red or orange) are reserved for the main thesis. Use smaller Caveat/Architects Daughter labels for specific callouts.
+8. Place labels slightly above or beside images, spread them across the board, and avoid covering important image content.
 
 AVAILABLE COLORS: "#cc2200" (red), "#1a6fd4" (blue), "#e8a800" (gold), "#228b22" (green), "#e06020" (orange), "#1a1a1a" (black)
 
@@ -70,6 +66,9 @@ OUTPUT: Return ONLY valid JSON with this exact schema — no markdown, no explan
       "arrowEndY": number,
       "highlightStyle": "rect" | "underline" | "curlyBrace",
       "emoji": "single emoji character (emoji type only)"
+      "cameraBeat": true,
+      "narrationTime": 12.4,
+      "rationale": "why this annotation advances the whole video's argument"
     }
   ]
 }`;

@@ -2,7 +2,7 @@ export const AUTO_BUILD_IMAGE_REQUEST_TIMEOUT_MS = 290_000;
 export const AUTO_BUILD_IMAGE_RETRY_DELAY_MS = 2_000;
 export const AUTO_BUILD_IMAGE_ATTEMPTS = 2;
 
-export type ImageSearchSource = "google" | "bing" | "openverse";
+export type ImageSearchSource = "google" | "bing" | "openverse" | "library";
 
 export type AutoBuildFoundImage = {
   dataUrl: string;
@@ -176,6 +176,7 @@ export async function requestAutoBuildImage({
 }
 
 function sourceLabel(source: ImageSearchSource): string {
+  if (source === "library") return "Asset library";
   return source === "openverse" ? "Openverse" : source[0].toUpperCase() + source.slice(1);
 }
 

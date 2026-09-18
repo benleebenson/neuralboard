@@ -478,7 +478,7 @@ type Clip = {
   // automated narration draft provenance:
   provenance?: "browserFound";
   sourceAttributionUrl?: string;
-  imageSearchSource?: "google" | "bing" | "openverse";
+  imageSearchSource?: "google" | "bing" | "openverse" | "library";
   searchQuery?: string;
   imagePlanReason?: string;
   imagePlanModel?: string;
@@ -489,7 +489,10 @@ type Clip = {
   autoTopicEndTime?: number;
   autoLayoutSeed?: number;
   autoShot?: "wide" | "tight";
-  autoRole?: "outro";
+  autoRole?: "outro" | "intro" | "title" | "annotationTarget";
+  cameraBeat?: boolean;
+  narrationTime?: number;
+  rationale?: string;
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -1375,7 +1378,10 @@ type Annotation = {
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
   autoLayoutSeed?: number;
-  autoRole?: "outro";
+  autoRole?: "outro" | "title" | "annotationTarget";
+  cameraBeat?: boolean;
+  narrationTime?: number;
+  rationale?: string;
 };
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
@@ -6579,25 +6585,32 @@ function Board2Editor({
   // download, project load, duplicate, undo/redo...) catches every current and future path clips
   // reach the board by. Dedup is by clip id client-side (savedAssetIdsRef) and by (email, url) /
   // (email, youtube_id, yt_start, yt_end) server-side, so re-saving an already-known asset is a
-  // harmless no-op upsert. Locally uploaded images (blob: sourceUrl) are skipped — the URL would
-  // already be dead by the time a future board tried to reuse it.
+  // harmless no-op upsert. Local blobs are uploaded as compressed cloud assets by the API.
   useEffect(() => {
     const email = session?.user?.email;
     if (!email) return;
     for (const clip of clips) {
-      if (clip.boardX === undefined || savedAssetIdsRef.current.has(clip.id)) continue;
+      if (clip.boardX === undefined || savedAssetIdsRef.current.has(clip.id) || clip.imageSearchSource === "library") continue;
       // sourceUrl is usually a tab-scoped blob: URL (the downloaded bytes); sourceAttributionUrl,
       // when set, is the original external image URL and is what a future board can still load.
       const stableImageUrl = clip.sourceAttributionUrl?.startsWith("http")
         ? clip.sourceAttributionUrl
         : clip.sourceUrl?.startsWith("http") ? clip.sourceUrl : null;
-      if (clip.type === "image" && stableImageUrl) {
+      if (clip.type === "image" && (stableImageUrl || clip.sourceBlob)) {
         savedAssetIdsRef.current.add(clip.id);
-        void fetch("/api/board2/assets", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ type: "image", url: stableImageUrl, thumbnailUrl: stableImageUrl, label: clip.name, source: clip.source ?? "manual" }),
-        }).catch(() => {});
+        if (clip.sourceBlob) {
+          const form = new FormData();
+          form.set("file", new File([clip.sourceBlob], `${clip.name || "board-image"}.webp`, { type: clip.sourceBlob.type || "image/webp" }));
+          form.set("label", clip.name);
+          form.set("source", clip.source ?? "manual");
+          void fetch("/api/board2/assets", { method: "POST", body: form }).catch(() => {});
+        } else {
+          void fetch("/api/board2/assets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type: "image", url: stableImageUrl, label: clip.name, source: clip.source ?? "manual" }),
+          }).catch(() => {});
+        }
       } else if (clip.type === "video" && clip.youtubeId) {
         savedAssetIdsRef.current.add(clip.id);
         void fetch("/api/board2/assets", {
@@ -10041,6 +10054,7 @@ function Board2Editor({
         const planData = await planResponse.json().catch(() => null) as {
           error?: string;
           model?: string;
+          title?: string | null;
           targetCount?: number;
           chunkCount?: number;
           plannerCallCount?: number;
@@ -10066,7 +10080,10 @@ function Board2Editor({
         }
         appliedStyleExemplarCount = planData?.style?.applied ? Number(planData.style.exemplarCount) || 0 : 0;
         appliedStyleNote = typeof planData?.style?.note === "string" ? planData.style.note : null;
-        plannedBoardTitle = typeof planData?.boardTitle === "string" ? planData.boardTitle.trim().slice(0, 80) : "";
+        const returnedBoardTitle = planData?.boardTitle ?? planData?.title;
+        plannedBoardTitle = typeof returnedBoardTitle === "string"
+          ? returnedBoardTitle.trim().slice(0, 80)
+          : "";
         effectivePlanSecondsPerImage = Number(planData?.style?.effectiveSecondsPerImage) || autoImageSeconds;
         reportProgress("planning", `Planning images… (LLM · ${Number(planData?.targetCount) || keywordFallbackSegments.length} slots)`, 1, 1);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
@@ -10184,6 +10201,11 @@ function Board2Editor({
       const skipped: Array<{ index: number; query: string; reason: string; code?: string }> = [];
       const plannedMediaReferences = planMediaReferences(segments);
       const resolvedPlanMedia = new Map<number, { image: Omit<BrowserFoundImage, "dataUrl">; sourceBlob: Blob; previewBlob: Blob }>();
+      const usePermanentIntro = /\b(?:welcome back|bbtv)\b/i.test(transcript.slice(0, 700));
+      const introAsset = usePermanentIntro
+        ? await fetch("/api/board2/assets?intro=true", { signal: controller.signal }).then((response) => response.ok ? response.json() : null).catch(() => null) as { asset?: { id?: string; url?: string; description?: string } | null } | null
+        : null;
+      let libraryImageCount = 0;
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
         const slot = index + 1;
@@ -10199,6 +10221,30 @@ function Board2Editor({
           });
           reportProgress("finding", `Finding images ${slot}/${segments.length} — this can take several minutes`, index + 1, segments.length);
           continue;
+        }
+        const libraryResponse = index === 0 && introAsset?.asset?.url
+          ? { match: { ...introAsset.asset, score: 1, is_intro: true } }
+          : await fetch(`/api/board2/assets?type=image&query=${encodeURIComponent(segment.query)}`, { signal: controller.signal })
+              .then((response) => response.ok ? response.json() : null)
+              .catch(() => null) as { match?: { id?: string; url?: string; description?: string; score?: number; is_intro?: boolean } | null } | null;
+        if (libraryResponse?.match?.url) {
+          try {
+            const sourceBlob = await fetch(libraryResponse.match.url, { signal: controller.signal }).then((response) => {
+              if (!response.ok) throw new Error(`Library asset failed (${response.status})`);
+              return response.blob();
+            });
+            const bitmap = await createImageBitmap(sourceBlob);
+            const image = { sourceUrl: libraryResponse.match.url, width: bitmap.width, height: bitmap.height, source: "library" as const };
+            bitmap.close();
+            const previewBlob = await createImagePreviewBlob(sourceBlob);
+            found.push({ originalIndex: index, segment, image, sourceBlob, previewBlob });
+            libraryImageCount += 1;
+            updateProgressSlot(index, { status: "found", source: "library", reason: libraryResponse.match.is_intro ? "Used permanent intro image" : `Asset library semantic match (${Number(libraryResponse.match.score ?? 0).toFixed(2)})`, attempt: 1, completedAt: Date.now() });
+            reportProgress("finding", `Finding images ${slot}/${segments.length} — ${libraryImageCount} reused from library`, index + 1, segments.length);
+            continue;
+          } catch (libraryError) {
+            console.warn("[board2:auto-build] Library match could not be loaded; falling back to web", libraryError);
+          }
         }
         try {
           const result = await requestAutoBuildImage({
@@ -10475,6 +10521,7 @@ function Board2Editor({
           }
         }
       }
+      if (plannedBoardTitle) setSaveName(plannedBoardTitle);
       const nextClips = [...clipsRef.current];
       const timingByAppearance = new Map(buildNarrationLockedImageWindows(
         mediaItems.map(({ originalIndex, segment }) => ({ id: String(originalIndex), startTime: segment.start })),
@@ -10522,6 +10569,7 @@ function Board2Editor({
           autoTopicEndTime: segment.topicEndTime,
           autoLayoutSeed: layoutSeed,
           autoShot: segment.shot,
+          ...(image.source === "library" && image.sourceUrl === introAsset?.asset?.url ? { autoRole: "intro" as const } : {}),
         };
         nextClips.push(clip);
         return clip;
@@ -10632,12 +10680,23 @@ function Board2Editor({
         ...newMediaItems.map(({ item }) => item),
         ...(outroMediaItem ? [outroMediaItem] : []),
       ]);
-      setAnnotations((prev) => [...prev, ...autoTopicAnnotations, ...outroAnnotations]);
+      annotationsRef.current = [...annotationsRef.current, ...autoTopicAnnotations, ...outroAnnotations];
+      setAnnotations(annotationsRef.current);
       clipsRef.current = nextClips;
       setClips(nextClips);
       setAutoBuildSource(generatedBoardSourceSignature(nextClips));
       setClipSelection([...autoClips, ...(outroClip ? [outroClip] : [])].map((clip) => clip.id));
       placed = true;
+      // Content annotations are part of auto-build, not a separate afterthought. The annotation
+      // planner sees the full transcript and may add invisible custom-zoom camera targets for up
+      // to two especially strong quotes or emoji marks.
+      if (AI_FEATURES_ENABLED) {
+        await applyAnnotationsFromTranscript(transcript, controller.signal, narrationStart).catch((error) => {
+          if (isAbortError(error)) throw error;
+          console.warn("[board2:auto-build] Annotation planning failed; continuing", error);
+          return false;
+        });
+      }
       autoBuildRetryContextRef.current = {
         segments,
         narrationStart,
@@ -10652,7 +10711,8 @@ function Board2Editor({
       // build — the owner would otherwise see "auto-build failed" despite the images being there.
       let cameraWarning: string | null = null;
       let cameraStats = "";
-      const cameraClips = [...autoClips, ...(outroClip ? [outroClip] : [])];
+      const annotationCameraTargets = clipsRef.current.filter((clip) => clip.type === "customZoom" && clip.autoRole === "annotationTarget");
+      const cameraClips = [...autoClips, ...annotationCameraTargets, ...(outroClip ? [outroClip] : [])];
       if (cameraClips.length) {
         reportProgress("camera", "Generating camera…", 0, 1);
         try {
@@ -10678,6 +10738,7 @@ function Board2Editor({
               boardH: clip.boardH!,
               topicId: clip.autoTopicId,
               shot: clip.autoShot,
+              role: clip.autoRole === "intro" || clip.autoRole === "outro" || clip.autoRole === "annotationTarget" ? clip.autoRole : undefined,
             })),
             topicBounds: [...cameraTopicBounds.values()],
             canvasWidth: W,
@@ -10728,6 +10789,7 @@ function Board2Editor({
         return counts;
       }, {});
       const compositionStats = ` ${placedTopics.length} clusters; largest/median area ${sizeRatio.toFixed(1)}×; annotations ${Object.entries(annotationCounts).map(([type, count]) => `${type} ${count}`).join(", ")}.`;
+      const sourceSummary = ` ${libraryImageCount} from asset library · ${autoClips.length - libraryImageCount} from web.`;
       const outroSummary = outroClip ? ` Outro appended for ${AUTO_BUILD_OUTRO_DURATION_SECONDS.toFixed(1)}s.` : "";
       const styleSummary = appliedStyleExemplarCount
         ? ` Planned in your style from ${appliedStyleExemplarCount} starred board${appliedStyleExemplarCount === 1 ? "" : "s"}${appliedStyleNote ? ` — ${appliedStyleNote}` : "."}`
@@ -10738,7 +10800,7 @@ function Board2Editor({
         ? ` Skipped: ${skipped.map(({ index, query, reason }) => `#${index + 1} “${query}” (${reason.replace(/^Slot \d+: /, "")})`).join(", ")}.`
         : "";
       const cameraNote = cameraWarning ? ` ⚠ ${cameraWarning}` : "";
-      setAutoBuildSummary(`${summary}${compositionStats}${cameraStats}${outroSummary}${styleSummary}${skippedSlots}${cameraNote}`);
+      setAutoBuildSummary(`${summary}${compositionStats}${sourceSummary}${cameraStats}${outroSummary}${styleSummary}${skippedSlots}${cameraNote}`);
       commitAutoBuildProgress((current) => ({
         ...current,
         status: unavailable || cameraWarning ? "partial" : "success",
@@ -14838,7 +14900,7 @@ function Board2Editor({
 
   // ─ AI annotation generation ────────────────────────────────────────────────
 
-  async function applyAnnotationsFromTranscript(transcript: string, signal?: AbortSignal): Promise<boolean> {
+  async function applyAnnotationsFromTranscript(transcript: string, signal?: AbortSignal, timelineOffset = 0): Promise<boolean> {
     setAiPhase("Generating annotations...");
     await waitForUiPaint();
     const boardClips = clipsRef.current.filter((c) => c.boardX !== undefined);
@@ -14859,7 +14921,7 @@ function Board2Editor({
         signal,
         body: JSON.stringify({
           transcript,
-          board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
+          board: { width: boardDimensionsRef.current.width, height: boardDimensionsRef.current.height, backgroundColor: BOARD_SURFACE_COLOR },
           clips: sendClips,
         }),
       });
@@ -14880,27 +14942,32 @@ function Board2Editor({
       return false;
     }
     const raw: Partial<Annotation>[] = Array.isArray(d.annotations) ? d.annotations : [];
+    const annotationBoardWidth = boardDimensionsRef.current.width;
+    const annotationBoardHeight = boardDimensionsRef.current.height;
     const validTypes = new Set(["text", "arrow", "circle", "highlight", "emoji"]);
     const newAnnotations: Annotation[] = raw
       .filter((a) => a.type && validTypes.has(a.type))
       .map((a) => ({
         id: generateId(),
         type: a.type as Annotation["type"],
-        boardX: clamp(Number(a.boardX) || 0, 0, BOARD_W - 1),
-        boardY: clamp(Number(a.boardY) || 0, 0, BOARD_H - 1),
-        boardW: clamp(Number(a.boardW) || 200, 10, BOARD_W),
-        boardH: clamp(Number(a.boardH) || 100, 10, BOARD_H),
+        boardX: clamp(Number(a.boardX) || 0, 0, annotationBoardWidth - 1),
+        boardY: clamp(Number(a.boardY) || 0, 0, annotationBoardHeight - 1),
+        boardW: clamp(Number(a.boardW) || 200, 10, annotationBoardWidth),
+        boardH: clamp(Number(a.boardH) || 100, 10, annotationBoardHeight),
         color: typeof a.color === "string" && /^#[0-9a-fA-F]{6}$/.test(a.color) ? a.color : "#cc2200",
         ...(a.text != null ? { text: String(a.text).slice(0, 300) } : {}),
         ...(a.fontFamily != null ? { fontFamily: String(a.fontFamily) } : {}),
         ...(a.fontSize != null ? { fontSize: Number(a.fontSize) } : {}),
         ...(a.fontWeight === "bold" || a.fontWeight === "normal" ? { fontWeight: a.fontWeight } : {}),
-        ...(a.arrowStartX != null ? { arrowStartX: clamp(Number(a.arrowStartX), 0, BOARD_W) } : {}),
-        ...(a.arrowStartY != null ? { arrowStartY: clamp(Number(a.arrowStartY), 0, BOARD_H) } : {}),
-        ...(a.arrowEndX != null ? { arrowEndX: clamp(Number(a.arrowEndX), 0, BOARD_W) } : {}),
-        ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, BOARD_H) } : {}),
+        ...(a.arrowStartX != null ? { arrowStartX: clamp(Number(a.arrowStartX), 0, annotationBoardWidth) } : {}),
+        ...(a.arrowStartY != null ? { arrowStartY: clamp(Number(a.arrowStartY), 0, annotationBoardHeight) } : {}),
+        ...(a.arrowEndX != null ? { arrowEndX: clamp(Number(a.arrowEndX), 0, annotationBoardWidth) } : {}),
+        ...(a.arrowEndY != null ? { arrowEndY: clamp(Number(a.arrowEndY), 0, annotationBoardHeight) } : {}),
         ...(a.highlightStyle != null ? { highlightStyle: a.highlightStyle } : {}),
         ...(a.emoji != null ? { emoji: String(a.emoji) } : {}),
+        ...(a.cameraBeat === true ? { cameraBeat: true } : {}),
+        ...(Number.isFinite(Number(a.narrationTime)) ? { narrationTime: Number(a.narrationTime) } : {}),
+        ...(a.rationale != null ? { rationale: String(a.rationale).slice(0, 300) } : {}),
         source: "auto" as const,
       }));
     if (!newAnnotations.length) {
@@ -14910,7 +14977,21 @@ function Board2Editor({
       setAiPhase(null);
       return false;
     }
-    setAnnotations((prev) => [...prev, ...newAnnotations]);
+    annotationsRef.current = [...annotationsRef.current, ...newAnnotations];
+    setAnnotations(annotationsRef.current);
+    const cameraTargets: Clip[] = newAnnotations.flatMap((annotation) => annotation.cameraBeat && Number.isFinite(annotation.narrationTime)
+      ? [{
+          id: generateId(), type: "customZoom" as const, name: "Annotation focus", sourceUrl: "",
+          startTime: Math.max(0, timelineOffset + annotation.narrationTime!), duration: 1.5, holdFraction: 0.55, layer: 4,
+          boardX: annotation.boardX - 40, boardY: annotation.boardY - 40,
+          boardW: annotation.boardW + 80, boardH: annotation.boardH + 80,
+          source: "auto" as const, autoRole: "annotationTarget" as const,
+        }]
+      : []);
+    if (cameraTargets.length) {
+      clipsRef.current = [...clipsRef.current, ...cameraTargets];
+      setClips(clipsRef.current);
+    }
     setAiSource(generatedBoardSourceSignature(clipsRef.current));
     const message = `Annotations generated — ${newAnnotations.length} annotation${newAnnotations.length === 1 ? "" : "s"}`;
     setAiMessage({ kind: "success", text: message });
@@ -15003,7 +15084,7 @@ function Board2Editor({
         const message = "Annotation generation failed — couldn't understand the narration. Try pasting the script instead.";
         setAiError(message); setAiMessage({ kind: "error", text: message }); setAiPhase(null); return;
       }
-      await applyAnnotationsFromTranscript(data.transcript, controller.signal);
+      await applyAnnotationsFromTranscript(data.transcript, controller.signal, narrationClips[0]?.startTime ?? 0);
     } catch (error) {
       const cancelled = isAbortError(error);
       const message = cancelled ? "Annotation generation cancelled" : `Annotation transcription failed — ${error instanceof Error ? error.message : "network error"}`;

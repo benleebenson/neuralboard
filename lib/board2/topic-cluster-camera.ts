@@ -11,6 +11,7 @@ export type TopicCameraClip = {
   boardH: number;
   topicId?: string;
   shot?: "wide" | "tight";
+  role?: "intro" | "outro" | "annotationTarget";
 };
 
 export type TopicCameraBounds = {
@@ -33,6 +34,14 @@ export type TopicCameraKeyframe = {
 
 type CameraStop = Omit<TopicCameraKeyframe, "time" | "easing">;
 
+export type CameraArrivalAudit = {
+  clipId: string;
+  plannedTime: number;
+  arrivalTime: number;
+  driftSeconds: number;
+  travelSeconds: number;
+};
+
 type TopicCameraOptions = {
   clips: TopicCameraClip[];
   topicBounds: TopicCameraBounds[];
@@ -51,6 +60,13 @@ function stopForRect(
   fillRatio: number,
 ): CameraStop {
   return cameraForFocusRect(rect, canvasWidth, canvasHeight, boardWidth, fillRatio);
+}
+
+export function cameraTravelSeconds(from: CameraStop, to: CameraStop, boardWidth: number): number {
+  const distance = Math.hypot(to.cameraX - from.cameraX, to.cameraY - from.cameraY);
+  const distanceSeconds = distance / Math.max(1, boardWidth) * 5.5;
+  const zoomSeconds = Math.abs(Math.log(Math.max(0.01, to.boardZoom) / Math.max(0.01, from.boardZoom))) * 0.55;
+  return Math.min(2.5, Math.max(0.35, distanceSeconds + zoomSeconds));
 }
 
 export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): TopicCameraKeyframe[] {
@@ -73,29 +89,26 @@ export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): T
     const holdEnd = clip.startTime + clip.duration * (clip.holdFraction ?? 0.6);
     const clipEnd = clip.startTime + clip.duration;
     const topicBounds = clip.topicId ? boundsByTopic.get(clip.topicId) : undefined;
-    const broadPan = !!topicBounds && clip.duration >= 2 && (clip.shot === "wide" ||
-      (Number.isFinite(options.maxBroadPanGapSec) && clip.startTime - lastBroadPan >= (options.maxBroadPanGapSec ?? Infinity) - 2));
-    if (broadPan && topicBounds) {
-      const travel = Math.min(4, Math.max(2, clip.duration * 0.65));
-      const wideStop = stopForRect(topicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.76);
-      const sweep = topicBounds.width * 0.15;
-      const direction = index % 2 ? -1 : 1;
-      events.push({ time: clip.startTime, ...wideStop, cameraX: wideStop.cameraX - sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
-      events.push({ time: Math.min(clipEnd, clip.startTime + travel), ...wideStop, cameraX: wideStop.cameraX + sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
-      lastBroadPan = clip.startTime;
-      for (let panTime = clip.startTime + 16; panTime + 2 <= clipEnd; panTime += 16) {
-        events.push({ time: panTime, ...wideStop, cameraX: wideStop.cameraX + sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
-        events.push({ time: panTime + 2, ...wideStop, cameraX: wideStop.cameraX - sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
-        lastBroadPan = panTime;
-      }
-      continue;
-    }
     // The editorial timestamp is an arrival deadline, not the beginning of a camera move.
     // Every image must therefore be the resolved camera stop at its exact narration start.
+    const previousStop = index > 0 ? imageStops[index - 1] : imageStop;
+    const travelSeconds = index > 0 ? cameraTravelSeconds(previousStop, imageStop, options.boardWidth) : 0;
+    const travelStart = Math.max(clips[index - 1]?.startTime ?? 0, clip.startTime - travelSeconds);
+    if (index > 0 && travelStart < clip.startTime - 0.001) {
+      events.push({ time: travelStart, ...previousStop, easing: "ease-in-out" });
+    }
     events.push({ time: clip.startTime, ...imageStop, easing: "ease-in-out", shot: "tight" });
-    if (holdEnd > clip.startTime) events.push({ time: holdEnd, ...imageStop, easing: "ease-in-out", shot: "tight" });
+    if (clip.role === "intro" && holdEnd - clip.startTime >= 0.8) {
+      const panDistance = clip.boardW * 0.015;
+      events.push({ time: clip.startTime + (holdEnd - clip.startTime) * 0.5, ...imageStop, cameraX: imageStop.cameraX - panDistance, easing: "ease-in-out" });
+      events.push({ time: holdEnd, ...imageStop, cameraX: imageStop.cameraX + panDistance, easing: "ease-in-out" });
+    } else if (holdEnd > clip.startTime) {
+      events.push({ time: holdEnd, ...imageStop, easing: "ease-in-out", shot: "tight" });
+    }
     if (topicBounds && Number.isFinite(options.maxBroadPanGapSec)) {
-      for (let panTime = Math.max(clip.startTime + 2, lastBroadPan + 16); panTime + 2 <= clipEnd; panTime += 16) {
+      const wantsWide = clip.shot === "wide";
+      const firstPanTime = wantsWide ? clip.startTime + Math.min(2, Math.max(0.4, clip.duration * 0.25)) : Math.max(clip.startTime + 2, lastBroadPan + 16);
+      for (let panTime = firstPanTime; panTime + 2 <= clipEnd; panTime += 16) {
         const wideStop = stopForRect(topicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.76);
         const sweep = topicBounds.width * 0.15;
         const direction = (index + Math.floor(panTime)) % 2 ? -1 : 1;
@@ -138,4 +151,32 @@ export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): T
       return true;
     })
     .map((keyframe) => ({ ...keyframe, time: Number(keyframe.time.toFixed(3)) }));
+}
+
+
+export function auditTopicCameraArrivals(options: TopicCameraOptions, keyframes: TopicCameraKeyframe[]): CameraArrivalAudit[] {
+  const sorted = keyframes.slice().sort((a, b) => a.time - b.time);
+  return options.clips.slice().sort((a, b) => a.startTime - b.startTime).map((clip, index, clips) => {
+    const target = stopForRect(
+      { x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH },
+      options.canvasWidth,
+      options.canvasHeight,
+      options.boardWidth,
+      options.imageFocusRatio,
+    );
+    const exact = sorted.find((keyframe) => Math.abs(keyframe.time - clip.startTime) < 0.0005 &&
+      Math.abs(keyframe.cameraX - target.cameraX) < 0.01 && Math.abs(keyframe.cameraY - target.cameraY) < 0.01);
+    const arrivalTime = exact?.time ?? Number.POSITIVE_INFINITY;
+    const previous = index > 0 ? stopForRect(
+      { x: clips[index - 1].boardX, y: clips[index - 1].boardY, width: clips[index - 1].boardW, height: clips[index - 1].boardH },
+      options.canvasWidth, options.canvasHeight, options.boardWidth, options.imageFocusRatio,
+    ) : target;
+    return {
+      clipId: clip.id,
+      plannedTime: clip.startTime,
+      arrivalTime,
+      driftSeconds: Number.isFinite(arrivalTime) ? Math.abs(arrivalTime - clip.startTime) : Number.POSITIVE_INFINITY,
+      travelSeconds: index > 0 ? cameraTravelSeconds(previous, target, options.boardWidth) : 0,
+    };
+  });
 }

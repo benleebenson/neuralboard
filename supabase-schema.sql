@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS nb_assets (
   yt_end        NUMERIC,          -- youtube only, seconds
   label         TEXT,             -- optional display name / caption
   source        TEXT,             -- 'auto-build' | 'manual' | 'top5' | ...
+  description   TEXT,             -- AI-generated semantic description
+  embedding     JSONB,            -- 512-d text-embedding-3-small vector
+  storage_path  TEXT,             -- private asset-library bucket object
+  is_intro      BOOLEAN NOT NULL DEFAULT false,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -48,3 +52,4 @@ CREATE INDEX IF NOT EXISTS idx_nb_assets_email ON nb_assets (email);
 -- (youtube_id/yt_start/yt_end all null) never collide under the youtube index and vice versa.
 CREATE UNIQUE INDEX IF NOT EXISTS nb_assets_image_unique ON nb_assets (email, url);
 CREATE UNIQUE INDEX IF NOT EXISTS nb_assets_youtube_unique ON nb_assets (email, youtube_id, yt_start, yt_end);
+CREATE UNIQUE INDEX IF NOT EXISTS nb_assets_storage_unique ON nb_assets (email, storage_path);

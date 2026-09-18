@@ -14,8 +14,8 @@ import {
   type EditorialTopicOutline,
   type EditorialTranscriptSegment,
   parseEditorialTopicOutline,
-  parseEditorialTopicPlan,
   parseEditorialBoardTitle,
+  parseEditorialTopicPlan,
 } from "@/lib/board2/editorial-image-plan";
 import {
   describeAppliedStyle,
@@ -163,12 +163,14 @@ export async function POST(req: NextRequest) {
 
     const chunks = buildEditorialPlanningChunks(durationSec, targetCount);
     let topicOutline: EditorialTopicOutline[] = [];
+    let boardTitle: string | null = null;
     let plannerCallCount = 0;
     if (chunks.length > 1) {
       const outlinePrompt = buildEditorialTopicOutlinePrompt({ transcript, segments, durationSec, styleExemplars });
       const outlineText = await callPlanner(outlinePrompt, 2400);
       plannerCallCount += 1;
       topicOutline = parseEditorialTopicOutline(outlineText, durationSec);
+      boardTitle = parseEditorialBoardTitle(outlineText);
     }
     if (!topicOutline.length) {
       topicOutline = [{ topicTitle: IMPLICIT_EDITORIAL_TOPIC_TITLE, startTime: 0, endTime: durationSec }];
@@ -196,7 +198,8 @@ export async function POST(req: NextRequest) {
       const images = parsed.flatMap((topic) => topic.images).filter((image) =>
         image.startTime >= chunk.startTime - 0.01 && (isLastChunk ? image.startTime <= chunk.endTime : image.startTime < chunk.endTime)
       ).slice(0, chunk.targetCount);
-      return { images, topics: parsed, boardTitle: parseEditorialBoardTitle(responseText) };
+      const title = parseEditorialBoardTitle(responseText);
+      return { images, topics: parsed, title, boardTitle: title };
     };
 
     const chunkResults: Awaited<ReturnType<typeof planChunk>>[] = new Array(chunks.length);
@@ -217,6 +220,7 @@ export async function POST(req: NextRequest) {
           const images = plan.filter((image) => image.startTime >= outline.startTime && (isLast ? image.startTime <= outline.endTime : image.startTime < outline.endTime));
           return images.length ? [{ ...outline, images }] : [];
         });
+    boardTitle ??= chunkResults.find((result) => result.title)?.title ?? null;
 
     const usage = aggregateUsage;
     const costUsd = +(
@@ -235,6 +239,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       model: EDITORIAL_IMAGE_PLAN_MODEL,
+      title: boardTitle,
       targetCount,
       chunkCount: chunks.length,
       plannerCallCount,
