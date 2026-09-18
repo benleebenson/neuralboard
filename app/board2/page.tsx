@@ -188,7 +188,9 @@ import {
   layoutOrganicTopicClusters,
   organicBoardSizeForImageCount,
   stableOrganicLayoutSeed,
+  titleCenterpieceRect,
 } from "@/lib/board2/organic-topic-layout";
+import { canonicalSourceKey, imageContentFingerprint, planMediaReferences } from "@/lib/board2/auto-build-media";
 import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
 import {
   FOCUS_FILL_RATIO,
@@ -486,6 +488,7 @@ type Clip = {
   autoTopicStartTime?: number;
   autoTopicEndTime?: number;
   autoLayoutSeed?: number;
+  autoShot?: "wide" | "tight";
   autoRole?: "outro";
 };
 
@@ -529,6 +532,10 @@ type AutoNarrationImageSegment = TranscriptSegment & {
   characterCallback?: boolean;
   reactionShot?: boolean;
   sentiment?: string;
+  importance?: "anchor" | "support";
+  shot?: "wide" | "tight";
+  callout?: string;
+  emphasis?: "circle" | "contrast-no" | "contrast-yes";
 };
 // Shape of one raw image entry as returned by /api/board2/plan-images, before validation.
 type PlanImageItem = {
@@ -539,6 +546,10 @@ type PlanImageItem = {
   characterCallback?: unknown;
   reactionShot?: unknown;
   sentiment?: unknown;
+  importance?: unknown;
+  shot?: unknown;
+  callout?: unknown;
+  emphasis?: unknown;
 };
 type BrowserFoundImage = AutoBuildFoundImage;
 type ConfiguredOutroImage = PersistedOutroImage & { url: string };
@@ -1351,6 +1362,7 @@ type Annotation = {
   fontFamily?: string;
   fontSize?: number;
   fontWeight?: "normal" | "bold";
+  rotationDeg?: number;
   strokeWidth?: number;
   arrowStartX?: number;
   arrowStartY?: number;
@@ -2300,6 +2312,13 @@ function drawAnnotationsToCanvas(
       const boardFontSize = ann.fontSize ?? 80;
       const fs = boardFontSize * sf;
       ctx.save();
+      if (ann.rotationDeg) {
+        const cx = toSX(ann.boardX + ann.boardW / 2);
+        const cy = toSY(ann.boardY + ann.boardH / 2);
+        ctx.translate(cx, cy);
+        ctx.rotate(ann.rotationDeg * Math.PI / 180);
+        ctx.translate(-cx, -cy);
+      }
       const lines = annotationLinesForContext(ann, ctx);
       ctx.font = annotationFontCss(fs, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
       ctx.fillStyle = ann.color;
@@ -9944,6 +9963,7 @@ function Board2Editor({
       const buildStyleSelection = selectStyleExemplars(buildStyleExemplars, STYLE_EXEMPLAR_TOKEN_BUDGET);
       controller.signal.throwIfAborted();
       let appliedStyleNote: string | null = null;
+      let plannedBoardTitle = "";
       let appliedStyleExemplarCount = 0;
       let effectivePlanSecondsPerImage = autoImageSeconds;
       reportProgress("preparing", "Compiling narration…", autoStyleConditioning ? 1 : 0, autoStyleConditioning ? 2 : 1);
@@ -10024,6 +10044,7 @@ function Board2Editor({
           targetCount?: number;
           chunkCount?: number;
           plannerCallCount?: number;
+          boardTitle?: string;
           style?: {
             applied?: boolean;
             availableCount?: number;
@@ -10045,6 +10066,7 @@ function Board2Editor({
         }
         appliedStyleExemplarCount = planData?.style?.applied ? Number(planData.style.exemplarCount) || 0 : 0;
         appliedStyleNote = typeof planData?.style?.note === "string" ? planData.style.note : null;
+        plannedBoardTitle = typeof planData?.boardTitle === "string" ? planData.boardTitle.trim().slice(0, 80) : "";
         effectivePlanSecondsPerImage = Number(planData?.style?.effectiveSecondsPerImage) || autoImageSeconds;
         reportProgress("planning", `Planning images… (LLM · ${Number(planData?.targetCount) || keywordFallbackSegments.length} slots)`, 1, 1);
         const planModel = typeof planData?.model === "string" ? planData.model : "gpt-5-mini";
@@ -10060,6 +10082,10 @@ function Board2Editor({
                 ...(characterName ? { characterName, characterCallback: item.characterCallback === true } : {}),
                 ...(item.reactionShot === true ? { reactionShot: true } : {}),
                 ...(typeof item.sentiment === "string" ? { sentiment: item.sentiment } : {}),
+                ...(item.importance === "anchor" || item.importance === "support" ? { importance: item.importance as "anchor" | "support" } : {}),
+                ...(item.shot === "wide" || item.shot === "tight" ? { shot: item.shot as "wide" | "tight" } : {}),
+                ...(typeof item.callout === "string" ? { callout: item.callout.trim().slice(0, 40) } : {}),
+                ...(item.emphasis === "circle" || item.emphasis === "contrast-no" || item.emphasis === "contrast-yes" ? { emphasis: item.emphasis as "circle" | "contrast-no" | "contrast-yes" } : {}),
               }];
             }).sort((a, b) => a.startTime - b.startTime)
           : [];
@@ -10118,6 +10144,10 @@ function Board2Editor({
             characterCallback: item.characterCallback,
             reactionShot: item.reactionShot,
             sentiment: item.sentiment,
+            importance: item.importance,
+            shot: item.shot,
+            callout: item.callout,
+            emphasis: item.emphasis,
           };
         });
       } catch (plannerError) {
@@ -10152,20 +10182,18 @@ function Board2Editor({
         previewBlob: Blob;
       }> = [];
       const skipped: Array<{ index: number; query: string; reason: string; code?: string }> = [];
-      // Character continuity: the first non-callback resolution for a name is cached here and
-      // reused verbatim (no bridge round trip) for every later slot the planner flagged
-      // characterCallback for — giving that character one consistent "face" across the board.
-      const characterImageMap = new Map<string, { image: Omit<BrowserFoundImage, "dataUrl">; sourceBlob: Blob; previewBlob: Blob }>();
+      const plannedMediaReferences = planMediaReferences(segments);
+      const resolvedPlanMedia = new Map<number, { image: Omit<BrowserFoundImage, "dataUrl">; sourceBlob: Blob; previewBlob: Blob }>();
       for (let index = 0; index < segments.length; index++) {
         const segment = segments[index];
         const slot = index + 1;
-        if (segment.characterCallback && segment.characterName && characterImageMap.has(segment.characterName)) {
-          const cached = characterImageMap.get(segment.characterName)!;
+        const cached = resolvedPlanMedia.get(plannedMediaReferences[index]);
+        if (cached) {
           found.push({ originalIndex: index, segment, image: cached.image, sourceBlob: cached.sourceBlob, previewBlob: cached.previewBlob });
           updateProgressSlot(index, {
             status: "found",
             source: cached.image.source,
-            reason: `Reused ${segment.characterName}'s established image`,
+            reason: "Revisit to existing board image",
             attempt: 1,
             completedAt: Date.now(),
           });
@@ -10205,9 +10233,7 @@ function Board2Editor({
             source: image.source,
           };
           found.push({ originalIndex: index, segment, image: imageMetadata, sourceBlob, previewBlob });
-          if (segment.characterName && !characterImageMap.has(segment.characterName)) {
-            characterImageMap.set(segment.characterName, { image: imageMetadata, sourceBlob, previewBlob });
-          }
+          resolvedPlanMedia.set(plannedMediaReferences[index], { image: imageMetadata, sourceBlob, previewBlob });
           const successReason = result.failures.length || result.attempt > 1
             ? describeImageSuccess(slot, result).replace(/^Slot \d+: /, "")
             : undefined;
@@ -10239,21 +10265,42 @@ function Board2Editor({
       }
 
       reportProgress("placing", "Placing images…", 0, 1);
+      const mediaBySource = new Map<string, { item: MediaItem; previewUrl: string; sourceBlob: Blob }>();
+      const mediaByContent = new Map<string, { item: MediaItem; previewUrl: string; sourceBlob: Blob }>();
+      const fingerprintCache = new Map<Blob, Promise<string>>();
+      const fingerprintFor = (blob: Blob) => {
+        if (!fingerprintCache.has(blob)) fingerprintCache.set(blob, imageContentFingerprint(blob));
+        return fingerprintCache.get(blob)!;
+      };
+      const existingBoardMedia = new Map(clipsRef.current.filter((clip) => clip.type === "image").map((clip) => [boardEntityId(clip), clip]));
+      for (const [entityId, clip] of existingBoardMedia) {
+        if (!clip.sourceBlob) continue;
+        const canonical = {
+          item: { id: entityId, name: clip.name, type: "image", url: clip.sourceUrl },
+          previewUrl: clip.previewUrl ?? clip.sourceUrl,
+          sourceBlob: clip.sourceBlob,
+        } as const;
+        if (clip.sourceAttributionUrl) mediaBySource.set(canonicalSourceKey(clip.sourceAttributionUrl), canonical);
+        mediaByContent.set(await fingerprintFor(clip.sourceBlob), canonical);
+      }
+      const foundFingerprints = await Promise.all(found.map(({ sourceBlob }) => fingerprintFor(sourceBlob)));
+      controller.signal.throwIfAborted();
       const mediaItems = found.map(({ originalIndex, segment, image, sourceBlob, previewBlob }, index) => {
-        const url = URL.createObjectURL(sourceBlob);
-        const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
-        createdBlobUrls.push(url);
-        if (previewUrl !== url) createdBlobUrls.push(previewUrl);
-        return {
-          item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url },
-          segment,
-          image,
-          sourceBlob,
-          previewUrl,
-          originalIndex,
-          index,
-        };
+        const sourceKey = canonicalSourceKey(image.sourceUrl);
+        let canonical = mediaByContent.get(foundFingerprints[index]) ?? mediaBySource.get(sourceKey);
+        if (!canonical) {
+          const url = URL.createObjectURL(sourceBlob);
+          const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
+          createdBlobUrls.push(url);
+          if (previewUrl !== url) createdBlobUrls.push(previewUrl);
+          canonical = { item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url }, previewUrl, sourceBlob };
+          mediaBySource.set(sourceKey, canonical);
+          mediaByContent.set(foundFingerprints[index], canonical);
+        }
+        return { ...canonical, segment, image, originalIndex, index };
       });
+      const uniqueMediaItems = mediaItems.filter((entry, index) => mediaItems.findIndex((other) => other.item.id === entry.item.id) === index);
+      const newMediaItems = uniqueMediaItems.filter((entry) => !existingBoardMedia.has(entry.item.id));
 
       const layoutSeed = stableOrganicLayoutSeed(JSON.stringify({
         transcript,
@@ -10268,7 +10315,25 @@ function Board2Editor({
           topicIndex: segment.topicIndex ?? 0,
         }]),
       ).values()).sort((a, b) => a.topicIndex - b.topicIndex);
-      const requestedBoardSize = organicBoardSizeForImageCount(mediaItems.length, BOARD_W, BOARD_H);
+      const layoutTopics = topicDefinitions.flatMap((topic) => {
+        const items = uniqueMediaItems.filter(({ segment }) => (segment.topicId ?? "topic-0") === topic.id);
+        const groupSize = items.length > 14 ? 10 : items.length || 1;
+        const groups = [];
+        for (let offset = 0; offset < items.length; offset += groupSize) {
+          const members = items.slice(offset, offset + groupSize);
+          groups.push({
+            ...topic,
+            id: items.length > 14 ? `${topic.id}-cluster-${Math.floor(offset / groupSize)}` : topic.id,
+            images: members.map(({ item, segment, image }) => ({
+              id: item.id, width: image.width, height: image.height,
+              startTime: segment.start,
+              importance: mediaItems.some((entry) => entry.item.id === item.id && entry.segment.importance === "anchor") ? "anchor" as const : segment.importance,
+            })),
+          });
+        }
+        return groups;
+      });
+      const requestedBoardSize = organicBoardSizeForImageCount(newMediaItems.length, BOARD_W, BOARD_H);
       let layoutBoardDimensions = {
         width: Math.max(boardDimensionsRef.current.width, requestedBoardSize.width),
         height: Math.max(boardDimensionsRef.current.height, requestedBoardSize.height),
@@ -10283,20 +10348,20 @@ function Board2Editor({
           clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined
             ? [{ x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH }]
             : []),
-        topics: topicDefinitions.map((topic) => ({
+        topics: layoutTopics.map((topic) => ({
           ...topic,
-          images: mediaItems
-            .filter(({ segment }) => (segment.topicId ?? "topic-0") === topic.id)
-            .map(({ item, segment, image }) => ({
-              id: item.id,
-              width: image.width,
-              height: image.height,
-              startTime: segment.start,
-            })),
+          images: topic.images.filter((image) => newMediaItems.some((entry) => entry.item.id === image.id)),
         })),
+        sizeRatio: buildStyleSelection.selected.map((style) => style.layout?.largestToMedianArea).find((value): value is number => typeof value === "number") ?? 2.7,
+        clusterGapRatio: 0.29 + Math.min(0.1, Math.max(0, buildStyleSelection.selected[0]?.layout?.whitespaceRatio ?? 0.7) * 0.1),
       });
-      const placementByMediaId = new Map(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image])));
-      const autoTopicAnnotations: Annotation[] = placedTopics.map((topic) => ({
+      const placementByMediaId = new Map<string, { x: number; y: number; width: number; height: number }>(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image] as const)));
+      for (const [entityId, clip] of existingBoardMedia) {
+        if (clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined) {
+          placementByMediaId.set(entityId, { x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH });
+        }
+      }
+      const autoTopicAnnotations: Annotation[] = placedTopics.filter((topic) => !/-cluster-[1-9]\d*$/.test(topic.id)).map((topic, index) => ({
         id: generateId(),
         type: "text",
         boardX: topic.label.x,
@@ -10305,34 +10370,132 @@ function Board2Editor({
         boardH: topic.label.height,
         color: "#2a2a2a",
         text: topic.title,
-        textAlign: "center",
-        fontFamily: "Caveat",
-        fontSize: Math.round(topic.label.height * 0.72),
+        textAlign: "left",
+        fontFamily: "Permanent Marker",
+        fontSize: Math.round(topic.label.height * 0.6),
         fontWeight: "bold",
+        rotationDeg: index % 2 ? 4 : -4,
         source: "auto",
         autoTopicId: topic.id,
         autoLayoutSeed: layoutSeed,
       }));
+      const titleRect = titleCenterpieceRect(layoutBoardDimensions.width, layoutBoardDimensions.height);
+      const boardTitle = saveName.trim() && !/^untitled board\b/i.test(saveName.trim())
+        ? saveName.trim() : plannedBoardTitle || topicDefinitions.map((topic) => topic.title).slice(0, 2).join(" / ");
+      autoTopicAnnotations.push({
+        id: generateId(), type: "text", boardX: titleRect.x, boardY: titleRect.y,
+        boardW: titleRect.width, boardH: titleRect.height, color: "#202020",
+        text: boardTitle.slice(0, 80), textAlign: "center", fontFamily: "Permanent Marker",
+        fontSize: Math.round(Math.min(titleRect.height * 0.52, titleRect.width / Math.max(5, boardTitle.length * 0.56))),
+        fontWeight: "bold", source: "auto", autoLayoutSeed: layoutSeed,
+        rotationDeg: -2,
+      });
+      // Rough.js draws these saved annotation shapes in both the editor and the export.
+      // Budget: about 0.45 marginal marks per distinct image, plus cluster labels and title.
+      const styleMarksPerMedia = buildStyleSelection.selected[0]?.annotations.perMedia;
+      const markBudget = Math.max(3, Math.round(uniqueMediaItems.length * clamp(styleMarksPerMedia ?? 0.45, 0.3, 0.65)));
+      let markCount = 0;
+      for (const topic of placedTopics) {
+        const images = topic.images.slice().sort((a, b) => a.startTime - b.startTime);
+        const clusterBudget = Math.max(2, Math.ceil(markBudget / Math.max(1, placedTopics.length)));
+        let clusterMarks = 0;
+        const hasMarkRoom = () => markCount < markBudget && clusterMarks < clusterBudget;
+        const arrowPair = images.slice(1).map((to, index) => {
+          const from = images[index];
+          const fx = from.x + from.width / 2, fy = from.y + from.height / 2;
+          const tx = to.x + to.width / 2, ty = to.y + to.height / 2;
+          const distance = Math.hypot(tx - fx, ty - fy);
+          const crossesTitle = Array.from({ length: 9 }, (_, step) => (step + 1) / 10).some((fraction) => {
+            const x = fx + (tx - fx) * fraction, y = fy + (ty - fy) * fraction;
+            return x >= titleRect.x - 80 && x <= titleRect.x + titleRect.width + 80 &&
+              y >= titleRect.y - 80 && y <= titleRect.y + titleRect.height + 80;
+          });
+          return { from, to, distance, crossesTitle };
+        }).filter((pair) => !pair.crossesTitle && pair.distance < Math.min(layoutBoardDimensions.width, layoutBoardDimensions.height) * 0.26)
+          .sort((a, b) => a.distance - b.distance)[0];
+        if (arrowPair && hasMarkRoom()) {
+          const { from, to } = arrowPair;
+          const fx = from.x + from.width / 2, fy = from.y + from.height / 2;
+          const tx = to.x + to.width / 2, ty = to.y + to.height / 2;
+          const dx = tx - fx, dy = ty - fy;
+          const distance = Math.max(1, Math.hypot(dx, dy));
+          autoTopicAnnotations.push({
+            id: generateId(), type: "arrow", boardX: Math.min(fx, tx), boardY: Math.min(fy, ty),
+            boardW: Math.abs(dx), boardH: Math.abs(dy),
+            arrowStartX: fx + dx / distance * Math.min(from.width, from.height) * 0.55,
+            arrowStartY: fy + dy / distance * Math.min(from.width, from.height) * 0.55,
+            arrowEndX: tx - dx / distance * Math.min(to.width, to.height) * 0.55,
+            arrowEndY: ty - dy / distance * Math.min(to.width, to.height) * 0.55,
+            color: "#333333", strokeWidth: 3, source: "auto", autoTopicId: topic.id, autoLayoutSeed: layoutSeed,
+          });
+          markCount++;
+          clusterMarks++;
+        }
+        const calloutIndex = images.findIndex((image) => mediaItems.some((entry) => entry.item.id === image.id && !!entry.segment.callout));
+        if (calloutIndex >= 0 && hasMarkRoom()) {
+          const image = images[calloutIndex];
+          const callout = mediaItems.find((entry) => entry.item.id === image.id && !!entry.segment.callout)!.segment.callout!;
+          autoTopicAnnotations.push({
+            id: generateId(), type: "text", boardX: image.x + image.width * 0.72,
+            boardY: image.y - 55 - (calloutIndex % 2) * 20, boardW: 280, boardH: 70,
+            color: "#333333", text: callout, fontFamily: calloutIndex % 3 ? "Caveat" : "Permanent Marker",
+            fontSize: calloutIndex % 3 ? 54 : 38, source: "auto", autoTopicId: topic.id,
+            autoLayoutSeed: layoutSeed, rotationDeg: calloutIndex % 2 ? 7 : -6,
+          });
+          markCount++;
+          clusterMarks++;
+        }
+        for (const image of images) {
+          const contrast = mediaItems.find((entry) => entry.item.id === image.id && entry.segment.emphasis?.startsWith("contrast-"))?.segment.emphasis;
+          if (!contrast || !hasMarkRoom()) continue;
+          autoTopicAnnotations.push({
+            id: generateId(), type: "text", boardX: image.x + image.width - 50,
+            boardY: image.y - 30, boardW: 90, boardH: 100,
+            color: contrast === "contrast-yes" ? "#19864d" : "#c52b21",
+            text: contrast === "contrast-yes" ? "✓" : "✗", fontFamily: "Caveat",
+            fontSize: 85, fontWeight: "bold", source: "auto", autoTopicId: topic.id, autoLayoutSeed: layoutSeed,
+          });
+          markCount++;
+          clusterMarks++;
+        }
+        for (let i = 0; i < images.length && hasMarkRoom(); i++) {
+          const image = images[i];
+          const segment = mediaItems.find((entry) => entry.item.id === image.id && (entry.segment.emphasis || entry.segment.callout))?.segment
+            ?? uniqueMediaItems.find((entry) => entry.item.id === image.id)?.segment;
+          if (!segment) continue;
+          if ((segment.emphasis === "circle" || (segment.importance === "anchor" && i % 2 === 0) || i % 6 === 2) && hasMarkRoom()) {
+            autoTopicAnnotations.push({
+              id: generateId(), type: "circle", boardX: image.x + image.width * 0.26,
+              boardY: image.y + image.height * 0.19, boardW: image.width * 0.48,
+              boardH: image.height * 0.56, color: "#d33923", strokeWidth: 4,
+              source: "auto", autoTopicId: topic.id, autoLayoutSeed: layoutSeed,
+            });
+            markCount++;
+            clusterMarks++;
+          }
+        }
+      }
       const nextClips = [...clipsRef.current];
-      const timingByMediaId = new Map(buildNarrationLockedImageWindows(
-        mediaItems.map(({ item, segment }) => ({ id: item.id, startTime: segment.start })),
+      const timingByAppearance = new Map(buildNarrationLockedImageWindows(
+        mediaItems.map(({ originalIndex, segment }) => ({ id: String(originalIndex), startTime: segment.start })),
         narrationStart,
         transcriptionDuration,
       ).map((timing) => [timing.id, timing]));
       // Built into a plain array (rather than committed to state as each clip is derived) so a
       // thrown invariant below leaves no orphaned media-library entries or topic-label annotations
       // referencing clips that were never created.
-      const autoClips: Clip[] = mediaItems.map(({ item, segment, image, sourceBlob, previewUrl }) => {
+      const autoClips: Clip[] = mediaItems.map(({ item, segment, image, sourceBlob, previewUrl, originalIndex }) => {
         const placement = placementByMediaId.get(item.id);
         if (!placement) throw new Error(`Organic placement missing for ${item.name}`);
-        const timing = timingByMediaId.get(item.id);
+        const timing = timingByAppearance.get(String(originalIndex));
         if (!timing) throw new Error(`Narration timing missing for ${item.name}`);
         const { startTime, duration } = timing;
-        const id = generateId();
+        const id = nextClips.some((candidate) => candidate.id === item.id) ? generateId() : item.id;
         const clip: Clip = {
           id,
           type: "image",
           name: item.name,
+          mediaId: item.id,
           sourceUrl: item.url,
           sourceBlob,
           previewUrl,
@@ -10353,11 +10516,12 @@ function Board2Editor({
           imagePlanReason: segment.reason,
           imagePlanModel: segment.planModel,
           imagePlanStyleNote: appliedStyleNote ?? undefined,
-          autoTopicId: segment.topicId ?? "topic-0",
+          autoTopicId: placedTopics.find((topic) => topic.images.some((image) => image.id === item.id))?.id ?? segment.topicId ?? "topic-0",
           autoTopicTitle: segment.topicTitle ?? "Narration Overview",
           autoTopicStartTime: segment.topicStartTime,
           autoTopicEndTime: segment.topicEndTime,
           autoLayoutSeed: layoutSeed,
+          autoShot: segment.shot,
         };
         nextClips.push(clip);
         return clip;
@@ -10465,7 +10629,7 @@ function Board2Editor({
       }
       setMediaLibrary((prev) => [
         ...prev,
-        ...mediaItems.map(({ item }) => item),
+        ...newMediaItems.map(({ item }) => item),
         ...(outroMediaItem ? [outroMediaItem] : []),
       ]);
       setAnnotations((prev) => [...prev, ...autoTopicAnnotations, ...outroAnnotations]);
@@ -10487,12 +10651,21 @@ function Board2Editor({
       // generating the camera path is downgraded to a warning rather than failing the whole
       // build — the owner would otherwise see "auto-build failed" despite the images being there.
       let cameraWarning: string | null = null;
+      let cameraStats = "";
       const cameraClips = [...autoClips, ...(outroClip ? [outroClip] : [])];
       if (cameraClips.length) {
         reportProgress("camera", "Generating camera…", 0, 1);
         try {
           const W = canvasWRef.current;
           const H = canvasHRef.current;
+          const cameraTopicBounds = new Map(placedTopics.map((topic) => [topic.id, { topicId: topic.id, ...topic.bounds }]));
+          for (const clip of cameraClips) {
+            const topicId = clip.autoTopicId;
+            if (!topicId || clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+            if (!cameraTopicBounds.has(topicId)) cameraTopicBounds.set(topicId, {
+              topicId, x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH,
+            });
+          }
           const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
             clips: cameraClips.map((clip) => ({
               id: clip.id,
@@ -10504,16 +10677,24 @@ function Board2Editor({
               boardW: clip.boardW!,
               boardH: clip.boardH!,
               topicId: clip.autoTopicId,
+              shot: clip.autoShot,
             })),
-            topicBounds: placedTopics.map((topic) => ({ topicId: topic.id, ...topic.bounds })),
+            topicBounds: [...cameraTopicBounds.values()],
             canvasWidth: W,
             canvasHeight: H,
             boardWidth: layoutBoardDimensions.width,
             imageFocusRatio: FOCUS_FILL_RATIO,
+            maxBroadPanGapSec: 18,
           }).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
             ? { ...keyframe, autoRole: "outro" as const }
             : keyframe);
           if (!generatedCamera.length) throw new Error("no camera keyframes were generated");
+          const broadTimes = generatedCamera.filter((keyframe) => keyframe.broadPan).filter((_, index) => index % 2 === 0).map((keyframe) => keyframe.time);
+          const maxBroadGap = [narrationStart, ...broadTimes, narrationEnd].sort((a, b) => a - b)
+            .reduce((largest, time, index, times) => index ? Math.max(largest, time - times[index - 1]) : largest, 0);
+          const wideBeats = broadTimes.length;
+          const tightBeats = Math.max(0, autoClips.length - wideBeats);
+          cameraStats = ` ${wideBeats} wide / ${tightBeats} tight beats; broad pan at most ${maxBroadGap.toFixed(1)}s apart.`;
           cameraKeyframesRef.current = generatedCamera;
           setCameraKeyframes(generatedCamera);
           setKeyframesOutOfDate(false);
@@ -10537,7 +10718,16 @@ function Board2Editor({
       const elapsed = Date.now() - startedAt;
       const summary = unavailable
         ? `Built ${autoClips.length}/${segments.length} — ${unavailable} slot${unavailable === 1 ? "" : "s"} unavailable in ${formatAutoBuildDuration(elapsed)}`
-        : `Built ${autoClips.length}/${segments.length} images in ${formatAutoBuildDuration(elapsed)}`;
+        : `Built ${autoClips.length} appearances from ${uniqueMediaItems.length} distinct images in ${formatAutoBuildDuration(elapsed)}`;
+      const mediaAreas = uniqueMediaItems.map(({ item }) => placementByMediaId.get(item.id))
+        .filter((placement): placement is NonNullable<typeof placement> => !!placement)
+        .map((placement) => placement.width * placement.height).sort((a, b) => a - b);
+      const sizeRatio = mediaAreas.length ? mediaAreas.at(-1)! / mediaAreas[Math.floor(mediaAreas.length / 2)] : 0;
+      const annotationCounts = autoTopicAnnotations.reduce<Record<string, number>>((counts, annotation) => {
+        counts[annotation.type] = (counts[annotation.type] ?? 0) + 1;
+        return counts;
+      }, {});
+      const compositionStats = ` ${placedTopics.length} clusters; largest/median area ${sizeRatio.toFixed(1)}×; annotations ${Object.entries(annotationCounts).map(([type, count]) => `${type} ${count}`).join(", ")}.`;
       const outroSummary = outroClip ? ` Outro appended for ${AUTO_BUILD_OUTRO_DURATION_SECONDS.toFixed(1)}s.` : "";
       const styleSummary = appliedStyleExemplarCount
         ? ` Planned in your style from ${appliedStyleExemplarCount} starred board${appliedStyleExemplarCount === 1 ? "" : "s"}${appliedStyleNote ? ` — ${appliedStyleNote}` : "."}`
@@ -10548,7 +10738,7 @@ function Board2Editor({
         ? ` Skipped: ${skipped.map(({ index, query, reason }) => `#${index + 1} “${query}” (${reason.replace(/^Slot \d+: /, "")})`).join(", ")}.`
         : "";
       const cameraNote = cameraWarning ? ` ⚠ ${cameraWarning}` : "";
-      setAutoBuildSummary(`${summary}${outroSummary}${styleSummary}${skippedSlots}${cameraNote}`);
+      setAutoBuildSummary(`${summary}${compositionStats}${cameraStats}${outroSummary}${styleSummary}${skippedSlots}${cameraNote}`);
       commitAutoBuildProgress((current) => ({
         ...current,
         status: unavailable || cameraWarning ? "partial" : "success",
@@ -10751,20 +10941,49 @@ function Board2Editor({
         return;
       }
 
-      const mediaItems = found.map(({ originalIndex, segment, image, sourceBlob, previewBlob }) => {
-        const url = URL.createObjectURL(sourceBlob);
-        const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
-        createdBlobUrls.push(url);
-        if (previewUrl !== url) createdBlobUrls.push(previewUrl);
-        return { item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url }, segment, image, sourceBlob, previewUrl, originalIndex };
+      const existingBoardMedia = new Map(clipsRef.current.filter((clip) => clip.type === "image").map((clip) => [boardEntityId(clip), clip]));
+      const mediaBySource = new Map<string, { item: MediaItem; previewUrl: string; sourceBlob: Blob }>();
+      const mediaByContent = new Map<string, { item: MediaItem; previewUrl: string; sourceBlob: Blob }>();
+      const fingerprintCache = new Map<Blob, Promise<string>>();
+      const fingerprintFor = (blob: Blob) => {
+        if (!fingerprintCache.has(blob)) fingerprintCache.set(blob, imageContentFingerprint(blob));
+        return fingerprintCache.get(blob)!;
+      };
+      for (const [entityId, clip] of existingBoardMedia) {
+        if (!clip.sourceBlob) continue;
+        const canonical = {
+          item: { id: entityId, name: clip.name, type: "image", url: clip.sourceUrl },
+          previewUrl: clip.previewUrl ?? clip.sourceUrl, sourceBlob: clip.sourceBlob,
+        } as const;
+        if (clip.sourceAttributionUrl) mediaBySource.set(canonicalSourceKey(clip.sourceAttributionUrl), canonical);
+        mediaByContent.set(await fingerprintFor(clip.sourceBlob), canonical);
+      }
+      const foundFingerprints = await Promise.all(found.map(({ sourceBlob }) => fingerprintFor(sourceBlob)));
+      controller.signal.throwIfAborted();
+      const mediaItems = found.map(({ originalIndex, segment, image, sourceBlob, previewBlob }, index) => {
+        const sourceKey = canonicalSourceKey(image.sourceUrl);
+        const contentKey = foundFingerprints[index];
+        let canonical = mediaByContent.get(contentKey) ?? mediaBySource.get(sourceKey);
+        if (!canonical) {
+          const url = URL.createObjectURL(sourceBlob);
+          const previewUrl = previewBlob === sourceBlob ? url : URL.createObjectURL(previewBlob);
+          createdBlobUrls.push(url);
+          if (previewUrl !== url) createdBlobUrls.push(previewUrl);
+          canonical = { item: { id: generateId(), name: segment.query.slice(0, 40), type: "image" as const, url }, previewUrl, sourceBlob };
+          mediaBySource.set(sourceKey, canonical);
+          mediaByContent.set(contentKey, canonical);
+        }
+        return { ...canonical, segment, image, originalIndex };
       });
+      const newMediaItems = mediaItems.filter((entry, index) =>
+        !existingBoardMedia.has(entry.item.id) && mediaItems.findIndex((other) => other.item.id === entry.item.id) === index);
 
       // Group the newly-found images by topic and place them avoiding every currently-occupied
       // board rect. They land as a fresh cluster rather than being woven back into the original
       // topic's cluster — acceptable for a recovery path, though visually the topic can end up
       // split across two areas of the board.
       const byTopic = new Map<string, typeof mediaItems>();
-      for (const mediaItem of mediaItems) {
+      for (const mediaItem of newMediaItems) {
         const topicId = mediaItem.segment.topicId ?? "topic-0";
         byTopic.set(topicId, [...(byTopic.get(topicId) ?? []), mediaItem]);
       }
@@ -10789,7 +11008,12 @@ function Board2Editor({
             : []),
         topics: topicDefsForRetry,
       });
-      const placementByMediaId = new Map(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image])));
+      const placementByMediaId = new Map<string, { x: number; y: number; width: number; height: number }>(placedTopics.flatMap((topic) => topic.images.map((image) => [image.id, image] as const)));
+      for (const [entityId, clip] of existingBoardMedia) {
+        if (clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined) {
+          placementByMediaId.set(entityId, { x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH });
+        }
+      }
 
       // Recompute narration-locked windows across every placed image from this build (existing +
       // newly-retried) so durations stay contiguous — this must include the already-placed clips,
@@ -10798,8 +11022,7 @@ function Board2Editor({
       for (let index = 0; index < ctx.segments.length; index++) {
         const retryItem = mediaItems.find((mediaItem) => mediaItem.originalIndex === index);
         const existingClipId = ctx.clipIdBySegmentIndex.get(index);
-        if (retryItem) allMoments.push({ id: retryItem.item.id, startTime: ctx.segments[index].start });
-        else if (existingClipId) allMoments.push({ id: existingClipId, startTime: ctx.segments[index].start });
+        if (retryItem || existingClipId) allMoments.push({ id: String(index), startTime: ctx.segments[index].start });
       }
       const windows = buildNarrationLockedImageWindows(allMoments, ctx.narrationStart, ctx.transcriptionDuration);
       const windowById = new Map(windows.map((timingWindow) => [timingWindow.id, timingWindow]));
@@ -10807,13 +11030,15 @@ function Board2Editor({
       const newClips: Clip[] = [];
       for (const mediaItem of mediaItems) {
         const placement = placementByMediaId.get(mediaItem.item.id);
-        const timing = windowById.get(mediaItem.item.id);
+        const timing = windowById.get(String(mediaItem.originalIndex));
         if (!placement || !timing) continue;
-        const id = generateId();
+        const id = clipsRef.current.some((clip) => clip.id === mediaItem.item.id) || newClips.some((clip) => clip.id === mediaItem.item.id)
+          ? generateId() : mediaItem.item.id;
         newClips.push({
           id,
           type: "image",
           name: mediaItem.item.name,
+          mediaId: mediaItem.item.id,
           sourceUrl: mediaItem.item.url,
           sourceBlob: mediaItem.sourceBlob,
           previewUrl: mediaItem.previewUrl,
@@ -10839,13 +11064,15 @@ function Board2Editor({
           autoTopicStartTime: mediaItem.segment.topicStartTime,
           autoTopicEndTime: mediaItem.segment.topicEndTime,
           autoLayoutSeed: ctx.layoutSeed,
+          autoShot: mediaItem.segment.shot,
         });
         ctx.clipIdBySegmentIndex.set(mediaItem.originalIndex, id);
       }
 
-      setMediaLibrary((prev) => [...prev, ...mediaItems.map(({ item }) => item)]);
+      setMediaLibrary((prev) => [...prev, ...newMediaItems.map(({ item }) => item)]);
       const updatedClips = clipsRef.current.map((clip) => {
-        const timingWindow = windowById.get(clip.id);
+        const segmentIndex = [...ctx.clipIdBySegmentIndex.entries()].find(([, id]) => id === clip.id)?.[0];
+        const timingWindow = segmentIndex === undefined ? undefined : windowById.get(String(segmentIndex));
         if (!timingWindow || (timingWindow.startTime === clip.startTime && timingWindow.duration === clip.duration)) return clip;
         return { ...clip, startTime: timingWindow.startTime, duration: timingWindow.duration };
       });
@@ -14385,12 +14612,14 @@ function Board2Editor({
           boardW: clip.boardW!,
           boardH: clip.boardH!,
           topicId: clip.autoTopicId,
+          shot: clip.autoShot,
         })),
         topicBounds,
         canvasWidth: canvasWRef.current,
         canvasHeight: canvasHRef.current,
         boardWidth: boardDimensionsRef.current.width,
         imageFocusRatio: FOCUS_FILL_RATIO,
+        maxBroadPanGapSec: 18,
       }).map((keyframe) => {
         const outro = topicAwareClips.find((clip) => clip.autoRole === "outro");
         return outro && keyframe.time >= outro.startTime
@@ -20423,6 +20652,7 @@ function Board2Editor({
           volume: clip.volume,
           muted: clip.muted,
           holdFraction: clip.holdFraction,
+          autoShot: clip.autoShot,
           source: recipeProvenance(clip.source === "autoDerived" ? "auto" : clip.source as ClipSource | undefined),
         };
       });

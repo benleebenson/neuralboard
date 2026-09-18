@@ -10,6 +10,7 @@ export type TopicCameraClip = {
   boardW: number;
   boardH: number;
   topicId?: string;
+  shot?: "wide" | "tight";
 };
 
 export type TopicCameraBounds = {
@@ -26,6 +27,8 @@ export type TopicCameraKeyframe = {
   cameraY: number;
   boardZoom: number;
   easing: "ease-in-out";
+  shot?: "wide" | "tight";
+  broadPan?: boolean;
 };
 
 type CameraStop = Omit<TopicCameraKeyframe, "time" | "easing">;
@@ -37,6 +40,7 @@ type TopicCameraOptions = {
   canvasHeight: number;
   boardWidth: number;
   imageFocusRatio: number;
+  maxBroadPanGapSec?: number;
 };
 
 function stopForRect(
@@ -62,15 +66,44 @@ export function buildTopicClusterCameraKeyframes(options: TopicCameraOptions): T
   ));
   const firstTopicClip = clips.map((clip, index) => !!clip.topicId && (index === 0 || clips[index - 1].topicId !== clip.topicId));
   const events: TopicCameraKeyframe[] = [];
+  let lastBroadPan = clips[0].startTime;
   for (let index = 0; index < clips.length; index++) {
     const clip = clips[index];
     const imageStop = imageStops[index];
     const holdEnd = clip.startTime + clip.duration * (clip.holdFraction ?? 0.6);
     const clipEnd = clip.startTime + clip.duration;
+    const topicBounds = clip.topicId ? boundsByTopic.get(clip.topicId) : undefined;
+    const broadPan = !!topicBounds && clip.duration >= 2 && (clip.shot === "wide" ||
+      (Number.isFinite(options.maxBroadPanGapSec) && clip.startTime - lastBroadPan >= (options.maxBroadPanGapSec ?? Infinity) - 2));
+    if (broadPan && topicBounds) {
+      const travel = Math.min(4, Math.max(2, clip.duration * 0.65));
+      const wideStop = stopForRect(topicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.76);
+      const sweep = topicBounds.width * 0.15;
+      const direction = index % 2 ? -1 : 1;
+      events.push({ time: clip.startTime, ...wideStop, cameraX: wideStop.cameraX - sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+      events.push({ time: Math.min(clipEnd, clip.startTime + travel), ...wideStop, cameraX: wideStop.cameraX + sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+      lastBroadPan = clip.startTime;
+      for (let panTime = clip.startTime + 16; panTime + 2 <= clipEnd; panTime += 16) {
+        events.push({ time: panTime, ...wideStop, cameraX: wideStop.cameraX + sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+        events.push({ time: panTime + 2, ...wideStop, cameraX: wideStop.cameraX - sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+        lastBroadPan = panTime;
+      }
+      continue;
+    }
     // The editorial timestamp is an arrival deadline, not the beginning of a camera move.
     // Every image must therefore be the resolved camera stop at its exact narration start.
-    events.push({ time: clip.startTime, ...imageStop, easing: "ease-in-out" });
-    if (holdEnd > clip.startTime) events.push({ time: holdEnd, ...imageStop, easing: "ease-in-out" });
+    events.push({ time: clip.startTime, ...imageStop, easing: "ease-in-out", shot: "tight" });
+    if (holdEnd > clip.startTime) events.push({ time: holdEnd, ...imageStop, easing: "ease-in-out", shot: "tight" });
+    if (topicBounds && Number.isFinite(options.maxBroadPanGapSec)) {
+      for (let panTime = Math.max(clip.startTime + 2, lastBroadPan + 16); panTime + 2 <= clipEnd; panTime += 16) {
+        const wideStop = stopForRect(topicBounds, options.canvasWidth, options.canvasHeight, options.boardWidth, 0.76);
+        const sweep = topicBounds.width * 0.15;
+        const direction = (index + Math.floor(panTime)) % 2 ? -1 : 1;
+        events.push({ time: panTime, ...wideStop, cameraX: wideStop.cameraX - sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+        events.push({ time: panTime + 2, ...wideStop, cameraX: wideStop.cameraX + sweep * direction, easing: "ease-in-out", shot: "wide", broadPan: true });
+        lastBroadPan = panTime;
+      }
+    }
 
     const nextClip = clips[index + 1];
     const nextTopicBounds = nextClip && firstTopicClip[index + 1] && nextClip.topicId

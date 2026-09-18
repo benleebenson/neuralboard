@@ -15,6 +15,7 @@ import {
   type EditorialTranscriptSegment,
   parseEditorialTopicOutline,
   parseEditorialTopicPlan,
+  parseEditorialBoardTitle,
 } from "@/lib/board2/editorial-image-plan";
 import {
   describeAppliedStyle,
@@ -195,7 +196,7 @@ export async function POST(req: NextRequest) {
       const images = parsed.flatMap((topic) => topic.images).filter((image) =>
         image.startTime >= chunk.startTime - 0.01 && (isLastChunk ? image.startTime <= chunk.endTime : image.startTime < chunk.endTime)
       ).slice(0, chunk.targetCount);
-      return { images, topics: parsed };
+      return { images, topics: parsed, boardTitle: parseEditorialBoardTitle(responseText) };
     };
 
     const chunkResults: Awaited<ReturnType<typeof planChunk>>[] = new Array(chunks.length);
@@ -207,13 +208,7 @@ export async function POST(req: NextRequest) {
       }
     }));
 
-    const seenQueries = new Set<string>();
-    const plan = chunkResults.flatMap((result) => result.images).sort((a, b) => a.startTime - b.startTime).filter((image) => {
-      const key = image.query.toLowerCase();
-      if (seenQueries.has(key)) return false;
-      seenQueries.add(key);
-      return true;
-    }).slice(0, targetCount);
+    const plan = chunkResults.flatMap((result) => result.images).sort((a, b) => a.startTime - b.startTime).slice(0, targetCount);
     if (plan.length) plan[0] = { ...plan[0], startTime: 0 };
     const topics = chunks.length === 1
       ? chunkResults[0].topics
@@ -262,6 +257,7 @@ export async function POST(req: NextRequest) {
       },
       topics,
       plan,
+      boardTitle: chunkResults.find((chunk) => chunk.boardTitle)?.boardTitle ?? "",
     });
   } catch (error: unknown) {
     const timeout = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");

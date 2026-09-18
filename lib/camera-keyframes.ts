@@ -8,6 +8,8 @@ export type CameraKeyframe = CameraState & {
   time: number;
   easing?: "linear" | "ease-in-out"; // applied when interpolating TO this keyframe
   autoRole?: "outro";
+  shot?: "wide" | "tight";
+  broadPan?: boolean;
 };
 
 export function easeInOutCubic(t: number): number {

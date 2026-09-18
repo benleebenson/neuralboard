@@ -5,6 +5,7 @@ export type OrganicLayoutImage = {
   width: number;
   height: number;
   startTime: number;
+  importance?: "anchor" | "support";
 };
 
 export type OrganicLayoutTopic = {
@@ -37,13 +38,17 @@ type OrganicLayoutOptions = {
   seed: number;
   topics: OrganicLayoutTopic[];
   occupied?: LayoutRect[];
+  sizeRatio?: number;
+  clusterGapRatio?: number;
 };
 
 const OUTER_MARGIN_X = 140;
 const OUTER_MARGIN_Y = 140;
-const CLUSTER_GAP_X = 160;
-const CLUSTER_GAP_Y = 190;
-const IMAGE_GAP = 24;
+const IMAGE_GAP = 18;
+
+export function titleCenterpieceRect(boardWidth: number, boardHeight: number): LayoutRect {
+  return { x: boardWidth * 0.31, y: boardHeight * 0.42, width: boardWidth * 0.38, height: boardHeight * 0.16 };
+}
 
 export function organicBoardSizeForImageCount(
   imageCount: number,
@@ -141,49 +146,50 @@ export function layoutOrganicTopicClusters(options: OrganicLayoutOptions): Organ
   const topics = options.topics.filter((topic) => topic.images.length > 0);
   if (!topics.length) return [];
   const random = seededRandom(options.seed);
-  const occupied = [...(options.occupied ?? [])];
-  const columns = topics.length === 1
-    ? 1
-    : Math.min(4, Math.ceil(Math.sqrt(topics.length * options.boardWidth / options.boardHeight)));
-  const rows = Math.ceil(topics.length / columns);
-  const cellWidth = (options.boardWidth - OUTER_MARGIN_X * 2 - CLUSTER_GAP_X * (columns - 1)) / columns;
-  const cellHeight = (options.boardHeight - OUTER_MARGIN_Y * 2 - CLUSTER_GAP_Y * (rows - 1)) / rows;
+  const title = titleCenterpieceRect(options.boardWidth, options.boardHeight);
+  const occupied = [...(options.occupied ?? []), title];
+  const count = topics.length;
+  const orbit = count === 1 ? 0 : clampNumber(options.clusterGapRatio ?? 0.34, 0.25, 0.4);
+  const regionWidth = count === 1 ? options.boardWidth - 2 * OUTER_MARGIN_X :
+    Math.min(options.boardWidth * 0.42, options.boardWidth * 1.1 / Math.sqrt(count));
+  const regionHeight = count === 1 ? options.boardHeight - 2 * OUTER_MARGIN_Y :
+    Math.min(options.boardHeight * 0.43, options.boardHeight * 1.08 / Math.sqrt(count));
 
   return topics.map((topic, topicIndex): OrganicPlacedTopic => {
-    const column = topicIndex % columns;
-    const row = Math.floor(topicIndex / columns);
+    const angle = -Math.PI / 2 + topicIndex * Math.PI * 2 / count + (random() - 0.5) * 0.17;
+    const centerX = options.boardWidth * (0.5 + Math.cos(angle) * orbit);
+    const centerY = options.boardHeight * (0.5 + Math.sin(angle) * orbit);
     const region: LayoutRect = {
-      x: OUTER_MARGIN_X + column * (cellWidth + CLUSTER_GAP_X),
-      y: OUTER_MARGIN_Y + row * (cellHeight + CLUSTER_GAP_Y),
-      width: cellWidth,
-      height: cellHeight,
+      x: clampNumber(centerX - regionWidth / 2, OUTER_MARGIN_X, options.boardWidth - OUTER_MARGIN_X - regionWidth),
+      y: clampNumber(centerY - regionHeight / 2, OUTER_MARGIN_Y, options.boardHeight - OUTER_MARGIN_Y - regionHeight),
+      width: regionWidth,
+      height: regionHeight,
     };
-    const titleZoneHeight = clampNumber(cellHeight * 0.16, 76, 116);
     const contentRegion: LayoutRect = {
-      x: region.x + 24,
-      y: region.y + titleZoneHeight,
-      width: region.width - 48,
-      height: region.height - titleZoneHeight - 28,
+      x: region.x + 18,
+      y: region.y + 18,
+      width: region.width - 36,
+      height: region.height - 36,
     };
     const imageCount = topic.images.length;
-    const slotColumns = Math.max(1, Math.min(imageCount, Math.ceil(Math.sqrt(imageCount * contentRegion.width / contentRegion.height))));
-    const slotRows = Math.ceil(imageCount / slotColumns);
-    const slotWidth = contentRegion.width / slotColumns;
-    const slotHeight = contentRegion.height / slotRows;
     const placedImages: OrganicPlacedImage[] = [];
 
     topic.images
       .slice()
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id))
       .forEach((image, imageIndex) => {
-        const slotColumn = imageIndex % slotColumns;
-        const slotRow = Math.floor(imageIndex / slotColumns);
-        const anchorX = contentRegion.x + (slotColumn + 0.5) * slotWidth + (random() - 0.5) * slotWidth * 0.24;
-        const anchorY = contentRegion.y + (slotRow + 0.5) * slotHeight + (random() - 0.5) * slotHeight * 0.22;
-        const sizeVariation = 0.8 + random() * 0.4;
+        const spiralAngle = imageIndex * 2.39996 + random() * 0.6;
+        const spiralRadius = Math.sqrt((imageIndex + 0.5) / imageCount) * 0.46;
+        const anchorX = centerX + Math.cos(spiralAngle) * contentRegion.width * spiralRadius;
+        const anchorY = centerY + Math.sin(spiralAngle) * contentRegion.height * spiralRadius;
+        const anchor = image.importance === "anchor" || (!image.importance && imageIndex % 7 === 0);
+        const sizeVariation = anchor
+          ? clampNumber(options.sizeRatio ?? 2.7, 2, 3.8) * (0.65 + random() * 0.15)
+          : 0.64 + random() * 0.55;
         const safeWidth = Math.max(1, image.width);
         const safeHeight = Math.max(1, image.height);
-        const baseScale = Math.min(1, slotWidth * 0.76 / safeWidth, slotHeight * 0.72 / safeHeight);
+        const nominal = Math.sqrt(contentRegion.width * contentRegion.height / imageCount) * 0.59;
+        const baseScale = Math.min(1, nominal / Math.sqrt(safeWidth * safeHeight));
         let width = Math.max(72, safeWidth * baseScale * sizeVariation);
         let height = Math.max(54, safeHeight * baseScale * sizeVariation);
         const regionFit = Math.min(1, contentRegion.width / width, contentRegion.height / height);
@@ -191,7 +197,7 @@ export function layoutOrganicTopicClusters(options: OrganicLayoutOptions): Organ
         height *= regionFit;
 
         let position: LayoutRect | null = null;
-        for (let shrink = 0; shrink < 12 && !position; shrink++) {
+        for (let shrink = 0; shrink < 18 && !position; shrink++) {
           position = findOrganicPosition(contentRegion, anchorX, anchorY, width, height, random, occupied);
           if (!position) {
             width *= 0.91;
@@ -206,7 +212,7 @@ export function layoutOrganicTopicClusters(options: OrganicLayoutOptions): Organ
           const step = IMAGE_GAP + 8;
           for (let y = contentRegion.y; y <= contentRegion.y + contentRegion.height - height && !position; y += step) {
             for (let x = contentRegion.x; x <= contentRegion.x + contentRegion.width - width; x += step) {
-              const candidate = { x, y, width, height };
+              const candidate = { x: x + random() * 3, y: y + random() * 3, width, height };
               if (candidateFits(candidate, contentRegion, occupied)) {
                 position = candidate;
                 break;
@@ -228,15 +234,31 @@ export function layoutOrganicTopicClusters(options: OrganicLayoutOptions): Organ
       });
 
     const imageBounds = boundingRect(placedImages);
-    const labelHeight = clampNumber(titleZoneHeight - 18, 58, 92);
+    const labelHeight = clampNumber(region.height * 0.08, 58, 92);
     const estimatedTitleWidth = topic.title.length * labelHeight * 0.52 + 50;
-    const labelWidth = clampNumber(estimatedTitleWidth, Math.min(260, region.width), region.width - 32);
-    const label: LayoutRect = {
-      x: clampNumber(imageBounds.x + imageBounds.width / 2 - labelWidth / 2, region.x + 16, region.x + region.width - labelWidth - 16),
-      y: region.y + Math.max(0, (titleZoneHeight - labelHeight - 12) / 2),
-      width: labelWidth,
-      height: labelHeight,
-    };
+    const labelWidth = clampNumber(estimatedTitleWidth, Math.min(200, region.width), region.width - 32);
+    let label: LayoutRect | null = null;
+    const boardRegion = { x: OUTER_MARGIN_X, y: OUTER_MARGIN_Y,
+      width: options.boardWidth - 2 * OUTER_MARGIN_X, height: options.boardHeight - 2 * OUTER_MARGIN_Y };
+    for (let attempt = 0; attempt < 180 && !label; attempt++) {
+      const angle = -Math.PI / 2 + ((attempt * 0.61803398875) % 1) * Math.PI * 2;
+      const radiusX = imageBounds.width * (0.4 + attempt / 180 * 0.2) + labelWidth * 0.55;
+      const radiusY = imageBounds.height * (0.4 + attempt / 180 * 0.2) + labelHeight * 0.65;
+      const candidate = {
+        x: clampNumber(imageBounds.x + imageBounds.width / 2 + Math.cos(angle) * radiusX - labelWidth / 2,
+          boardRegion.x, boardRegion.x + boardRegion.width - labelWidth),
+        y: clampNumber(imageBounds.y + imageBounds.height / 2 + Math.sin(angle) * radiusY - labelHeight / 2,
+          boardRegion.y, boardRegion.y + boardRegion.height - labelHeight),
+        width: labelWidth, height: labelHeight,
+      };
+      if (candidateFits(candidate, boardRegion, occupied)) label = candidate;
+    }
+    if (!label) {
+      label = findOrganicPosition(boardRegion, imageBounds.x + imageBounds.width / 2,
+        imageBounds.y + imageBounds.height / 2, labelWidth, labelHeight, random, occupied)
+        ?? { x: region.x, y: region.y, width: labelWidth, height: labelHeight };
+    }
+    occupied.push(label);
     return {
       id: topic.id,
       title: topic.title,

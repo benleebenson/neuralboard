@@ -40,7 +40,19 @@ export type BoardStyleSummary = {
     panCount: number;
     focusCount: number;
     customZoomCount: number;
+    broadPanCount?: number;
+    wideBeatFraction?: number;
     typicalHoldSec: DistributionSummary | null;
+    panFraction?: number;
+    customZoomFraction?: number;
+  };
+  layout?: {
+    distinctMediaCount: number;
+    largestToMedianArea: number | null;
+    clusterCount: number;
+    whitespaceRatio: number | null;
+    edgeAlignmentFraction: number | null;
+    titleCenterpiece: { present: boolean; xFraction: number | null; yFraction: number | null };
   };
   characters: {
     enabledCount: number;
@@ -55,6 +67,8 @@ export type BoardStyleSummary = {
     medianCharacters: number | null;
     phrasing: { questionCount: number; exclamationCount: number; allCapsCount: number };
     examples: string[];
+    perMedia?: number;
+    byType?: Record<string, number>;
   };
   approximateTokens: number;
 };
@@ -206,6 +220,8 @@ export function extractBoardStyleSummary(manifestValue: unknown): BoardStyleSumm
   const titleWordCounts = topicTitles.map((title) => title.split(/\s+/).filter(Boolean).length);
 
   const blocks = cameraBlocks(manifest);
+  const keyframes = records(record(manifest.camera).keyframes);
+  const broadPanCount = Math.floor(keyframes.filter((keyframe) => keyframe.broadPan === true).length / 2);
   const holdValues = images.flatMap((image) => {
     const duration = Math.max(0, finiteNumber(image.duration));
     const holdFraction = Math.min(1, Math.max(0, finiteNumber(image.holdFraction, 0.7)));
@@ -228,6 +244,53 @@ export function extractBoardStyleSummary(manifestValue: unknown): BoardStyleSumm
   const textAnnotations = annotations.map((annotation) => cleanText(annotation.text, 120)).filter(Boolean);
   const wordCounts = textAnnotations.map((text) => text.split(/\s+/).filter(Boolean).length);
   const characterCounts = textAnnotations.map((text) => text.length);
+  const board = record(manifest.board);
+  const dimensions = record(board.dimensions);
+  const boardWidth = finiteNumber(dimensions.width);
+  const boardHeight = finiteNumber(dimensions.height);
+  const uniqueMedia = records(board.media).length ? records(board.media) : images;
+  const rects = uniqueMedia.flatMap((media) => {
+    const x = finiteNumber(media.boardX, NaN);
+    const y = finiteNumber(media.boardY, NaN);
+    const width = finiteNumber(media.boardW, NaN);
+    const height = finiteNumber(media.boardH, NaN);
+    return [x, y, width, height].every(Number.isFinite) && width > 0 && height > 0
+      ? [{ x, y, width, height, topic: cleanText(media.autoTopicId, 80) }] : [];
+  });
+  const areas = rects.map((rect) => rect.width * rect.height);
+  const areaDistribution = summarizeDistribution(areas);
+  const explicitClusters = new Set(rects.map((rect) => rect.topic).filter(Boolean));
+  const centers = rects.map((rect) => ({ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }));
+  const distance = (left: number, right: number) => Math.hypot(centers[left].x - centers[right].x, centers[left].y - centers[right].y);
+  const nearest = centers.map((_, index) => Math.min(...centers.flatMap((__, other) => index === other ? [] : [distance(index, other)])));
+  const spatialThreshold = (summarizeDistribution(nearest)?.median ?? 0) * 1.8;
+  const visited = new Set<number>();
+  let spatialClusters = 0;
+  for (let index = 0; index < centers.length; index++) {
+    if (visited.has(index)) continue;
+    spatialClusters++;
+    const queue = [index];
+    visited.add(index);
+    for (const current of queue) {
+      for (let other = 0; other < centers.length; other++) {
+        if (!visited.has(other) && distance(current, other) <= spatialThreshold) {
+          visited.add(other);
+          queue.push(other);
+        }
+      }
+    }
+  }
+  const alignedPairs = rects.flatMap((left, index) => rects.slice(index + 1).map((right) =>
+    [left.x, left.x + left.width].some((edge) => [right.x, right.x + right.width].some((other) => Math.abs(edge - other) < 12)) ||
+    [left.y, left.y + left.height].some((edge) => [right.y, right.y + right.height].some((other) => Math.abs(edge - other) < 12))
+  ));
+  const centeredTitles = annotations.filter((annotation) => annotation.type === "text" &&
+    boardWidth > 0 && boardHeight > 0 &&
+    Math.abs((finiteNumber(annotation.boardX) + finiteNumber(annotation.boardW) / 2) / boardWidth - 0.5) < 0.22 &&
+    Math.abs((finiteNumber(annotation.boardY) + finiteNumber(annotation.boardH) / 2) / boardHeight - 0.5) < 0.2);
+  const centerpiece = centeredTitles.sort((a, b) => finiteNumber(b.fontSize) - finiteNumber(a.fontSize))[0];
+  const annotationTypes = Object.fromEntries([...new Set(annotations.map((annotation) => cleanText(annotation.type, 30)))].map((type) =>
+    [type, annotations.filter((annotation) => annotation.type === type).length]));
 
   const summaryWithoutTokens: Omit<BoardStyleSummary, "approximateTokens"> = {
     schemaVersion: 1,
@@ -263,7 +326,23 @@ export function extractBoardStyleSummary(manifestValue: unknown): BoardStyleSumm
       panCount: blocks.filter((block) => block.type === "pan").length,
       focusCount: blocks.filter((block) => block.type === "characterFocus" || block.type === "characterZoom").length,
       customZoomCount: blocks.filter((block) => block.type === "customZoom").length,
+      broadPanCount,
+      wideBeatFraction: images.length ? round(broadPanCount / images.length) : 0,
       typicalHoldSec: summarizeDistribution(holdValues),
+      panFraction: blocks.length ? round(blocks.filter((block) => block.type === "pan").length / blocks.length) : 0,
+      customZoomFraction: blocks.length ? round(blocks.filter((block) => block.type === "customZoom").length / blocks.length) : 0,
+    },
+    layout: {
+      distinctMediaCount: uniqueMedia.length,
+      largestToMedianArea: areaDistribution?.median ? round(areaDistribution.max / areaDistribution.median) : null,
+      clusterCount: explicitClusters.size || spatialClusters || topicValues.length,
+      whitespaceRatio: boardWidth > 0 && boardHeight > 0 ? round(Math.max(0, 1 - areas.reduce((sum, area) => sum + area, 0) / (boardWidth * boardHeight))) : null,
+      edgeAlignmentFraction: alignedPairs.length ? round(alignedPairs.filter(Boolean).length / alignedPairs.length) : null,
+      titleCenterpiece: {
+        present: !!centerpiece,
+        xFraction: centerpiece ? round((finiteNumber(centerpiece.boardX) + finiteNumber(centerpiece.boardW) / 2) / boardWidth) : null,
+        yFraction: centerpiece ? round((finiteNumber(centerpiece.boardY) + finiteNumber(centerpiece.boardH) / 2) / boardHeight) : null,
+      },
     },
     characters: {
       enabledCount: characters.filter((character) => character.enabled !== false).length,
@@ -282,6 +361,8 @@ export function extractBoardStyleSummary(manifestValue: unknown): BoardStyleSumm
         allCapsCount: textAnnotations.filter((text) => /[A-Z]/.test(text) && text === text.toUpperCase()).length,
       },
       examples: textAnnotations.slice(0, 6),
+      perMedia: uniqueMedia.length ? round(annotations.length / uniqueMedia.length) : 0,
+      byType: annotationTypes,
     },
   };
   const approximateTokens = estimateStyleSummaryTokens(summaryWithoutTokens);
@@ -317,5 +398,7 @@ export function describeAppliedStyle(summaries: readonly BoardStyleSummary[], pa
   const literal = summaries.reduce((sum, summary) => sum + summary.imagery.literalCount, 0);
   const metaphoricalCount = summaries.reduce((sum, summary) => sum + summary.imagery.metaphoricalCount, 0);
   const imagery = metaphoricalCount > literal * 0.6 ? "concrete-metaphor image choices" : "concrete documentary image choices";
-  return `Matched your ~${round(pacingSec)}s pacing and ${imagery}.`;
+  const sizeRatios = summaries.flatMap((summary) => summary.layout?.largestToMedianArea ? [summary.layout.largestToMedianArea] : []);
+  const hierarchy = summarizeDistribution(sizeRatios)?.median;
+  return `Matched your ~${round(pacingSec)}s pacing, ${imagery}${hierarchy ? `, and ~${round(hierarchy)}× image-area hierarchy` : ""}.`;
 }
