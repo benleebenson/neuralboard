@@ -8,7 +8,7 @@ import { ProGated, UpgradeModal } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
-import { WorldView } from "@/app/board2/world/WorldView";
+import { WorldView, type WorkspaceWorldApi } from "@/app/board2/world/WorldView";
 import { WORLD_PENDING_IMPORT_FILE, type WorldRegion } from "@/lib/board-world";
 import { updateWorldRegion } from "@/lib/board-world-storage";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
@@ -5135,6 +5135,46 @@ export default function Board2Page() {
   const nextWorkspaceIndexRef = useRef(2);
   const [workspaces, setWorkspaces] = useState<BoardWorkspaceStatus[]>(() => [createBoardWorkspace(1)]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
+  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
+  useEffect(() => { activeWorkspaceIdRef.current = activeWorkspaceId; }, [activeWorkspaceId]);
+
+  // ── Neural Board World: one overlay for the whole page, shared by every workspace tab ──
+  const [worldOpen, setWorldOpen] = useState(false);
+  const workspaceWorldApisRef = useRef(new Map<string, WorkspaceWorldApi>());
+  const workspaceRegionRef = useRef(new Map<string, string>());
+  const openWorld = useCallback(() => setWorldOpen(true), []);
+  const closeWorld = useCallback(() => setWorldOpen(false), []);
+  const registerWorkspaceWorldApi = useCallback((workspaceId: string, api: WorkspaceWorldApi | null) => {
+    if (api) workspaceWorldApisRef.current.set(workspaceId, api);
+    else { workspaceWorldApisRef.current.delete(workspaceId); workspaceRegionRef.current.delete(workspaceId); }
+  }, []);
+  const setWorkspaceWorldRegion = useCallback((workspaceId: string, regionId: string | null) => {
+    if (regionId) workspaceRegionRef.current.set(workspaceId, regionId);
+    else workspaceRegionRef.current.delete(workspaceId);
+  }, []);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("world") !== "1" && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
+    const timer = window.setTimeout(() => setWorldOpen(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  // Runs before the world zooms into a region. Returning false cancels the open.
+  const beforeOpenWorldRegion = useCallback(async (region: WorldRegion): Promise<boolean> => {
+    const activeId = activeWorkspaceIdRef.current;
+    const owner = [...workspaceRegionRef.current].find(([, regionId]) => regionId === region.id)?.[0];
+    if (owner === activeId) { setWorldOpen(false); return false; }
+    if (owner) { setActiveWorkspaceId(owner); setWorldOpen(false); return false; }
+    const api = workspaceWorldApisRef.current.get(activeId);
+    if (api?.isDirty()) {
+      return window.confirm(`“${api.name()}” has unsaved changes. Opening “${region.name}” will replace the board in this tab and discard them. Open anyway?`);
+    }
+    return true;
+  }, []);
+  const openWorldRegion = useCallback(async (file: File, region: WorldRegion): Promise<boolean> => {
+    const api = workspaceWorldApisRef.current.get(activeWorkspaceIdRef.current);
+    return api ? api.loadRegion(file, region) : false;
+  }, []);
 
   const updateWorkspace = useCallback((status: BoardWorkspaceStatus) => {
     setWorkspaces((current) => current.map((workspace) => {
@@ -5194,10 +5234,15 @@ export default function Board2Page() {
               initialName={workspace.name}
               initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
               onWorkspaceStatus={updateWorkspace}
+              isWorldOpen={worldOpen}
+              onOpenWorld={openWorld}
+              registerWorldApi={registerWorkspaceWorldApi}
+              onWorldRegionChange={setWorkspaceWorldRegion}
             />
           </div>
         ))}
       </div>
+      <WorldView open={worldOpen} onClose={closeWorld} beforeOpenRegion={beforeOpenWorldRegion} onOpenRegion={openWorldRegion} />
     </div>
   );
 }
@@ -5208,12 +5253,20 @@ function Board2Editor({
   initialName,
   initialJoinCode,
   onWorkspaceStatus,
+  isWorldOpen,
+  onOpenWorld,
+  registerWorldApi,
+  onWorldRegionChange,
 }: {
   workspaceId: string;
   isWorkspaceActive: boolean;
   initialName: string;
   initialJoinCode: string;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
+  isWorldOpen: boolean;
+  onOpenWorld: () => void;
+  registerWorldApi: (workspaceId: string, api: WorkspaceWorldApi | null) => void;
+  onWorldRegionChange: (workspaceId: string, regionId: string | null) => void;
 }) {
   const { data: session } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
@@ -5376,7 +5429,6 @@ function Board2Editor({
   const [isSaving, setIsSaving] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isExportingBoardData, setIsExportingBoardData] = useState(false);
-  const [worldOpen, setWorldOpen] = useState(false);
   const [activeWorldRegion, setActiveWorldRegion] = useState<WorldRegion | null>(null);
 
   // ── Annotations ──
@@ -6838,6 +6890,59 @@ function Board2Editor({
     clips: boardUndoSnapshot.clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, ...clip }) => clip),
   }), [boardUndoSnapshot]);
 
+  // Unsaved-change tracking for the world's "open region" guard. The baseline is the undo signature
+  // as of the last load or save; after a load it is captured once the signature has stopped
+  // changing, because restoring a board settles over several async state updates.
+  const boardUndoSignatureRef = useRef(boardUndoSignature);
+  const savedBoardSignatureRef = useRef<string | null>(null);
+  const boardBaselineArmedRef = useRef(false);
+  const boardBaselineTimerRef = useRef<number | null>(null);
+  const armBoardBaseline = useCallback(() => {
+    boardBaselineArmedRef.current = true;
+    if (boardBaselineTimerRef.current !== null) window.clearTimeout(boardBaselineTimerRef.current);
+    boardBaselineTimerRef.current = window.setTimeout(() => {
+      boardBaselineTimerRef.current = null;
+      boardBaselineArmedRef.current = false;
+      savedBoardSignatureRef.current = boardUndoSignatureRef.current;
+    }, 800);
+  }, []);
+  useEffect(() => {
+    boardUndoSignatureRef.current = boardUndoSignature;
+    if (savedBoardSignatureRef.current === null) savedBoardSignatureRef.current = boardUndoSignature;
+    else if (boardBaselineArmedRef.current) armBoardBaseline();
+  }, [armBoardBaseline, boardUndoSignature]);
+  useEffect(() => () => {
+    if (boardBaselineTimerRef.current !== null) window.clearTimeout(boardBaselineTimerRef.current);
+  }, []);
+
+  // Everything the page-level world overlay needs from this workspace. Refs keep the registered
+  // object stable while always calling the latest render's closures.
+  const worldApiStateRef = useRef({ loadRegion: null as null | ((file: File, region: WorldRegion) => Promise<boolean>), name: initialName });
+  useEffect(() => {
+    worldApiStateRef.current = {
+      name: saveName.trim() || "Untitled Board",
+      loadRegion: async (file, region) => {
+        const opened = await loadBoard(file, region);
+        if (opened) setToast(`Opened world region “${region.name}”`);
+        return opened;
+      },
+    };
+  });
+  useEffect(() => {
+    registerWorldApi(workspaceId, {
+      isDirty: () => !boardBaselineArmedRef.current && savedBoardSignatureRef.current !== null && savedBoardSignatureRef.current !== boardUndoSignatureRef.current,
+      name: () => worldApiStateRef.current.name,
+      loadRegion: (file, region) => worldApiStateRef.current.loadRegion?.(file, region) ?? Promise.resolve(false),
+    });
+    return () => registerWorldApi(workspaceId, null);
+  }, [registerWorldApi, workspaceId]);
+  useEffect(() => { onWorldRegionChange(workspaceId, activeWorldRegion?.id ?? null); }, [activeWorldRegion?.id, onWorldRegionChange, workspaceId]);
+  useEffect(() => {
+    if (isWorldOpen && isWorkspaceActive && isPlayingRef.current) togglePlay();
+  // togglePlay is recreated every render; only the open transition matters.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isWorldOpen]);
+
   useEffect(() => {
     if (boardUndoApplyingSignatureRef.current === boardUndoSignature) {
       boardUndoApplyingSignatureRef.current = null;
@@ -7087,12 +7192,6 @@ function Board2Editor({
     const timer = window.setTimeout(() => void refreshStyleExemplars(), 0);
     return () => window.clearTimeout(timer);
   }, [refreshStyleExemplars]);
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("world") !== "1" && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
-    const timer = window.setTimeout(() => setWorldOpen(true), 0);
-    return () => window.clearTimeout(timer);
-  }, []);
   useEffect(() => {
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
@@ -21329,6 +21428,7 @@ function Board2Editor({
     if (isSaving) return;
     setIsSaving(true);
     setToast("Saving…");
+    const signatureAtSave = boardUndoSignatureRef.current;
     try {
       const { manifest, zipFiles } = await buildRecipeManifest(false);
       if (activeWorldRegion) {
@@ -21337,6 +21437,7 @@ function Board2Editor({
         const assetFiles = Object.fromEntries(Object.entries(zipFiles).map(([path, entry]) => [path, entry[0]]));
         const updated = await updateWorldRegion(directory, activeWorldRegion.id, manifest, assetFiles);
         setActiveWorldRegion(updated.region);
+        savedBoardSignatureRef.current = signatureAtSave;
         setSaveModalOpen(false);
         setToast(`Saved “${updated.region.name}” to Neural Board World`);
         return;
@@ -21368,6 +21469,7 @@ function Board2Editor({
         a.click();
         URL.revokeObjectURL(url);
       }
+      savedBoardSignatureRef.current = signatureAtSave;
       setSaveModalOpen(false);
       setToast(savedToFolder ? "Board saved to library!" : "Board downloaded!");
     } catch (err) {
@@ -21703,6 +21805,7 @@ function Board2Editor({
           : `Loaded "${manifest.name ?? "board"}"`,
       );
       setActiveWorldRegion(worldRegion);
+      armBoardBaseline();
       return true;
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
@@ -22007,10 +22110,10 @@ function Board2Editor({
               {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
             </span>
           )}
-          <button onClick={() => setWorldOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">∞ World</button>
+          <button onClick={onOpenWorld} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">∞ World</button>
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
-          <MainSectionNav active={worldOpen ? "world" : "board"} desktopOnly onOpenWorld={() => setWorldOpen(true)} />
+          <MainSectionNav active="board" desktopOnly onOpenWorld={onOpenWorld} />
           {session?.user?.email ? (
             <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} />
           ) : (
@@ -22040,7 +22143,7 @@ function Board2Editor({
           )}
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
-          <button onClick={() => { setWorldOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>∞ World</button>
+          <button onClick={() => { onOpenWorld(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>∞ World</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
@@ -25853,16 +25956,6 @@ function Board2Editor({
           </div>
         </div>
       )}
-
-      <WorldView
-        open={worldOpen && isWorkspaceActive}
-        onClose={() => setWorldOpen(false)}
-        onOpenRegion={async (file, region) => {
-          const opened = await loadBoard(file, region);
-          if (opened) setToast(`Opened world region “${region.name}”`);
-          return opened;
-        }}
-      />
 
       {isExporting && (
         <div data-export-progress role="status" aria-live="polite" style={{ position: "fixed", right: 24, bottom: 24, zIndex: 9997, width: 360, padding: "16px 18px", background: "rgba(255,253,245,.98)", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>

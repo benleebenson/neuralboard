@@ -31,9 +31,18 @@ type Gesture = {
   moved: boolean;
 };
 
+/** What the page-level world overlay needs from one editor workspace. */
+export type WorkspaceWorldApi = {
+  isDirty: () => boolean;
+  name: () => string;
+  loadRegion: (file: File, region: WorldRegion) => Promise<boolean>;
+};
+
 export type WorldViewProps = {
   open: boolean;
   onClose: () => void;
+  /** Runs before the zoom-in. Return false to cancel (unsaved-changes prompt, region already open elsewhere). */
+  beforeOpenRegion?: (region: WorldRegion) => Promise<boolean>;
   onOpenRegion: (file: File, region: WorldRegion) => Promise<boolean>;
 };
 
@@ -70,7 +79,7 @@ function worldBounds(regions: readonly WorldRegion[]): WorldRect {
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
-export function WorldView({ open, onClose, onOpenRegion }: WorldViewProps) {
+export function WorldView({ open, onClose, beforeOpenRegion, onOpenRegion }: WorldViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<BoardWorld | null>(null);
@@ -171,18 +180,49 @@ export function WorldView({ open, onClose, onOpenRegion }: WorldViewProps) {
     return () => { cancelled = true; };
   }, [open, setNextWorld]);
 
+  // While the world is open it owns the keyboard and clipboard. The editor underneath registers
+  // bubble-phase window listeners (undo, delete, space-to-play, live-mode keys, paste-to-board…);
+  // a capture-phase listener that stops propagation keeps every one of them, present or future,
+  // from seeing the event. Focus is moved off any hidden editor input so typing cannot reach it.
   useEffect(() => {
     if (!open) return;
-    const down = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable) return;
-      if (event.code === "Space") { event.preventDefault(); setSpaceDown(true); }
-      if (event.key === "Escape") { setSelection(new Set()); setMode("select"); setMarquee(null); setCreateDraft(null); }
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body) active.blur();
+    containerRef.current?.focus({ preventScroll: true });
+    const onKey = (event: KeyboardEvent) => {
+      const container = containerRef.current;
+      if (event.type === "keydown") {
+        if (event.code === "Space") { event.preventDefault(); setSpaceDown(true); }
+        if (event.key === "Escape") { setSelection(new Set()); setMode("select"); setMarquee(null); setCreateDraft(null); }
+        if (event.key === "Tab" && container) {
+          const focusable = [...container.querySelectorAll<HTMLElement>("button:not([disabled])")];
+          const first = focusable[0];
+          const last = focusable.at(-1);
+          const inside = container.contains(document.activeElement) && document.activeElement !== container;
+          if (!focusable.length) event.preventDefault();
+          else if (!inside) { event.preventDefault(); (event.shiftKey ? last : first)?.focus(); }
+          else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        }
+      } else if (event.type === "keyup" && event.code === "Space") setSpaceDown(false);
+      event.stopImmediatePropagation();
     };
-    const up = (event: KeyboardEvent) => { if (event.code === "Space") setSpaceDown(false); };
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+    const swallow = (event: Event) => event.stopImmediatePropagation();
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", onKey, true);
+    window.addEventListener("keypress", swallow, true);
+    window.addEventListener("paste", swallow, true);
+    window.addEventListener("copy", swallow, true);
+    window.addEventListener("cut", swallow, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keyup", onKey, true);
+      window.removeEventListener("keypress", swallow, true);
+      window.removeEventListener("paste", swallow, true);
+      window.removeEventListener("copy", swallow, true);
+      window.removeEventListener("cut", swallow, true);
+      setSpaceDown(false);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -334,15 +374,16 @@ export function WorldView({ open, onClose, onOpenRegion }: WorldViewProps) {
   const openRegion = useCallback(async (event: React.MouseEvent<HTMLCanvasElement>) => {
     if (openingRef.current || !worldRef.current || !directoryRef.current) return;
     const target = hit(toWorld(event.clientX, event.clientY));
-    if (!target) return;
-    openingRef.current = true;
-    overviewCameraRef.current = cameraRef.current;
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const start = cameraRef.current;
-    const targetCamera = fitCamera(target.region.bounds, canvas.clientWidth, canvas.clientHeight, 24);
-    await animateCamera(start, targetCamera, 560, (value) => { cameraRef.current = value; setCamera(value); });
+    if (!target || !canvas) return;
+    openingRef.current = true;
     try {
+      // The guard runs first: no zoom animation, no file work, until the user has agreed to
+      // discard unsaved edits (or the region turns out to be open in another tab).
+      if (beforeOpenRegion && !(await beforeOpenRegion(target.region))) return;
+      overviewCameraRef.current = cameraRef.current;
+      const targetCamera = fitCamera(target.region.bounds, canvas.clientWidth, canvas.clientHeight, 24);
+      await animateCamera(cameraRef.current, targetCamera, 560, (value) => { cameraRef.current = value; setCamera(value); });
       setBusy(true);
       const file = await materializeRegionFile(directoryRef.current, worldRef.current, target.region);
       const opened = await onOpenRegion(file, target.region);
@@ -350,10 +391,13 @@ export function WorldView({ open, onClose, onOpenRegion }: WorldViewProps) {
         activeRegionRef.current = target.region.id;
         setHasActiveRegion(true);
         onClose();
+      } else if (overviewCameraRef.current) {
+        cameraRef.current = overviewCameraRef.current;
+        setCamera(overviewCameraRef.current);
       }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Could not open this region."); }
     finally { setBusy(false); openingRef.current = false; }
-  }, [hit, onClose, onOpenRegion, toWorld]);
+  }, [beforeOpenRegion, hit, onClose, onOpenRegion, toWorld]);
 
   const loadImage = useCallback((path: string) => {
     const directory = directoryRef.current;
@@ -482,7 +526,7 @@ export function WorldView({ open, onClose, onOpenRegion }: WorldViewProps) {
   const detailLevel = metricWeights.far >= metricWeights.mid && metricWeights.far >= metricWeights.near ? "FAR" : metricWeights.near > metricWeights.mid ? "NEAR" : "MID";
 
   return (
-    <div ref={containerRef} aria-hidden={!open} style={{ position: "fixed", inset: 0, zIndex: 5000, background: paper, opacity: open ? 1 : 0, pointerEvents: open ? "auto" : "none", transition: "opacity 280ms ease", fontFamily: "monospace" }}>
+    <div ref={containerRef} tabIndex={-1} role="dialog" aria-label="Neural Board World" aria-hidden={!open} style={{ position: "fixed", inset: 0, zIndex: 5000, background: paper, opacity: open ? 1 : 0, visibility: open ? "visible" : "hidden", pointerEvents: open ? "auto" : "none", transition: `opacity 280ms ease, visibility 0s linear ${open ? 0 : 280}ms`, fontFamily: "monospace", outline: "none" }}>
       <style>{`@media (max-width: 720px) { .nb-world-title, .nb-world-metrics { display: none !important; } .nb-world-toolbar { flex-wrap: wrap; max-width: calc(100vw - 32px); } }`}</style>
       <canvas ref={canvasRef} aria-label="Neural Board World canvas" onContextMenu={(event) => event.preventDefault()} onWheel={onWheel} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onDoubleClick={(event) => void openRegion(event)} style={{ width: "100%", height: "100%", display: "block", cursor: spaceDown ? "grab" : mode === "create" ? "crosshair" : "default", touchAction: "none" }} />
       <header style={{ position: "absolute", top: 16, left: 16, right: 16, display: "flex", alignItems: "center", gap: 8, pointerEvents: "none" }}>
