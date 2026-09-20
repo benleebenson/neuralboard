@@ -8,6 +8,9 @@ import { ProGated, UpgradeModal } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
+import { WorldView } from "@/app/board2/world/WorldView";
+import { WORLD_PENDING_IMPORT_FILE, type WorldRegion } from "@/lib/board-world";
+import { updateWorldRegion } from "@/lib/board-world-storage";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
@@ -5373,6 +5376,8 @@ function Board2Editor({
   const [isSaving, setIsSaving] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isExportingBoardData, setIsExportingBoardData] = useState(false);
+  const [worldOpen, setWorldOpen] = useState(false);
+  const [activeWorldRegion, setActiveWorldRegion] = useState<WorldRegion | null>(null);
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -7082,6 +7087,12 @@ function Board2Editor({
     const timer = window.setTimeout(() => void refreshStyleExemplars(), 0);
     return () => window.clearTimeout(timer);
   }, [refreshStyleExemplars]);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("world") !== "1" && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
+    const timer = window.setTimeout(() => setWorldOpen(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
   useEffect(() => {
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
@@ -20989,7 +21000,7 @@ function Board2Editor({
               />
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700, padding: "10px 0" }}>
-                  {isSaving ? "Saving…" : "💾 Save .nbp"}
+                  {isSaving ? "Saving…" : activeWorldRegion ? "💾 Save to World" : "💾 Save .nbp"}
                 </button>
                 <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1, padding: "10px 0" }}>Cancel</button>
               </div>
@@ -21320,6 +21331,16 @@ function Board2Editor({
     setToast("Saving…");
     try {
       const { manifest, zipFiles } = await buildRecipeManifest(false);
+      if (activeWorldRegion) {
+        const directory = await getBoardsDirectory({ prompt: true, write: true });
+        if (!directory) throw new Error("Choose the world folder to save this region.");
+        const assetFiles = Object.fromEntries(Object.entries(zipFiles).map(([path, entry]) => [path, entry[0]]));
+        const updated = await updateWorldRegion(directory, activeWorldRegion.id, manifest, assetFiles);
+        setActiveWorldRegion(updated.region);
+        setSaveModalOpen(false);
+        setToast(`Saved “${updated.region.name}” to Neural Board World`);
+        return;
+      }
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
       const zipped = zipSync(zipFiles);
@@ -21382,8 +21403,8 @@ function Board2Editor({
     }
   }
 
-  async function loadBoard(file: File) {
-    if (isLoadingProject) return;
+  async function loadBoard(file: File, worldRegion: WorldRegion | null = null): Promise<boolean> {
+    if (isLoadingProject) return false;
     setIsLoadingProject(true);
     setToast("Loading project…");
     try {
@@ -21681,8 +21702,11 @@ function Board2Editor({
           ? `Loaded "${manifest.name ?? "board"}" · regenerate the standard camera path`
           : `Loaded "${manifest.name ?? "board"}"`,
       );
+      setActiveWorldRegion(worldRegion);
+      return true;
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
+      return false;
     } finally {
       setIsLoadingProject(false);
     }
@@ -21983,9 +22007,10 @@ function Board2Editor({
               {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
             </span>
           )}
+          <button onClick={() => setWorldOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">∞ World</button>
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
-          <MainSectionNav active="board" desktopOnly />
+          <MainSectionNav active={worldOpen ? "world" : "board"} desktopOnly onOpenWorld={() => setWorldOpen(true)} />
           {session?.user?.email ? (
             <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} />
           ) : (
@@ -22015,6 +22040,7 @@ function Board2Editor({
           )}
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
+          <button onClick={() => { setWorldOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>∞ World</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
@@ -25828,6 +25854,16 @@ function Board2Editor({
         </div>
       )}
 
+      <WorldView
+        open={worldOpen && isWorkspaceActive}
+        onClose={() => setWorldOpen(false)}
+        onOpenRegion={async (file, region) => {
+          const opened = await loadBoard(file, region);
+          if (opened) setToast(`Opened world region “${region.name}”`);
+          return opened;
+        }}
+      />
+
       {isExporting && (
         <div data-export-progress role="status" aria-live="polite" style={{ position: "fixed", right: 24, bottom: 24, zIndex: 9997, width: 360, padding: "16px 18px", background: "rgba(255,253,245,.98)", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a" }}>
           <div style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 800, color: "#2a2a2a" }}>
@@ -25878,7 +25914,7 @@ function Board2Editor({
             />
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700 }}>
-                {isSaving ? "Saving…" : "💾 Save .nbp"}
+                {isSaving ? "Saving…" : activeWorldRegion ? "💾 Save to World" : "💾 Save .nbp"}
               </button>
               <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1 }}>Cancel</button>
             </div>
