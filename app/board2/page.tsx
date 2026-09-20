@@ -455,10 +455,15 @@ type Clip = {
                                // makes project saves independent of temporary/revoked object URLs;
                                // videos are cloned per-instance to avoid shared decoder limits.
   previewUrl?: string;        // low-resolution editor-only image; originals remain in sourceBlob/sourceUrl
+  mediaRotationDeg?: number;  // non-destructive image/video rotation applied in preview and export
+  cropLeft?: number;          // non-destructive crop edges, stored as percentages of source media
+  cropRight?: number;
+  cropTop?: number;
+  cropBottom?: number;
+  sourceOffsetSec?: number;   // non-destructive in-point for video and narration media
   // narration-only:
   audioBlob?: Blob;
   waveform?: number[];
-  sourceOffsetSec?: number;
   speechBubbles?: boolean;
   speechBubbleGestures?: boolean;
   transcriptSegments?: TranscriptSegment[];
@@ -493,6 +498,19 @@ type Clip = {
   cameraBeat?: boolean;
   narrationTime?: number;
   rationale?: string;
+};
+
+type MediaEditDraft = {
+  clipId: string;
+  rotationDeg: number;
+  cropLeft: number;
+  cropRight: number;
+  cropTop: number;
+  cropBottom: number;
+  trimStart: number;
+  trimEnd: number;
+  sourceDuration: number;
+  swapFrame: boolean;
 };
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
@@ -1902,6 +1920,105 @@ function lerp(a: number, b: number, t: number): number {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+const MAX_MEDIA_CROP_PERCENT = 45;
+const MIN_MEDIA_TRIM_SECONDS = 0.1;
+
+function normalizedMediaRotation(value?: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const wrapped = ((value! + 180) % 360 + 360) % 360 - 180;
+  return Math.abs(wrapped) < 0.005 ? 0 : wrapped;
+}
+
+function normalizedMediaCrop(clip: Pick<Clip, "cropLeft" | "cropRight" | "cropTop" | "cropBottom">) {
+  const left = clamp(Number(clip.cropLeft) || 0, 0, MAX_MEDIA_CROP_PERCENT);
+  const right = clamp(Number(clip.cropRight) || 0, 0, Math.min(MAX_MEDIA_CROP_PERCENT, 95 - left));
+  const top = clamp(Number(clip.cropTop) || 0, 0, MAX_MEDIA_CROP_PERCENT);
+  const bottom = clamp(Number(clip.cropBottom) || 0, 0, Math.min(MAX_MEDIA_CROP_PERCENT, 95 - top));
+  return { left, right, top, bottom };
+}
+
+function mediaRotationLayout(rotationDeg: number, width: number, height: number) {
+  const radians = Math.abs(rotationDeg) * Math.PI / 180;
+  const sin = Math.abs(Math.sin(radians));
+  const cos = Math.abs(Math.cos(radians));
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  const quarterTurn = sin > cos;
+  const drawWidth = quarterTurn ? safeHeight : safeWidth;
+  const drawHeight = quarterTurn ? safeWidth : safeHeight;
+  const scale = Math.max(
+    (cos * safeWidth + sin * safeHeight) / drawWidth,
+    (sin * safeWidth + cos * safeHeight) / drawHeight,
+  );
+  return { drawWidth, drawHeight, scale };
+}
+
+type EditableMediaSource = HTMLImageElement | HTMLVideoElement | ImageBitmap;
+
+function editableMediaDimensions(media: EditableMediaSource): { width: number; height: number } {
+  if (media instanceof HTMLVideoElement) return { width: media.videoWidth, height: media.videoHeight };
+  if (media instanceof HTMLImageElement) return { width: media.naturalWidth, height: media.naturalHeight };
+  return { width: media.width, height: media.height };
+}
+
+function clipHasMediaEdits(clip: Clip): boolean {
+  const crop = normalizedMediaCrop(clip);
+  return normalizedMediaRotation(clip.mediaRotationDeg) !== 0 || crop.left > 0 || crop.right > 0 || crop.top > 0 || crop.bottom > 0;
+}
+
+function drawEditedCrateredMedia(
+  ctx: CanvasRenderingContext2D,
+  media: EditableMediaSource,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  clip: Clip,
+  craters: StreamCrater[],
+  scratch: HTMLCanvasElement,
+) {
+  if (!clipHasMediaEdits(clip)) {
+    drawCrateredImage(ctx, media, x, y, width, height, clip.boardW ?? width, clip.boardH ?? height, craters);
+    return;
+  }
+
+  const targetWidth = Math.max(1, Math.ceil(width));
+  const targetHeight = Math.max(1, Math.ceil(height));
+  if (scratch.width !== targetWidth) scratch.width = targetWidth;
+  if (scratch.height !== targetHeight) scratch.height = targetHeight;
+  const scratchCtx = scratch.getContext("2d");
+  if (!scratchCtx) return;
+  scratchCtx.clearRect(0, 0, targetWidth, targetHeight);
+
+  const source = editableMediaDimensions(media);
+  const crop = normalizedMediaCrop(clip);
+  const sourceX = source.width * crop.left / 100;
+  const sourceY = source.height * crop.top / 100;
+  const sourceWidth = Math.max(1, source.width * (1 - (crop.left + crop.right) / 100));
+  const sourceHeight = Math.max(1, source.height * (1 - (crop.top + crop.bottom) / 100));
+  const rotationDeg = normalizedMediaRotation(clip.mediaRotationDeg);
+  const rotation = mediaRotationLayout(rotationDeg, targetWidth, targetHeight);
+
+  scratchCtx.save();
+  scratchCtx.translate(targetWidth / 2, targetHeight / 2);
+  scratchCtx.rotate(rotationDeg * Math.PI / 180);
+  scratchCtx.scale(rotation.scale, rotation.scale);
+  scratchCtx.drawImage(
+    media,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    -rotation.drawWidth / 2,
+    -rotation.drawHeight / 2,
+    rotation.drawWidth,
+    rotation.drawHeight,
+  );
+  scratchCtx.restore();
+
+  drawCrateredImage(ctx, scratch, x, y, width, height, clip.boardW ?? width, clip.boardH ?? height, craters);
 }
 
 function formatTime(sec: number): string {
@@ -5218,6 +5335,8 @@ function Board2Editor({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number; clipId?: string } | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
   const [isBoardDropActive, setIsBoardDropActive] = useState(false);
+  const [mediaEditDraft, setMediaEditDraft] = useState<MediaEditDraft | null>(null);
+  const [mediaEditorPlaying, setMediaEditorPlaying] = useState(false);
 
   // ── Mobile ──
   const [isMobile, setIsMobile] = useState(false);
@@ -5543,6 +5662,8 @@ function Board2Editor({
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportVideoFramesRef = useRef<Map<string, ImageBitmap>>(new Map());
+  const mediaEditScratchRef = useRef<HTMLCanvasElement | null>(null);
+  const mediaEditorPreviewRef = useRef<HTMLVideoElement | null>(null);
   const exportCancelRef = useRef(false);
   const exportRafRef = useRef<number | null>(null);
   const isExportingRef = useRef(false);
@@ -7756,6 +7877,8 @@ function Board2Editor({
       (authoredShake.y + sequenceShake.y) * outputShakeScale,
     );
     const sortedClips = boardEntityRepresentativesAtTime(currentClips, time).sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
+    const mediaEditScratch = mediaEditScratchRef.current ?? document.createElement("canvas");
+    mediaEditScratchRef.current = mediaEditScratch;
     for (const clip of sortedClips) {
       if (clip.boardX === undefined) continue;
       const bx = clip.boardX, by = clip.boardY!, bw = clip.boardW!, bh = clip.boardH!;
@@ -7778,7 +7901,7 @@ function Board2Editor({
           : cachedPreviewImage(renderUrl);
         if (!img && quality === "preview") loadMedia(renderUrl, "image");
         if (img?.complete && img.naturalWidth > 0) {
-          drawCrateredImage(ctx,img,sx-sw/2,sy-sh/2,sw,sh,bw,bh,renderCraters.filter(crater=>crater.clipId===clip.id));
+          drawEditedCrateredMedia(ctx, img, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
         }
       } else if (clip.type === "customZoom") {
         // No pixels of its own — it's purely a camera target, so whatever else is on the board
@@ -7795,11 +7918,11 @@ function Board2Editor({
         // immediately after an active-range restart to avoid the first-play thumbnail/audio race.
         const offlineFrame = offlineVideoRendering ? exportVideoFramesRef.current.get(clip.id) : undefined;
         if (offlineFrame) {
-          drawCrateredImage(ctx, offlineFrame, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
+          drawEditedCrateredMedia(ctx, offlineFrame, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
           drewLive = true;
         } else if (!offlineVideoRendering && vid && vid.readyState >= 3 && !vid.paused && !vid.ended && (!justRestartedActive || vid.currentTime > 0.05)) {
           try {
-            drawCrateredImage(ctx, vid, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
+            drawEditedCrateredMedia(ctx, vid, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
             drewLive = true;
           } catch { drewLive = false; }
         }
@@ -7825,7 +7948,7 @@ function Board2Editor({
         }
         if (!drewLive) {
           if (thumbEl) {
-            drawCrateredImage(ctx, thumbEl, sx - sw / 2, sy - sh / 2, sw, sh, bw, bh, renderCraters.filter((crater) => crater.clipId === clip.id));
+            drawEditedCrateredMedia(ctx, thumbEl, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
           } else {
             // Thumbnail not yet captured or failed — draw black box with play icon
             ctx.fillStyle = "#111";
@@ -8175,9 +8298,12 @@ function Board2Editor({
           // Only replace pixels when the next frame is drawable. The CSS preview underneath and
           // the previous canvas frame remain visible while a cache miss is decoding.
           ctx.clearRect(0, 0, canvas.width, canvas.height);
-          drawCrateredImage(
-            ctx, image, 0, 0, canvas.width, canvas.height, clip.boardW, clip.boardH,
+          const mediaEditScratch = mediaEditScratchRef.current ?? document.createElement("canvas");
+          mediaEditScratchRef.current = mediaEditScratch;
+          drawEditedCrateredMedia(
+            ctx, image, 0, 0, canvas.width, canvas.height, clip,
             authoredBazooka.craters.filter((crater) => crater.clipId === clip.id),
+            mediaEditScratch,
           );
         }
       }
@@ -8494,7 +8620,7 @@ function Board2Editor({
       if (desired === "active") {
         activeCount++;
         vid.loop = false;
-        const expected = isActive ? Math.max(0, time - activeWindows.get(clip.id)!.start) : 0;
+        const expected = Math.max(0, (clip.sourceOffsetSec ?? 0) + (isActive ? time - activeWindows.get(clip.id)!.start : 0));
         let started = false;
         if (previousState !== "active" || vid.paused || vid.ended) {
           restartAndPlay(vid, expected);
@@ -18023,7 +18149,7 @@ function Board2Editor({
       const inInput = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable;
       if (inInput) return;
       const anyModalOpen = ytModalOpen || neuralModalOpen || top5ModalOpen || saveModalOpen ||
-        aiModalOpen || directCharacterOpen || !!imagePreviewTarget;
+        aiModalOpen || directCharacterOpen || !!imagePreviewTarget || !!mediaEditDraft;
       if (anyModalOpen) return;
       const items = Array.from(e.clipboardData?.items ?? []);
       const itemImages = items
@@ -18342,6 +18468,289 @@ function Board2Editor({
             </div>
           );
         })}
+      </div>
+    );
+  }
+
+  function openMediaEditor(clip: Clip) {
+    if (!isBoardMediaClip(clip)) return;
+    const videoDuration = clip.type === "video" ? videoElsRef.current.get(clip.id)?.duration : undefined;
+    const sourceDuration = clip.type === "video"
+      ? Math.max(
+          MIN_MEDIA_TRIM_SECONDS,
+          Number.isFinite(videoDuration) ? videoDuration! : 0,
+          clip.sourceDurationSec ?? 0,
+          (clip.sourceOffsetSec ?? 0) + clip.duration,
+        )
+      : 0;
+    const trimStart = clip.type === "video"
+      ? clamp(clip.sourceOffsetSec ?? 0, 0, Math.max(0, sourceDuration - MIN_MEDIA_TRIM_SECONDS))
+      : 0;
+    const trimEnd = clip.type === "video"
+      ? clamp(trimStart + clip.duration, trimStart + MIN_MEDIA_TRIM_SECONDS, sourceDuration)
+      : 0;
+    const crop = normalizedMediaCrop(clip);
+    setMediaEditorPlaying(false);
+    setMediaEditDraft({
+      clipId: clip.id,
+      rotationDeg: normalizedMediaRotation(clip.mediaRotationDeg),
+      cropLeft: crop.left,
+      cropRight: crop.right,
+      cropTop: crop.top,
+      cropBottom: crop.bottom,
+      trimStart,
+      trimEnd,
+      sourceDuration,
+      swapFrame: false,
+    });
+  }
+
+  function closeMediaEditor() {
+    mediaEditorPreviewRef.current?.pause();
+    setMediaEditorPlaying(false);
+    setMediaEditDraft(null);
+  }
+
+  function updateMediaEditCrop(edge: "cropLeft" | "cropRight" | "cropTop" | "cropBottom", rawValue: number) {
+    setMediaEditDraft((draft) => {
+      if (!draft) return draft;
+      const opposite = edge === "cropLeft" ? draft.cropRight
+        : edge === "cropRight" ? draft.cropLeft
+        : edge === "cropTop" ? draft.cropBottom
+        : draft.cropTop;
+      return { ...draft, [edge]: clamp(rawValue, 0, Math.min(MAX_MEDIA_CROP_PERCENT, 95 - opposite)) };
+    });
+  }
+
+  function rotateMediaEditBy(delta: number) {
+    setMediaEditDraft((draft) => draft ? {
+      ...draft,
+      rotationDeg: normalizedMediaRotation(draft.rotationDeg + delta),
+      swapFrame: Math.abs(delta) % 180 === 90 ? !draft.swapFrame : draft.swapFrame,
+    } : draft);
+  }
+
+  function nudgeMediaTrim(edge: "start" | "end", delta: number) {
+    setMediaEditDraft((draft) => {
+      if (!draft) return draft;
+      const next = edge === "start"
+        ? { ...draft, trimStart: clamp(draft.trimStart + delta, 0, draft.trimEnd - MIN_MEDIA_TRIM_SECONDS) }
+        : { ...draft, trimEnd: clamp(draft.trimEnd + delta, draft.trimStart + MIN_MEDIA_TRIM_SECONDS, draft.sourceDuration) };
+      const preview = mediaEditorPreviewRef.current;
+      if (preview) preview.currentTime = edge === "start" ? next.trimStart : Math.max(next.trimStart, next.trimEnd - 0.03);
+      return next;
+    });
+  }
+
+  function handleMediaTrimPointerDown(e: React.PointerEvent<HTMLDivElement>, edge: "start" | "end") {
+    if (!mediaEditDraft || mediaEditDraft.sourceDuration <= 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rail = e.currentTarget.parentElement;
+    if (!rail) return;
+    const rect = rail.getBoundingClientRect();
+    const update = (clientX: number) => {
+      const requested = clamp((clientX - rect.left) / Math.max(1, rect.width) * mediaEditDraft.sourceDuration, 0, mediaEditDraft.sourceDuration);
+      setMediaEditDraft((draft) => {
+        if (!draft) return draft;
+        const next = edge === "start"
+          ? { ...draft, trimStart: Math.min(requested, draft.trimEnd - MIN_MEDIA_TRIM_SECONDS) }
+          : { ...draft, trimEnd: Math.max(requested, draft.trimStart + MIN_MEDIA_TRIM_SECONDS) };
+        const preview = mediaEditorPreviewRef.current;
+        if (preview) preview.currentTime = edge === "start" ? next.trimStart : Math.max(next.trimStart, next.trimEnd - 0.03);
+        return next;
+      });
+    };
+    update(e.clientX);
+    const onMove = (event: PointerEvent) => update(event.clientX);
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  function applyMediaEdit() {
+    if (!mediaEditDraft) return;
+    const target = clipsRef.current.find((clip) => clip.id === mediaEditDraft.clipId);
+    if (!target || !isBoardMediaClip(target)) { closeMediaEditor(); return; }
+    const mediaEntityId = boardEntityId(target);
+    const trimmedDuration = target.type === "video"
+      ? Math.max(MIN_MEDIA_TRIM_SECONDS, mediaEditDraft.trimEnd - mediaEditDraft.trimStart)
+      : target.duration;
+    const rotationDeg = normalizedMediaRotation(mediaEditDraft.rotationDeg);
+    setClips((previous) => previous.map((clip) => {
+      const sameMediaEntity = isBoardMediaClip(clip) && boardEntityId(clip) === mediaEntityId;
+      const isTrimTarget = clip.id === target.id && target.type === "video";
+      if (!sameMediaEntity && !isTrimTarget) return clip;
+      let boardGeometry = {};
+      if (sameMediaEntity && mediaEditDraft.swapFrame && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined) {
+        const centerX = clip.boardX + clip.boardW / 2;
+        const centerY = clip.boardY + clip.boardH / 2;
+        boardGeometry = {
+          boardX: centerX - clip.boardH / 2,
+          boardY: centerY - clip.boardW / 2,
+          boardW: clip.boardH,
+          boardH: clip.boardW,
+        };
+      }
+      return {
+        ...clip,
+        ...(sameMediaEntity ? {
+          mediaRotationDeg: rotationDeg || undefined,
+          cropLeft: mediaEditDraft.cropLeft || undefined,
+          cropRight: mediaEditDraft.cropRight || undefined,
+          cropTop: mediaEditDraft.cropTop || undefined,
+          cropBottom: mediaEditDraft.cropBottom || undefined,
+          ...boardGeometry,
+        } : {}),
+        ...(isTrimTarget ? {
+          sourceOffsetSec: mediaEditDraft.trimStart || undefined,
+          duration: trimmedDuration,
+          sourceDurationSec: mediaEditDraft.sourceDuration,
+        } : {}),
+      };
+    }));
+    if (cameraKeyframesRef.current.length > 0 && (target.duration !== trimmedDuration || mediaEditDraft.swapFrame)) setKeyframesOutOfDate(true);
+    setToast(target.type === "video" ? "Video edits applied" : "Image edits applied");
+    closeMediaEditor();
+  }
+
+  function renderMediaEditorModal() {
+    if (!mediaEditDraft) return null;
+    const clip = clips.find((candidate) => candidate.id === mediaEditDraft.clipId);
+    if (!clip || !isBoardMediaClip(clip)) return null;
+    const crop = normalizedMediaCrop(mediaEditDraft);
+    const remainingX = Math.max(0.05, 1 - (crop.left + crop.right) / 100);
+    const remainingY = Math.max(0.05, 1 - (crop.top + crop.bottom) / 100);
+    const frameWidth = mediaEditDraft.swapFrame ? clip.boardH ?? 16 : clip.boardW ?? 16;
+    const frameHeight = mediaEditDraft.swapFrame ? clip.boardW ?? 9 : clip.boardH ?? 9;
+    const rotation = mediaRotationLayout(mediaEditDraft.rotationDeg, frameWidth, frameHeight);
+    const visualSource = clip.type === "image" ? clip.previewUrl ?? clip.sourceUrl : clip.sourceUrl;
+    const trimLeft = clip.type === "video" ? mediaEditDraft.trimStart / mediaEditDraft.sourceDuration * 100 : 0;
+    const trimRight = clip.type === "video" ? (1 - mediaEditDraft.trimEnd / mediaEditDraft.sourceDuration) * 100 : 0;
+    const cropControls = [
+      ["cropLeft", "Left", crop.left],
+      ["cropRight", "Right", crop.right],
+      ["cropTop", "Top", crop.top],
+      ["cropBottom", "Bottom", crop.bottom],
+    ] as const;
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Edit ${clip.name}`}
+        onClick={(event) => { if (event.target === event.currentTarget) closeMediaEditor(); }}
+        style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(0,0,0,.68)" }}
+      >
+        <div style={{ width: 760, maxWidth: "96vw", maxHeight: "94vh", overflow: "hidden", display: "flex", flexDirection: "column", background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "5px 5px 0 #2a2a2a", fontFamily: "monospace" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a" }}>
+            <strong style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>EDIT {clip.type.toUpperCase()} — {clip.name}</strong>
+            <button type="button" aria-label="Close media editor" onClick={closeMediaEditor} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+          </div>
+          <div style={{ minHeight: 0, overflowY: "auto", display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(300px, 1.35fr) minmax(230px, .8fr)", gap: 16, padding: 16 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ position: "relative", width: "100%", aspectRatio: `${Math.max(1, frameWidth)} / ${Math.max(1, frameHeight)}`, maxHeight: "52vh", overflow: "hidden", background: "#111", border: "1.5px solid #2a2a2a" }}>
+                <div style={{ position: "absolute", left: "50%", top: "50%", width: `${rotation.drawWidth / Math.max(1, frameWidth) * 100}%`, height: `${rotation.drawHeight / Math.max(1, frameHeight) * 100}%`, transform: `translate(-50%, -50%) rotate(${mediaEditDraft.rotationDeg}deg) scale(${rotation.scale})`, transformOrigin: "center" }}>
+                  {clip.type === "video" ? (
+                    <video
+                      ref={mediaEditorPreviewRef}
+                      src={visualSource}
+                      muted
+                      playsInline
+                      onLoadedMetadata={(event) => {
+                        const duration = event.currentTarget.duration;
+                        if (!Number.isFinite(duration) || duration <= 0) return;
+                        setMediaEditDraft((draft) => draft && draft.clipId === clip.id ? {
+                          ...draft,
+                          sourceDuration: duration,
+                          trimStart: clamp(draft.trimStart, 0, Math.max(0, duration - MIN_MEDIA_TRIM_SECONDS)),
+                          trimEnd: clamp(draft.trimEnd, Math.min(duration, draft.trimStart + MIN_MEDIA_TRIM_SECONDS), duration),
+                        } : draft);
+                        event.currentTarget.currentTime = mediaEditDraft.trimStart;
+                      }}
+                      onTimeUpdate={(event) => {
+                        if (event.currentTarget.currentTime < mediaEditDraft.trimEnd - 0.02) return;
+                        event.currentTarget.pause();
+                        event.currentTarget.currentTime = mediaEditDraft.trimStart;
+                      }}
+                      onPlay={() => setMediaEditorPlaying(true)}
+                      onPause={() => setMediaEditorPlaying(false)}
+                      style={{ position: "absolute", left: `${-crop.left / remainingX * 100}%`, top: `${-crop.top / remainingY * 100}%`, width: `${100 / remainingX}%`, height: `${100 / remainingY}%`, objectFit: "fill" }}
+                    />
+                  ) : (
+                    <img src={visualSource} alt="" draggable={false} style={{ position: "absolute", left: `${-crop.left / remainingX * 100}%`, top: `${-crop.top / remainingY * 100}%`, width: `${100 / remainingX}%`, height: `${100 / remainingY}%`, objectFit: "fill" }} />
+                  )}
+                </div>
+                {clip.type === "video" && (
+                  <button
+                    type="button"
+                    aria-label={mediaEditorPlaying ? "Pause preview" : "Play preview"}
+                    onClick={() => {
+                      const video = mediaEditorPreviewRef.current;
+                      if (!video) return;
+                      if (video.paused) {
+                        if (video.currentTime < mediaEditDraft.trimStart || video.currentTime >= mediaEditDraft.trimEnd) video.currentTime = mediaEditDraft.trimStart;
+                        void video.play();
+                      } else video.pause();
+                    }}
+                    style={{ position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)", width: 48, height: 48, borderRadius: "50%", border: "2px solid #fff", background: "rgba(0,0,0,.55)", color: "#fff", fontSize: 20, cursor: "pointer" }}
+                  >{mediaEditorPlaying ? "Ⅱ" : "▶"}</button>
+                )}
+              </div>
+
+              {clip.type === "video" && (
+                <div style={{ marginTop: 14 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, fontSize: 10, color: "#5a5a5a" }}>
+                    <strong>TRIM</strong>
+                    <span>{mediaEditDraft.trimStart.toFixed(1)}s – {mediaEditDraft.trimEnd.toFixed(1)}s · {(mediaEditDraft.trimEnd - mediaEditDraft.trimStart).toFixed(1)}s</span>
+                  </div>
+                  <div style={{ position: "relative", height: 66, display: "flex", overflow: "hidden", border: "2px solid #f3c431", background: "#171717", touchAction: "none" }}>
+                    {Array.from({ length: 9 }, (_, index) => (
+                      <div key={index} style={{ flex: 1, minWidth: 0, borderRight: index < 8 ? "1px solid rgba(255,255,255,.18)" : undefined, backgroundImage: clip.thumbnailBlobUrl ? `url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", opacity: .82 }} />
+                    ))}
+                    <div style={{ position: "absolute", inset: 0, left: `${trimLeft}%`, right: `${trimRight}%`, borderTop: "4px solid #ffd43b", borderBottom: "4px solid #ffd43b", pointerEvents: "none" }} />
+                    <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${trimLeft}%`, background: "rgba(0,0,0,.62)", pointerEvents: "none" }} />
+                    <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: `${trimRight}%`, background: "rgba(0,0,0,.62)", pointerEvents: "none" }} />
+                    <div onPointerDown={(event) => handleMediaTrimPointerDown(event, "start")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); nudgeMediaTrim("start", (event.key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 1 : 0.1)); } }} tabIndex={0} aria-label="Drag clip start" role="slider" aria-valuemin={0} aria-valuemax={mediaEditDraft.trimEnd} aria-valuenow={mediaEditDraft.trimStart} style={{ position: "absolute", left: `${trimLeft}%`, top: 0, bottom: 0, width: 18, transform: "translateX(-2px)", borderRadius: "4px 0 0 4px", background: "#ffd43b", cursor: "ew-resize", touchAction: "none" }}><span style={{ position: "absolute", left: 7, top: 22, width: 3, height: 20, borderRadius: 2, background: "#4b3b00" }} /></div>
+                    <div onPointerDown={(event) => handleMediaTrimPointerDown(event, "end")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); nudgeMediaTrim("end", (event.key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 1 : 0.1)); } }} tabIndex={0} aria-label="Drag clip end" role="slider" aria-valuemin={mediaEditDraft.trimStart} aria-valuemax={mediaEditDraft.sourceDuration} aria-valuenow={mediaEditDraft.trimEnd} style={{ position: "absolute", left: `${100 - trimRight}%`, top: 0, bottom: 0, width: 18, transform: "translateX(-16px)", borderRadius: "0 4px 4px 0", background: "#ffd43b", cursor: "ew-resize", touchAction: "none" }}><span style={{ position: "absolute", left: 7, top: 22, width: 3, height: 20, borderRadius: 2, background: "#4b3b00" }} /></div>
+                  </div>
+                  <div style={{ marginTop: 5, fontSize: 9, color: "#6a6a6a" }}>Drag either yellow edge inward to set the clip’s start and end.</div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <div style={{ ...panelLabelStyle, marginBottom: 7 }}>Rotation · {mediaEditDraft.rotationDeg.toFixed(1)}°</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 8 }}>
+                  <button type="button" onClick={() => rotateMediaEditBy(-90)} style={{ ...miniButton, padding: "7px 5px" }}>↶ 90°</button>
+                  <button type="button" onClick={() => rotateMediaEditBy(90)} style={{ ...miniButton, padding: "7px 5px" }}>↷ 90°</button>
+                </div>
+                <input type="range" min={-180} max={180} step={0.5} value={mediaEditDraft.rotationDeg} onChange={(event) => setMediaEditDraft((draft) => draft ? { ...draft, rotationDeg: Number(event.target.value), swapFrame: false } : draft)} style={{ width: "100%", accentColor: "#c8f135" }} />
+              </div>
+              <div>
+                <div style={{ ...panelLabelStyle, marginBottom: 7 }}>Crop edges</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "9px 12px" }}>
+                  {cropControls.map(([key, label, value]) => (
+                    <label key={key} style={{ fontSize: 9, color: "#5a5a5a" }}>
+                      <span style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}><span>{label}</span><span>{value.toFixed(0)}%</span></span>
+                      <input type="range" min={0} max={MAX_MEDIA_CROP_PERCENT} step={1} value={value} onChange={(event) => updateMediaEditCrop(key, Number(event.target.value))} style={{ width: "100%", accentColor: "#ff8b55" }} />
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <button type="button" onClick={() => setMediaEditDraft((draft) => draft ? { ...draft, rotationDeg: 0, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, trimStart: 0, trimEnd: draft.sourceDuration, swapFrame: false } : draft)} style={{ ...miniButton, width: "100%" }}>Reset edits</button>
+              <div style={{ display: "flex", gap: 8, marginTop: "auto" }}>
+                <button type="button" onClick={closeMediaEditor} style={{ ...sketchButton, flex: 1 }}>Cancel</button>
+                <button type="button" onClick={applyMediaEdit} style={{ ...sketchButton, flex: 1, background: "#c8f135" }}>Apply edits</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -20109,6 +20518,11 @@ function Board2Editor({
                     {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                    {isBoardMediaClip(selectedClip) && (
+                      <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "11px 14px", fontSize: 13, background: "#ffd45c" }}>
+                        ✎ Edit {selectedClip.type}
+                      </button>
+                    )}
                     <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Duration (s)</div>
                       <input
@@ -20464,6 +20878,7 @@ function Board2Editor({
           </div>
         )}
         {renderDownloadToasts()}
+        {renderMediaEditorModal()}
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
         {renderImagePreviewModal()}
@@ -20598,9 +21013,9 @@ function Board2Editor({
         } else {
           const blob = await readClipAsset(clip);
           const ext = mimeToExt(blob.type, clip.name);
-          const assetFile = `assets/${clip.id}.${ext}`;
+          const assetFile = `assets/${isBoardBackedClipType(clip.type) ? boardEntityId(clip) : clip.id}.${ext}`;
           const buf = await blob.arrayBuffer();
-          zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
+          if (!zipFiles[assetFile]) zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
           manifestClips.push({ ...withSource, assetFile, assetMime: blob.type });
         }
       } else {
@@ -21936,6 +22351,16 @@ function Board2Editor({
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
                       ))}
+                      {isSel && isBoardMediaClip(clip) && (
+                        <button
+                          type="button"
+                          aria-label={`Edit ${clip.name}`}
+                          title={`Edit ${clip.type}`}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); if (isBoardMediaClip(clip)) openMediaEditor(clip); }}
+                          style={{ position: "absolute", left: "calc(50% + 20px)", top: isMobile ? -52 : -30, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 9px", borderRadius: 4, border: "2px solid #fff", background: "#ffd45c", color: "#2a2a2a", fontFamily: "monospace", fontSize: isMobile ? 13 : 10, fontWeight: 700, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                        >✎ Edit</button>
+                      )}
                       {isSel && (
                         <button
                           type="button"
@@ -22137,6 +22562,7 @@ function Board2Editor({
                         top: ann.boardY * boardZoom,
                         width: ann.boardW * boardZoom,
                         height: ann.boardH * boardZoom,
+                        transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
@@ -23827,6 +24253,11 @@ function Board2Editor({
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
+                {isBoardMediaClip(selectedClip) && (
+                  <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "7px 10px", fontSize: 11, background: "#ffd45c" }}>
+                    ✎ Edit {selectedClip.type}
+                  </button>
+                )}
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Sweeps across all board images
@@ -25334,6 +25765,7 @@ function Board2Editor({
         </div>
       )}
       {renderDownloadToasts()}
+      {renderMediaEditorModal()}
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
       {renderImagePreviewModal()}
