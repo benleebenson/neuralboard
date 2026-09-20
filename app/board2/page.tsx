@@ -191,7 +191,13 @@ import {
   titleCenterpieceRect,
 } from "@/lib/board2/organic-topic-layout";
 import { canonicalSourceKey, imageContentFingerprint, planMediaReferences } from "@/lib/board2/auto-build-media";
-import { buildTopicClusterCameraKeyframes } from "@/lib/board2/topic-cluster-camera";
+import {
+  AUTO_CAMERA_HOLD_FRACTION,
+  auditCameraMotion,
+  auditTopicCameraArrivals,
+  buildTopicClusterCameraKeyframes,
+  countBroadMovesInsideNarrowBeats,
+} from "@/lib/board2/topic-cluster-camera";
 import {
   FOCUS_FILL_RATIO,
   cameraForFocusRect,
@@ -493,6 +499,8 @@ type Clip = {
   autoTopicStartTime?: number;
   autoTopicEndTime?: number;
   autoLayoutSeed?: number;
+  autoScope?: "narrow" | "broad";
+  autoNarrationText?: string;
   autoShot?: "wide" | "tight";
   autoRole?: "outro" | "intro" | "title" | "annotationTarget";
   cameraBeat?: boolean;
@@ -554,6 +562,8 @@ type AutoNarrationImageSegment = TranscriptSegment & {
   reactionShot?: boolean;
   sentiment?: string;
   importance?: "anchor" | "support";
+  scope?: "narrow" | "broad";
+  narrationText?: string;
   shot?: "wide" | "tight";
   callout?: string;
   emphasis?: "circle" | "contrast-no" | "contrast-yes";
@@ -568,6 +578,8 @@ type PlanImageItem = {
   reactionShot?: unknown;
   sentiment?: unknown;
   importance?: unknown;
+  scope?: unknown;
+  narrationText?: unknown;
   shot?: unknown;
   callout?: unknown;
   emphasis?: unknown;
@@ -5301,7 +5313,16 @@ function Board2Editor({
     styleNote: string | null;
     styleExemplarCount: number;
     effectiveSecondsPerImage: number;
-    images: Array<{ query: string; reason: string; startTime: number }>;
+    images: Array<{
+      query: string;
+      reason: string;
+      narrationText: string;
+      scope: "narrow" | "broad";
+      framing: "tight subject" | "wide cluster move";
+      startTime: number;
+      actualArrival?: number;
+      driftSeconds?: number;
+    }>;
   } | null>(null);
   const [autoBuildCharacters, setAutoBuildCharacters] = useState<CharacterRosterEntry[]>([]);
   const [autoBuildPhase, setAutoBuildPhase] = useState<string | null>(null);
@@ -10112,6 +10133,16 @@ function Board2Editor({
       let plannedBoardTitle = "";
       let appliedStyleExemplarCount = 0;
       let effectivePlanSecondsPerImage = autoImageSeconds;
+      let plannedBeatDetails: Array<{
+        query: string;
+        reason: string;
+        narrationText: string;
+        scope: "narrow" | "broad";
+        framing: "tight subject" | "wide cluster move";
+        startTime: number;
+        actualArrival?: number;
+        driftSeconds?: number;
+      }> = [];
       reportProgress("preparing", "Compiling narration…", autoStyleConditioning ? 1 : 0, autoStyleConditioning ? 2 : 1);
       const narrationStart = narrationClips[0].startTime;
       const narrationEnd = narrationClips.reduce((end, clip) => Math.max(end, clip.startTime + clip.duration), narrationStart);
@@ -10226,14 +10257,16 @@ function Board2Editor({
               const startTime = Number(item.startTime);
               const reason = typeof item.reason === "string" ? item.reason.trim() : "";
               const characterName = typeof item.characterName === "string" ? item.characterName.trim() : "";
+              const narrationText = typeof item.narrationText === "string" ? item.narrationText.replace(/\s+/g, " ").trim() : "";
+              const scope = typeof item.scope === "string" && item.scope.toLowerCase() === "broad" ? "broad" as const : "narrow" as const;
               if (!(query && reason && Number.isFinite(startTime))) return [];
               return [{
-                query, startTime: clamp(startTime, 0, Math.max(0, transcriptionDuration - 0.1)), reason,
+                query, startTime: clamp(startTime, 0, Math.max(0, transcriptionDuration - 0.1)), reason, narrationText, scope,
                 ...(characterName ? { characterName, characterCallback: item.characterCallback === true } : {}),
                 ...(item.reactionShot === true ? { reactionShot: true } : {}),
                 ...(typeof item.sentiment === "string" ? { sentiment: item.sentiment } : {}),
                 ...(item.importance === "anchor" || item.importance === "support" ? { importance: item.importance as "anchor" | "support" } : {}),
-                ...(item.shot === "wide" || item.shot === "tight" ? { shot: item.shot as "wide" | "tight" } : {}),
+                shot: scope === "broad" ? "wide" as const : "tight" as const,
                 ...(typeof item.callout === "string" ? { callout: item.callout.trim().slice(0, 40) } : {}),
                 ...(item.emphasis === "circle" || item.emphasis === "contrast-no" || item.emphasis === "contrast-yes" ? { emphasis: item.emphasis as "circle" | "contrast-no" | "contrast-yes" } : {}),
               }];
@@ -10270,18 +10303,26 @@ function Board2Editor({
               topicIndex: 0,
             }));
         if (!editorialPlan.length) throw new Error("Editorial planner returned no usable images");
+        plannedBeatDetails = editorialPlan.map((item) => ({
+          query: item.query,
+          reason: item.reason,
+          narrationText: item.narrationText || item.reason,
+          scope: item.scope,
+          framing: item.scope === "broad" ? "wide cluster move" : "tight subject",
+          startTime: item.startTime,
+        }));
         setAutoBuildPlanDetails({
           styleNote: appliedStyleNote,
           styleExemplarCount: appliedStyleExemplarCount,
           effectiveSecondsPerImage: effectivePlanSecondsPerImage,
-          images: editorialPlan.map((item) => ({ query: item.query, reason: item.reason, startTime: item.startTime })),
+          images: plannedBeatDetails,
         });
         segments = editorialPlan.map((item, index) => {
           const end = editorialPlan[index + 1]?.startTime ?? transcriptionDuration;
           return {
             start: item.startTime,
             end: Math.max(item.startTime + 0.1, end),
-            text: item.reason,
+            text: item.narrationText || item.reason,
             query: item.query,
             reason: item.reason,
             planModel,
@@ -10295,6 +10336,8 @@ function Board2Editor({
             reactionShot: item.reactionShot,
             sentiment: item.sentiment,
             importance: item.importance,
+            scope: item.scope,
+            narrationText: item.narrationText,
             shot: item.shot,
             callout: item.callout,
             emphasis: item.emphasis,
@@ -10312,6 +10355,31 @@ function Board2Editor({
           updatedAt: Date.now(),
         }));
         reportProgress("planning", "Planning failed — using keyword fallback…", 1, 1);
+      }
+
+      // Fallback planning is deliberately conservative: without a semantic LLM
+      // classification, no beat is allowed to manufacture a broad move.
+      segments = segments.map((segment) => ({
+        ...segment,
+        scope: segment.scope === "broad" ? "broad" : "narrow",
+        shot: segment.scope === "broad" ? "wide" : "tight",
+        narrationText: segment.narrationText || segment.text,
+      }));
+      if (!plannedBeatDetails.length) {
+        plannedBeatDetails = segments.map((segment) => ({
+          query: segment.query,
+          reason: segment.reason ?? "Keyword fallback",
+          narrationText: segment.narrationText || segment.text,
+          scope: "narrow",
+          framing: "tight subject",
+          startTime: segment.start,
+        }));
+        setAutoBuildPlanDetails({
+          styleNote: appliedStyleNote,
+          styleExemplarCount: appliedStyleExemplarCount,
+          effectiveSecondsPerImage: effectivePlanSecondsPerImage,
+          images: plannedBeatDetails,
+        });
       }
 
       const findingStartedAt = Date.now();
@@ -10687,7 +10755,7 @@ function Board2Editor({
           boardY: placement.y,
           boardW: placement.width,
           boardH: placement.height,
-          holdFraction: 0.7,
+          holdFraction: AUTO_CAMERA_HOLD_FRACTION,
           featured: true,
           provenance: "browserFound",
           sourceAttributionUrl: image.sourceUrl,
@@ -10701,7 +10769,9 @@ function Board2Editor({
           autoTopicStartTime: segment.topicStartTime,
           autoTopicEndTime: segment.topicEndTime,
           autoLayoutSeed: layoutSeed,
-          autoShot: segment.shot,
+          autoScope: segment.scope === "broad" ? "broad" : "narrow",
+          autoNarrationText: segment.narrationText || segment.text,
+          autoShot: segment.scope === "broad" ? "wide" : "tight",
           ...(image.source === "library" && image.sourceUrl === introAsset?.asset?.url ? { autoRole: "intro" as const } : {}),
         };
         nextClips.push(clip);
@@ -10844,8 +10914,9 @@ function Board2Editor({
       // build — the owner would otherwise see "auto-build failed" despite the images being there.
       let cameraWarning: string | null = null;
       let cameraStats = "";
-      const annotationCameraTargets = clipsRef.current.filter((clip) => clip.type === "customZoom" && clip.autoRole === "annotationTarget");
-      const cameraClips = [...autoClips, ...annotationCameraTargets, ...(outroClip ? [outroClip] : [])];
+      // Annotation targets remain board content, but they do not get independent camera stops:
+      // an inserted stop could split a narration-owned broad move or a tight beat.
+      const cameraClips = [...autoClips, ...(outroClip ? [outroClip] : [])];
       if (cameraClips.length) {
         reportProgress("camera", "Generating camera…", 0, 1);
         try {
@@ -10859,7 +10930,7 @@ function Board2Editor({
               topicId, x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH,
             });
           }
-          const generatedCamera: CameraKeyframe[] = buildTopicClusterCameraKeyframes({
+          const cameraOptions = {
             clips: cameraClips.map((clip) => ({
               id: clip.id,
               startTime: clip.startTime,
@@ -10870,25 +10941,42 @@ function Board2Editor({
               boardW: clip.boardW!,
               boardH: clip.boardH!,
               topicId: clip.autoTopicId,
+              scope: clip.autoScope,
               shot: clip.autoShot,
-              role: clip.autoRole === "intro" || clip.autoRole === "outro" || clip.autoRole === "annotationTarget" ? clip.autoRole : undefined,
+              role: clip.autoRole === "intro" || clip.autoRole === "outro" ? clip.autoRole : undefined,
             })),
             topicBounds: [...cameraTopicBounds.values()],
             canvasWidth: W,
             canvasHeight: H,
             boardWidth: layoutBoardDimensions.width,
             imageFocusRatio: FOCUS_FILL_RATIO,
-            maxBroadPanGapSec: 18,
-          }).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
+          };
+          const generatedCamera = buildTopicClusterCameraKeyframes(cameraOptions).map((keyframe) => outroClip && keyframe.time >= outroClip.startTime
             ? { ...keyframe, autoRole: "outro" as const }
             : keyframe);
           if (!generatedCamera.length) throw new Error("no camera keyframes were generated");
-          const broadTimes = generatedCamera.filter((keyframe) => keyframe.broadPan).filter((_, index) => index % 2 === 0).map((keyframe) => keyframe.time);
-          const maxBroadGap = [narrationStart, ...broadTimes, narrationEnd].sort((a, b) => a - b)
-            .reduce((largest, time, index, times) => index ? Math.max(largest, time - times[index - 1]) : largest, 0);
-          const wideBeats = broadTimes.length;
-          const tightBeats = Math.max(0, autoClips.length - wideBeats);
-          cameraStats = ` ${wideBeats} wide / ${tightBeats} tight beats; broad pan at most ${maxBroadGap.toFixed(1)}s apart.`;
+          const narrationOptions = { ...cameraOptions, clips: cameraOptions.clips.filter((clip) => autoClips.some((candidate) => candidate.id === clip.id)) };
+          const arrivals = auditTopicCameraArrivals(narrationOptions, generatedCamera);
+          const motion = auditCameraMotion(generatedCamera, narrationStart, narrationEnd);
+          const wideBeats = narrationOptions.clips.filter((clip) => clip.scope === "broad").length;
+          const tightBeats = narrationOptions.clips.length - wideBeats;
+          const maxDrift = Math.max(0, ...arrivals.map((arrival) => arrival.driftSeconds));
+          const interruptions = countBroadMovesInsideNarrowBeats(narrationOptions.clips, generatedCamera);
+          const arrivalByStart = new Map(arrivals.map((arrival) => [Number((arrival.plannedTime - narrationStart).toFixed(3)), arrival]));
+          setAutoBuildPlanDetails({
+            styleNote: appliedStyleNote,
+            styleExemplarCount: appliedStyleExemplarCount,
+            effectiveSecondsPerImage: effectivePlanSecondsPerImage,
+            images: plannedBeatDetails.map((beat) => {
+              const arrival = arrivalByStart.get(Number(beat.startTime.toFixed(3)));
+              return arrival ? {
+                ...beat,
+                actualArrival: arrival.arrivalTime - narrationStart,
+                driftSeconds: arrival.driftSeconds,
+              } : beat;
+            }),
+          });
+          cameraStats = ` ${wideBeats} broad / ${tightBeats} narrow beats; ${(motion.motionFraction * 100).toFixed(1)}% motion / ${(motion.holdFraction * 100).toFixed(1)}% hold; max arrival drift ${maxDrift.toFixed(3)}s; ${interruptions} broad moves inside narrow beats.`;
           cameraKeyframesRef.current = generatedCamera;
           setCameraKeyframes(generatedCamera);
           setKeyframesOutOfDate(false);
@@ -11245,7 +11333,7 @@ function Board2Editor({
           boardY: placement.y,
           boardW: placement.width,
           boardH: placement.height,
-          holdFraction: 0.7,
+          holdFraction: AUTO_CAMERA_HOLD_FRACTION,
           featured: true,
           provenance: "browserFound",
           sourceAttributionUrl: mediaItem.image.sourceUrl,
@@ -11259,7 +11347,9 @@ function Board2Editor({
           autoTopicStartTime: mediaItem.segment.topicStartTime,
           autoTopicEndTime: mediaItem.segment.topicEndTime,
           autoLayoutSeed: ctx.layoutSeed,
-          autoShot: mediaItem.segment.shot,
+          autoScope: mediaItem.segment.scope === "broad" ? "broad" : "narrow",
+          autoNarrationText: mediaItem.segment.narrationText || mediaItem.segment.text,
+          autoShot: mediaItem.segment.scope === "broad" ? "wide" : "tight",
         });
         ctx.clipIdBySegmentIndex.set(mediaItem.originalIndex, id);
       }
@@ -14773,7 +14863,7 @@ function Board2Editor({
       setCameraGenerationPhase(null);
     });
     const topicAwareClips = clipsRef.current
-      .filter((clip) => isFeaturedTimelineClip(clip) && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+      .filter((clip) => isFeaturedTimelineClip(clip) && clip.autoRole !== "annotationTarget" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
     const hasTopicClusters = topicAwareClips.some((clip) => !!clip.autoTopicId);
     const hasPanBlocks = clipsRef.current.some((clip) => isFeaturedTimelineClip(clip) && clip.type === "pan");
@@ -14807,6 +14897,7 @@ function Board2Editor({
           boardW: clip.boardW!,
           boardH: clip.boardH!,
           topicId: clip.autoTopicId,
+          scope: clip.autoScope,
           shot: clip.autoShot,
         })),
         topicBounds,
@@ -14814,7 +14905,6 @@ function Board2Editor({
         canvasHeight: canvasHRef.current,
         boardWidth: boardDimensionsRef.current.width,
         imageFocusRatio: FOCUS_FILL_RATIO,
-        maxBroadPanGapSec: 18,
       }).map((keyframe) => {
         const outro = topicAwareClips.find((clip) => clip.autoRole === "outro");
         return outro && keyframe.time >= outro.startTime
@@ -20488,9 +20578,9 @@ function Board2Editor({
                       {autoBuildSummary && !autoBuildPhase && <div style={{ fontSize: 10, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>}
                       {autoBuildPlanDetails && !autoBuildPhase && (
                         <details style={{ fontSize: 9, lineHeight: 1.4 }}>
-                          <summary style={{ cursor: "pointer", fontWeight: 700 }}>Why these images?</summary>
+                          <summary style={{ cursor: "pointer", fontWeight: 700 }}>Narration scope & camera audit</summary>
                           {autoBuildPlanDetails.styleNote && <div style={{ margin: "5px 0", color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
-                          {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 5 }}><b>{index + 1}. {item.startTime.toFixed(1)}s — {item.query}</b><br />{item.reason}</div>)}
+                          {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 7, paddingTop: 5, borderTop: "1px solid rgba(42,42,42,.14)" }}><b>{index + 1}. {item.startTime.toFixed(2)}s · {item.scope.toUpperCase()} · {item.framing}</b>{item.actualArrival !== undefined && <span> · arrived {item.actualArrival.toFixed(2)}s (Δ {item.driftSeconds?.toFixed(3)}s)</span>}<br />“{item.narrationText}”<br /><span style={{ color: "#6a6a6a" }}>{item.query} — {item.reason}</span></div>)}
                         </details>
                       )}
                       {!autoBuildPhase && <div style={{ fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
@@ -21124,6 +21214,8 @@ function Board2Editor({
           volume: clip.volume,
           muted: clip.muted,
           holdFraction: clip.holdFraction,
+          autoScope: clip.autoScope,
+          autoNarrationText: clip.autoNarrationText,
           autoShot: clip.autoShot,
           source: recipeProvenance(clip.source === "autoDerived" ? "auto" : clip.source as ClipSource | undefined),
         };
@@ -22118,9 +22210,9 @@ function Board2Editor({
                 )}
                 {autoBuildPlanDetails && !autoBuildPhase && (
                   <details style={{ marginTop: 5, fontSize: 8, lineHeight: 1.4 }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700 }}>Why these images?</summary>
+                    <summary style={{ cursor: "pointer", fontWeight: 700 }}>Narration scope & camera audit</summary>
                     {autoBuildPlanDetails.styleNote && <div style={{ marginTop: 4, color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
-                    {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 5 }}><b>{index + 1}. {item.startTime.toFixed(1)}s — {item.query}</b><br />{item.reason}</div>)}
+                    {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 7, paddingTop: 5, borderTop: "1px solid rgba(42,42,42,.14)" }}><b>{index + 1}. {item.startTime.toFixed(2)}s · {item.scope.toUpperCase()} · {item.framing}</b>{item.actualArrival !== undefined && <span> · arrived {item.actualArrival.toFixed(2)}s (Δ {item.driftSeconds?.toFixed(3)}s)</span>}<br />“{item.narrationText}”<br /><span style={{ color: "#6a6a6a" }}>{item.query} — {item.reason}</span></div>)}
                   </details>
                 )}
                 {!autoBuildPhase && <div style={{ marginTop: 5, fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}

@@ -8,11 +8,14 @@ export type EditorialImagePlanItem = {
   query: string;
   startTime: number;
   reason: string;
+  narrationText?: string;
+  scope?: "narrow" | "broad";
   characterCallback?: boolean;
   characterName?: string;
   reactionShot?: boolean;
   sentiment?: "comedic" | "tense" | "reverent" | "melancholy" | "neutral";
   importance?: "anchor" | "support";
+  /** @deprecated Scope owns framing. Retained only when parsing old saved plans. */
   shot?: "wide" | "tight";
   callout?: string;
   emphasis?: "circle" | "contrast-no" | "contrast-yes";
@@ -179,7 +182,12 @@ For every image:
   BAD "dream fragments collage" -> GOOD "long empty hotel corridor repeating doors photograph"
 - Set startTime to the spoken moment when the image should first appear, never the end of that transcript segment. ${planningWindow ? `Start times must be inside ${planningWindow.startTime.toFixed(2)}-${Math.max(planningWindow.startTime, planningWindow.endTime - 0.01).toFixed(2)} seconds.` : "The first image must start at 0."} Start times must be unique, increasing, at least 0.1 seconds apart, and between 0 and ${(input.durationSec - 0.1).toFixed(2)}.
 - Give a concise one-line editorial reason that connects the image to the narrative meaning.
-- Mark each beat "shot":"wide" for abstract/general narration and "shot":"tight" for a concrete detail. Include a wide beat at least every 15-20 seconds.
+- Classify every beat on a SCOPE axis using "scope":"NARROW" or "scope":"BROAD". Judge scope RELATIVE TO THIS VIDEO'S SUBJECT, after reading the full narration:
+  - NARROW: a specific example, named person, concrete detail, single fact, or close examination within the video's subject.
+  - BROAD: a thesis, summary, meaningful topic transition, whole-subject rhetorical question, or an explicit invitation to step back and consider the larger picture.
+  - The same sentence can be broad in a video about one person and narrow in a video about an entire field. Do not use elapsed time, spacing, quotas, visual variety, or a desire to add a camera move when deciding scope.
+  - There is NO required number or cadence of BROAD beats. If the meaning is narrow, classify it NARROW.
+- Copy the exact spoken words covered by the beat into "narrationText". Do not paraphrase them. The camera will use scope directly: BROAD replaces that beat's tight image framing with one continuous wide cluster move; NARROW stays tight on its subject.
 - Mark roughly one in every 5-8 distinct subjects "importance":"anchor" and the rest "support".
 - When the exact same subject returns, repeat its query. The camera will revisit the same board image.
 - Add a 1-4 word "callout" for roughly one in six distinct subjects, and "emphasis":"circle" or "contrast-no"/"contrast-yes" when the narration calls for it. Keep the board legible.
@@ -187,7 +195,7 @@ For every image:
 Create a short, punchy BOARD TITLE from the whole transcript (normally 3-8 words, specific to the argument, never "My Board" or "Narration Overview").
 
 Return STRICT JSON ONLY with no prose or Markdown fences (omit characterCallback/characterName/reactionShot/sentiment entirely when a character roster wasn't supplied):
-{"boardTitle":"specific punchy board title","topics":[{"topicTitle":"2-4 word cluster label","startTime":0,"endTime":12.5,"images":[{"query":"concrete real-photo search query","startTime":0,"reason":"one-line editorial reason","importance":"anchor","shot":"wide","callout":"brief note","emphasis":"circle","characterCallback":false,"characterName":"<name>","reactionShot":false,"sentiment":"neutral"}]}]}`;
+{"boardTitle":"specific punchy board title","topics":[{"topicTitle":"2-4 word cluster label","startTime":0,"endTime":12.5,"images":[{"query":"concrete real-photo search query","startTime":0,"reason":"one-line editorial reason","narrationText":"exact spoken words for this beat","scope":"NARROW","importance":"anchor","callout":"brief note","emphasis":"circle","characterCallback":false,"characterName":"<name>","reactionShot":false,"sentiment":"neutral"}]}]}`;
 
   const conditionedSystem = `${system}${styleGuidance}${characterGuidance}`;
 
@@ -315,7 +323,7 @@ function normalizeEditorialItems(
     const item = rawItem as {
       query?: unknown; startTime?: unknown; reason?: unknown;
       characterCallback?: unknown; characterName?: unknown; reactionShot?: unknown; sentiment?: unknown;
-      importance?: unknown; shot?: unknown; callout?: unknown; emphasis?: unknown;
+      importance?: unknown; shot?: unknown; scope?: unknown; narrationText?: unknown; callout?: unknown; emphasis?: unknown;
     };
     const query = typeof item.query === "string" ? item.query.replace(/\s+/g, " ").trim().slice(0, 200) : "";
     const reason = typeof item.reason === "string" ? item.reason.replace(/\s+/g, " ").trim().slice(0, 500) : "";
@@ -324,11 +332,22 @@ function normalizeEditorialItems(
       : Number.NaN;
     if (query.length < 3 || !reason || !Number.isFinite(startTime)) continue;
     const characterName = typeof item.characterName === "string" ? item.characterName.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+    const narrationText = typeof item.narrationText === "string" ? item.narrationText.replace(/\s+/g, " ").trim().slice(0, 1000) : "";
+    const normalizedScope = typeof item.scope === "string" ? item.scope.toLowerCase() : "";
+    const scope = normalizedScope === "broad" || normalizedScope === "narrow"
+      ? normalizedScope as EditorialImagePlanItem["scope"]
+      : item.shot === "wide"
+        ? "broad" as const
+        : item.shot === "tight"
+          ? "narrow" as const
+          : undefined;
     const sentiment = typeof item.sentiment === "string" && sentiments.has(item.sentiment) ? item.sentiment as EditorialImagePlanItem["sentiment"] : undefined;
     items.push({
       query,
       startTime: Math.min(Math.max(0, startTime), Math.max(0, duration - 0.1)),
       reason,
+      ...(narrationText ? { narrationText } : {}),
+      ...(scope ? { scope } : {}),
       ...(characterName ? { characterName, characterCallback: item.characterCallback === true } : {}),
       ...(item.reactionShot === true ? { reactionShot: true } : {}),
       ...(sentiment ? { sentiment } : {}),

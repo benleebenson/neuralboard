@@ -211,8 +211,27 @@ export async function POST(req: NextRequest) {
       }
     }));
 
-    const plan = chunkResults.flatMap((result) => result.images).sort((a, b) => a.startTime - b.startTime).slice(0, targetCount);
-    if (plan.length) plan[0] = { ...plan[0], startTime: 0 };
+    const rawPlan = chunkResults.flatMap((result) => result.images).sort((a, b) => a.startTime - b.startTime).slice(0, targetCount);
+    if (rawPlan.length) rawPlan[0] = { ...rawPlan[0], startTime: 0 };
+    // Report source transcript words, not an LLM paraphrase. Scope remains the
+    // model's semantic judgment, but every beat shown to the owner is grounded
+    // in the timestamped narration supplied to this request.
+    const plan = rawPlan.map((image, index) => {
+      const endTime = rawPlan[index + 1]?.startTime ?? durationSec;
+      const narrationText = segments
+        .filter((segment) => segment.end > image.startTime && segment.start < endTime)
+        .map((segment) => segment.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim() || image.narrationText || (rawPlan.length === 1 ? transcript : "");
+      return {
+        ...image,
+        narrationText,
+        // A failed/malformed classification can never create an arbitrary wide
+        // move. The safe fallback is a tight, narrow beat.
+        scope: image.scope === "broad" ? "broad" as const : "narrow" as const,
+      };
+    });
     const topics = chunks.length === 1
       ? chunkResults[0].topics
       : topicOutline.flatMap((outline, index) => {
