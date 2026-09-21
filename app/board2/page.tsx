@@ -9,8 +9,8 @@ import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
 import { WorldView, type WorkspaceWorldApi } from "@/app/board2/world/WorldView";
-import { WORLD_PENDING_IMPORT_FILE, type WorldRegion } from "@/lib/board-world";
-import { updateWorldRegion } from "@/lib/board-world-storage";
+import { WORLD_PENDING_IMPORT_FILE, type WorldRegion } from "@/lib/world/world-model";
+import { updateWorldRegion } from "@/lib/world/region-import";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
@@ -5152,9 +5152,11 @@ export default function Board2Page() {
     if (regionId) workspaceRegionRef.current.set(workspaceId, regionId);
     else workspaceRegionRef.current.delete(workspaceId);
   }, []);
+  // `/board2?worldRegionId=<id>` opens the world and zooms straight into that region.
+  const [initialWorldRegionId] = useState<string | null>(() => typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("worldRegionId"));
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("world") !== "1" && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
+    if (params.get("world") !== "1" && !params.get("worldRegionId") && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
     const timer = window.setTimeout(() => setWorldOpen(true), 0);
     return () => window.clearTimeout(timer);
   }, []);
@@ -5242,7 +5244,7 @@ export default function Board2Page() {
           </div>
         ))}
       </div>
-      <WorldView open={worldOpen} onClose={closeWorld} beforeOpenRegion={beforeOpenWorldRegion} onOpenRegion={openWorldRegion} />
+      <WorldView open={worldOpen} onClose={closeWorld} beforeOpenRegion={beforeOpenWorldRegion} onOpenRegion={openWorldRegion} initialRegionId={initialWorldRegionId} />
     </div>
   );
 }
@@ -22110,7 +22112,7 @@ function Board2Editor({
               {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
             </span>
           )}
-          <button onClick={onOpenWorld} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">∞ World</button>
+          <button onClick={onOpenWorld} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">{activeWorldRegion ? "← Back to World" : "∞ World"}</button>
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <MainSectionNav active="board" desktopOnly onOpenWorld={onOpenWorld} />
@@ -22143,7 +22145,7 @@ function Board2Editor({
           )}
           <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
-          <button onClick={() => { onOpenWorld(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>∞ World</button>
+          <button onClick={() => { onOpenWorld(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>{activeWorldRegion ? "← Back to World" : "∞ World"}</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>

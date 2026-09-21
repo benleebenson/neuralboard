@@ -3,7 +3,7 @@
 import Image from "next/image";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BOARD_LIBRARY_PENDING_FILE, type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory, updateTrainingFlag } from "@/lib/board-library";
-import { WORLD_PENDING_IMPORT_FILE } from "@/lib/board-world";
+import { WORLD_PENDING_IMPORT_FILE } from "@/lib/world/world-model";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
 
 type CloudAsset = { id: string; url: string; thumbnail_url?: string; label?: string; description?: string; is_intro?: boolean; created_at?: string };
