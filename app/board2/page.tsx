@@ -10055,43 +10055,68 @@ function Board2Editor({
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
-    const isVideoFile = file.type.startsWith("video/") || /\.(mp4|mov|webm|mkv)$/i.test(file.name);
+    const isVideoFile = file.type.startsWith("video/") || (!file.type.startsWith("audio/") && /\.(mp4|mov|mkv)$/i.test(file.name));
     setToast("Processing audio…");
+    let blobUrl: string | null = null;
     try {
-      let blobUrl: string;
-      let audioBlob: Blob;
-      if (isVideoFile) {
-        // Extract just the audio track from the video container
-        const arrayBuffer = await file.arrayBuffer();
+      let audioBlob: Blob = file;
+      if (isVideoFile && file.size <= 32 * 1024 * 1024) {
+        // Some browsers cannot decode a video container with decodeAudioData, even though their
+        // media element plays its audio. Keep the original as a fallback for those browsers.
         const tmpCtx = new AudioContext();
-        const audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer);
-        await tmpCtx.close().catch(() => {});
-        const wavBlob = audioBufferToWav(audioBuffer);
-        blobUrl = URL.createObjectURL(wavBlob);
-        audioBlob = wavBlob;
-      } else {
-        audioBlob = file;
-        blobUrl = URL.createObjectURL(file);
+        try {
+          const audioBuffer = await tmpCtx.decodeAudioData(await file.arrayBuffer());
+          audioBlob = audioBufferToWav(audioBuffer);
+        } catch (error) {
+          console.info("[board2] Using video container for narration playback", error);
+        } finally {
+          await tmpCtx.close().catch(() => {});
+        }
       }
-      const dur: number = await new Promise((resolve) => {
-        const audio = new Audio(blobUrl);
-        audio.onloadedmetadata = () => resolve(isFinite(audio.duration) ? audio.duration : 1);
-        audio.onerror = () => resolve(1);
+      blobUrl = URL.createObjectURL(audioBlob);
+      const sourceUrl = blobUrl;
+      const dur = await new Promise<number>((resolve, reject) => {
+        const media = document.createElement(isVideoFile && audioBlob === file ? "video" : "audio");
+        media.preload = "metadata";
+        const release = () => {
+          media.onloadedmetadata = null;
+          media.onerror = null;
+          media.removeAttribute("src");
+          media.load();
+        };
+        media.onloadedmetadata = () => {
+          const duration = media.duration;
+          release();
+          if (Number.isFinite(duration) && duration > 0) resolve(duration);
+          else reject(new Error("Could not read the narration duration"));
+        };
+        media.onerror = () => {
+          release();
+          reject(new Error("Could not read audio from this file"));
+        };
+        media.src = sourceUrl;
       });
-      if (dur < 0.1) { URL.revokeObjectURL(blobUrl); setToast("No audio found in file"); return; }
-      const waveform = await generateNarrationWaveform(blobUrl).catch(() => undefined);
+      if (dur < 0.1) throw new Error("No audio found in file");
+      const clipId = generateId();
       setClips((prev) => [...prev, {
-        id: generateId(),
+        id: clipId,
         type: "narration" as const,
         name: file.name.replace(/\.[^.]+$/, "").slice(0, 40),
-        sourceUrl: blobUrl,
+        sourceUrl,
         audioBlob,
         startTime: playheadRef.current,
         duration: dur,
-        waveform,
       }]);
-      setToast(isVideoFile ? "Audio extracted from video" : "Narration added");
+      // The waveform is optional. Large recordings should appear on the board without waiting
+      // for another full decode of the file.
+      if (audioBlob.size <= 32 * 1024 * 1024 && !(isVideoFile && audioBlob === file)) {
+        void generateNarrationWaveform(sourceUrl).then((waveform) => {
+          setClips((current) => current.map((clip) => clip.id === clipId ? { ...clip, waveform } : clip));
+        }).catch(() => {});
+      }
+      setToast(isVideoFile ? "Video narration added" : "Narration added");
     } catch (err) {
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
       setToast(err instanceof Error ? err.message : "Failed to process file");
     }
   }
@@ -20140,7 +20165,7 @@ function Board2Editor({
     return (
       <div style={{ ...pageStyle, overflow: "hidden", display: "flex", flexDirection: "column", height: "100dvh" }}>
         <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-        <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
+        <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
         <input ref={projectFileInputRef} type="file" accept=".nbp,.zip" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }} />
         <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
@@ -22235,7 +22260,7 @@ function Board2Editor({
             <input
               ref={narrationUploadRef}
               type="file"
-              accept="audio/*,video/mp4,video/quicktime,video/webm"
+              accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm"
               style={{ display: "none" }}
               onChange={handleNarrationUpload}
             />
