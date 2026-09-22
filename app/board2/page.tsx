@@ -22072,6 +22072,13 @@ function Board2Editor({
         <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
           {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
+          {!isMobile && <details style={{ position: "relative", zIndex: 400, alignSelf: "center" }}>
+            <summary style={{ ...sketchButton, padding: "4px 8px", fontSize: 11, listStyle: "none" }}>↑ Upload files</summary>
+            <div style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, width: 270, maxWidth: "calc(100vw - 24px)", display: "grid", gap: 12, padding: 12, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "3px 3px 0 #2a2a2a" }}>
+              <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700 }}>Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media from header" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
+              <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700 }}>Audio / MP4 narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration from header" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
+            </div>
+          </details>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
           {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
@@ -22192,6 +22199,7 @@ function Board2Editor({
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
             <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
+            <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700, flexShrink: 0 }}>↑ Upload audio / mp4<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
             <button
               onClick={() => addPanClip()}
               style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
@@ -22231,8 +22239,6 @@ function Board2Editor({
                 🏆 Top 5
               </button>
             </ProGated>}
-
-            <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700 }}>↑ Upload audio / mp4<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
 
             <ProGated featureName="Narration Recording">
               <button
