@@ -5730,7 +5730,6 @@ function Board2Editor({
   const lastEditorFrameTimeRef = useRef(0);
   const lastPlayheadUiTimeRef = useRef(0);
   const rafIdRef = useRef<number | null>(null);
-  const narrationUploadRef = useRef<HTMLInputElement>(null);
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const imgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const warmImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -20165,7 +20164,8 @@ function Board2Editor({
     return (
       <div style={{ ...pageStyle, overflow: "hidden", display: "flex", flexDirection: "column", height: "100dvh" }}>
         <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
-        <input ref={narrationUploadRef} type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" style={{ display: "none" }} onChange={handleNarrationUpload} />
+        <input id="board2-narration-upload" type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" style={filePickerInputStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileDrawer(null); }} />
+        <input id="board2-media-upload" type="file" accept="image/*,video/*" multiple style={filePickerInputStyle} onChange={(event) => { void handleMediaUpload(event); setMobileDrawer(null); }} />
         <input ref={projectFileInputRef} type="file" accept=".nbp,.zip" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) loadBoard(f); }} />
         <style>{`@keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
@@ -20608,20 +20608,8 @@ function Board2Editor({
                   )}
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    <label style={{ ...sketchButton, position: "relative", display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box", overflow: "hidden" }}>
+                    <label htmlFor="board2-media-upload" style={{ ...sketchButton, display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box" }}>
                       ↑  Upload photo / video
-                      <input
-                        type="file"
-                        accept="image/*,video/*"
-                        multiple
-                        aria-label="Upload photo or video"
-                        onClick={(e) => { e.currentTarget.value = ""; }}
-                        onChange={(e) => {
-                          void handleMediaUpload(e);
-                          setMobileDrawer(null);
-                        }}
-                        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
-                      />
                     </label>
                     <button onClick={() => { setYtModalOpen(true); setYtView("search"); setYtTab("search"); setYtError(""); setMobileDrawer(null); }} style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}>
                       ▶  Add YouTube clip
@@ -20648,12 +20636,9 @@ function Board2Editor({
                         🏆  Top 5
                       </button>
                     </ProGated>}
-                    <button
-                      onClick={() => { narrationUploadRef.current?.click(); setMobileDrawer(null); }}
-                      style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
-                    >
+                    <label htmlFor="board2-narration-upload" style={{ ...sketchButton, display: "block", width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13, boxSizing: "border-box" }}>
                       ↑  Upload audio / mp4
-                    </button>
+                    </label>
                     <ProGated featureName="Narration Recording">
                       <button
                         onClick={() => { if (isRecording) stopNarrationRecording(); else startNarrationRecording(); setMobileDrawer(null); }}
@@ -22056,6 +22041,8 @@ function Board2Editor({
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
+      <input id="board2-media-upload" type="file" accept="image/*,video/*" multiple style={filePickerInputStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} />
+      <input id="board2-narration-upload" type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" style={filePickerInputStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
         [data-board2-exporting] > :not(style):not([aria-hidden="true"]):not([data-export-progress]) { visibility: hidden !important; }
@@ -22168,7 +22155,8 @@ function Board2Editor({
               onAction={() => setMobileEditorMenuOpen(false)}
             />
           )}
-          <label style={{ ...sketchButton, position: "relative", overflow: "hidden", textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" onClick={(e) => { e.currentTarget.value = ""; }} onChange={(e) => { void handleMediaUpload(e); setMobileEditorMenuOpen(false); }} style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%" }} /></label>
+          <label htmlFor="board2-media-upload" style={{ ...sketchButton, textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Media</label>
+          <label htmlFor="board2-narration-upload" style={{ ...sketchButton, textAlign: "center", padding: "10px 5px", fontSize: 10 }}>↑ Audio / MP4 narration</label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { onOpenWorld(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>{activeWorldRegion ? "← Back to World" : "∞ World"}</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
@@ -22199,17 +22187,8 @@ function Board2Editor({
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
-            <label style={{ ...sketchButton, position: "relative", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 36, lineHeight: 1.2, textAlign: "center", boxSizing: "border-box", overflow: "hidden", flexShrink: 0 }}>
+            <label htmlFor="board2-media-upload" style={{ ...sketchButton, display: "flex", alignItems: "center", justifyContent: "center", minHeight: 36, lineHeight: 1.2, textAlign: "center", boxSizing: "border-box", flexShrink: 0 }}>
               ↑ Upload media
-              <input
-                type="file"
-                accept="image/*,video/*"
-                multiple
-                aria-label="Upload media"
-                onClick={(e) => { e.currentTarget.value = ""; }}
-                onChange={handleMediaUpload}
-                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer" }}
-              />
             </label>
             <button
               onClick={() => addPanClip()}
@@ -22251,19 +22230,9 @@ function Board2Editor({
               </button>
             </ProGated>}
 
-            <button
-              onClick={() => narrationUploadRef.current?.click()}
-              style={{ ...sketchButton, fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%" }}
-            >
+            <label htmlFor="board2-narration-upload" style={{ ...sketchButton, display: "block", fontSize: 11, padding: "6px 10px", fontWeight: 700, width: "100%", boxSizing: "border-box", textAlign: "center" }}>
               ↑ Upload audio / mp4
-            </button>
-            <input
-              ref={narrationUploadRef}
-              type="file"
-              accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm"
-              style={{ display: "none" }}
-              onChange={handleNarrationUpload}
-            />
+            </label>
 
             <ProGated featureName="Narration Recording">
               <button
@@ -26189,6 +26158,16 @@ const panelLabelStyle: React.CSSProperties = {
   color: "#6a6a6a",
   letterSpacing: 1,
   textTransform: "uppercase",
+};
+
+const filePickerInputStyle: React.CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  overflow: "hidden",
+  clipPath: "inset(50%)",
+  whiteSpace: "nowrap",
 };
 
 const sketchButton: React.CSSProperties = {
