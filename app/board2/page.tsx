@@ -5795,6 +5795,7 @@ function Board2Editor({
   const videoRangeStateRef = useRef<Map<string, boolean>>(new Map()); // clip.id → wasInRange (previous frame)
   const videoStuckFrameCountRef = useRef<Map<string, number>>(new Map()); // clip.id → consecutive failed-draw frames while active
   const videoPlaybackStateRef = useRef<Map<string, VideoPlaybackRuntime>>(new Map()); // clip.id → active/ambient/dormant runtime state
+  const videoRedownloadsRef = useRef<Set<string>>(new Set()); // board entity ids currently being restored
   const ambientVideoEnabledRef = useRef(ambientVideoEnabled);
   const ambientCandidateIdsRef = useRef<Set<string>>(new Set());
   const lastAmbientEvalAtRef = useRef(0);
@@ -9133,6 +9134,17 @@ function Board2Editor({
     return promise;
   }
 
+  function registerVideoThumbnail(clipId: string, thumbnailUrl: string): void {
+    const img = new Image();
+    img.onload = () => {
+      thumbnailImagesRef.current.set(clipId, img);
+      drawFrame(playheadRef.current);
+      drawBoardImageOverlaysRef.current(playheadRef.current);
+    };
+    img.onerror = () => thumbnailImagesRef.current.set(clipId, null);
+    img.src = thumbnailUrl;
+  }
+
   async function captureVideoThumbnail(clipId: string, srcUrl: string): Promise<void> {
     if (thumbnailImagesRef.current.has(clipId)) return; // already captured or pre-set (pasted clip)
     try {
@@ -9169,10 +9181,7 @@ function Board2Editor({
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
       if (!blob) throw new Error("toBlob failed");
       const thumbUrl = URL.createObjectURL(blob);
-      const img = new Image();
-      img.src = thumbUrl;
-      await new Promise<void>((resolve) => { img.onload = () => resolve(); img.onerror = () => resolve(); });
-      thumbnailImagesRef.current.set(clipId, img);
+      registerVideoThumbnail(clipId, thumbUrl);
       setClips((prev) => prev.map((c) => c.id === clipId ? { ...c, thumbnailBlobUrl: thumbUrl } : c));
     } catch {
       thumbnailImagesRef.current.set(clipId, null); // mark failed — renders black box fallback
@@ -20270,13 +20279,17 @@ function Board2Editor({
                 >
                   <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: clip.needsRedownload ? "auto" : "none" }}>
                     {clip.needsRedownload ? (
-                      <div
-                        style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3 }}
-                        onClick={(e) => { e.stopPropagation(); redownloadYtClip(clip.id); }}
+                      <button
+                        type="button"
+                        data-video-redownload={clip.id}
+                        aria-label={`Re-download ${clip.name}`}
+                        style={{ width: "100%", height: "100%", border: 0, padding: 0, backgroundColor: "#1a1a2e", backgroundImage: clip.thumbnailBlobUrl ? `linear-gradient(rgba(10,10,20,.38), rgba(10,10,20,.62)), url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, cursor: "pointer", touchAction: "manipulation" }}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={(e) => { e.stopPropagation(); void redownloadYtClip(clip.id); }}
                       >
                         <span style={{ color: "#ff9f5e", fontSize: 16, pointerEvents: "none" }}>▶</span>
                         <span style={{ color: "#ff9f5e", fontSize: Math.max(6, 7 * boardZoom), fontFamily: "monospace", textAlign: "center", pointerEvents: "none" }}>tap to re-download</span>
-                      </div>
+                      </button>
                     ) : clip.type === "image" ? (
                       <canvas
                         ref={(canvas) => {
@@ -20293,8 +20306,8 @@ function Board2Editor({
                         <span style={{ color: "rgba(28,111,201,0.45)", fontSize: Math.max(10, 16 * boardZoom), pointerEvents: "none" }}>🔍</span>
                       </div>
                     ) : (
-                      <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                        <span style={{ color: "#7df5b0", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace" }}>▶ {clip.name}</span>
+                      <div style={{ width: "100%", height: "100%", backgroundColor: "#1a1a2e", backgroundImage: clip.thumbnailBlobUrl ? `url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <span style={{ color: "#7df5b0", background: clip.thumbnailBlobUrl ? "rgba(20,20,30,.62)" : "transparent", borderRadius: clip.thumbnailBlobUrl ? "50%" : 0, width: clip.thumbnailBlobUrl ? Math.max(22, 34 * boardZoom) : undefined, height: clip.thumbnailBlobUrl ? Math.max(22, 34 * boardZoom) : undefined, display: "flex", alignItems: "center", justifyContent: "center", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace", pointerEvents: "none" }}>▶{clip.thumbnailBlobUrl ? "" : ` ${clip.name}`}</span>
                       </div>
                     )}
                     <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none" }}>
@@ -21135,7 +21148,7 @@ function Board2Editor({
   // self-contained .json with media inlined as data URIs, no zip). See the RecipeManifest doc
   // comment near narrationVisemeSourceSignature for the shape and design rationale.
   async function buildRecipeManifest(embedMedia: boolean) {
-    type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob" | "source"> & {
+    type ManifestClip = Omit<Clip, "sourceUrl" | "audioBlob" | "source" | "thumbnailBlobUrl"> & {
       source: RecipeProvenance;
       assetFile?: string;
       assetMime?: string;
@@ -21193,7 +21206,7 @@ function Board2Editor({
     };
 
     for (const clip of clipsRef.current) {
-      const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, previewUrl: _p, ...rest } = clip;
+      const { sourceUrl: _s, audioBlob: _a, sourceBlob: _b, previewUrl: _p, thumbnailBlobUrl: _t, ...rest } = clip;
       const withSource = { ...rest, source: recipeProvenance(rest.source) };
       if (clip.type === "pan" || clip.type === "characterFocus" || clip.type === "customZoom") {
         manifestClips.push(withSource);
@@ -21205,7 +21218,11 @@ function Board2Editor({
             thumbnailDataUri: clip.thumbnailBlobUrl ? await tryBlobUrlToDataUri(clip.thumbnailBlobUrl) : undefined,
           });
         } else {
-          manifestClips.push({ ...withSource, needsRedownload: true });
+          manifestClips.push({
+            ...withSource,
+            needsRedownload: true,
+            thumbnailDataUri: clip.thumbnailBlobUrl ? await tryBlobUrlToDataUri(clip.thumbnailBlobUrl) : undefined,
+          });
         }
       } else if (clip.type === "narration" && clip.audioBlob) {
         if (embedMedia) {
@@ -21605,17 +21622,38 @@ function Board2Editor({
       for (const clip of clipsRef.current) {
         if (clip.sourceUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.sourceUrl);
         if (clip.previewUrl?.startsWith("blob:") && clip.previewUrl !== clip.sourceUrl) URL.revokeObjectURL(clip.previewUrl);
+        if (clip.thumbnailBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(clip.thumbnailBlobUrl);
       }
       if (characterFaceRef.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFaceRef.current.faceBlobUrl);
       if (characterFace2Ref.current?.faceBlobUrl?.startsWith("blob:")) URL.revokeObjectURL(characterFace2Ref.current.faceBlobUrl);
       // Clean up all video elements
       for (const vid of videoElsRef.current.values()) { vid.pause(); vid.src = ""; }
       videoElsRef.current.clear();
+      thumbnailImagesRef.current.clear();
       imgCacheRef.current.clear();
       warmImgCacheRef.current.clear();
 
       const loadedClips: Clip[] = [];
-      for (const mc of (manifest.clips ?? [])) {
+      for (const savedClip of (manifest.clips ?? [])) {
+        // Object URLs are scoped to the tab that created them, so older manifests may contain a
+        // thumbnailBlobUrl that is guaranteed to be dead here. New saves carry the small JPEG as
+        // a data URI instead, which can immediately paint the restored YouTube card.
+        const {
+          thumbnailDataUri,
+          thumbnailBlobUrl: _staleThumbnailBlobUrl,
+          ...mc
+        } = savedClip;
+        const persistedThumbnailUrl = mc.type === "video" && typeof thumbnailDataUri === "string" && thumbnailDataUri.startsWith("data:image/")
+          ? thumbnailDataUri
+          : undefined;
+        // Old .nbp files predate embedded thumbnails. Their durable YouTube id can still provide
+        // a useful board-card image while the user decides whether to restore the video bytes.
+        const restoredThumbnailUrl = persistedThumbnailUrl
+          ?? (mc.type === "video" && typeof mc.youtubeId === "string" && /^[A-Za-z0-9_-]{11}$/.test(mc.youtubeId)
+            ? `https://img.youtube.com/vi/${mc.youtubeId}/hqdefault.jpg`
+            : undefined);
+        if (persistedThumbnailUrl) registerVideoThumbnail(mc.id, persistedThumbnailUrl);
+        const restoredThumbnail = restoredThumbnailUrl ? { thumbnailBlobUrl: restoredThumbnailUrl } : {};
         if (mc.type === "frameSurface") {
           continue;
         } else if (mc.type === "characterZoom") {
@@ -21623,7 +21661,7 @@ function Board2Editor({
         } else if (mc.type === "pan" || mc.type === "characterFocus" || mc.type === "customZoom") {
           loadedClips.push({ ...mc, sourceUrl: "" });
         } else if (mc.needsRedownload) {
-          loadedClips.push({ ...mc, sourceUrl: "" });
+          loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: "" });
         } else if (mc.assetFile && files[mc.assetFile]) {
           const data = files[mc.assetFile];
           const assetBytes = new Uint8Array(data.byteLength);
@@ -21638,10 +21676,10 @@ function Board2Editor({
             loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob, previewUrl });
           } else if (mc.type === "video") {
             createVideoElement(mc.id, blobUrl);
-            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
+            loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: blobUrl, sourceBlob: blob });
           }
         } else {
-          loadedClips.push({ ...mc, sourceUrl: mc.sourceUrl ?? "" });
+          loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: mc.sourceUrl ?? "" });
         }
       }
 
@@ -21836,24 +21874,43 @@ function Board2Editor({
   async function redownloadYtClip(clipId: string) {
     const clip = clipsRef.current.find((c) => c.id === clipId);
     if (!clip?.youtubeId) return;
+    const entityId = boardEntityId(clip);
+    if (videoRedownloadsRef.current.has(entityId)) return;
+    videoRedownloadsRef.current.add(entityId);
     setToast("Re-downloading video…");
     try {
+      const start = clip.ytStart ?? 0;
       const dlRes = await fetch("/api/ytdl", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: clip.youtubeId, start: clip.ytStart ?? 0, end: clip.ytEnd ?? 30 }),
+        body: JSON.stringify({ id: clip.youtubeId, start, end: clip.ytEnd ?? start + 30 }),
       });
       if (!dlRes.ok) {
         const err = await dlRes.json().catch(() => ({})) as { error?: string };
         throw new Error(err.error || `Download failed (${dlRes.status})`);
       }
       const blob = await dlRes.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      createVideoElement(clipId, blobUrl);
-      setClips((prev) => prev.map((c) => c.id !== clipId ? c : { ...c, sourceUrl: blobUrl, sourceBlob: blob, needsRedownload: false }));
+      const sourceBytes = await blob.arrayBuffer();
+      const restoredSources = new Map<string, { sourceUrl: string; sourceBlob: Blob }>();
+      const relatedClips = clipsRef.current.filter((candidate) =>
+        candidate.type === "video" && referencesBoardEntity(candidate, entityId));
+      for (const relatedClip of relatedClips) {
+        // Every timeline appearance keeps its own Blob and object URL so parallel video elements
+        // do not fight over a shared browser decoder.
+        const sourceBlob = new Blob([sourceBytes.slice(0)], { type: blob.type || "video/mp4" });
+        const sourceUrl = URL.createObjectURL(sourceBlob);
+        restoredSources.set(relatedClip.id, { sourceUrl, sourceBlob });
+        createVideoElement(relatedClip.id, sourceUrl);
+      }
+      setClips((prev) => prev.map((candidate) => {
+        const source = restoredSources.get(candidate.id);
+        return source ? { ...candidate, ...source, needsRedownload: false } : candidate;
+      }));
       setToast("Video ready");
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Re-download failed");
+    } finally {
+      videoRedownloadsRef.current.delete(entityId);
     }
   }
 
@@ -22509,13 +22566,17 @@ function Board2Editor({
                     >
                       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
                         {clip.needsRedownload ? (
-                          <div
-                            style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", gap: 4 }}
-                            onClick={(e) => { e.stopPropagation(); redownloadYtClip(clip.id); }}
+                          <button
+                            type="button"
+                            data-video-redownload={clip.id}
+                            aria-label={`Re-download ${clip.name}`}
+                            style={{ width: "100%", height: "100%", border: 0, padding: 0, backgroundColor: "#1a1a2e", backgroundImage: clip.thumbnailBlobUrl ? `linear-gradient(rgba(10,10,20,.38), rgba(10,10,20,.62)), url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", gap: 4, touchAction: "manipulation" }}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); void redownloadYtClip(clip.id); }}
                           >
                             <span style={{ color: "#ff9f5e", fontSize: 18, pointerEvents: "none" }}>▶</span>
                             <span style={{ color: "#ff9f5e", fontSize: 8, fontFamily: "monospace", textAlign: "center", pointerEvents: "none", padding: "0 4px" }}>click to re-download</span>
-                          </div>
+                          </button>
                         ) : clip.type === "image" ? (
                           <canvas
                             ref={(canvas) => {
@@ -22532,8 +22593,8 @@ function Board2Editor({
                             <span style={{ color: "rgba(28,111,201,0.45)", fontSize: 20, pointerEvents: "none" }}>🔍</span>
                           </div>
                         ) : (
-                          <div style={{ width: "100%", height: "100%", background: "#1a1a2e", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                            <span style={{ color: "#7df5b0", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>▶ {clip.name}</span>
+                          <div style={{ width: "100%", height: "100%", backgroundColor: "#1a1a2e", backgroundImage: clip.thumbnailBlobUrl ? `url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            <span style={{ color: "#7df5b0", background: clip.thumbnailBlobUrl ? "rgba(20,20,30,.62)" : "transparent", borderRadius: clip.thumbnailBlobUrl ? "50%" : 0, width: clip.thumbnailBlobUrl ? 38 : undefined, height: clip.thumbnailBlobUrl ? 38 : undefined, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>▶{clip.thumbnailBlobUrl ? "" : ` ${clip.name}`}</span>
                           </div>
                         )}
                         <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 4px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: 9, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none" }}>
