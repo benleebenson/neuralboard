@@ -77,18 +77,9 @@ The complete product is a single large client component. Key subsystems:
 - **State pattern**: React state for render triggers; `useRef` mirrors (`clipsRef`, `isPlayingRef`, etc.) used inside RAF/event handlers to avoid stale closures.
 - **YouTube modal**: searches via Railway `/video-search`, downloads via Railway `/ytdl` + `/ytdl-file/:id`.
 
-### Neural Board World (`lib/world/`, `app/board2/world/`)
+### Infinite board space (`lib/simple-world.ts`, `app/board2/page.tsx`)
 
-One infinite canvas where every board is a **region**; a region is a project. It is an overlay on `/board2` (not a route: `/world` redirects to `/board2?world=1`), so world ↔ region is a camera zoom, not a page load. Local files only, no Supabase.
-
-- `lib/world/world-model.ts` — the `.nbw` format (schema documented in its header comment), geometry, overlap rules, staging strip, selection moves. Pure, no imports; tested by `world-model.test.mjs`.
-- `lib/world/world-store.ts` — File System Access persistence: the `.nbw` index, `<name>.media/{regions,assets,previews}`, serialized writes, garbage collection.
-- `lib/world/region-import.ts` — `.nbp` → region (source file is only read), and writing an edited region back.
-- `lib/world/lod-renderer.ts` — FAR/MID/NEAR levels, cross-fade weights, cached far-zoom blobs, culling-aware drawing.
-- `app/board2/world/WorldView.tsx` — the overlay (camera, marquee/move/create gestures); `image-store.ts` bounds decoded images.
-- `app/world-bench/` — dev-only fixture + measurement harness (see the header of `WorldBench.tsx`).
-- The world file holds references only, never `data:` base64 bytes (validated on read and write). Regions are at least one board (4000×3000) and never overlap.
-- Editor coupling is minimal: `loadBoard(file, region?)`, "Save to World" when a region is open, the "Back to World" button, and `?worldRegionId=`. The plain `.nbp` path is unchanged.
+The editor board and every Library-added `.nbp` share the editor's existing parchment coordinate space. The bottom-left control hides editor chrome without changing the board; normal wheel zoom and direct drag-panning then reveal other boards. Inactive boards are each one flattened PNG generated once when added and written to `.neuralboard-space/` inside the chosen boards folder. Only on-screen composites mount, failed composites are not retried, and opening a centered board swaps its composite for that board's live editor while mounted workspaces preserve unsaved state.
 
 ### AI pipeline (`/api/transcribe`)
 

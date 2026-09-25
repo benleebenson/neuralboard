@@ -8,9 +8,7 @@ import { ProGated, UpgradeModal } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
-import { WorldView, type WorkspaceWorldApi } from "@/app/board2/world/WorldView";
-import { WORLD_PENDING_IMPORT_FILE, type WorldRegion } from "@/lib/world/world-model";
-import { updateWorldRegion } from "@/lib/world/region-import";
+import { listSimpleWorldBoards, openSimpleWorldBoardFile, openSimpleWorldPreviewFile, type SimpleWorldBoard } from "@/lib/simple-world";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
@@ -2429,6 +2427,39 @@ function drawCurlyBrace(
   ctx.lineTo(x + q * 1.5, mid);
   ctx.stroke();
   ctx.restore();
+}
+
+const BOARD_EXPORT_PADDING = 160;
+
+/**
+ * The true extent of everything actually on the board — every image/video plus every
+ * annotation — regardless of the board's nominal `boardDimensions` box. Used to "shrink-wrap"
+ * the full-board image export around real content instead of an arbitrary fixed frame.
+ * Returns null when the board has nothing placed on it yet.
+ */
+function boardContentBounds(
+  clips: Clip[],
+  annotations: Annotation[]
+): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const clip of boardEntitiesForDisplay(clips)) {
+    // Custom Zoom regions are camera targets with no pixels of their own — including them
+    // could balloon the export around an empty focus rectangle far from any real content.
+    if (clip.type === "customZoom") continue;
+    if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+    minX = Math.min(minX, clip.boardX);
+    minY = Math.min(minY, clip.boardY);
+    maxX = Math.max(maxX, clip.boardX + clip.boardW);
+    maxY = Math.max(maxY, clip.boardY + clip.boardH);
+  }
+  for (const ann of annotations) {
+    minX = Math.min(minX, ann.boardX);
+    minY = Math.min(minY, ann.boardY);
+    maxX = Math.max(maxX, ann.boardX + ann.boardW);
+    maxY = Math.max(maxY, ann.boardY + ann.boardH);
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
+  return { minX, minY, maxX, maxY };
 }
 
 function drawAnnotationsToCanvas(
@@ -5111,82 +5142,96 @@ function poseAllowsSpeechBubble(pose: CharPoseResult): boolean {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+const failedWorldCompositeIds = new Set<string>();
+
+function WorldBoardComposite({ board, style }: { board: SimpleWorldBoard; style: React.CSSProperties }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (failedWorldCompositeIds.has(board.id)) return;
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    void openSimpleWorldPreviewFile(board).then((blob) => {
+      if (cancelled) return;
+      objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+    }).catch(() => { failedWorldCompositeIds.add(board.id); });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [board]);
+  if (!url || failedWorldCompositeIds.has(board.id)) return null;
+  return (
+    // Each inactive board is exactly one on-disk flattened image; no individual media are mounted.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={url}
+      alt={board.name}
+      draggable={false}
+      data-world-board-composite={board.id}
+      onError={() => { failedWorldCompositeIds.add(board.id); setUrl(null); }}
+      style={{ ...style, objectFit: "fill", userSelect: "none", pointerEvents: "none" }}
+    />
+  );
+}
+
 type BoardWorkspaceStatus = {
   id: string;
   name: string;
   isExporting: boolean;
   exportProgress: number;
   hasContent: boolean;
+  isDirty: boolean;
 };
 
-function createBoardWorkspace(index: number): BoardWorkspaceStatus {
+type BoardWorkspace = BoardWorkspaceStatus & {
+  sourceFileName?: string;
+  initialFile?: File;
+};
+
+function createBoardWorkspace(index: number, source?: { file: File; fileName: string; name: string }): BoardWorkspace {
   return {
     id: index === 1 ? "board-workspace-1" : `board-workspace-${Date.now()}-${index}`,
-    name: index === 1 ? "My Board" : `Board ${index}`,
+    name: source?.name ?? (index === 1 ? "My Board" : `Board ${index}`),
     isExporting: false,
     exportProgress: 0,
     hasContent: false,
+    isDirty: false,
+    sourceFileName: source?.fileName,
+    initialFile: source?.file,
   };
 }
 
 export default function Board2Page() {
   const [initialJoinCode, setInitialJoinCode] = useState("");
+  // Query-derived initial state is applied after hydration so server/client markup stays aligned.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setInitialJoinCode(normalizeJoinCode(new URLSearchParams(window.location.search).get("join"))); }, []);
   const nextWorkspaceIndexRef = useRef(2);
-  const [workspaces, setWorkspaces] = useState<BoardWorkspaceStatus[]>(() => [createBoardWorkspace(1)]);
+  const [workspaces, setWorkspaces] = useState<BoardWorkspace[]>(() => [createBoardWorkspace(1)]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
-  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
-  useEffect(() => { activeWorkspaceIdRef.current = activeWorkspaceId; }, [activeWorkspaceId]);
-
-  // ── Neural Board World: one overlay for the whole page, shared by every workspace tab ──
-  const [worldOpen, setWorldOpen] = useState(false);
-  const workspaceWorldApisRef = useRef(new Map<string, WorkspaceWorldApi>());
-  const workspaceRegionRef = useRef(new Map<string, string>());
-  const openWorld = useCallback(() => setWorldOpen(true), []);
-  const closeWorld = useCallback(() => setWorldOpen(false), []);
-  const registerWorkspaceWorldApi = useCallback((workspaceId: string, api: WorkspaceWorldApi | null) => {
-    if (api) workspaceWorldApisRef.current.set(workspaceId, api);
-    else { workspaceWorldApisRef.current.delete(workspaceId); workspaceRegionRef.current.delete(workspaceId); }
-  }, []);
-  const setWorkspaceWorldRegion = useCallback((workspaceId: string, regionId: string | null) => {
-    if (regionId) workspaceRegionRef.current.set(workspaceId, regionId);
-    else workspaceRegionRef.current.delete(workspaceId);
-  }, []);
-  // `/board2?worldRegionId=<id>` opens the world and zooms straight into that region.
-  const [initialWorldRegionId] = useState<string | null>(() => typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("worldRegionId"));
+  const [chromeHidden, setChromeHidden] = useState(false);
+  const [worldBoards, setWorldBoards] = useState<SimpleWorldBoard[]>([]);
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("world") !== "1" && !params.get("worldRegionId") && !sessionStorage.getItem(WORLD_PENDING_IMPORT_FILE)) return;
-    const timer = window.setTimeout(() => setWorldOpen(true), 0);
-    return () => window.clearTimeout(timer);
+    let cancelled = false;
+    void listSimpleWorldBoards().then((boards) => {
+      if (!cancelled) setWorldBoards(boards.map((board) => ({ ...board, width: board.width || 4000, height: board.height || 3000 })));
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, []);
-
-  // Runs before the world zooms into a region. Returning false cancels the open.
-  const beforeOpenWorldRegion = useCallback(async (region: WorldRegion): Promise<boolean> => {
-    const activeId = activeWorkspaceIdRef.current;
-    const owner = [...workspaceRegionRef.current].find(([, regionId]) => regionId === region.id)?.[0];
-    if (owner === activeId) { setWorldOpen(false); return false; }
-    if (owner) { setActiveWorkspaceId(owner); setWorldOpen(false); return false; }
-    const api = workspaceWorldApisRef.current.get(activeId);
-    if (api?.isDirty()) {
-      return window.confirm(`“${api.name()}” has unsaved changes. Opening “${region.name}” will replace the board in this tab and discard them. Open anyway?`);
-    }
-    return true;
-  }, []);
-  const openWorldRegion = useCallback(async (file: File, region: WorldRegion): Promise<boolean> => {
-    const api = workspaceWorldApisRef.current.get(activeWorkspaceIdRef.current);
-    return api ? api.loadRegion(file, region) : false;
-  }, []);
-
   const updateWorkspace = useCallback((status: BoardWorkspaceStatus) => {
     setWorkspaces((current) => current.map((workspace) => {
       if (workspace.id !== status.id) return workspace;
       if (
         workspace.name === status.name && workspace.isExporting === status.isExporting &&
-        workspace.exportProgress === status.exportProgress && workspace.hasContent === status.hasContent
+        workspace.exportProgress === status.exportProgress && workspace.hasContent === status.hasContent &&
+        workspace.isDirty === status.isDirty
       ) return workspace;
-      return status;
+      return { ...workspace, ...status };
     }));
+  }, []);
+  const updateWorkspaceSource = useCallback((workspaceId: string, fileName: string) => {
+    setWorkspaces((current) => current.map((workspace) => workspace.id === workspaceId ? { ...workspace, sourceFileName: fileName } : workspace));
   }, []);
 
   const addWorkspace = useCallback(() => {
@@ -5199,7 +5244,7 @@ export default function Board2Page() {
     const closingIndex = workspaces.findIndex((workspace) => workspace.id === workspaceId);
     const closing = workspaces[closingIndex];
     if (!closing || closing.isExporting || workspaces.length === 1) return;
-    if (closing.hasContent && !window.confirm(`Close “${closing.name}”? Unsaved changes in this tab will be lost.`)) return;
+    if (closing.isDirty && !window.confirm(`Close “${closing.name}”? Unsaved changes in this tab will be lost.`)) return;
     const remaining = workspaces.filter((workspace) => workspace.id !== workspaceId);
     setWorkspaces(remaining);
     if (activeWorkspaceId === workspaceId) {
@@ -5207,9 +5252,28 @@ export default function Board2Page() {
     }
   }, [activeWorkspaceId, workspaces]);
 
+  const openWorldBoard = useCallback(async (board: SimpleWorldBoard) => {
+    const existing = workspaces.find((workspace) => workspace.sourceFileName === board.fileName);
+    if (existing?.id === activeWorkspaceId) {
+      setChromeHidden(false);
+      return;
+    }
+    if (existing) {
+      setActiveWorkspaceId(existing.id);
+      setChromeHidden(false);
+      return;
+    }
+    const file = await openSimpleWorldBoardFile(board);
+    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++, { file, fileName: board.fileName, name: board.name });
+    setWorkspaces((items) => [...items, next]);
+    setActiveWorkspaceId(next.id);
+    setChromeHidden(false);
+  }, [activeWorkspaceId, workspaces]);
+
   return (
-    <div style={{ height: "100dvh", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: "#e8e2d5" }}>
-      <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
+    <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
+      <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
+        {!chromeHidden && <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
         {workspaces.map((workspace) => {
           const active = workspace.id === activeWorkspaceId;
           const percent = Math.max(0, Math.min(100, Math.round(workspace.exportProgress * 100)));
@@ -5226,25 +5290,29 @@ export default function Board2Page() {
           );
         })}
         <button type="button" onClick={addWorkspace} aria-label="Open a new board tab" title="New board" style={{ width: 34, minWidth: 34, border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 18 }}>+</button>
-      </nav>
-      <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
-        {workspaces.map((workspace) => (
-          <div key={workspace.id} aria-hidden={workspace.id !== activeWorkspaceId} style={{ position: "absolute", inset: 0, display: workspace.id === activeWorkspaceId ? "block" : "none" }}>
-            <Board2Editor
-              workspaceId={workspace.id}
-              isWorkspaceActive={workspace.id === activeWorkspaceId}
-              initialName={workspace.name}
-              initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
-              onWorkspaceStatus={updateWorkspace}
-              isWorldOpen={worldOpen}
-              onOpenWorld={openWorld}
-              registerWorldApi={registerWorkspaceWorldApi}
-              onWorldRegionChange={setWorkspaceWorldRegion}
-            />
-          </div>
-        ))}
+        </nav>}
+        <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
+          {workspaces.map((workspace) => (
+            <div key={workspace.id} aria-hidden={workspace.id !== activeWorkspaceId} style={{ position: "absolute", inset: 0, display: workspace.id === activeWorkspaceId ? "block" : "none" }}>
+              <Board2Editor
+                workspaceId={workspace.id}
+                isWorkspaceActive={workspace.id === activeWorkspaceId}
+                initialName={workspace.name}
+                initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
+                initialFile={workspace.initialFile}
+                initialFileName={workspace.sourceFileName}
+                onWorkspaceStatus={updateWorkspace}
+                onWorkspaceSource={updateWorkspaceSource}
+                chromeHidden={chromeHidden}
+                worldBoards={worldBoards}
+                activeWorldBoard={worldBoards.find((board) => board.fileName === workspace.sourceFileName) ?? null}
+                onToggleChrome={() => setChromeHidden((hidden) => !hidden)}
+                onEnterWorldBoard={openWorldBoard}
+              />
+            </div>
+          ))}
+        </div>
       </div>
-      <WorldView open={worldOpen} onClose={closeWorld} beforeOpenRegion={beforeOpenWorldRegion} onOpenRegion={openWorldRegion} initialRegionId={initialWorldRegionId} />
     </div>
   );
 }
@@ -5254,21 +5322,29 @@ function Board2Editor({
   isWorkspaceActive,
   initialName,
   initialJoinCode,
+  initialFile,
+  initialFileName,
   onWorkspaceStatus,
-  isWorldOpen,
-  onOpenWorld,
-  registerWorldApi,
-  onWorldRegionChange,
+  onWorkspaceSource,
+  chromeHidden,
+  worldBoards,
+  activeWorldBoard,
+  onToggleChrome,
+  onEnterWorldBoard,
 }: {
   workspaceId: string;
   isWorkspaceActive: boolean;
   initialName: string;
   initialJoinCode: string;
+  initialFile?: File;
+  initialFileName?: string;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
-  isWorldOpen: boolean;
-  onOpenWorld: () => void;
-  registerWorldApi: (workspaceId: string, api: WorkspaceWorldApi | null) => void;
-  onWorldRegionChange: (workspaceId: string, regionId: string | null) => void;
+  onWorkspaceSource: (workspaceId: string, fileName: string) => void;
+  chromeHidden: boolean;
+  worldBoards: SimpleWorldBoard[];
+  activeWorldBoard: SimpleWorldBoard | null;
+  onToggleChrome: () => void;
+  onEnterWorldBoard: (board: SimpleWorldBoard) => Promise<void>;
 }) {
   const { data: session } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
@@ -5431,7 +5507,11 @@ function Board2Editor({
   const [isSaving, setIsSaving] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [isExportingBoardData, setIsExportingBoardData] = useState(false);
-  const [activeWorldRegion, setActiveWorldRegion] = useState<WorldRegion | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
+  const currentDirtySignatureRef = useRef("");
+  const savedDirtySignatureRef = useRef<string | null>(null);
+  const resetDirtyAfterLoadRef = useRef(false);
+  const initialFileLoadStartedRef = useRef(false);
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -5686,6 +5766,7 @@ function Board2Editor({
     [boardImageCount, deviceMemoryGb],
   );
   const visibleBoardClips = useMemo(() => {
+    if (!isWorkspaceActive) return [];
     const zoom = Math.max(0.001, boardZoom);
     const viewportLeft = -boardPan.x / zoom;
     const viewportTop = -boardPan.y / zoom;
@@ -5700,7 +5781,30 @@ function Board2Editor({
         clip.boardY + clip.boardH >= viewportTop - paddingY &&
         clip.boardY <= viewportTop + viewportHeight + paddingY;
     });
-  }, [clips, boardPan, boardZoom, boardViewportSize, previewCachePolicy.preloadViewportMargin]);
+  }, [clips, boardPan, boardZoom, boardViewportSize, isWorkspaceActive, previewCachePolicy.preloadViewportMargin]);
+  const activeWorldOrigin = activeWorldBoard ? { x: activeWorldBoard.x, y: activeWorldBoard.y } : { x: 0, y: 0 };
+  const activeBoardOnScreen = boardPan.x + boardDimensions.width * boardZoom >= 0 &&
+    boardPan.x <= boardViewportSize.width &&
+    boardPan.y + boardDimensions.height * boardZoom >= 0 &&
+    boardPan.y <= boardViewportSize.height;
+  const visibleWorldBoards = useMemo(() => {
+    if (!chromeHidden) return [];
+    // Mount a composite just before it reaches the viewport so disk I/O never becomes a visible pop.
+    // Boards outside this narrow screen-space margin remain completely unloaded.
+    const preloadMargin = 320;
+    return worldBoards.filter((board) => {
+      if (board.fileName === activeWorldBoard?.fileName) return false;
+      const left = boardPan.x + (board.x - activeWorldOrigin.x) * boardZoom;
+      const top = boardPan.y + (board.y - activeWorldOrigin.y) * boardZoom;
+      const width = (board.width || BOARD_W) * boardZoom;
+      const height = (board.height || BOARD_H) * boardZoom;
+      return left + width >= -preloadMargin && left <= boardViewportSize.width + preloadMargin &&
+        top + height >= -preloadMargin && top <= boardViewportSize.height + preloadMargin;
+    });
+  }, [activeWorldBoard?.fileName, activeWorldOrigin.x, activeWorldOrigin.y, boardPan.x, boardPan.y, boardViewportSize.height, boardViewportSize.width, boardZoom, chromeHidden, worldBoards]);
+  const loadedWorldMediaCount = (chromeHidden && activeBoardOnScreen
+    ? visibleBoardClips.filter((clip) => clip.type === "image" || clip.type === "video").length
+    : 0) + visibleWorldBoards.length;
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -6743,6 +6847,8 @@ function Board2Editor({
 
   useEffect(() => {
     if (!initialJoinCode || joinCode) return;
+    // Apply the query-derived initial code after hydration to preserve the current join flow.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setJoinCode(initialJoinCode);
     setJoinStatus("connecting");
     if (isMobile) setMobileDesktopOverride(true);
@@ -6837,8 +6943,8 @@ function Board2Editor({
   // playheadRef is the authoritative playback clock. Every explicit seek updates state and this
   // ref together; copying throttled React state back into it here would rewind live playback.
   useEffect(() => {
-    onWorkspaceStatus({ id: workspaceId, name: saveName.trim() || "Untitled Board", isExporting, exportProgress, hasContent: clips.length > 0 || annotations.length > 0 });
-  }, [annotations.length, clips.length, exportProgress, isExporting, onWorkspaceStatus, saveName, workspaceId]);
+    onWorkspaceStatus({ id: workspaceId, name: saveName.trim() || "Untitled Board", isExporting, exportProgress, hasContent: clips.length > 0 || annotations.length > 0, isDirty });
+  }, [annotations.length, clips.length, exportProgress, isDirty, isExporting, onWorkspaceStatus, saveName, workspaceId]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
   useEffect(() => {
     if (isWorkspaceActive || !isPlayingRef.current) return;
@@ -6852,6 +6958,17 @@ function Board2Editor({
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  useEffect(() => {
+    if (isWorkspaceActive && (!chromeHidden || activeBoardOnScreen)) return;
+    for (const image of [...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()]) image.src = "";
+    imgCacheRef.current.clear();
+    warmImgCacheRef.current.clear();
+    previewImagePendingRef.current.clear();
+    boardImageCanvasRefs.current.clear();
+    stopAllVideoPlayback("board-offscreen");
+  // Cache/media teardown deliberately follows visibility instead of board edits.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBoardOnScreen, chromeHidden, isWorkspaceActive]);
   useEffect(() => {
     previewCachePolicyRef.current = previewCachePolicy;
     trimPreviewImageCaches();
@@ -6891,59 +7008,18 @@ function Board2Editor({
     ...boardUndoSnapshot,
     clips: boardUndoSnapshot.clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, ...clip }) => clip),
   }), [boardUndoSnapshot]);
-
-  // Unsaved-change tracking for the world's "open region" guard. The baseline is the undo signature
-  // as of the last load or save; after a load it is captured once the signature has stopped
-  // changing, because restoring a board settles over several async state updates.
-  const boardUndoSignatureRef = useRef(boardUndoSignature);
-  const savedBoardSignatureRef = useRef<string | null>(null);
-  const boardBaselineArmedRef = useRef(false);
-  const boardBaselineTimerRef = useRef<number | null>(null);
-  const armBoardBaseline = useCallback(() => {
-    boardBaselineArmedRef.current = true;
-    if (boardBaselineTimerRef.current !== null) window.clearTimeout(boardBaselineTimerRef.current);
-    boardBaselineTimerRef.current = window.setTimeout(() => {
-      boardBaselineTimerRef.current = null;
-      boardBaselineArmedRef.current = false;
-      savedBoardSignatureRef.current = boardUndoSignatureRef.current;
-    }, 800);
-  }, []);
+  const dirtySignature = useMemo(() => `${saveName}\n${boardUndoSignature}`, [boardUndoSignature, saveName]);
   useEffect(() => {
-    boardUndoSignatureRef.current = boardUndoSignature;
-    if (savedBoardSignatureRef.current === null) savedBoardSignatureRef.current = boardUndoSignature;
-    else if (boardBaselineArmedRef.current) armBoardBaseline();
-  }, [armBoardBaseline, boardUndoSignature]);
-  useEffect(() => () => {
-    if (boardBaselineTimerRef.current !== null) window.clearTimeout(boardBaselineTimerRef.current);
-  }, []);
-
-  // Everything the page-level world overlay needs from this workspace. Refs keep the registered
-  // object stable while always calling the latest render's closures.
-  const worldApiStateRef = useRef({ loadRegion: null as null | ((file: File, region: WorldRegion) => Promise<boolean>), name: initialName });
-  useEffect(() => {
-    worldApiStateRef.current = {
-      name: saveName.trim() || "Untitled Board",
-      loadRegion: async (file, region) => {
-        const opened = await loadBoard(file, region);
-        if (opened) setToast(`Opened world region “${region.name}”`);
-        return opened;
-      },
-    };
-  });
-  useEffect(() => {
-    registerWorldApi(workspaceId, {
-      isDirty: () => !boardBaselineArmedRef.current && savedBoardSignatureRef.current !== null && savedBoardSignatureRef.current !== boardUndoSignatureRef.current,
-      name: () => worldApiStateRef.current.name,
-      loadRegion: (file, region) => worldApiStateRef.current.loadRegion?.(file, region) ?? Promise.resolve(false),
-    });
-    return () => registerWorldApi(workspaceId, null);
-  }, [registerWorldApi, workspaceId]);
-  useEffect(() => { onWorldRegionChange(workspaceId, activeWorldRegion?.id ?? null); }, [activeWorldRegion?.id, onWorldRegionChange, workspaceId]);
-  useEffect(() => {
-    if (isWorldOpen && isWorkspaceActive && isPlayingRef.current) togglePlay();
-  // togglePlay is recreated every render; only the open transition matters.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isWorldOpen]);
+    currentDirtySignatureRef.current = dirtySignature;
+    if (isLoadingProject) return;
+    if (resetDirtyAfterLoadRef.current || savedDirtySignatureRef.current === null) {
+      resetDirtyAfterLoadRef.current = false;
+      savedDirtySignatureRef.current = dirtySignature;
+      setIsDirty(false);
+      return;
+    }
+    setIsDirty(savedDirtySignatureRef.current !== dirtySignature);
+  }, [dirtySignature, isLoadingProject]);
 
   useEffect(() => {
     if (boardUndoApplyingSignatureRef.current === boardUndoSignature) {
@@ -7210,6 +7286,14 @@ function Board2Editor({
       }
     })();
     // loadBoard is a component-local file loader; this intentionally runs once on editor mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    if (!initialFile || initialFileLoadStartedRef.current) return;
+    initialFileLoadStartedRef.current = true;
+    recipeLibraryFilenameRef.current = initialFileName ?? null;
+    void loadBoard(initialFile);
+    // A workspace is created with its source file once; later edits stay in its mounted editor.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -7763,13 +7847,13 @@ function Board2Editor({
     if (!container) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const factor = Math.exp(-e.deltaY * 0.0015);
       const rect = container.getBoundingClientRect();
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
       const pz = boardZoomRef.current;
       const pp = boardPanRef.current;
-      const nz = Math.max(0.05, Math.min(3, pz * factor));
+      const nz = Math.max(0.018, Math.min(3, pz * factor));
       const np = { x: mx - (mx - pp.x) * (nz / pz), y: my - (my - pp.y) * (nz / pz) };
       boardZoomRef.current = nz;
       boardPanRef.current = np;
@@ -14077,8 +14161,25 @@ function Board2Editor({
     placePendingMediaAt(clientToBoardPoint(e.clientX, e.clientY));
   }
 
+  function boardAtViewportCenter(): SimpleWorldBoard | null {
+    const container = boardContainerRef.current;
+    if (!container) return activeWorldBoard;
+    const worldX = activeWorldOrigin.x + (container.clientWidth / 2 - boardPanRef.current.x) / boardZoomRef.current;
+    const worldY = activeWorldOrigin.y + (container.clientHeight / 2 - boardPanRef.current.y) / boardZoomRef.current;
+    return worldBoards.find((board) => worldX >= board.x && worldX <= board.x + (board.width || BOARD_W) && worldY >= board.y && worldY <= board.y + (board.height || BOARD_H)) ?? null;
+  }
+
+  function restoreChromeForCenteredBoard() {
+    const centered = boardAtViewportCenter();
+    if (!centered || centered.fileName === activeWorldBoard?.fileName) {
+      onToggleChrome();
+      return;
+    }
+    void onEnterWorldBoard(centered).catch((error) => setToast(error instanceof Error ? error.message : "Could not open that board"));
+  }
+
   function handleBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isSpaceDownRef.current) return;
+    if (!isSpaceDownRef.current && !chromeHidden) return;
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const startX = e.clientX, startY = e.clientY;
@@ -15227,6 +15328,8 @@ function Board2Editor({
   // then rebuild from the latest refs instead of asking the user to maintain it manually.
   useEffect(() => {
     if (!canGenerateCamera || isLoadingProject) return;
+    // Mark the derived keyframes stale as soon as their source board data changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setKeyframesOutOfDate(true);
     const timer = window.setTimeout(() => { void generateCameraKeyframes(); }, 400);
     return () => window.clearTimeout(timer);
@@ -16568,6 +16671,7 @@ function Board2Editor({
     exportCancelRef.current = false;
     const currentClips = clipsRef.current;
     const currentAnnotations = annotationsRef.current;
+    const originalBoardDimensions = boardDimensionsRef.current;
     try {
       await Promise.all([
         ensureAnnotationFontsLoaded(currentAnnotations),
@@ -16575,7 +16679,20 @@ function Board2Editor({
       ]);
       if (snapshotIncludeCharacter && characterFaceImageRef.current) await characterFaceImageRef.current.decode();
       if (snapshotIncludeCharacter && characterFace2ImageRef.current) await characterFace2ImageRef.current.decode();
-      const { width, height } = snapshotDimensions(boardDimensionsRef.current.width, boardDimensionsRef.current.height);
+      // Shrink-wrap the export around whatever's actually on the board — images can be placed
+      // anywhere on the infinite board, well outside the nominal boardDimensions box, so exporting
+      // that fixed box would crop real content or capture mostly empty parchment. Fall back to the
+      // nominal box only when the board is empty.
+      const bounds = boardContentBounds(currentClips, currentAnnotations);
+      const frame = bounds
+        ? {
+            minX: bounds.minX - BOARD_EXPORT_PADDING,
+            minY: bounds.minY - BOARD_EXPORT_PADDING,
+            width: Math.max(1, bounds.maxX - bounds.minX + BOARD_EXPORT_PADDING * 2),
+            height: Math.max(1, bounds.maxY - bounds.minY + BOARD_EXPORT_PADDING * 2),
+          }
+        : { minX: 0, minY: 0, width: originalBoardDimensions.width, height: originalBoardDimensions.height };
+      const { width, height } = snapshotDimensions(frame.width, frame.height);
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
@@ -16584,10 +16701,14 @@ function Board2Editor({
       context.imageSmoothingEnabled = true;
       context.imageSmoothingQuality = "high";
       const camera = {
-        cameraX: boardDimensionsRef.current.width / 2,
-        cameraY: boardDimensionsRef.current.height / 2,
+        cameraX: frame.minX + frame.width / 2,
+        cameraY: frame.minY + frame.height / 2,
         boardZoom: 1,
       };
+      // renderToCtx and prepareOfflineVideoFrames scale/cull off of boardDimensionsRef.current.width
+      // rather than a passed-in frame width, so point that ref at the shrink-wrapped frame for the
+      // duration of this render.
+      boardDimensionsRef.current = { width: frame.width, height: frame.height };
       const time = playheadRef.current;
       await prepareOfflineVideoFrames(time, currentClips, camera, width, height);
       renderToCtx(context, time, currentClips, cameraKeyframesRef.current, width, height, currentAnnotations, camera, undefined, "snapshot", { includeCharacter: snapshotIncludeCharacter });
@@ -16606,6 +16727,7 @@ function Board2Editor({
     } catch (error) {
       setToast(error instanceof Error ? error.message : "Board image export failed");
     } finally {
+      boardDimensionsRef.current = originalBoardDimensions;
       releaseOfflineRenderAssets();
       setIsExportingBoardImage(false);
       drawFrameRef.current(playheadRef.current);
@@ -20625,7 +20747,7 @@ function Board2Editor({
                   )}
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>Add Media</div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    <label style={{ display: "grid", gap: 5, fontSize: 13, fontWeight: 700 }}>
+                    <label style={{ ...uploadControlStyle, width: "100%", padding: "10px 14px", fontSize: 13 }}>
                       ↑ Upload photo / video
                       <input type="file" accept="image/*,video/*" multiple aria-label="Upload photo or video" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileDrawer(null); }} />
                     </label>
@@ -20654,8 +20776,8 @@ function Board2Editor({
                         🏆  Top 5
                       </button>
                     </ProGated>}
-                    <label style={{ display: "grid", gap: 5, fontSize: 13, fontWeight: 700 }}>
-                      ↑ Upload audio / mp4
+                    <label style={{ ...uploadControlStyle, width: "100%", padding: "10px 14px", fontSize: 13 }}>
+                      ↑ Upload narration
                       <input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileDrawer(null); }} />
                     </label>
                     <ProGated featureName="Narration Recording">
@@ -21130,7 +21252,7 @@ function Board2Editor({
               />
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700, padding: "10px 0" }}>
-                  {isSaving ? "Saving…" : activeWorldRegion ? "💾 Save to World" : "💾 Save .nbp"}
+                  {isSaving ? "Saving…" : "💾 Save .nbp"}
                 </button>
                 <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1, padding: "10px 0" }}>Cancel</button>
               </div>
@@ -21463,20 +21585,8 @@ function Board2Editor({
     if (isSaving) return;
     setIsSaving(true);
     setToast("Saving…");
-    const signatureAtSave = boardUndoSignatureRef.current;
     try {
       const { manifest, zipFiles } = await buildRecipeManifest(false);
-      if (activeWorldRegion) {
-        const directory = await getBoardsDirectory({ prompt: true, write: true });
-        if (!directory) throw new Error("Choose the world folder to save this region.");
-        const assetFiles = Object.fromEntries(Object.entries(zipFiles).map(([path, entry]) => [path, entry[0]]));
-        const updated = await updateWorldRegion(directory, activeWorldRegion.id, manifest, assetFiles);
-        setActiveWorldRegion(updated.region);
-        savedBoardSignatureRef.current = signatureAtSave;
-        setSaveModalOpen(false);
-        setToast(`Saved “${updated.region.name}” to Neural Board World`);
-        return;
-      }
       zipFiles["manifest.json"] = [strToU8(JSON.stringify(manifest, null, 2)), { level: 6 }];
 
       const zipped = zipSync(zipFiles);
@@ -21504,7 +21614,8 @@ function Board2Editor({
         a.click();
         URL.revokeObjectURL(url);
       }
-      savedBoardSignatureRef.current = signatureAtSave;
+      savedDirtySignatureRef.current = currentDirtySignatureRef.current;
+      setIsDirty(false);
       setSaveModalOpen(false);
       setToast(savedToFolder ? "Board saved to library!" : "Board downloaded!");
     } catch (err) {
@@ -21540,8 +21651,9 @@ function Board2Editor({
     }
   }
 
-  async function loadBoard(file: File, worldRegion: WorldRegion | null = null): Promise<boolean> {
+  async function loadBoard(file: File): Promise<boolean> {
     if (isLoadingProject) return false;
+    resetDirtyAfterLoadRef.current = true;
     setIsLoadingProject(true);
     setToast("Loading project…");
     try {
@@ -21555,6 +21667,8 @@ function Board2Editor({
       const files = unzipSync(new Uint8Array(buffer));
       if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
       const rawManifest = JSON.parse(strFromU8(files["manifest.json"]));
+      recipeLibraryFilenameRef.current = file.name;
+      onWorkspaceSource(workspaceId, file.name);
 
       // schemaVersion >= 1 is the nested "complete recipe" format (see buildRecipeManifest).
       // Older saves have no schemaVersion field at all — treat them as v0 and read the flat
@@ -21860,8 +21974,6 @@ function Board2Editor({
           ? `Loaded "${manifest.name ?? "board"}" · regenerate the standard camera path`
           : `Loaded "${manifest.name ?? "board"}"`,
       );
-      setActiveWorldRegion(worldRegion);
-      armBoardBaseline();
       return true;
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
@@ -22125,15 +22237,15 @@ function Board2Editor({
       )}
 
       {/* ── Header ── */}
-      <header style={{ ...headerStyle, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
+      {!chromeHidden && <header style={{ ...headerStyle, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
           {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
           <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
           {!isMobile && <details style={{ position: "relative", zIndex: 400, alignSelf: "center" }}>
             <summary style={{ ...sketchButton, padding: "4px 8px", fontSize: 11, listStyle: "none" }}>↑ Upload files</summary>
             <div style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, width: 270, maxWidth: "calc(100vw - 24px)", display: "grid", gap: 12, padding: 12, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "3px 3px 0 #2a2a2a" }}>
-              <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700 }}>Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media from header" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
-              <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700 }}>Audio / MP4 narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration from header" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
+              <label style={uploadControlStyle}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media from header" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
+              <label style={uploadControlStyle}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration from header" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
             </div>
           </details>}
         </div>
@@ -22192,10 +22304,9 @@ function Board2Editor({
               {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
             </span>
           )}
-          <button onClick={onOpenWorld} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: activeWorldRegion ? "#c8f135" : undefined }} title="Open the single infinite canvas">{activeWorldRegion ? "← Back to World" : "∞ World"}</button>
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
-          <MainSectionNav active="board" desktopOnly onOpenWorld={onOpenWorld} />
+          <MainSectionNav active="board" desktopOnly />
           {session?.user?.email ? (
             <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} />
           ) : (
@@ -22208,10 +22319,10 @@ function Board2Editor({
           )}
           </>}
         </div>
-      </header>
-      <CheckoutReturnNotice isPro={isProUser} />
+      </header>}
+      {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
-      {isMobile && mobileEditorMenuOpen && (
+      {!chromeHidden && isMobile && mobileEditorMenuOpen && (
         <div style={{ position: "fixed", top: isPortrait ? "calc(max(44px, env(safe-area-inset-top) + 44px))" : "calc(max(34px, env(safe-area-inset-top) + 34px))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
           {session?.user?.email && (
             <AccountControl
@@ -22223,10 +22334,9 @@ function Board2Editor({
               onAction={() => setMobileEditorMenuOpen(false)}
             />
           )}
-          <label style={{ display: "grid", gap: 3, fontSize: 10, fontWeight: 700 }}>↑ Media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
-          <label style={{ display: "grid", gap: 3, fontSize: 10, fontWeight: 700 }}>↑ Audio / MP4 narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
+          <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
+          <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
-          <button onClick={() => { onOpenWorld(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: activeWorldRegion ? "#c8f135" : undefined }}>{activeWorldRegion ? "← Back to World" : "∞ World"}</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
@@ -22250,13 +22360,13 @@ function Board2Editor({
       <div style={{ display: "flex", flex: 1, minHeight: 0, flexDirection: "column", overflow: "hidden" }}>
 
         {/* Top row: media | board+preview | properties */}
-        <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: "1.5px solid rgba(42,42,42,0.15)" }}>
+        <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: chromeHidden ? 0 : "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
-          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: chromeHidden || isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
-            <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
-            <label style={{ display: "grid", gap: 4, fontSize: 11, fontWeight: 700, flexShrink: 0 }}>↑ Upload audio / mp4<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
+            <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
+            <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
             <button
               onClick={() => addPanClip()}
               style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
@@ -22491,6 +22601,8 @@ function Board2Editor({
               ref={boardContainerRef}
               data-board-drop-target
               data-board-drop-active={isBoardDropActive ? "true" : undefined}
+              data-chrome-hidden={chromeHidden ? "true" : "false"}
+              data-world-loaded-media-count={loadedWorldMediaCount}
               style={{
                 position: "absolute", inset: 0, overflow: "hidden", cursor: pendingMediaPlacement ? "crosshair" : "default", touchAction: isMobile ? "none" : undefined,
                 boxShadow: isBoardDropActive
@@ -22513,6 +22625,37 @@ function Board2Editor({
               onPointerUp={isMobile ? handleMobileBoardPointerUp : undefined}
               onPointerCancel={isMobile ? handleMobileBoardPointerUp : undefined}
             >
+              <button
+                type="button"
+                aria-label={chromeHidden ? "Open editor chrome for centered board" : "Hide editor chrome"}
+                title={chromeHidden ? "Edit the board centered on screen" : "Explore the full board space"}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
+                style={{ ...sketchButton, position: "absolute", left: 12, bottom: 12, zIndex: 220, width: 42, height: 42, padding: 0, display: "grid", placeItems: "center", borderRadius: 4, background: "rgba(255,253,245,.94)", fontSize: chromeHidden ? 19 : 17 }}
+              >
+                {chromeHidden ? "☰" : "∞"}
+              </button>
+              {visibleWorldBoards.map((board) => (
+                <WorldBoardComposite
+                  key={board.id}
+                  board={board}
+                  style={{
+                    position: "absolute",
+                    left: boardPan.x + (board.x - activeWorldOrigin.x) * boardZoom,
+                    top: boardPan.y + (board.y - activeWorldOrigin.y) * boardZoom,
+                    width: (board.width || BOARD_W) * boardZoom,
+                    height: (board.height || BOARD_H) * boardZoom,
+                    zIndex: 2,
+                  }}
+                />
+              ))}
+              {chromeHidden && (
+                <div
+                  aria-label="Pan infinite board space"
+                  onPointerDown={handleBoardPointerDown}
+                  style={{ position: "absolute", inset: 0, zIndex: 200, cursor: "grab", touchAction: "none" }}
+                />
+              )}
               {pendingMediaPlacement && (
                 <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
                   <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
@@ -22968,10 +23111,22 @@ function Board2Editor({
                   );
                 })}
 
-                {/* Glass pane — captures all pointer events for annotation drawing */}
+                {/* Glass pane — captures all pointer events for annotation drawing.
+                    This element lives inside the panned board surface. Negating that offset
+                    makes the drawing glass cover the complete visible editor viewport rather
+                    than only the initially-sized board rectangle, so annotations can be placed
+                    anywhere on the infinite board, not just within the board's nominal bounds. */}
                 {annotationTool !== "pointer" && !isSpaceDown && !editingAnnotationId && (
                   <div
-                    style={{ position: "absolute", inset: 0, zIndex: 10, cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair" }}
+                    style={{
+                      position: "absolute",
+                      left: -boardPan.x,
+                      top: -boardPan.y,
+                      width: boardViewportSize.width,
+                      height: boardViewportSize.height,
+                      zIndex: 10,
+                      cursor: annotationTool === "text" ? "text" : annotationTool === "emoji" ? "copy" : "crosshair",
+                    }}
                     onPointerDown={handleAnnotationGlassPointerDown}
                   />
                 )}
@@ -23014,7 +23169,7 @@ function Board2Editor({
               </div>
 
               {/* Empty state */}
-              {clips.filter((c) => c.boardX !== undefined).length === 0 && (!AI_FEATURES_ENABLED || (neuralPlaceholders.length === 0 && imagePlaceholders.length === 0)) && (
+              {!chromeHidden && clips.filter((c) => c.boardX !== undefined).length === 0 && (!AI_FEATURES_ENABLED || (neuralPlaceholders.length === 0 && imagePlaceholders.length === 0)) && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
                   <span style={{ fontFamily: "monospace", fontSize: 11, color: "rgba(42,42,42,0.4)" }}>
                     Upload images or videos to auto-add to the board
@@ -23023,12 +23178,12 @@ function Board2Editor({
               )}
 
               {/* Board info */}
-              <div style={{ position: "absolute", bottom: 8, left: 8, fontFamily: "monospace", fontSize: 9, color: "rgba(42,42,42,0.4)", pointerEvents: "none" }}>
+              <div style={{ position: "absolute", bottom: 8, left: 8, display: chromeHidden ? "none" : "block", fontFamily: "monospace", fontSize: 9, color: "rgba(42,42,42,0.4)", pointerEvents: "none" }}>
                 {BOARD_W}×{BOARD_H} · {Math.round(boardZoom * 100)}% · space+drag=pan · scroll=zoom
               </div>
 
               {/* Annotation toolbar — available to every board editor */}
-              <div style={{ position: "absolute", top: 8, left: isMobile ? "max(8px, env(safe-area-inset-left))" : 8, zIndex: 30, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 4, maxWidth: isMobile ? "calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
+              <div style={{ position: "absolute", top: 8, left: isMobile ? "max(8px, env(safe-area-inset-left))" : 8, zIndex: 30, display: chromeHidden ? "none" : "flex", flexDirection: "column", alignItems: "flex-start", gap: 4, maxWidth: isMobile ? "calc(100vw - 16px - env(safe-area-inset-left) - env(safe-area-inset-right))" : undefined }}>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -23613,7 +23768,7 @@ function Board2Editor({
                 zIndex: 20,
                 pointerEvents: isMobile ? "none" : "auto",
                 touchAction: "none",
-                display: isMobile ? "none" : "block",
+                display: chromeHidden || isMobile ? "none" : "block",
               }}
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
@@ -23691,7 +23846,7 @@ function Board2Editor({
           </div>
 
           {/* ── Right: properties panel (no keyframes) ── */}
-          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
+          <div style={{ width: 240, flexShrink: 0, borderLeft: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: chromeHidden || isMobile ? "none" : "flex", flexDirection: "column", gap: 10, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
               <div style={panelLabelStyle}>Properties</div>
               <div style={{ display: "flex", gap: 5 }}>
@@ -24775,7 +24930,7 @@ function Board2Editor({
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: "flex", flexDirection: "column" }}>
+        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: chromeHidden ? "none" : "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
           <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 5 : 8, padding: isMobile ? "3px max(6px, env(safe-area-inset-left))" : "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap", overflowX: isMobile ? "auto" : "visible" }}>
@@ -26070,7 +26225,7 @@ function Board2Editor({
             />
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700 }}>
-                {isSaving ? "Saving…" : activeWorldRegion ? "💾 Save to World" : "💾 Save .nbp"}
+                {isSaving ? "Saving…" : "💾 Save .nbp"}
               </button>
               <button onClick={() => setSaveModalOpen(false)} style={{ ...sketchButton, flex: 1 }}>Cancel</button>
             </div>
@@ -26228,16 +26383,28 @@ const panelLabelStyle: React.CSSProperties = {
 };
 
 const nativeFilePickerStyle: React.CSSProperties = {
-  display: "block",
+  position: "absolute",
+  inset: 0,
   width: "100%",
-  minHeight: 38,
+  height: "100%",
+  opacity: 0,
+  cursor: "pointer",
+};
+
+const uploadControlStyle: React.CSSProperties = {
+  position: "relative",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "flex-start",
+  width: "100%",
   boxSizing: "border-box",
-  padding: 6,
+  padding: "8px 10px",
   border: "1.5px solid #2a2a2a",
   background: "#fffdf5",
   color: "#2a2a2a",
-  font: "11px monospace",
+  font: "700 11px 'Courier New', monospace",
   cursor: "pointer",
+  boxShadow: "2px 2px 0 #2a2a2a",
 };
 
 const sketchButton: React.CSSProperties = {
