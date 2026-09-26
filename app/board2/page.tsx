@@ -506,6 +506,8 @@ type Clip = {
   autoRole?: "outro" | "intro" | "title" | "annotationTarget";
   cameraBeat?: boolean;
   narrationTime?: number;
+  narrationTypewriter?: boolean; // customZoom-only: type out the narration spoken during this zoom
+
   rationale?: string;
 };
 
@@ -1169,6 +1171,144 @@ function drawFloatingNarrationBubble(
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   lines.forEach((item, index) => ctx.fillText(item, centerX, y + fontSize * 0.82 + lineHeight * (index + 0.5)));
+  ctx.restore();
+}
+
+// ─── Custom zoom narration typewriter ──────────────────────────────────────────
+// A customZoom clip with `narrationTypewriter` types out whatever narration is spoken during its
+// window, centered on screen (the camera is centered on the zoom box), then disappears when the
+// zoom ends. Word timings are estimated from Whisper segments, weighted by word length.
+type TypewriterWord = { text: string; start: number; end: number };
+
+function zoomNarrationWords(zoom: Clip, clips: readonly Clip[]): TypewriterWord[] {
+  const zoomStart = zoom.startTime;
+  const zoomEnd = zoom.startTime + zoom.duration;
+  const words: TypewriterWord[] = [];
+  for (const clip of clips) {
+    if (clip.type !== "narration" || !clip.transcriptSegments?.length) continue;
+    const clipEnd = clip.startTime + clip.duration;
+    if (clipEnd <= zoomStart || clip.startTime >= zoomEnd) continue;
+    const toTimeline = clip.startTime - (clip.sourceOffsetSec ?? 0);
+    for (const segment of clip.transcriptSegments) {
+      const parts = segment.text.trim().split(/\s+/).filter(Boolean);
+      if (!parts.length) continue;
+      const segStart = segment.start + toTimeline;
+      const segDur = Math.max(0.05, segment.end - segment.start);
+      const totalChars = parts.reduce((sum, word) => sum + word.length, 0);
+      let cursor = segStart;
+      for (const word of parts) {
+        const dur = segDur * word.length / Math.max(1, totalChars);
+        if (cursor >= zoomStart && cursor < zoomEnd && cursor >= clip.startTime && cursor < clipEnd) {
+          words.push({ text: word, start: cursor, end: cursor + dur });
+        }
+        cursor += dur;
+      }
+    }
+  }
+  return words.sort((a, b) => a.start - b.start);
+}
+
+function wrapTypewriterLines(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(candidate).width > maxWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function drawZoomNarrationTypewriter(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  clips: readonly Clip[],
+  width: number,
+  height: number,
+) {
+  const zoom = clips.find((clip) =>
+    clip.type === "customZoom" &&
+    clip.narrationTypewriter &&
+    clip.featured !== false &&
+    time >= clip.startTime &&
+    time < clip.startTime + clip.duration
+  );
+  if (!zoom) return;
+  const words = zoomNarrationWords(zoom, clips);
+  if (!words.length) return;
+
+  // Reveal characters word by word, spread across each word's estimated speaking time.
+  const fullText = words.map((word) => word.text).join(" ");
+  let revealed = "";
+  let typing = false;
+  for (let index = 0; index < words.length; index++) {
+    const word = words[index];
+    if (time < word.start) break;
+    const fraction = clamp((time - word.start) / Math.max(0.01, word.end - word.start), 0, 1);
+    const count = Math.ceil(word.text.length * fraction);
+    revealed += (index > 0 ? " " : "") + word.text.slice(0, count);
+    if (fraction < 1) { typing = true; break; }
+  }
+
+  const fadeIn = clamp((time - zoom.startTime) / 0.2, 0, 1);
+  const fadeOut = clamp((zoom.startTime + zoom.duration - time) / 0.2, 0, 1);
+  const alpha = Math.min(fadeIn, fadeOut);
+  if (alpha <= 0) return;
+
+  // Lay out against the full text so the panel and line breaks never jump while typing.
+  const maxWidth = width * 0.74;
+  let fontSize = clamp(Math.round(width * 0.052), 20, 96);
+  const minFont = Math.max(14, Math.round(width * 0.022));
+  const fontFor = (size: number) => `700 ${size}px 'Courier New', Courier, monospace`;
+  ctx.save();
+  ctx.font = fontFor(fontSize);
+  let lines = wrapTypewriterLines(ctx, fullText, maxWidth);
+  while (fontSize > minFont && lines.length * fontSize * 1.3 > height * 0.62) {
+    fontSize = Math.max(minFont, Math.round(fontSize * 0.9));
+    ctx.font = fontFor(fontSize);
+    lines = wrapTypewriterLines(ctx, fullText, maxWidth);
+  }
+  const lineHeight = fontSize * 1.3;
+  const padX = fontSize * 0.8;
+  const padY = fontSize * 0.6;
+  const textWidth = Math.max(...lines.map((line) => ctx.measureText(line).width), fontSize);
+  const boxW = textWidth + padX * 2 + fontSize * 0.7;
+  const boxH = lines.length * lineHeight + padY * 2;
+  const boxX = (width - boxW) / 2;
+  const boxY = (height - boxH) / 2;
+
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = "rgba(14, 14, 18, 0.78)";
+  ctx.beginPath();
+  ctx.roundRect(boxX, boxY, boxW, boxH, fontSize * 0.35);
+  ctx.fill();
+
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  const textX = boxX + padX;
+  let remaining = revealed.length;
+  let caretX = textX;
+  let caretY = boxY + padY + lineHeight / 2;
+  for (let index = 0; index < lines.length && remaining > 0; index++) {
+    const line = lines[index];
+    const shown = line.slice(0, remaining);
+    const y = boxY + padY + lineHeight * (index + 0.5);
+    ctx.fillText(shown, textX, y);
+    caretX = textX + ctx.measureText(shown).width;
+    caretY = y;
+    remaining -= line.length + 1; // +1 for the space consumed by the line break
+  }
+  // Solid caret while typing, blinking while waiting for the next word.
+  if (typing || Math.floor(time * 2.2) % 2 === 0) {
+    ctx.fillStyle = "#c8f135";
+    ctx.fillRect(caretX + fontSize * 0.08, caretY - fontSize * 0.5, fontSize * 0.55, fontSize);
+  }
   ctx.restore();
 }
 
@@ -5491,6 +5631,7 @@ function Board2Editor({
   const [clipboardReady, setClipboardReady] = useState(false);
   const [isBoardDropActive, setIsBoardDropActive] = useState(false);
   const [mediaEditDraft, setMediaEditDraft] = useState<MediaEditDraft | null>(null);
+  const [zoomEditClipId, setZoomEditClipId] = useState<string | null>(null);
   const [mediaEditorPlaying, setMediaEditorPlaying] = useState(false);
 
   // ── Mobile ──
@@ -8302,6 +8443,7 @@ function Board2Editor({
     ctx.restore();
     const mediaBubbleTarget = narrationMediaBubbleTarget(time, currentClips, cam, sf, W, H);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor, mediaBubbleTarget);
+    drawZoomNarrationTypewriter(ctx, time, currentClips, W, H);
     const captionSourceIsCurrent = captionTrackSourceRef.current === narrationVisemeSourceSignature(currentClips);
     if (captionsEnabledRef.current && captionSourceIsCurrent) {
       drawScreenSpaceCaption(
@@ -18982,6 +19124,93 @@ function Board2Editor({
     closeMediaEditor();
   }
 
+  function setZoomNarrationTypewriter(clipId: string, enabled: boolean) {
+    setClips((prev) => prev.map((clip) => clip.id === clipId ? { ...clip, narrationTypewriter: enabled || undefined } : clip));
+    setToast(enabled ? "Narration block added — it types out during this zoom" : "Narration block removed");
+  }
+
+  function renderZoomEditorModal() {
+    if (!zoomEditClipId) return null;
+    const clip = clips.find((candidate) => candidate.id === zoomEditClipId);
+    if (!clip || clip.type !== "customZoom") return null;
+    const close = () => setZoomEditClipId(null);
+    const overlapping = clips.filter((candidate) =>
+      candidate.type === "narration" &&
+      candidate.startTime < clip.startTime + clip.duration &&
+      candidate.startTime + candidate.duration > clip.startTime
+    );
+    const untranscribed = overlapping.filter((candidate) => !candidate.transcriptSegments?.length);
+    const previewText = zoomNarrationWords(clip, clips).map((word) => word.text).join(" ");
+    const enabled = !!clip.narrationTypewriter;
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Edit custom zoom"
+        onClick={(event) => { if (event.target === event.currentTarget) close(); }}
+        style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(0,0,0,.55)" }}
+      >
+        <div style={{ width: 420, maxWidth: "96vw", maxHeight: "90vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, padding: 16, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "5px 5px 0 #2a2a2a", fontFamily: "monospace" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700 }}>🔍 Edit custom zoom</div>
+            <button type="button" onClick={close} aria-label="Close" style={{ ...miniButton, minWidth: 32, minHeight: 28 }}>✕</button>
+          </div>
+          <div style={{ fontSize: 10, color: "#6a6a6a" }}>
+            {clip.startTime.toFixed(1)}s – {(clip.startTime + clip.duration).toFixed(1)}s · {clip.duration.toFixed(1)}s
+          </div>
+          <div style={panelLabelStyle}>Blocks</div>
+          <button
+            type="button"
+            aria-pressed={enabled}
+            onClick={() => setZoomNarrationTypewriter(clip.id, !enabled)}
+            style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 12px", fontSize: 12, background: enabled ? "#2a2a2a" : "#ffd45c", color: enabled ? "#c8f135" : "#2a2a2a" }}
+          >
+            {enabled ? "✓ ⌨ Narration block on — click to remove" : "⌨ Add narration block"}
+          </button>
+          <div style={{ fontSize: 10, lineHeight: 1.5, color: "#4a4a4a" }}>
+            Types out the narration spoken during this zoom in the middle of the screen, then disappears when the zoom ends.
+          </div>
+          {overlapping.length === 0 ? (
+            <div style={{ fontSize: 10, color: "#a32916" }}>⚠ No narration overlaps this zoom on the timeline.</div>
+          ) : untranscribed.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: 8, border: "1.5px dashed #a32916", background: "#fff3ee" }}>
+              <div style={{ fontSize: 10, color: "#a32916" }}>⚠ The narration here needs a transcript before it can type out.</div>
+              {untranscribed.map((narration) => (
+                <button
+                  key={narration.id}
+                  type="button"
+                  disabled={!!transcribingNarrationId}
+                  onClick={() => void transcribeNarrationWithWhisper(narration)}
+                  style={{ ...sketchButton, width: "100%", padding: "7px 8px", fontSize: 11, background: "#fffdf5", opacity: transcribingNarrationId ? 0.55 : 1 }}
+                >
+                  {transcribingNarrationId === narration.id
+                    ? `⟳ ${narrationTranscriptionPhase ?? "Transcribing…"}`
+                    : `✎ Transcribe “${narration.name.slice(0, 24)}”`}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {previewText && (
+            <div>
+              <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Will type</div>
+              <div style={{ fontSize: 11, lineHeight: 1.5, padding: "8px 10px", background: "#17171c", color: "#fff", border: "1.5px solid #2a2a2a" }}>
+                {previewText}<span style={{ display: "inline-block", width: 7, height: 12, marginLeft: 3, background: "#c8f135", verticalAlign: "middle" }} />
+              </div>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button type="button" onClick={close} style={{ ...sketchButton, flex: 1, padding: "8px 10px", fontSize: 11, background: "#c8f135" }}>Done</button>
+            <button
+              type="button"
+              onClick={() => { close(); deleteBoardMedia(clip.id); }}
+              style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, color: "#a32916", background: "#fffdf5" }}
+            >✕ Delete zoom</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderMediaEditorModal() {
     if (!mediaEditDraft) return null;
     const clip = clips.find((candidate) => candidate.id === mediaEditDraft.clipId);
@@ -20676,7 +20905,7 @@ function Board2Editor({
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? "🔍 Custom Zoom" : clip.name}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -20874,6 +21103,11 @@ function Board2Editor({
                     {isBoardMediaClip(selectedClip) && (
                       <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "11px 14px", fontSize: 13, background: "#ffd45c" }}>
                         ✎ Edit {selectedClip.type}
+                      </button>
+                    )}
+                    {selectedClip.type === "customZoom" && (
+                      <button type="button" onClick={() => setZoomEditClipId(selectedClip.id)} style={{ ...sketchButton, width: "100%", padding: "11px 14px", fontSize: 13, background: "#ffd45c" }}>
+                        ✎ Edit custom zoom{selectedClip.narrationTypewriter ? " · ⌨ narration on" : ""}
                       </button>
                     )}
                     <div>
@@ -21232,6 +21466,7 @@ function Board2Editor({
         )}
         {renderDownloadToasts()}
         {renderMediaEditorModal()}
+        {renderZoomEditorModal()}
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
         {renderImagePreviewModal()}
@@ -22778,13 +23013,13 @@ function Board2Editor({
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
                       ))}
-                      {isSel && isBoardMediaClip(clip) && (
+                      {isSel && (isBoardMediaClip(clip) || clip.type === "customZoom") && (
                         <button
                           type="button"
                           aria-label={`Edit ${clip.name}`}
-                          title={`Edit ${clip.type}`}
+                          title={clip.type === "customZoom" ? "Edit custom zoom (narration typewriter)" : `Edit ${clip.type}`}
                           onPointerDown={(e) => e.stopPropagation()}
-                          onClick={(e) => { e.stopPropagation(); if (isBoardMediaClip(clip)) openMediaEditor(clip); }}
+                          onClick={(e) => { e.stopPropagation(); if (isBoardMediaClip(clip)) openMediaEditor(clip); else setZoomEditClipId(clip.id); }}
                           style={{ position: "absolute", left: "calc(50% + 20px)", top: isMobile ? -52 : -30, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 9px", borderRadius: 4, border: "2px solid #fff", background: "#ffd45c", color: "#2a2a2a", fontFamily: "monospace", fontSize: isMobile ? 13 : 10, fontWeight: 700, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
                         >✎ Edit</button>
                       )}
@@ -24697,6 +24932,11 @@ function Board2Editor({
                     ✎ Edit {selectedClip.type}
                   </button>
                 )}
+                {selectedClip.type === "customZoom" && (
+                  <button type="button" onClick={() => setZoomEditClipId(selectedClip.id)} style={{ ...sketchButton, width: "100%", padding: "7px 10px", fontSize: 11, background: "#ffd45c" }}>
+                    ✎ Edit custom zoom{selectedClip.narrationTypewriter ? " · ⌨ narration on" : ""}
+                  </button>
+                )}
                 {selectedClip.type === "pan" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a", background: PAN_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Sweeps across all board images
@@ -25206,7 +25446,7 @@ function Board2Editor({
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? "🔍 Custom Zoom" : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
@@ -26205,6 +26445,7 @@ function Board2Editor({
       )}
       {renderDownloadToasts()}
       {renderMediaEditorModal()}
+      {renderZoomEditorModal()}
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
       {renderImagePreviewModal()}
