@@ -20,6 +20,7 @@ import {
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
+import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
@@ -1935,17 +1936,46 @@ const BOARD_AUTOSAVE_STORAGE_KEY = "nb_board2_autosave";
 // files that already live on disk.
 const BOARD_AUTOSAVE_WORKSPACE_ID = "board-workspace-1";
 
+// Cache keys for media bytes written to (or restored from) IndexedDB this session, by Blob
+// identity. Keeping them off the clip means media swapped onto a clip can never reuse a stale key.
+const mediaCacheKeys = new WeakMap<Blob, string>();
+const cachedMediaKeys = new Set<string>();
+
+// Every clip source (uploads, drops, recordings, YouTube) keeps its bytes on the clip, so the
+// autosave caches them here instead of each ingest path. Uploaded Files keep their file-derived
+// key; other blobs key by board entity so per-instance video clones share one stored copy.
+function ensureClipMediaCached(clip: Clip): string | undefined {
+  const blob = clip.type === "narration" ? clip.audioBlob : clip.sourceBlob;
+  if (!blob?.size || !clip.sourceUrl.startsWith("blob:")) return undefined;
+  let key = mediaCacheKeys.get(blob);
+  if (!key) {
+    key = blob instanceof File ? mediaCacheKeyForFile(blob) : `${boardEntityId(clip)}-${blob.size}`;
+    mediaCacheKeys.set(blob, key);
+  }
+  if (!cachedMediaKeys.has(key)) {
+    // Not retried on failure (usually quota): the clip then restores as an empty card.
+    cachedMediaKeys.add(key);
+    void saveCachedMedia(key, blob).catch(() => {});
+  }
+  return key;
+}
+
 // Autosave stores the flat (schema v0) manifest shape loadBoard already reads. Blobs and blob:
-// URLs die with the page, so they're dropped: uploaded media restores as an empty card and
-// YouTube clips come back as "click to re-download". https:// and data: URLs survive.
-function autosaveClip({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, thumbnailBlobUrl, previewUrl, ...clip }: Clip) {
+// URLs die with the page, so they're dropped; cached media is referenced by `mediaCacheKey`
+// instead, and anything uncached restores as an empty card (YouTube clips as "click to
+// re-download"). https:// and data: URLs survive as-is.
+function autosaveClip(
+  { sourceBlob: _sourceBlob, audioBlob: _audioBlob, thumbnailBlobUrl, previewUrl, ...clip }: Clip,
+  mediaCacheKey: string | undefined,
+) {
   const deadSource = clip.sourceUrl.startsWith("blob:");
   return {
     ...clip,
     sourceUrl: deadSource ? "" : clip.sourceUrl,
     previewUrl: previewUrl?.startsWith("blob:") ? undefined : previewUrl,
     thumbnailDataUri: thumbnailBlobUrl?.startsWith("data:image/") ? thumbnailBlobUrl : undefined,
-    ...(deadSource && clip.youtubeId ? { needsRedownload: true } : {}),
+    mediaCacheKey,
+    ...(deadSource && clip.youtubeId && !mediaCacheKey ? { needsRedownload: true } : {}),
   };
 }
 const AMBIENT_BUDGET = 4;
@@ -7461,7 +7491,7 @@ function Board2Editor({
         version: 1,
         name: saveName,
         savedAt: new Date().toISOString(),
-        clips: clips.map(autosaveClip),
+        clips: clips.map((clip) => autosaveClip(clip, ensureClipMediaCached(clip))),
         annotations,
         cameraKeyframes,
         canvasAspect,
@@ -22091,6 +22121,21 @@ function Board2Editor({
       imgCacheRef.current.clear();
       warmImgCacheRef.current.clear();
 
+      const cachedMedia = new Map<string, Blob>();
+      const cachedMediaKeysToRestore: string[] = fromAutosave
+        ? [...new Set<string>((manifest.clips ?? []).flatMap((clip: { mediaCacheKey?: unknown }) =>
+            typeof clip.mediaCacheKey === "string" ? [clip.mediaCacheKey] : []))]
+        : [];
+      if (cachedMediaKeysToRestore.length) {
+        setToast("Restoring media…");
+        await Promise.all(cachedMediaKeysToRestore.map(async (key) => {
+          const blob = await getCachedMedia(key).catch(() => null);
+          if (!blob) return;
+          cachedMedia.set(key, blob);
+          cachedMediaKeys.add(key);
+        }));
+      }
+
       const loadedClips: Clip[] = [];
       for (const savedClip of (manifest.clips ?? [])) {
         // Object URLs are scoped to the tab that created them, so older manifests may contain a
@@ -22099,8 +22144,10 @@ function Board2Editor({
         const {
           thumbnailDataUri,
           thumbnailBlobUrl: _staleThumbnailBlobUrl,
+          mediaCacheKey,
           ...mc
         } = savedClip;
+        const cachedBlob = typeof mediaCacheKey === "string" ? cachedMedia.get(mediaCacheKey) : undefined;
         const persistedThumbnailUrl = mc.type === "video" && typeof thumbnailDataUri === "string" && thumbnailDataUri.startsWith("data:image/")
           ? thumbnailDataUri
           : undefined;
@@ -22118,13 +22165,20 @@ function Board2Editor({
           loadedClips.push({ ...mc, type: "characterFocus", name: "Character 1 Focus", focusCharacterId: "c1", sourceUrl: "" });
         } else if (mc.type === "pan" || mc.type === "characterFocus" || mc.type === "customZoom") {
           loadedClips.push({ ...mc, sourceUrl: "" });
-        } else if (mc.needsRedownload) {
-          loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: "" });
-        } else if (mc.assetFile && files[mc.assetFile]) {
-          const data = files[mc.assetFile];
-          const assetBytes = new Uint8Array(data.byteLength);
-          assetBytes.set(data);
-          const blob = new Blob([assetBytes.buffer], { type: mc.assetMime || "application/octet-stream" });
+        } else if (mc.needsRedownload || (mediaCacheKey && !cachedBlob && mc.youtubeId)) {
+          loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: "", needsRedownload: true });
+        } else if (cachedBlob || (mc.assetFile && files[mc.assetFile])) {
+          let blob: Blob;
+          if (cachedBlob) {
+            // A fresh Blob per clip, like the zip path: video instances must not share a decoder.
+            blob = new Blob([cachedBlob], { type: cachedBlob.type });
+            mediaCacheKeys.set(blob, mediaCacheKey);
+          } else {
+            const data = files[mc.assetFile];
+            const assetBytes = new Uint8Array(data.byteLength);
+            assetBytes.set(data);
+            blob = new Blob([assetBytes.buffer], { type: mc.assetMime || "application/octet-stream" });
+          }
           const blobUrl = URL.createObjectURL(blob);
           if (mc.type === "narration") {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, audioBlob: blob });
