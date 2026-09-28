@@ -1930,7 +1930,24 @@ const FRAME_ALL_PADDING = 0.1;
 const PAN_TRAVERSAL_REFERENCE_FILL_RATIO = 0.78;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY = "nb_board2_custom_zoom_continuous";
-const BOARD_COLOR_STORAGE_KEY = "nb_board2_board_color";
+const BOARD_AUTOSAVE_STORAGE_KEY = "nb_board2_autosave";
+// Only the default tab autosaves: one key holds one board, and other tabs are opened from .nbp
+// files that already live on disk.
+const BOARD_AUTOSAVE_WORKSPACE_ID = "board-workspace-1";
+
+// Autosave stores the flat (schema v0) manifest shape loadBoard already reads. Blobs and blob:
+// URLs die with the page, so they're dropped: uploaded media restores as an empty card and
+// YouTube clips come back as "click to re-download". https:// and data: URLs survive.
+function autosaveClip({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, thumbnailBlobUrl, previewUrl, ...clip }: Clip) {
+  const deadSource = clip.sourceUrl.startsWith("blob:");
+  return {
+    ...clip,
+    sourceUrl: deadSource ? "" : clip.sourceUrl,
+    previewUrl: previewUrl?.startsWith("blob:") ? undefined : previewUrl,
+    thumbnailDataUri: thumbnailBlobUrl?.startsWith("data:image/") ? thumbnailBlobUrl : undefined,
+    ...(deadSource && clip.youtubeId ? { needsRedownload: true } : {}),
+  };
+}
 const AMBIENT_BUDGET = 4;
 const AMBIENT_STATE_EVAL_INTERVAL_MS = 100;
 const AMBIENT_VIEWPORT_EXPAND = 0.25;
@@ -5332,7 +5349,7 @@ type BoardWorkspace = BoardWorkspaceStatus & {
 
 function createBoardWorkspace(index: number, source?: { file: File; fileName: string; name: string }): BoardWorkspace {
   return {
-    id: index === 1 ? "board-workspace-1" : `board-workspace-${Date.now()}-${index}`,
+    id: index === 1 ? BOARD_AUTOSAVE_WORKSPACE_ID : `board-workspace-${Date.now()}-${index}`,
     name: source?.name ?? (index === 1 ? "My Board" : `Board ${index}`),
     isExporting: false,
     exportProgress: 0,
@@ -5549,15 +5566,7 @@ function Board2Editor({
       return true;
     }
   });
-  const [boardColor, setBoardColor] = useState(() => {
-    if (typeof window === "undefined") return BOARD_SURFACE_COLOR;
-    try {
-      const saved = window.localStorage.getItem(BOARD_COLOR_STORAGE_KEY);
-      return saved && /^#[0-9a-f]{6}$/i.test(saved) ? saved : BOARD_SURFACE_COLOR;
-    } catch {
-      return BOARD_SURFACE_COLOR;
-    }
-  });
+  const [boardColor, setBoardColor] = useState(BOARD_SURFACE_COLOR);
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
@@ -5663,6 +5672,11 @@ function Board2Editor({
   const savedDirtySignatureRef = useRef<string | null>(null);
   const resetDirtyAfterLoadRef = useRef(false);
   const initialFileLoadStartedRef = useRef(false);
+  const autosaveEnabled = workspaceId === BOARD_AUTOSAVE_WORKSPACE_ID && !initialFile;
+  const autosaveRestoreStartedRef = useRef(false);
+  const autosaveReadyRef = useRef(false);
+  const autosaveFlushRef = useRef<(() => void) | null>(null);
+  const autosaveQuotaWarnedRef = useRef(false);
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -7107,14 +7121,7 @@ function Board2Editor({
     ambientVideoEnabledRef.current = ambientVideoEnabled;
     try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
   }, [ambientVideoEnabled]);
-  // The picker fires on every drag tick; debounce the write like the other board saves.
-  useEffect(() => {
-    boardColorRef.current = boardColor;
-    const timer = window.setTimeout(() => {
-      try { window.localStorage.setItem(BOARD_COLOR_STORAGE_KEY, boardColor); } catch {}
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [boardColor]);
+  useEffect(() => { boardColorRef.current = boardColor; }, [boardColor]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
@@ -7430,6 +7437,83 @@ function Board2Editor({
     const timer = window.setTimeout(() => void refreshStyleExemplars(), 0);
     return () => window.clearTimeout(timer);
   }, [refreshStyleExemplars]);
+  // Restore must run before the library-handoff effect below, which clears the pending flag.
+  useEffect(() => {
+    if (!autosaveEnabled || autosaveRestoreStartedRef.current) return;
+    autosaveRestoreStartedRef.current = true;
+    let saved: string | null = null;
+    try {
+      if (!sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE)) saved = window.localStorage.getItem(BOARD_AUTOSAVE_STORAGE_KEY);
+    } catch {}
+    if (!saved) {
+      autosaveReadyRef.current = true;
+      return;
+    }
+    void loadBoard({ autosaveJson: saved }).finally(() => { autosaveReadyRef.current = true; });
+    // loadBoard is a component-local loader; this intentionally runs once on editor mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    if (!autosaveEnabled || !autosaveReadyRef.current || isLoadingProject) return;
+    const flush = () => {
+      autosaveFlushRef.current = null;
+      const payload = JSON.stringify({
+        version: 1,
+        name: saveName,
+        savedAt: new Date().toISOString(),
+        clips: clips.map(autosaveClip),
+        annotations,
+        cameraKeyframes,
+        canvasAspect,
+        pxPerSec,
+        boardZoom,
+        boardPan,
+        boardDimensions,
+        boardColor,
+        spawnDoor,
+        customZoomDurationSeconds: customZoomDuration,
+        characters: [
+          { id: "c1", enabled: showCharacter, mode: characterMode, skin: characterSkin, characterType, expression: characterExpression, actions: characterActions, start: characterStart ?? undefined },
+          { id: "c2", enabled: showCharacter2, mode: characterMode2, skin: characterSkin2, characterType: characterType2, expression: characterExpression2, actions: characterActions2, start: characterStart2 ?? undefined },
+        ],
+        narrationVisemeTrack,
+        narrationVisemeTrackSource,
+        narrationGestureTrack,
+        narrationGestureTrackSource,
+        smartGestures,
+        captions: { enabled: captionsEnabled, fontSize: captionFontSize, position: captionPosition, track: captionTrack, trackFingerprint: captionTrackSource },
+      });
+      try {
+        window.localStorage.setItem(BOARD_AUTOSAVE_STORAGE_KEY, payload);
+      } catch (error) {
+        if (!autosaveQuotaWarnedRef.current) {
+          autosaveQuotaWarnedRef.current = true;
+          console.warn("[board2:autosave] Could not autosave board", error);
+          setToast("Board is too large to autosave — use 💾 Save");
+        }
+      }
+    };
+    autosaveFlushRef.current = flush;
+    const timer = window.setTimeout(flush, 500);
+    return () => {
+      window.clearTimeout(timer);
+      if (autosaveFlushRef.current === flush) autosaveFlushRef.current = null;
+    };
+  }, [
+    autosaveEnabled, isLoadingProject, saveName, clips, annotations, cameraKeyframes, canvasAspect, pxPerSec, boardZoom, boardPan,
+    boardDimensions, boardColor, spawnDoor, customZoomDuration, showCharacter, characterMode, characterSkin, characterType,
+    characterExpression, characterActions, characterStart, showCharacter2, characterMode2, characterSkin2, characterType2,
+    characterExpression2, characterActions2, characterStart2, narrationVisemeTrack, narrationVisemeTrackSource,
+    narrationGestureTrack, narrationGestureTrackSource, smartGestures, captionsEnabled, captionFontSize, captionPosition,
+    captionTrack, captionTrackSource,
+  ]);
+  // A refresh inside the debounce window would otherwise drop the last edit.
+  useEffect(() => {
+    if (!autosaveEnabled) return;
+    const onPageHide = () => autosaveFlushRef.current?.();
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, [autosaveEnabled]);
   useEffect(() => {
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
@@ -21909,11 +21993,12 @@ function Board2Editor({
     }
   }
 
-  async function loadBoard(file: File): Promise<boolean> {
+  async function loadBoard(source: File | { autosaveJson: string }): Promise<boolean> {
     if (isLoadingProject) return false;
+    const fromAutosave = !(source instanceof File);
     resetDirtyAfterLoadRef.current = true;
     setIsLoadingProject(true);
-    setToast("Loading project…");
+    setToast(fromAutosave ? "Restoring board…" : "Loading project…");
     try {
       type ManifestFace = {
         faceAspect: number;
@@ -21921,12 +22006,13 @@ function Board2Editor({
         assetFile: string;
         assetMime: string;
       };
-      const buffer = await file.arrayBuffer();
-      const files = unzipSync(new Uint8Array(buffer));
-      if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
-      const rawManifest = JSON.parse(strFromU8(files["manifest.json"]));
-      recipeLibraryFilenameRef.current = file.name;
-      onWorkspaceSource(workspaceId, file.name);
+      const files: Record<string, Uint8Array> = fromAutosave ? {} : unzipSync(new Uint8Array(await source.arrayBuffer()));
+      if (!fromAutosave && !files["manifest.json"]) throw new Error("Not a valid .nbp file");
+      const rawManifest = JSON.parse(fromAutosave ? source.autosaveJson : strFromU8(files["manifest.json"]));
+      if (!fromAutosave) {
+        recipeLibraryFilenameRef.current = source.name;
+        onWorkspaceSource(workspaceId, source.name);
+      }
 
       // schemaVersion >= 1 is the nested "complete recipe" format (see buildRecipeManifest).
       // Older saves have no schemaVersion field at all — treat them as v0 and read the flat
@@ -22159,6 +22245,7 @@ function Board2Editor({
         setBoardDimensions({ width: BOARD_W, height: BOARD_H });
       }
       if (manifest.name) setSaveName(manifest.name);
+      if (typeof manifest.boardColor === "string" && /^#[0-9a-f]{6}$/i.test(manifest.boardColor)) setBoardColor(manifest.boardColor);
       const loadFace = (face: ManifestFace | null | undefined): CharacterFaceSettings | null => {
         if (!face?.assetFile || !files[face.assetFile]) return null;
         const faceData = files[face.assetFile];
@@ -22227,11 +22314,8 @@ function Board2Editor({
         setCharacterFace2(null);
         setCharacterStart2(null);
       }
-      setToast(
-        hadLegacyGeneratedCameraMode
-          ? `Loaded "${manifest.name ?? "board"}" · regenerate the standard camera path`
-          : `Loaded "${manifest.name ?? "board"}"`,
-      );
+      const loadedLabel = fromAutosave ? "Restored your board" : `Loaded "${manifest.name ?? "board"}"`;
+      setToast(hadLegacyGeneratedCameraMode ? `${loadedLabel} · regenerate the standard camera path` : loadedLabel);
       return true;
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Failed to load project");
