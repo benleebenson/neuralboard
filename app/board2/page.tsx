@@ -1930,6 +1930,7 @@ const FRAME_ALL_PADDING = 0.1;
 const PAN_TRAVERSAL_REFERENCE_FILL_RATIO = 0.78;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY = "nb_board2_custom_zoom_continuous";
+const BOARD_COLOR_STORAGE_KEY = "nb_board2_board_color";
 const AMBIENT_BUDGET = 4;
 const AMBIENT_STATE_EVAL_INTERVAL_MS = 100;
 const AMBIENT_VIEWPORT_EXPAND = 0.25;
@@ -5548,6 +5549,15 @@ function Board2Editor({
       return true;
     }
   });
+  const [boardColor, setBoardColor] = useState(() => {
+    if (typeof window === "undefined") return BOARD_SURFACE_COLOR;
+    try {
+      const saved = window.localStorage.getItem(BOARD_COLOR_STORAGE_KEY);
+      return saved && /^#[0-9a-f]{6}$/i.test(saved) ? saved : BOARD_SURFACE_COLOR;
+    } catch {
+      return BOARD_SURFACE_COLOR;
+    }
+  });
   const [isRecording, setIsRecording] = useState(false);
   const [recElapsed, setRecElapsed] = useState(0);
   const [transcribingNarrationId, setTranscribingNarrationId] = useState<string | null>(null);
@@ -5996,6 +6006,7 @@ function Board2Editor({
   const outroImageRef = useRef<ConfiguredOutroImage | null>(null);
   const outroTextRef = useRef(DEFAULT_OUTRO_TEXT);
   const outroSettingsSaveTimerRef = useRef<number | null>(null);
+  const boardColorRef = useRef(boardColor);
   const lipSyncAbortRef = useRef<AbortController | null>(null);
   const captionGenerationAbortRef = useRef<AbortController | null>(null);
   const narrationTranscriptionAbortRef = useRef<AbortController | null>(null);
@@ -6560,7 +6571,7 @@ function Board2Editor({
       streamId: STREAM_OWNER_USER_ID,
       sessionId: streamSessionIdRef.current,
       sentAt: Date.now(),
-      board: { width: BOARD_W, height: BOARD_H, backgroundColor: BOARD_SURFACE_COLOR },
+      board: { width: BOARD_W, height: BOARD_H, backgroundColor: boardColorRef.current },
       spawnDoor: spawnDoorRef.current,
       clips: await buildStreamClips(maxLongEdge),
       annotations: annotationsRef.current,
@@ -7096,6 +7107,14 @@ function Board2Editor({
     ambientVideoEnabledRef.current = ambientVideoEnabled;
     try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
   }, [ambientVideoEnabled]);
+  // The picker fires on every drag tick; debounce the write like the other board saves.
+  useEffect(() => {
+    boardColorRef.current = boardColor;
+    const timer = window.setTimeout(() => {
+      try { window.localStorage.setItem(BOARD_COLOR_STORAGE_KEY, boardColor); } catch {}
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [boardColor]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
@@ -8211,7 +8230,7 @@ function Board2Editor({
     quality: "preview" | "realtime-export" | "export" | "snapshot" = "preview",
     renderOptions: { includeCharacter?: boolean } = {},
   ) => {
-    ctx.fillStyle = BOARD_SURFACE_COLOR;
+    ctx.fillStyle = boardColorRef.current;
     ctx.fillRect(0, 0, W, H);
     const cam = overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
     const sf = cam.boardZoom * W / boardDimensionsRef.current.width;
@@ -15540,7 +15559,7 @@ function Board2Editor({
         signal,
         body: JSON.stringify({
           transcript,
-          board: { width: boardDimensionsRef.current.width, height: boardDimensionsRef.current.height, backgroundColor: BOARD_SURFACE_COLOR },
+          board: { width: boardDimensionsRef.current.width, height: boardDimensionsRef.current.height, backgroundColor: boardColorRef.current },
           clips: sendClips,
         }),
       });
@@ -20592,7 +20611,7 @@ function Board2Editor({
           data-board-drop-target
           data-board-drop-active={isBoardDropActive ? "true" : undefined}
           style={{
-            flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0, background: BOARD_SURFACE_COLOR,
+            flex: 1, position: "relative", overflow: "hidden", touchAction: "none", minHeight: 0, background: boardColor,
             boxShadow: isBoardDropActive
               ? "inset 0 0 0 3px rgba(46,143,255,.8), inset 0 0 0 9999px rgba(46,143,255,.06)"
               : undefined,
@@ -21078,6 +21097,10 @@ function Board2Editor({
                       {!autoBuildPhase && <div style={{ fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
+                    <label style={{ ...sketchButton, width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", fontSize: 13 }}>
+                      <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={22} />
+                      Board color
+                    </label>
                     <button
                       onClick={() => { setSaveModalOpen(true); setMobileDrawer(null); }}
                       style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
@@ -22539,6 +22562,7 @@ function Board2Editor({
               {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
             </span>
           )}
+          <BoardColorSwatch color={boardColor} onChange={setBoardColor} />
           <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
           <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
           <MainSectionNav active="board" desktopOnly />
@@ -22571,6 +22595,7 @@ function Board2Editor({
           )}
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
+          <label style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><BoardColorSwatch color={boardColor} onChange={setBoardColor} size={18} />Board color</label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
@@ -22829,7 +22854,7 @@ function Board2Editor({
           </div>
 
           {/* ── Center: board (primary) + preview overlay ── */}
-          <div style={{ flex: 1, minWidth: 0, position: "relative", overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
+          <div style={{ flex: 1, minWidth: 0, position: "relative", overflow: "hidden", background: boardColor }}>
 
             {/* Board container — fills the whole center */}
             <div
@@ -26647,6 +26672,21 @@ const uploadControlStyle: React.CSSProperties = {
   cursor: "pointer",
   boxShadow: "2px 2px 0 #2a2a2a",
 };
+
+// Circular swatch over a native color input: the OS picker (the color wheel on macOS) is the popover.
+function BoardColorSwatch({ color, onChange, size = 22 }: { color: string; onChange: (color: string) => void; size?: number }) {
+  return (
+    <span title="Board color" style={{ position: "relative", display: "inline-block", width: size, height: size, flexShrink: 0, borderRadius: "50%", background: color, border: "1.5px solid #2a2a2a", boxShadow: "1.5px 1.5px 0 #2a2a2a", cursor: "pointer" }}>
+      <input
+        type="color"
+        value={color}
+        onChange={(event) => onChange(event.target.value)}
+        aria-label="Board background color"
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, border: 0, padding: 0, cursor: "pointer" }}
+      />
+    </span>
+  );
+}
 
 const sketchButton: React.CSSProperties = {
   fontFamily: "'Courier New', monospace",
