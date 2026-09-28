@@ -1810,6 +1810,38 @@ type BoardMarquee = {
   currentY: number;
 } | null;
 
+// Custom zoom drawing magnets toward common frame shapes (Canva-style "snap to square"): within
+// CUSTOM_ZOOM_SNAP_TOLERANCE of a ratio, the rect is constrained to it exactly. The export
+// aspect wins when several are in range; the windows don't overlap today, but that keeps it true.
+const CUSTOM_ZOOM_SNAP_RATIOS = [9 / 16, 16 / 9, 1];
+const CUSTOM_ZOOM_SNAP_TOLERANCE = 0.15;
+const CUSTOM_ZOOM_SNAP_MIN_PX = 10;
+const CUSTOM_ZOOM_SNAPPED_COLOR = "#f5a623";
+
+// Keeps the drag's start corner fixed and changes whichever side needs the smaller adjustment.
+function snapCustomZoomDraw(
+  startX: number,
+  startY: number,
+  currentX: number,
+  currentY: number,
+  preferredRatio: number,
+): { currentX: number; currentY: number; snapped: boolean } {
+  const dx = currentX - startX, dy = currentY - startY;
+  const w = Math.abs(dx), h = Math.abs(dy);
+  if (w < CUSTOM_ZOOM_SNAP_MIN_PX || h < CUSTOM_ZOOM_SNAP_MIN_PX) return { currentX, currentY, snapped: false };
+  const ratio = w / h;
+  const inRange = CUSTOM_ZOOM_SNAP_RATIOS
+    .map((target) => ({ target, error: Math.abs(ratio - target) / target }))
+    .filter((candidate) => candidate.error <= CUSTOM_ZOOM_SNAP_TOLERANCE)
+    .sort((a, b) => a.error - b.error);
+  const target = inRange.find((candidate) => Math.abs(candidate.target - preferredRatio) < 1e-6)?.target ?? inRange[0]?.target;
+  if (target === undefined) return { currentX, currentY, snapped: false };
+  const snappedW = h * target, snappedH = w / target;
+  return Math.abs(snappedW - w) <= Math.abs(snappedH - h)
+    ? { currentX: startX + (dx < 0 ? -snappedW : snappedW), currentY, snapped: true }
+    : { currentX, currentY: startY + (dy < 0 ? -snappedH : snappedH), snapped: true };
+}
+
 type TimelineMarquee = {
   startX: number;
   startY: number;
@@ -5895,7 +5927,7 @@ function Board2Editor({
   const [boardMarquee, setBoardMarquee] = useState<BoardMarquee>(null);
   const [timelineMarquee, setTimelineMarquee] = useState<TimelineMarquee>(null);
   const [customZoomDrawMode, setCustomZoomDrawMode] = useState(false);
-  const [customZoomDrawPreview, setCustomZoomDrawPreview] = useState<BoardMarquee>(null);
+  const [customZoomDrawPreview, setCustomZoomDrawPreview] = useState<(NonNullable<BoardMarquee> & { snapped: boolean }) | null>(null);
   const [customZoomDuration, setCustomZoomDuration] = useState(DEFAULT_CUSTOM_ZOOM_DURATION);
   const [customZoomContinuous, setCustomZoomContinuous] = useState(false);
 
@@ -14907,7 +14939,7 @@ function Board2Editor({
       startX: start.x,
       startY: start.y,
     };
-    setCustomZoomDrawPreview({ startX: start.x, startY: start.y, currentX: start.x, currentY: start.y });
+    setCustomZoomDrawPreview({ startX: start.x, startY: start.y, currentX: start.x, currentY: start.y, snapped: false });
   }
 
   function handleCustomZoomGlassPointerMove(e: React.PointerEvent<HTMLDivElement>) {
@@ -14952,11 +14984,13 @@ function Board2Editor({
     }
 
     const point = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
+    const snap = snapCustomZoomDraw(gesture.startX, gesture.startY, point.x, point.y, canvasAspect === "9:16" ? 9 / 16 : 16 / 9);
     setCustomZoomDrawPreview({
       startX: gesture.startX,
       startY: gesture.startY,
-      currentX: point.x,
-      currentY: point.y,
+      currentX: snap.currentX,
+      currentY: snap.currentY,
+      snapped: snap.snapped,
     });
   }
 
@@ -14977,7 +15011,9 @@ function Board2Editor({
     setCustomZoomDrawPreview(null);
     if (!customZoomContinuousRef.current) disarmCustomZoomDrawMode();
     if (cancelled) return;
-    const end = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
+    const rawEnd = clientToCustomZoomBoardPoint(e.clientX, e.clientY);
+    const snappedEnd = snapCustomZoomDraw(gesture.startX, gesture.startY, rawEnd.x, rawEnd.y, canvasAspect === "9:16" ? 9 / 16 : 16 / 9);
+    const end = { x: snappedEnd.currentX, y: snappedEnd.currentY };
     const minBX = Math.min(gesture.startX, end.x), maxBX = Math.max(gesture.startX, end.x);
     const minBY = Math.min(gesture.startY, end.y), maxBY = Math.max(gesture.startY, end.y);
     const bw = maxBX - minBX, bh = maxBY - minBY;
@@ -23561,7 +23597,7 @@ function Board2Editor({
                   const w = Math.abs(customZoomDrawPreview.currentX - customZoomDrawPreview.startX) * boardZoom;
                   const h = Math.abs(customZoomDrawPreview.currentY - customZoomDrawPreview.startY) * boardZoom;
                   return (
-                    <div style={{ position: "absolute", left: x, top: y, width: w, height: h, border: "2px solid #2e8fff", background: "rgba(184,226,255,0.3)", pointerEvents: "none", zIndex: 21 }} />
+                    <div style={{ position: "absolute", left: x, top: y, width: w, height: h, border: `2px solid ${customZoomDrawPreview.snapped ? CUSTOM_ZOOM_SNAPPED_COLOR : "#2e8fff"}`, background: "rgba(184,226,255,0.3)", pointerEvents: "none", zIndex: 21 }} />
                   );
                 })()}
               </div>
