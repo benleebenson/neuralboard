@@ -20,6 +20,7 @@ import {
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
+import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
@@ -12561,7 +12562,13 @@ function Board2Editor({
 
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
   // in the media library, and places it on the board via addClipAndPlaceOnBoard.
-  async function ingestMediaFile(file: File | Blob, name: string, center?: { x: number; y: number }) {
+  async function ingestMediaFile(input: File | Blob, name: string, center?: { x: number; y: number }) {
+    let file = input;
+    if (isGifFile(file, name)) {
+      setToast(`Converting ${name} to a looping video…`);
+      const video = await convertAnimatedGifToMp4(file, boardColorRef.current);
+      if (video) file = video;
+    }
     const type: "image" | "video" = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(name)) ? "video" : "image";
     const url = type === "image" && joinCode ? await uploadJoinableImage(file, name) : URL.createObjectURL(file);
     let duration: number | undefined;
@@ -12627,8 +12634,9 @@ function Board2Editor({
     if (!files.length) return;
     setToast(`Adding ${files.length === 1 ? files[0].name : `${files.length} media files`}…`);
     try {
-    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
-    const otherFiles = files.filter((file) => !file.type.startsWith("image/"));
+    // GIFs skip the still-image batch layout so ingestMediaFile can turn animated ones into video.
+    const imageFiles = files.filter((file) => file.type.startsWith("image/") && !isGifFile(file, file.name));
+    const otherFiles = files.filter((file) => !imageFiles.includes(file));
     if (imageFiles.length > 1) {
       setToast(`Preparing ${imageFiles.length} images…`);
       const items: MediaItem[] = [];
