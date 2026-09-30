@@ -1501,7 +1501,48 @@ type BoardUndoSnapshot = {
   canvasAspect: "16:9" | "9:16";
   showCharacter: boolean;
   showCharacter2: boolean;
+  boardColor: string;
+  spawnDoor: SpawnDoor | null;
+  customZoomDuration: number;
+  characterMode: "auto" | "manual";
+  characterMode2: "auto" | "manual";
+  characterSkin: CharacterSkin;
+  characterSkin2: CharacterSkin;
+  characterType: CharacterType;
+  characterType2: CharacterType;
+  characterExpression: Expression;
+  characterExpression2: Expression;
+  characterStart: { x: number; y: number } | null;
+  characterStart2: { x: number; y: number } | null;
+  smartGestures: boolean;
+  captionsEnabled: boolean;
+  captionFontSize: CaptionFontSize;
+  captionPosition: CaptionPosition;
 };
+
+// Clip fields filled in asynchronously after a clip is added (thumbnails, decoded bytes, waveforms).
+// They never count as a separate undo step, and undo keeps the latest values rather than rolling a
+// clip back to its not-yet-loaded state.
+const BOARD_UNDO_DERIVED_CLIP_KEYS = ["sourceBlob", "audioBlob", "thumbnailBlobUrl", "previewUrl", "waveform", "sourceDurationSec"] as const;
+
+function stripDerivedClipFields(clip: Clip): Partial<Clip> {
+  const copy: Partial<Clip> = { ...clip };
+  for (const key of BOARD_UNDO_DERIVED_CLIP_KEYS) delete copy[key];
+  return copy;
+}
+
+function restoreDerivedClipFields(snapshotClips: Clip[], currentClips: readonly Clip[]): Clip[] {
+  const currentById = new Map(currentClips.map((clip) => [clip.id, clip]));
+  return snapshotClips.map((clip) => {
+    const current = currentById.get(clip.id);
+    if (!current || current.sourceUrl !== clip.sourceUrl) return clip;
+    const merged: Clip = { ...clip };
+    for (const key of BOARD_UNDO_DERIVED_CLIP_KEYS) {
+      if (current[key] !== undefined) (merged as Record<string, unknown>)[key] = current[key];
+    }
+    return merged;
+  });
+}
 
 type Board2PerformanceStats = {
   cache: PreviewCachePolicy & {
@@ -7232,10 +7273,31 @@ function Board2Editor({
     canvasAspect,
     showCharacter,
     showCharacter2,
-  }), [annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2]);
+    boardColor,
+    spawnDoor,
+    customZoomDuration,
+    characterMode,
+    characterMode2,
+    characterSkin,
+    characterSkin2,
+    characterType,
+    characterType2,
+    characterExpression,
+    characterExpression2,
+    characterStart,
+    characterStart2,
+    smartGestures,
+    captionsEnabled,
+    captionFontSize,
+    captionPosition,
+  }), [
+    annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2,
+    boardColor, spawnDoor, customZoomDuration, characterMode, characterMode2, characterSkin, characterSkin2, characterType, characterType2,
+    characterExpression, characterExpression2, characterStart, characterStart2, smartGestures, captionsEnabled, captionFontSize, captionPosition,
+  ]);
   const boardUndoSignature = useMemo(() => JSON.stringify({
     ...boardUndoSnapshot,
-    clips: boardUndoSnapshot.clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, ...clip }) => clip),
+    clips: boardUndoSnapshot.clips.map(stripDerivedClipFields),
   }), [boardUndoSnapshot]);
   const dirtySignature = useMemo(() => `${saveName}\n${boardUndoSignature}`, [boardUndoSignature, saveName]);
   useEffect(() => {
@@ -7288,7 +7350,9 @@ function Board2Editor({
     const target = history.at(-1);
     if (!target) return;
     boardUndoApplyingSignatureRef.current = target.signature;
-    clipsRef.current = target.snapshot.clips;
+    const restoredClips = restoreDerivedClipFields(target.snapshot.clips, clipsRef.current);
+    target.snapshot.clips = restoredClips;
+    clipsRef.current = restoredClips;
     annotationsRef.current = target.snapshot.annotations;
     cameraKeyframesRef.current = target.snapshot.cameraKeyframes;
     characterActionsRef.current = target.snapshot.characterActions;
@@ -7296,7 +7360,7 @@ function Board2Editor({
     boardDimensionsRef.current = target.snapshot.boardDimensions;
     showCharacterRef.current = target.snapshot.showCharacter;
     showCharacter2Ref.current = target.snapshot.showCharacter2;
-    setClips(target.snapshot.clips);
+    setClips(restoredClips);
     setAnnotations(target.snapshot.annotations);
     setCameraKeyframes(target.snapshot.cameraKeyframes);
     setCharacterActions(target.snapshot.characterActions);
@@ -7305,6 +7369,25 @@ function Board2Editor({
     setCanvasAspect(target.snapshot.canvasAspect);
     setShowCharacter(target.snapshot.showCharacter);
     setShowCharacter2(target.snapshot.showCharacter2);
+    const s = target.snapshot;
+    boardColorRef.current = s.boardColor;
+    setBoardColor(s.boardColor);
+    setSpawnDoor(s.spawnDoor);
+    setCustomZoomDuration(s.customZoomDuration);
+    setCharacterMode(s.characterMode);
+    setCharacterMode2(s.characterMode2);
+    setCharacterSkin(s.characterSkin);
+    setCharacterSkin2(s.characterSkin2);
+    setCharacterType(s.characterType);
+    setCharacterType2(s.characterType2);
+    setCharacterExpression(s.characterExpression);
+    setCharacterExpression2(s.characterExpression2);
+    setCharacterStart(s.characterStart);
+    setCharacterStart2(s.characterStart2);
+    setSmartGestures(s.smartGestures);
+    setCaptionsEnabled(s.captionsEnabled);
+    setCaptionFontSize(s.captionFontSize);
+    setCaptionPosition(s.captionPosition);
     setClipSelection([]);
     setAnnotationSelection([]);
     setCanUndoBoard(history.length > 1);
@@ -7315,8 +7398,14 @@ function Board2Editor({
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.key.toLowerCase() !== "z") return;
       const target = event.target as HTMLElement | null;
-      if (target?.isContentEditable || target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT") return;
+      // Only text-entry fields keep their native undo; color pickers, sliders, checkboxes etc. still
+      // hold focus after a change, and Ctrl/⌘ Z should undo that change on the board.
+      const isTextEntry = target instanceof HTMLInputElement
+        ? !["color", "range", "checkbox", "radio", "button", "submit", "reset", "file"].includes(target.type)
+        : !!target && (target.isContentEditable || target.tagName === "TEXTAREA");
+      if (isTextEntry) return;
       event.preventDefault();
+      (target as HTMLElement | null)?.blur?.();
       undoBoard();
     };
     window.addEventListener("keydown", onKeyDown);
