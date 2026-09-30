@@ -2154,6 +2154,56 @@ function interpolateGesturePose(from: GesturePose, to: GesturePose, progress: nu
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 let _idCounter = 0;
+// Flat clip records from any saved manifest version: v0 has top-level `clips`, v1 `board.clips`,
+// and v2+ splits board media from the timeline blocks that reference it. Takes and returns the
+// untyped JSON.parse output; callers normalize each record.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function manifestClipRecords(rawManifest: any): any[] {
+  const schemaVersion = normalizeLoadedSchemaVersion(rawManifest?.schemaVersion);
+  if (schemaVersion < 1) return rawManifest?.clips ?? [];
+  if (schemaVersion < 2) return rawManifest.board?.clips ?? [];
+  return [
+    ...(rawManifest.board?.media ?? []).flatMap((media: Record<string, unknown>) => {
+      const mediaId = String(media.id ?? "");
+      const blocks = (rawManifest.timeline?.blocks ?? []).filter((candidate: Record<string, unknown>) =>
+        isBoardBackedClipType(String(candidate.type ?? "")) &&
+        String(candidate.mediaId ?? candidate.id ?? "") === mediaId);
+      const canonicalBlock = blocks.find((block: Record<string, unknown>) => String(block.id ?? "") === mediaId);
+      const canonical = canonicalBlock
+        ? { ...media, ...canonicalBlock, id: mediaId, mediaId, featured: true }
+        : { ...media, id: mediaId, mediaId, featured: false, startTime: 0, duration: 4 };
+      const appearances = blocks
+        .filter((block: Record<string, unknown>) => String(block.id ?? "") !== mediaId)
+        .map((block: Record<string, unknown>) => ({
+          ...media,
+          ...block,
+          id: String(block.id ?? generateId()),
+          mediaId,
+          featured: true,
+        }));
+      return [canonical, ...appearances];
+    }),
+    ...(rawManifest.timeline?.blocks ?? []).filter((block: Record<string, unknown>) =>
+      !isBoardBackedClipType(String(block.type ?? ""))),
+  ];
+}
+
+const IMPORT_BOARD_GAP = 80;
+const IMPORT_BOARD_MIN_CLIP_W = 20;
+// Keeps a board of thumbnails or of wall-sized images from arriving absurdly scaled.
+const IMPORT_BOARD_SCALE_RANGE = [0.25, 4] as const;
+
+// Median board width of image/video clips, ignoring slivers; the "typical clip size" of a board.
+function medianBoardMediaWidth(clips: readonly Clip[]): number | null {
+  const widths = clips
+    .filter((clip) => isBoardMediaClip(clip) && (clip.boardW ?? 0) >= IMPORT_BOARD_MIN_CLIP_W)
+    .map((clip) => clip.boardW!)
+    .sort((a, b) => a - b);
+  if (!widths.length) return null;
+  const middle = Math.floor(widths.length / 2);
+  return widths.length % 2 ? widths[middle] : (widths[middle - 1] + widths[middle]) / 2;
+}
+
 function generateId(): string {
   return `b2_${Date.now()}_${++_idCounter}`;
 }
@@ -5646,6 +5696,7 @@ function Board2Editor({
   const [exportingClipId, setExportingClipId] = useState<string | null>(null);
   const [clipsUpgradeOpen, setClipsUpgradeOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [isImportingBoard, setIsImportingBoard] = useState(false);
   const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
@@ -20281,6 +20332,13 @@ function Board2Editor({
                 <button onClick={() => setLibraryOpen(false)} style={{ ...miniButton, padding: "3px 8px", fontSize: 15, marginLeft: isSignedIn ? 0 : "auto" }}>×</button>
               </div>
 
+              <div style={{ padding: "10px 14px", borderBottom: "1.5px solid rgba(42,42,42,0.2)", flexShrink: 0 }}>
+                <label title="Merge another board's visuals to the right of this one" style={{ ...uploadControlStyle, fontSize: 11, opacity: isImportingBoard ? 0.5 : 1, pointerEvents: isImportingBoard ? "none" : undefined }}>
+                  {isImportingBoard ? "Importing board…" : "⤓ Import Board (.nbp)"}
+                  <input type="file" accept=".nbp,.zip" aria-label="Import board" disabled={isImportingBoard} style={nativeFilePickerStyle} onChange={(event) => { const f = event.target.files?.[0]; event.target.value = ""; if (f) void importBoard(f); }} />
+                </label>
+              </div>
+
               {isSignedIn && (
                 <div style={{ padding: "10px 14px", borderBottom: "1.5px solid rgba(42,42,42,0.2)", display: "flex", flexDirection: "column", gap: 8, flexShrink: 0 }}>
                   <div style={{ display: "flex", gap: 4 }}>
@@ -22183,32 +22241,7 @@ function Board2Editor({
       // (asset restore, legacy clip-type migration, character/lip-sync restore) never has to
       // branch on version itself — it only ever sees today's familiar flat field names.
       const schemaVersion = normalizeLoadedSchemaVersion(rawManifest?.schemaVersion);
-      const normalizedRecipeClips = schemaVersion >= 2
-        ? [
-            ...(rawManifest.board?.media ?? []).flatMap((media: Record<string, unknown>) => {
-              const mediaId = String(media.id ?? "");
-              const blocks = (rawManifest.timeline?.blocks ?? []).filter((candidate: Record<string, unknown>) =>
-                isBoardBackedClipType(String(candidate.type ?? "")) &&
-                String(candidate.mediaId ?? candidate.id ?? "") === mediaId);
-              const canonicalBlock = blocks.find((block: Record<string, unknown>) => String(block.id ?? "") === mediaId);
-              const canonical = canonicalBlock
-                ? { ...media, ...canonicalBlock, id: mediaId, mediaId, featured: true }
-                : { ...media, id: mediaId, mediaId, featured: false, startTime: 0, duration: 4 };
-              const appearances = blocks
-                .filter((block: Record<string, unknown>) => String(block.id ?? "") !== mediaId)
-                .map((block: Record<string, unknown>) => ({
-                  ...media,
-                  ...block,
-                  id: String(block.id ?? generateId()),
-                  mediaId,
-                  featured: true,
-                }));
-              return [canonical, ...appearances];
-            }),
-            ...(rawManifest.timeline?.blocks ?? []).filter((block: Record<string, unknown>) =>
-              !isBoardBackedClipType(String(block.type ?? ""))),
-          ]
-        : rawManifest.board?.clips ?? [];
+      const normalizedRecipeClips = manifestClipRecords(rawManifest);
       const manifest = schemaVersion >= 1 ? {
         version: 1,
         name: rawManifest.meta?.title,
@@ -22509,6 +22542,157 @@ function Board2Editor({
       return false;
     } finally {
       setIsLoadingProject(false);
+    }
+  }
+
+  // Import Board (📚 panel): merges another .nbp's visual elements into this board without touching
+  // what's here. Narration and character-driven blocks (characterFocus, pan camera moves tied to
+  // the source layout) stay behind. The imported set keeps its internal layout: it's scaled so its
+  // median media width matches this board's, then placed IMPORT_BOARD_GAP right of the existing
+  // content. Its timeline blocks are queued after the current timeline instead of overlapping it.
+  async function importBoard(file: File) {
+    if (isLoadingProject || isImportingBoard) return;
+    setIsImportingBoard(true);
+    setToast(`Importing ${file.name}…`);
+    try {
+      const files = unzipSync(new Uint8Array(await file.arrayBuffer()));
+      if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
+      const rawManifest = JSON.parse(strFromU8(files["manifest.json"]));
+
+      // Fresh ids so nothing collides with this board; mediaId links between appearances survive.
+      const idMap = new Map<string, string>();
+      const remapId = (id: unknown) => {
+        const key = String(id ?? "");
+        let next = idMap.get(key);
+        if (!next) {
+          next = generateId();
+          idMap.set(key, next);
+        }
+        return next;
+      };
+
+      const importedClips: Clip[] = [];
+      for (const record of manifestClipRecords(rawManifest)) {
+        const type = String(record?.type ?? "");
+        if (type !== "image" && type !== "video" && type !== "customZoom") continue;
+        const { thumbnailDataUri, thumbnailBlobUrl: _staleThumbnailBlobUrl, mediaCacheKey: _mediaCacheKey, ...mc } = record;
+        const id = remapId(mc.id);
+        const base = { ...mc, id, ...(mc.mediaId ? { mediaId: remapId(mc.mediaId) } : {}) };
+        const thumbnailUrl = type === "video" && typeof thumbnailDataUri === "string" && thumbnailDataUri.startsWith("data:image/")
+          ? thumbnailDataUri
+          : type === "video" && typeof mc.youtubeId === "string" && /^[A-Za-z0-9_-]{11}$/.test(mc.youtubeId)
+            ? `https://img.youtube.com/vi/${mc.youtubeId}/hqdefault.jpg`
+            : undefined;
+        if (thumbnailUrl?.startsWith("data:")) registerVideoThumbnail(id, thumbnailUrl);
+        const thumbnail = thumbnailUrl ? { thumbnailBlobUrl: thumbnailUrl } : {};
+        let rawClip: Record<string, unknown>;
+        if (type === "customZoom") {
+          rawClip = { ...base, sourceUrl: "" };
+        } else if (mc.needsRedownload) {
+          rawClip = { ...base, ...thumbnail, sourceUrl: "", needsRedownload: true };
+        } else if (mc.assetFile && files[mc.assetFile]) {
+          const data = files[mc.assetFile];
+          const assetBytes = new Uint8Array(data.byteLength);
+          assetBytes.set(data);
+          // A File named after its source board gives the autosave a stable cache key; one File
+          // per clip keeps video instances off a shared decoder, as in loadBoard.
+          const asset = new File([assetBytes.buffer], `${file.name}/${mc.assetFile}`, {
+            type: mc.assetMime || "application/octet-stream",
+            lastModified: file.lastModified,
+          });
+          const cacheKey = mediaCacheKeyForFile(asset);
+          mediaCacheKeys.set(asset, cacheKey);
+          if (!cachedMediaKeys.has(cacheKey)) {
+            cachedMediaKeys.add(cacheKey);
+            void saveCachedMedia(cacheKey, asset).catch(() => {});
+          }
+          const blobUrl = URL.createObjectURL(asset);
+          if (type === "image") {
+            const previewBlob = await createImagePreviewBlob(asset);
+            const previewUrl = previewBlob === asset ? blobUrl : URL.createObjectURL(previewBlob);
+            rawClip = { ...base, sourceUrl: blobUrl, sourceBlob: asset, previewUrl };
+          } else {
+            createVideoElement(id, blobUrl);
+            rawClip = { ...base, ...thumbnail, sourceUrl: blobUrl, sourceBlob: asset };
+          }
+        } else {
+          rawClip = { ...base, ...thumbnail, sourceUrl: mc.sourceUrl ?? "" };
+        }
+        const clip = normalizeLoadedTimelineRecord(rawClip, `imported_clip_${importedClips.length}`, N_LAYERS - 1) as unknown as Clip;
+        importedClips.push(isBoardMediaClip(clip) && clip.featured === false
+          ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: false as const }
+          : clip);
+      }
+      const importedAnnotations: Annotation[] = (Array.isArray(rawManifest.annotations) ? rawManifest.annotations : [])
+        .map((annotation: Annotation) => ({ ...annotation, id: generateId() }));
+      if (!importedClips.length && !importedAnnotations.length) {
+        setToast(`${file.name} has no visual elements to import`);
+        return;
+      }
+
+      const hasGeometry = (clip: Clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined;
+      const existingClips = clipsRef.current;
+      const existingAnnotations = annotationsRef.current;
+      const existingRights = [
+        ...existingClips.filter(hasGeometry).map((clip) => clip.boardX! + clip.boardW!),
+        ...existingAnnotations.map((annotation) => annotation.boardX + annotation.boardW),
+      ];
+      const importedBoxes = [
+        ...importedClips.filter(hasGeometry).map((clip) => ({ x: clip.boardX!, y: clip.boardY! })),
+        ...importedAnnotations.map((annotation) => ({ x: annotation.boardX, y: annotation.boardY })),
+      ];
+      const currentMedian = medianBoardMediaWidth(existingClips);
+      const importedMedian = medianBoardMediaWidth(importedClips);
+      const scale = currentMedian && importedMedian
+        ? clamp(currentMedian / importedMedian, IMPORT_BOARD_SCALE_RANGE[0], IMPORT_BOARD_SCALE_RANGE[1])
+        : 1;
+      const sourceLeft = importedBoxes.length ? Math.min(...importedBoxes.map((box) => box.x)) : 0;
+      const sourceTop = importedBoxes.length ? Math.min(...importedBoxes.map((box) => box.y)) : 0;
+      // An empty board keeps the imported layout where it was.
+      const targetLeft = existingRights.length ? Math.max(...existingRights) + IMPORT_BOARD_GAP : sourceLeft;
+      const mapX = (x: number) => targetLeft + (x - sourceLeft) * scale;
+      const mapY = (y: number) => sourceTop + (y - sourceTop) * scale;
+
+      const timelineOffset = currentPlaybackDuration(existingClips);
+      const placedClips = importedClips.map((clip) => ({
+        ...clip,
+        ...(hasGeometry(clip) ? { boardX: mapX(clip.boardX!), boardY: mapY(clip.boardY!), boardW: clip.boardW! * scale, boardH: clip.boardH! * scale } : {}),
+        ...(isFeaturedTimelineClip(clip) ? { startTime: clip.startTime + timelineOffset } : {}),
+      }));
+      const placedAnnotations = importedAnnotations.map((annotation) => ({
+        ...annotation,
+        boardX: mapX(annotation.boardX),
+        boardY: mapY(annotation.boardY),
+        boardW: annotation.boardW * scale,
+        boardH: annotation.boardH * scale,
+        ...(annotation.arrowStartX !== undefined ? { arrowStartX: mapX(annotation.arrowStartX) } : {}),
+        ...(annotation.arrowStartY !== undefined ? { arrowStartY: mapY(annotation.arrowStartY) } : {}),
+        ...(annotation.arrowEndX !== undefined ? { arrowEndX: mapX(annotation.arrowEndX) } : {}),
+        ...(annotation.arrowEndY !== undefined ? { arrowEndY: mapY(annotation.arrowEndY) } : {}),
+        ...(annotation.points ? { points: annotation.points.map((point) => ({ ...point, x: mapX(point.x), y: mapY(point.y) })) } : {}),
+        ...(annotation.fontSize !== undefined ? { fontSize: annotation.fontSize * scale } : {}),
+        ...(annotation.strokeWidth !== undefined ? { strokeWidth: annotation.strokeWidth * scale } : {}),
+      }));
+
+      const placedRight = Math.max(0, ...placedClips.filter(hasGeometry).map((clip) => clip.boardX! + clip.boardW!), ...placedAnnotations.map((annotation) => annotation.boardX + annotation.boardW));
+      const placedBottom = Math.max(0, ...placedClips.filter(hasGeometry).map((clip) => clip.boardY! + clip.boardH!), ...placedAnnotations.map((annotation) => annotation.boardY + annotation.boardH));
+      const nextDimensions = {
+        width: Math.max(boardDimensionsRef.current.width, Math.ceil((placedRight + IMPORT_BOARD_GAP) / 500) * 500),
+        height: Math.max(boardDimensionsRef.current.height, Math.ceil((placedBottom + IMPORT_BOARD_GAP) / 500) * 500),
+      };
+      boardDimensionsRef.current = nextDimensions;
+      setBoardDimensions(nextDimensions);
+      clipsRef.current = [...existingClips, ...placedClips];
+      setClips(clipsRef.current);
+      annotationsRef.current = [...existingAnnotations, ...placedAnnotations];
+      setAnnotations(annotationsRef.current);
+      setClipSelection(placedClips.filter(hasGeometry).map((clip) => clip.id));
+      setLibraryOpen(false);
+      setToast(`Imported ${placedClips.length + placedAnnotations.length} clips from ${file.name}`);
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Import failed");
+    } finally {
+      setIsImportingBoard(false);
     }
   }
 
