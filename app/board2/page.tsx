@@ -443,7 +443,7 @@ function recipeProvenance(source?: ClipSource): RecipeProvenance {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration";
+  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration" | "flash";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -511,6 +511,8 @@ type Clip = {
   cameraBeat?: boolean;
   narrationTime?: number;
   narrationTypewriter?: boolean; // customZoom-only: type out the narration spoken during this zoom
+  flashImageUrl?: string; // flash-only: /flash/images/... drawn full-screen while the block is active
+  flashSoundUrl?: string; // flash-only: /flash/sounds/... played from the block's start
 
   rationale?: string;
 };
@@ -1312,6 +1314,95 @@ function drawZoomNarrationTypewriter(
   if (typing || Math.floor(time * 2.2) % 2 === 0) {
     ctx.fillStyle = "#c8f135";
     ctx.fillRect(caretX + fontSize * 0.08, caretY - fontSize * 0.5, fontSize * 0.55, fontSize);
+  }
+  ctx.restore();
+}
+
+// ─── Flash cut ─────────────────────────────────────────────────────────────────
+// A "flash" clip slams a full-screen meme image over everything (board, camera, captions) for its
+// whole duration and plays a sound effect from its start. The cut is deliberately a hard on/off —
+// no fade, scale or easing — so it lands within a single frame in preview and export alike.
+// Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets.
+const FLASH_CUT_DEFAULT_DURATION = 0.6;
+const FLASH_CLIP_COLOR = "#ffe14d";
+type FlashAsset = { name: string; url: string };
+
+const flashCutImageCache = new Map<string, HTMLImageElement>();
+const flashCutSoundBytes = new Map<string, Promise<ArrayBuffer>>();
+const flashCutDecodedSounds = new WeakMap<BaseAudioContext, Map<string, Promise<AudioBuffer>>>();
+
+function flashCutImage(url: string): HTMLImageElement {
+  let image = flashCutImageCache.get(url);
+  if (!image) {
+    image = new Image();
+    image.decoding = "async";
+    image.src = url;
+    flashCutImageCache.set(url, image);
+  }
+  return image;
+}
+
+// Export renders must never draw a frame before the flash image has decoded.
+async function preloadFlashCutImages(clips: readonly Clip[]): Promise<void> {
+  const urls = new Set(clips.flatMap((clip) => clip.type === "flash" && clip.flashImageUrl ? [clip.flashImageUrl] : []));
+  await Promise.all([...urls].map((url) => flashCutImage(url).decode().catch(() => {
+    console.warn("[flash-cut] image failed to load", url);
+  })));
+}
+
+function decodeFlashCutSound(context: BaseAudioContext, url: string): Promise<AudioBuffer> {
+  let decoded = flashCutDecodedSounds.get(context);
+  if (!decoded) { decoded = new Map(); flashCutDecodedSounds.set(context, decoded); }
+  let pending = decoded.get(url);
+  if (!pending) {
+    let bytes = flashCutSoundBytes.get(url);
+    if (!bytes) {
+      bytes = fetch(url).then((response) => {
+        if (!response.ok) throw new Error(`Flash sound failed (${response.status})`);
+        return response.arrayBuffer();
+      });
+      flashCutSoundBytes.set(url, bytes);
+      bytes.catch(() => flashCutSoundBytes.delete(url));
+    }
+    // decodeAudioData detaches its input, so every context decodes its own copy.
+    pending = bytes.then((data) => context.decodeAudioData(data.slice(0)));
+    decoded.set(url, pending);
+    pending.catch(() => decoded!.delete(url));
+  }
+  return pending;
+}
+
+function flashCutSoundClips(clips: readonly Clip[]): Array<Clip & { flashSoundUrl: string }> {
+  return clips.filter((clip): clip is Clip & { flashSoundUrl: string } =>
+    clip.type === "flash" && !!clip.flashSoundUrl && clip.duration > 0 && !clip.muted);
+}
+
+function drawFlashCutOverlay(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  clips: readonly Clip[],
+  width: number,
+  height: number,
+) {
+  // The most recently started flash wins when blocks overlap.
+  let flash: Clip | null = null;
+  for (const clip of clips) {
+    if (clip.type !== "flash" || time < clip.startTime || time >= clip.startTime + clip.duration) continue;
+    if (!flash || clip.startTime >= flash.startTime) flash = clip;
+  }
+  if (!flash?.flashImageUrl) return;
+  const image = flashCutImage(flash.flashImageUrl);
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, width, height);
+  if (image.complete && image.naturalWidth > 0) {
+    // Cover: scale to fill the frame and crop the overflow, centered.
+    const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
+    const sw = width / scale;
+    const sh = height / scale;
+    ctx.drawImage(image, (image.naturalWidth - sw) / 2, (image.naturalHeight - sh) / 2, sw, sh, 0, 0, width, height);
   }
   ctx.restore();
 }
@@ -5986,6 +6077,11 @@ function Board2Editor({
   const [isExportingBoardImage, setIsExportingBoardImage] = useState(false);
   const [snapshotIncludeCharacter, setSnapshotIncludeCharacter] = useState(true);
   const [clipsPanelOpen, setClipsPanelOpen] = useState(false);
+  const [flashPickerOpen, setFlashPickerOpen] = useState(false);
+  const [flashAssets, setFlashAssets] = useState<{ images: FlashAsset[]; sounds: FlashAsset[] } | null>(null);
+  const [flashPickImageUrl, setFlashPickImageUrl] = useState<string | null>(null);
+  const [flashPickSoundUrl, setFlashPickSoundUrl] = useState<string | null>(null);
+  const flashPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
   const [identifiedClips, setIdentifiedClips] = useState<IdentifiedClip[]>([]);
   const [clipsLoading, setClipsLoading] = useState(false);
   const [clipsError, setClipsError] = useState<string | null>(null);
@@ -6555,6 +6651,9 @@ function Board2Editor({
   const micStartWallRef = useRef(0);
   const isRecordingRef = useRef(false);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  // Flash-cut sound effects currently sounding in preview, and the blocks already fired this run.
+  const flashSoundNodesRef = useRef<Array<{ clipId: string; source: AudioBufferSourceNode; gain: GainNode }>>([]);
+  const flashFiredIdsRef = useRef<Set<string>>(new Set());
   const narrationAudioElsRef = useRef<Map<string, { element: HTMLAudioElement; sourceUrl: string }>>(new Map());
   const narrationPlayRequestRef = useRef<Map<string, number>>(new Map());
   const mobileYtIframeRef = useRef<HTMLIFrameElement | null>(null);
@@ -7441,6 +7540,23 @@ function Board2Editor({
   }, []);
 
   useEffect(() => { clipsRef.current = clips; }, [clips]);
+  // Warm flash-cut images as soon as a block exists, and silence the sound of a block that was
+  // deleted while it was still sounding.
+  useEffect(() => {
+    const flashIds = new Set<string>();
+    for (const clip of clips) {
+      if (clip.type !== "flash") continue;
+      flashIds.add(clip.id);
+      if (clip.flashImageUrl) flashCutImage(clip.flashImageUrl);
+    }
+    if (flashSoundNodesRef.current.some((node) => !flashIds.has(node.clipId))) stopFlashCutSounds(flashIds);
+  }, [clips]);
+  const selectedFlashClipId = selectedClip?.type === "flash" ? selectedClip.id : null;
+  useEffect(() => {
+    if (selectedFlashClipId && !flashAssets) void loadFlashAssets();
+  // Lists the asset folders the first time a flash block is selected.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFlashClipId]);
   const joinableSnapshot = useMemo<JoinableBoardState>(() => ({
     clips: clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, previewUrl: _previewUrl, thumbnailBlobUrl: _thumbnailBlobUrl, ...clip }) => clip as unknown as Record<string, unknown>),
     annotations: annotations as unknown as Array<Record<string, unknown>>,
@@ -9167,6 +9283,9 @@ function Board2Editor({
         captionPositionRef.current,
       );
     }
+    // Last, so a flash cut covers the board, camera, overlays and captions. Shared by preview,
+    // real-time export and deterministic export.
+    drawFlashCutOverlay(ctx, time, currentClips, W, H);
   // Cache accessors are component-local and intentionally read the latest refs.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drawStreamGuestsToCtx, editorCameraAtTime]);
@@ -9819,9 +9938,11 @@ function Board2Editor({
           runtime.reason = "playback-ended";
         }
         stopAllNarrationAudio();
+        stopFlashCutSounds();
         finishGesturePlaybackDebug("ended");
         drawFrame(maxEnd); return;
       }
+      triggerFlashCutSounds(previous, next);
       playheadRef.current = next;
       if (now - lastPlayheadUiTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
         lastPlayheadUiTimeRef.current = now;
@@ -9879,6 +10000,7 @@ function Board2Editor({
       ambientCandidateIdsRef.current = new Set();
       // Pause streamed narration elements without discarding their media state.
       stopAllNarrationAudio();
+      stopFlashCutSounds();
       finishGesturePlaybackDebug("paused");
     }
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
@@ -10473,6 +10595,127 @@ function Board2Editor({
     if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true);
   }
 
+  // ─ Flash cut blocks ───────────────────────────────────────────────────────
+
+  async function loadFlashAssets(): Promise<{ images: FlashAsset[]; sounds: FlashAsset[] } | null> {
+    try {
+      const response = await fetch("/api/board2/flash-assets", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const assets = await response.json() as { images: FlashAsset[]; sounds: FlashAsset[] };
+      setFlashAssets(assets);
+      return assets;
+    } catch (error) {
+      console.warn("[flash-cut] could not list assets", error);
+      setToast("Could not load flash images and sounds");
+      return null;
+    }
+  }
+
+  async function openFlashPicker() {
+    setFlashPickerOpen(true);
+    const assets = await loadFlashAssets();
+    if (!assets) return;
+    setFlashPickImageUrl((current) => current && assets.images.some((asset) => asset.url === current) ? current : assets.images[0]?.url ?? null);
+    setFlashPickSoundUrl((current) => current && assets.sounds.some((asset) => asset.url === current) ? current : assets.sounds[0]?.url ?? null);
+  }
+
+  function closeFlashPicker() {
+    setFlashPickerOpen(false);
+    stopFlashSoundPreview();
+  }
+
+  function previewFlashSound(url: string) {
+    stopFlashSoundPreview();
+    const audio = new Audio(url);
+    flashPreviewAudioRef.current = audio;
+    audio.play().catch((error) => console.warn("[flash-cut] sound preview failed", error));
+  }
+
+  function stopFlashSoundPreview() {
+    flashPreviewAudioRef.current?.pause();
+    flashPreviewAudioRef.current = null;
+  }
+
+  function flashAssetName(url: string | undefined, list: FlashAsset[] | undefined): string {
+    if (!url) return "none";
+    return list?.find((asset) => asset.url === url)?.name ?? decodeURIComponent(url.split("/").pop() ?? url).replace(/\.[^.]+$/, "");
+  }
+
+  function insertFlashCut(imageUrl: string, soundUrl: string) {
+    const id = generateId();
+    const startTime = Math.max(0, playheadRef.current);
+    const duration = FLASH_CUT_DEFAULT_DURATION;
+    const existingClips = clipsRef.current;
+    // Same time as the playhead, on the first visual layer that is free for the whole block.
+    const overlaps = (layer: number) => existingClips.some((clip) =>
+      clip.type !== "narration" && isFeaturedTimelineClip(clip) && (clip.layer ?? 1) === layer &&
+      clip.startTime < startTime + duration && startTime < clip.startTime + clip.duration);
+    const layer = Array.from({ length: N_LAYERS }, (_, index) => index).find((candidate) => !overlaps(candidate)) ?? 0;
+    const clip: Clip = {
+      id, type: "flash", name: "Flash", sourceUrl: "",
+      startTime, duration, layer,
+      flashImageUrl: imageUrl, flashSoundUrl: soundUrl,
+    };
+    flashCutImage(imageUrl);
+    clipsRef.current = [...existingClips, clip];
+    setClips((prev) => [...prev, clip]);
+    selectionSurfaceRef.current = "timeline";
+    setClipSelection([id]);
+    setToast(`⚡ Flash added at ${formatTime(startTime)}`);
+  }
+
+  function updateFlashCut(clipId: string, patch: { flashImageUrl?: string; flashSoundUrl?: string }) {
+    if (patch.flashImageUrl) flashCutImage(patch.flashImageUrl);
+    setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...patch } : clip));
+  }
+
+  // Properties-panel editor for a selected flash block (desktop and mobile drawers).
+  function renderFlashCutProperties(clip: Clip, compact: boolean) {
+    const images = flashAssets?.images;
+    const sounds = flashAssets?.sounds;
+    const thumb = compact ? 46 : 58;
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a5200", background: FLASH_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+          Full-screen image slams in on the sound — drag the block edge to hold it longer
+        </div>
+        {clip.flashImageUrl && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={clip.flashImageUrl} alt="" style={{ width: "100%", aspectRatio: canvasAspect === "9:16" ? "9 / 16" : "16 / 9", maxHeight: 160, objectFit: "cover", border: "1.5px solid #2a2a2a", background: "#000" }} />
+        )}
+        <div style={panelLabelStyle}>Image · {flashAssetName(clip.flashImageUrl, images)}</div>
+        {images ? (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {images.map((asset) => (
+              <button
+                key={asset.url}
+                type="button"
+                title={asset.name}
+                onClick={() => updateFlashCut(clip.id, { flashImageUrl: asset.url })}
+                style={{ width: thumb, height: thumb, padding: 0, border: asset.url === clip.flashImageUrl ? "2.5px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+              />
+            ))}
+          </div>
+        ) : (
+          <button type="button" onClick={() => void loadFlashAssets()} style={miniButton}>Load images & sounds</button>
+        )}
+        <div style={panelLabelStyle}>Sound · {flashAssetName(clip.flashSoundUrl, sounds)}</div>
+        {sounds && sounds.map((asset) => (
+          <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button type="button" title="Preview sound" onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 24, padding: 0 }}>▶</button>
+            <button
+              type="button"
+              onClick={() => updateFlashCut(clip.id, { flashSoundUrl: asset.url })}
+              style={{ ...miniButton, flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: asset.url === clip.flashSoundUrl ? "#2a2a2a" : "transparent", color: asset.url === clip.flashSoundUrl ? "#fff" : "#2a2a2a" }}
+            >
+              {asset.name}
+            </button>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   function clearCustomZoomBoxes() {
     const customZoomIds = new Set(clipsRef.current.filter((clip) => clip.type === "customZoom").map((clip) => clip.id));
     if (customZoomIds.size === 0) return;
@@ -10899,6 +11142,60 @@ function Board2Editor({
     setPlayhead(next);
     setIsPlaying(false);
     resyncNarrationAudioAtTime(next, false);
+    stopFlashCutSounds();
+  }
+
+  // ─ Flash-cut sound effects (preview) ──────────────────────────────────────
+  // Preview fires each sound from the RAF loop on the same playhead step that first draws the
+  // flash image, so picture and sound share one clock. Exports schedule the same sounds into
+  // their own audio graphs (see runRealtimeExport / decodeOfflineAudioSources).
+
+  function stopFlashCutSounds(keepClipIds?: ReadonlySet<string>) {
+    flashSoundNodesRef.current = flashSoundNodesRef.current.filter((node) => {
+      if (keepClipIds?.has(node.clipId)) return true;
+      try { node.source.stop(); } catch {}
+      try { node.source.disconnect(); } catch {}
+      try { node.gain.disconnect(); } catch {}
+      return false;
+    });
+    if (!keepClipIds) flashFiredIdsRef.current = new Set();
+  }
+
+  function playFlashCutSound(clip: Clip & { flashSoundUrl: string }, triggeredAtTimeline: number) {
+    const ctx = audioCtxRef.current;
+    if (!ctx || ctx.state === "closed" || isExportingRef.current) return;
+    flashFiredIdsRef.current.add(clip.id);
+    const triggeredAtCtx = ctx.currentTime;
+    void decodeFlashCutSound(ctx, clip.flashSoundUrl).then((buffer) => {
+      if (!isPlayingRef.current || !flashFiredIdsRef.current.has(clip.id) || ctx.state === "closed") return;
+      // Compensate for the frame (and any first-use decode wait) between the block start and now.
+      const offset = Math.max(0, triggeredAtTimeline - clip.startTime) + Math.max(0, ctx.currentTime - triggeredAtCtx);
+      if (offset >= buffer.duration) return;
+      const gain = ctx.createGain();
+      gain.gain.value = effectiveClipVolume(clip);
+      gain.connect(ctx.destination);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gain);
+      const node = { clipId: clip.id, source, gain };
+      source.onended = () => {
+        flashSoundNodesRef.current = flashSoundNodesRef.current.filter((candidate) => candidate !== node);
+        try { gain.disconnect(); } catch {}
+      };
+      source.start(0, offset);
+      flashSoundNodesRef.current.push(node);
+    }).catch((error) => console.warn("[flash-cut] sound failed", clip.flashSoundUrl, error));
+  }
+
+  // Fires every flash whose start lies in (previous, next]. With `startingAt`, also fires a block
+  // the playhead starts inside of (or exactly on), offset into its sound.
+  function triggerFlashCutSounds(previous: number, next: number, startingAt = false) {
+    for (const clip of flashCutSoundClips(clipsRef.current)) {
+      if (flashFiredIdsRef.current.has(clip.id)) continue;
+      const crossed = clip.startTime > previous && clip.startTime <= next;
+      const inside = startingAt && next >= clip.startTime && next < clip.startTime + clip.duration;
+      if (crossed || inside) playFlashCutSound(clip, next);
+    }
   }
 
   function removeNarrationAudioElement(clipId: string) {
@@ -15941,6 +16238,8 @@ function Board2Editor({
     evaluateVideoPlaybackStates(startPh, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { force: true });
     isPlayingRef.current = true;
     resyncNarrationAudioAtTime(startPh, true);
+    stopFlashCutSounds();
+    triggerFlashCutSounds(startPh, startPh, true);
     setIsPlaying(true);
   }
 
@@ -16866,7 +17165,21 @@ function Board2Editor({
           sourceOffsetSec: segment.sourceOffsetSec,
         }] : [];
       });
-      return [...videoSources, ...exclusiveNarration];
+      // Flash-cut sound effects: full length from each block's start, alongside the narration.
+      const flashSources: OfflineAudioSource[] = [];
+      for (const clip of flashCutSoundClips(currentClips)) {
+        if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+        const volume = effectiveClipVolume(clip);
+        if (volume <= 0) continue;
+        let buffer: AudioBuffer;
+        try {
+          buffer = await decodeFlashCutSound(context, clip.flashSoundUrl);
+        } catch {
+          throw new Error(`Could not load the flash sound for “${clip.name}”`);
+        }
+        flashSources.push({ startTime: clip.startTime, duration: buffer.duration, sourceOffsetSec: 0, volume, buffer });
+      }
+      return [...videoSources, ...exclusiveNarration, ...flashSources];
     } finally {
       await context.close().catch(() => {});
     }
@@ -16891,6 +17204,7 @@ function Board2Editor({
     if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
     rafIdRef.current = null;
     stopAllNarrationAudio();
+    stopFlashCutSounds();
 
     setIsExporting(true);
     isExportingRef.current = true;
@@ -16962,6 +17276,7 @@ function Board2Editor({
       await Promise.all([
         ensureAnnotationFontsLoaded(currentAnnotations),
         ...uniqueImages.map((clip) => ensureExportImage(clip)),
+        preloadFlashCutImages(currentClips),
         characterFaceImageRef.current?.decode().catch(() => {}),
         characterFace2ImageRef.current?.decode().catch(() => {}),
         ...[...thumbnailImagesRef.current.values()].flatMap((image) => image ? [image.decode().catch(() => {})] : []),
@@ -16988,7 +17303,10 @@ function Board2Editor({
         effectiveClipVolume(clip) > 0 && clip.duration > 0
       );
       let audioBuffers: AudioItem[] = [];
-      if (audioClips.length > 0) {
+      let flashSoundBuffers: AudioItem[] = [];
+      const flashSoundClips = flashCutSoundClips(currentClips).filter((clip) =>
+        clip.startTime < rangeEnd && effectiveClipVolume(clip) > 0);
+      if (audioClips.length > 0 || flashSoundClips.length > 0) {
         exportAudioCtx = new AudioContext();
         await exportAudioCtx.resume();
         exportAudioDest = exportAudioCtx.createMediaStreamDestination();
@@ -17009,6 +17327,14 @@ function Board2Editor({
           }
         }));
         audioBuffers = results.filter((item): item is AudioItem => item !== null);
+        // Flash-cut sound effects are mixed into the same destination as the narration.
+        flashSoundBuffers = await Promise.all(flashSoundClips.map(async (clip) => {
+          try {
+            return { clip, buffer: await decodeFlashCutSound(exportAudioCtx!, clip.flashSoundUrl) } satisfies AudioItem;
+          } catch {
+            throw new Error(`Could not load the flash sound for “${clip.name}”`);
+          }
+        }));
       }
 
       for (const nodes of videoAudioNodesRef.current.values()) {
@@ -17128,6 +17454,22 @@ function Board2Editor({
               (clip.sourceOffsetSec ?? 0) + (visibleStart - clip.startTime),
               visibleEnd - visibleStart,
               `export-video-${clip.id}`,
+            );
+          }
+          // A flash sound plays its full length from the block's start (the block length only
+          // governs how long the image holds), clipped to the exported range.
+          for (const { clip, buffer } of flashSoundBuffers) {
+            const soundEnd = clip.startTime + buffer.duration;
+            const visibleStart = Math.max(clip.startTime, rangeStart);
+            const visibleEnd = Math.min(soundEnd, rangeEnd);
+            if (visibleEnd <= visibleStart) continue;
+            scheduleSource(
+              clip,
+              buffer,
+              visibleStart - rangeStart,
+              visibleStart - clip.startTime,
+              visibleEnd - visibleStart,
+              `export-flash-${clip.id}`,
             );
           }
         }
@@ -17269,6 +17611,7 @@ function Board2Editor({
     if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
     rafIdRef.current = null;
     stopAllNarrationAudio();
+    stopFlashCutSounds();
     setIsExporting(true);
     isExportingRef.current = true;
     exportCancelRef.current = false;
@@ -17302,7 +17645,7 @@ function Board2Editor({
       const audioIsExpected = currentClips.some((clip) =>
         (clip.type === "narration" || (clip.type === "video" && isFeaturedTimelineClip(clip))) &&
         effectiveClipVolume(clip) > 0 && clip.duration > 0
-      );
+      ) || flashCutSoundClips(currentClips).some((clip) => effectiveClipVolume(clip) > 0);
       const candidates = buildExportEncodingCandidates({ quality: exportQuality, aspect: canvasAspect, fps: exportFps });
       const preferredCandidate = candidates[0];
       const audioSupportByCodec = new Map<string, boolean>();
@@ -17432,6 +17775,7 @@ function Board2Editor({
         await characterFace2ImageRef.current.decode();
         preparedAssets++;
       }
+      await preloadFlashCutImages(currentClips);
       const audioSources = await decodeOfflineAudioSources(currentClips, (current, total, clip) => {
         preparedAssets++;
         updatePreparing(`Preparing assets… ${preparedAssets}/${assetTotal} (audio ${current}/${total}: ${clip.name})`);
@@ -21670,7 +22014,7 @@ function Board2Editor({
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -21695,7 +22039,7 @@ function Board2Editor({
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -21887,7 +22231,7 @@ function Board2Editor({
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     {isBoardMediaClip(selectedClip) && (
@@ -21900,6 +22244,7 @@ function Board2Editor({
                         ✎ Edit custom zoom{selectedClip.narrationTypewriter ? " · ⌨ narration on" : ""}
                       </button>
                     )}
+                    {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, true)}
                     <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Duration (s)</div>
                       <input
@@ -21909,7 +22254,7 @@ function Board2Editor({
                         style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" } as React.CSSProperties}
                       />
                     </div>
-                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && (
+                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>
                           Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
@@ -26047,7 +26392,7 @@ function Board2Editor({
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {isBoardMediaClip(selectedClip) && (
                   <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "7px 10px", fontSize: 11, background: "#ffd45c" }}>
@@ -26069,6 +26414,7 @@ function Board2Editor({
                     Pans to Character {selectedClip.focusCharacterId === "c2" ? "2" : "1"}, follows them, then pans toward the next framing
                   </div>
                 )}
+                {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, false)}
                 {selectedClip.type === "customZoom" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#1c6fc9", background: CUSTOM_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Zooms into a hand-drawn region of the board — drag the corners to adjust it
@@ -26159,7 +26505,7 @@ function Board2Editor({
                   </div>
                 )}
 
-                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && (
+                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
                     <input
@@ -26307,6 +26653,85 @@ function Board2Editor({
             </span>
             <button onClick={() => seekEditorPlayback(0)} style={miniButton}>↩ reset</button>
             <button onClick={fitTimeline} style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11 }}>Fit</button>
+            <button
+              onClick={() => flashPickerOpen ? closeFlashPicker() : void openFlashPicker()}
+              title="Insert a flash cut (full-screen image + sound hit) at the playhead"
+              style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11, background: flashPickerOpen ? "#2a2a2a" : FLASH_CLIP_COLOR, color: flashPickerOpen ? "#fff" : "#2a2a2a", flexShrink: 0 }}
+            >
+              ⚡ Flash
+            </button>
+            {flashPickerOpen && (
+              <>
+                <div onClick={closeFlashPicker} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
+                <div
+                  role="dialog"
+                  aria-label="Flash cut picker"
+                  style={{
+                    position: "fixed", left: isMobile ? 8 : 120, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
+                    width: isMobile ? undefined : 380, maxHeight: "60vh", overflowY: "auto", zIndex: 901,
+                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
+                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 10,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <strong style={{ fontSize: 12 }}>⚡ Flash cut</strong>
+                    <button type="button" onClick={closeFlashPicker} style={miniButton}>✕</button>
+                  </div>
+                  {!flashAssets ? (
+                    <div style={{ fontSize: 10, color: "#6a6a6a" }}>Loading…</div>
+                  ) : (
+                    <>
+                      <div style={panelLabelStyle}>Image ({flashAssets.images.length})</div>
+                      {flashAssets.images.length === 0 ? (
+                        <div style={{ fontSize: 10, color: "#a32916" }}>No images in public/flash/images</div>
+                      ) : (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {flashAssets.images.map((asset) => (
+                            <button
+                              key={asset.url}
+                              type="button"
+                              data-flash-image={asset.url}
+                              title={asset.name}
+                              onClick={() => setFlashPickImageUrl(asset.url)}
+                              style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      <div style={panelLabelStyle}>Sound ({flashAssets.sounds.length})</div>
+                      {flashAssets.sounds.length === 0 && (
+                        <div style={{ fontSize: 10, color: "#a32916" }}>No sounds in public/flash/sounds</div>
+                      )}
+                      {flashAssets.sounds.map((asset) => (
+                        <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <button type="button" title="Preview sound" aria-label={`Preview ${asset.name}`} onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 28, padding: 0 }}>▶</button>
+                          <button
+                            type="button"
+                            data-flash-sound={asset.url}
+                            onClick={() => setFlashPickSoundUrl(asset.url)}
+                            style={{ ...miniButton, flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: asset.url === flashPickSoundUrl ? "#2a2a2a" : "transparent", color: asset.url === flashPickSoundUrl ? "#fff" : "#2a2a2a" }}
+                          >
+                            {asset.name}
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        disabled={!flashPickImageUrl || !flashPickSoundUrl}
+                        onClick={() => {
+                          if (!flashPickImageUrl || !flashPickSoundUrl) return;
+                          insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
+                          closeFlashPicker();
+                        }}
+                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl && flashPickSoundUrl ? 1 : 0.4 }}
+                      >
+                        Insert at {formatTime(playhead)} · {FLASH_CUT_DEFAULT_DURATION}s
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>zoom</span>
               <button onClick={() => { const n = clamp(pxPerSec / 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>−</button>
@@ -26509,11 +26934,12 @@ function Board2Editor({
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const isCharacterFocus = clip.type === "characterFocus";
-                const hf = isCharacterFocus ? 1 : clip.holdFraction ?? HOLD_FRACTION;
+                const isFlash = clip.type === "flash";
+                const hf = isCharacterFocus || isFlash ? 1 : clip.holdFraction ?? HOLD_FRACTION;
                 const innerW = clipPx - HANDLE_W * 2;
                 const holdW = Math.max(0, innerW * hf);
                 const transW = Math.max(0, innerW * (1 - hf));
@@ -26544,10 +26970,10 @@ function Board2Editor({
                     {/* Hold region */}
                     <div style={{ position: "absolute", left: HANDLE_W, top: 0, width: holdW, bottom: 0, background: holdColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
                       {holdW > 30 && (
-                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>{isCharacterFocus ? "focus shot" : "hold"}</span>
+                        <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(42,42,42,0.5)", textTransform: "uppercase", letterSpacing: 0.5, pointerEvents: "none" }}>{isCharacterFocus ? "focus shot" : isFlash ? "" : "hold"}</span>
                       )}
                     </div>
-                    {!isCharacterFocus && (
+                    {!isCharacterFocus && !isFlash && (
                       <>
                         {/* Transition region */}
                         <div style={{ position: "absolute", left: HANDLE_W + holdW, top: 0, width: transW, bottom: 0, background: transColor, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
@@ -26569,7 +26995,7 @@ function Board2Editor({
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
