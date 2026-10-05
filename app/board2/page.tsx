@@ -5499,6 +5499,8 @@ type BoardWorkspaceStatus = {
 type BoardWorkspace = BoardWorkspaceStatus & {
   sourceFileName?: string;
   initialFile?: File;
+  /** Opened by the app shell's "Create a joinable board": run "Make board joinable" once on mount. */
+  makeJoinable?: boolean;
 };
 
 function createBoardWorkspace(index: number, source?: { file: File; fileName: string; name: string }): BoardWorkspace {
@@ -5548,6 +5550,19 @@ export default function Board2Page() {
 
   const addWorkspace = useCallback(() => {
     const next = createBoardWorkspace(nextWorkspaceIndexRef.current++);
+    setWorkspaces((current) => [...current, next]);
+    setActiveWorkspaceId(next.id);
+  }, []);
+  const createRequestHandledRef = useRef(false);
+  useEffect(() => {
+    // The app shell opens /board2?create=blank (its + button) or ?create=joinable: a fresh tab beside the autosaved board.
+    const url = new URL(window.location.href);
+    const create = url.searchParams.get("create");
+    if (createRequestHandledRef.current || (create !== "blank" && create !== "joinable")) return;
+    createRequestHandledRef.current = true;
+    url.searchParams.delete("create");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    const next = { ...createBoardWorkspace(nextWorkspaceIndexRef.current++), makeJoinable: create === "joinable" };
     setWorkspaces((current) => [...current, next]);
     setActiveWorkspaceId(next.id);
   }, []);
@@ -5613,6 +5628,7 @@ export default function Board2Page() {
                 initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
                 initialFile={workspace.initialFile}
                 initialFileName={workspace.sourceFileName}
+                autoMakeJoinable={workspace.makeJoinable === true}
                 onWorkspaceStatus={updateWorkspace}
                 onWorkspaceSource={updateWorkspaceSource}
                 chromeHidden={chromeHidden}
@@ -5636,6 +5652,7 @@ function Board2Editor({
   initialJoinCode,
   initialFile,
   initialFileName,
+  autoMakeJoinable = false,
   onWorkspaceStatus,
   onWorkspaceSource,
   chromeHidden,
@@ -5650,6 +5667,7 @@ function Board2Editor({
   initialJoinCode: string;
   initialFile?: File;
   initialFileName?: string;
+  autoMakeJoinable?: boolean;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
   onWorkspaceSource: (workspaceId: string, fileName: string) => void;
   chromeHidden: boolean;
@@ -5658,7 +5676,7 @@ function Board2Editor({
   onToggleChrome: () => void;
   onEnterWorldBoard: (board: SimpleWorldBoard) => Promise<void>;
 }) {
-  const { data: session } = useSession();
+  const { data: session, status: sessionStatus } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
 
   const [joinCode, setJoinCode] = useState("");
@@ -7174,6 +7192,15 @@ function Board2Editor({
     setJoinStatus("connecting");
     if (isMobile) setMobileDesktopOverride(true);
   }, [initialJoinCode, isMobile, joinCode]);
+
+  const autoMakeJoinableStartedRef = useRef(false);
+  useEffect(() => {
+    if (!autoMakeJoinable || autoMakeJoinableStartedRef.current || sessionStatus === "loading") return;
+    autoMakeJoinableStartedRef.current = true;
+    void makeBoardJoinable();
+    // makeBoardJoinable is a component-local action; this runs once for a shell-created board.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoMakeJoinable, sessionStatus]);
 
   useEffect(() => {
     if (!joinCode) return;

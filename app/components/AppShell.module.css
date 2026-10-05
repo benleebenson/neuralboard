@@ -1,0 +1,46 @@
+.shell{--ink:#2a2a2a;--paper:#fffdf5;--muted:#6a6a6a;--lime:#c8f135;--tab-bar-space:calc(96px + env(safe-area-inset-bottom));min-height:100dvh;width:100%;background:var(--paper);color:var(--ink);font-family:var(--font-geist-mono),monospace}
+.header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:calc(14px + env(safe-area-inset-top)) clamp(16px,4vw,48px) 12px;background:var(--paper);border-bottom:1.5px solid var(--ink)}
+.wordmark{font:700 clamp(22px,3vw,30px)/1 "Permanent Marker",Georgia,serif;letter-spacing:.5px;white-space:nowrap}
+.account{display:flex;justify-content:flex-end;min-width:0}
+.signIn{padding:7px 12px;border:1.5px solid var(--ink);background:var(--paper);color:var(--ink);box-shadow:2px 2px 0 var(--ink);font:800 11px/1 var(--font-geist-mono),monospace;cursor:pointer}
+.main{padding:22px clamp(16px,4vw,48px) var(--tab-bar-space)}
+.pageTitle{margin:0 0 18px;font:700 clamp(26px,3.4vw,36px)/1.1 Georgia,serif}
+
+.row{margin-bottom:28px}
+.rowTitle{margin:0 0 10px;font:800 12px/1.2 var(--font-geist-mono),monospace;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted)}
+.rowScroller{display:flex;gap:clamp(12px,2vw,24px);overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x mandatory;scroll-padding-inline:2px;margin:0 -4px;padding:4px 4px 12px;-webkit-overflow-scrolling:touch}
+.card{flex:0 0 clamp(150px,27vw,320px);scroll-snap-align:start;display:flex;flex-direction:column;padding:0;border:2px solid var(--ink);border-radius:10px;overflow:hidden;background:#fff;color:var(--ink);box-shadow:4px 4px 0 var(--ink);cursor:pointer;text-align:left;transition:transform .12s ease,box-shadow .12s ease}
+.card:hover,.card:focus-visible{transform:translate(-2px,-2px);box-shadow:6px 6px 0 var(--ink);outline:none}
+.card:focus-visible{border-color:#587500}
+.cardImage{position:relative;display:block;aspect-ratio:4/3;background:#ece7da}
+.cardImage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.cardPending{position:absolute;inset:0;background:linear-gradient(100deg,#ece7da 30%,#f5f1e8 50%,#ece7da 70%);background-size:200% 100%;animation:shimmer 1.4s linear infinite}
+@keyframes shimmer{to{background-position:-200% 0}}
+.cardName{display:block;padding:9px 11px;border-top:2px solid var(--ink);font:400 clamp(17px,1.8vw,21px)/1.15 Caveat,"Patrick Hand",Georgia,serif;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.empty{max-width:560px;padding:28px clamp(18px,4vw,32px);border:2px dashed #aaa;border-radius:10px;color:#4d4d4d;font-size:13px;line-height:1.55}
+.empty p{margin:0 0 8px}
+.emptyHeading{color:var(--ink);font:700 18px/1.3 Georgia,serif}
+.emptyActions{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.primaryButton,.secondaryButton{display:inline-flex;align-items:center;min-height:40px;padding:0 14px;border:1.5px solid var(--ink);color:var(--ink);box-shadow:2px 2px 0 var(--ink);font:800 12px/1 var(--font-geist-mono),monospace;text-decoration:none;cursor:pointer}
+.primaryButton{background:var(--lime)}
+.secondaryButton{background:var(--paper)}
+.textButton{padding:4px 0;border:0;background:transparent;color:var(--muted);font:700 11px/1.3 var(--font-geist-mono),monospace;text-decoration:underline;cursor:pointer}
+.error{color:#a32916}
+
+.tabBar{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom));z-index:40;display:flex;align-items:stretch;transform:translateX(-50%);border:2px solid var(--ink);border-radius:14px;overflow:hidden;background:var(--paper);box-shadow:4px 4px 0 var(--ink)}
+.tab{display:flex;align-items:center;justify-content:center;width:76px;height:60px;padding:0;border:0;border-left:2px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer}
+.tab:first-child{border-left:0}
+.tab svg{width:28px;height:28px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.tab[aria-current="page"]{background:#e3dac4;box-shadow:inset 0 -4px 0 var(--ink)}
+.tab:hover:not([aria-current="page"]),.tab:focus-visible:not([aria-current="page"]){background:#f0ead9;outline:none}
+.createTab{width:92px;background:var(--lime)}
+.createTab svg{width:34px;height:34px;stroke-width:3}
+.tab.createTab:hover,.tab.createTab:focus-visible{background:#b5dc22}
+.tab:focus-visible{box-shadow:inset 0 0 0 3px #587500}
+
+@media(max-width:600px){
+  .tab{width:68px;height:56px}
+  .createTab{width:84px}
+  .card{flex-basis:44vw}
+}

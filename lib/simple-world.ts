@@ -178,7 +178,8 @@ async function generateComposite(file: File): Promise<{ blob: Blob; width: numbe
   context.imageSmoothingQuality = "medium";
 
   let drawnMedia = 0;
-  const mediaItems = [...(board?.media ?? [])].sort((a, b) => Number(a.layer ?? 0) - Number(b.layer ?? 0));
+  // Pre-schemaVersion saves keep board-positioned media in a top-level `clips` array with the same fields.
+  const mediaItems = [...(board?.media ?? (manifest.clips as CompositeMedia[] | undefined) ?? [])].sort((a, b) => Number(a.layer ?? 0) - Number(b.layer ?? 0));
   for (const media of mediaItems) {
     if (media.type !== "image" && media.type !== "video") continue;
     const assetBytes = media.assetFile ? files[media.assetFile] : undefined;
@@ -219,6 +220,18 @@ async function writeComposite(directory: FileSystemDirectoryHandle, fileName: st
   await writable.write(blob);
   await writable.close();
   return handle;
+}
+
+/** A board card preview: the composite already written for the board space, else the same composite rendered in memory. */
+export async function boardCompositePreview(directory: FileSystemDirectoryHandle, fileName: string, file: File): Promise<Blob> {
+  try {
+    const compositeDirectory = await directory.getDirectoryHandle(COMPOSITE_DIRECTORY);
+    const stored = await (await compositeDirectory.getFileHandle(compositeFileName(fileName))).getFile();
+    if (stored.lastModified >= file.lastModified) return stored;
+  } catch {
+    // No stored composite for this board yet.
+  }
+  return (await generateComposite(file)).blob;
 }
 
 export async function addSimpleWorldBoard(input: AddSimpleWorldBoardInput): Promise<SimpleWorldBoard> {

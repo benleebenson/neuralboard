@@ -1,5 +1,5 @@
-import Board2Page from "./board2/page";
+import { AppShell } from "@/app/components/AppShell";
 
 export default function Home() {
-  return <Board2Page />;
+  return <AppShell />;
 }
