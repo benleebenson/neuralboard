@@ -1603,6 +1603,73 @@ type Annotation = {
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
 
+const ANNOTATION_COLOR_PRESETS = [
+  { color: "#ffffff", name: "White" },
+  { color: "#1a1a1a", name: "Black" },
+  { color: "#e03131", name: "Red" },
+  { color: "#f76707", name: "Orange" },
+  { color: "#fab005", name: "Yellow" },
+  { color: "#2f9e44", name: "Green" },
+  { color: "#0ca678", name: "Teal" },
+  { color: "#1971c2", name: "Blue" },
+  { color: "#7048e8", name: "Purple" },
+  { color: "#e64980", name: "Pink" },
+] as const;
+const DEFAULT_ANNOTATION_COLOR = "#e03131";
+// Board units, like every annotation stroke: the editor and exports both scale them with zoom.
+// Sized against ~500px board media (and the old pen presets, 2.25/6/14) so the steps stay
+// distinguishable when zoomed out.
+const ANNOTATION_STROKE_PRESETS = [
+  { width: 3, name: "Thin" },
+  { width: 6, name: "Medium" },
+  { width: 12, name: "Thick" },
+  { width: 24, name: "Extra thick" },
+] as const;
+const DEFAULT_ANNOTATION_STROKE_WIDTH = 6;
+const ANNOTATION_DRAW_PREVIEW_ID = "annotation-draw-preview";
+
+function annotationHasStroke(annotation: Annotation): boolean {
+  return annotation.type === "pen" || annotation.type === "arrow" || annotation.type === "circle" ||
+    (annotation.type === "highlight" && (annotation.highlightStyle ?? "rect") !== "rect");
+}
+
+// The one place a dragged shape becomes an Annotation: the live preview and the committed shape
+// both come from here, so what the user sees while dragging is exactly what lands.
+function buildShapeAnnotation(
+  tool: AnnotationTool,
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  style: { color: string; strokeWidth: number; highlightStyle: "rect" | "underline" | "curlyBrace" },
+  id: string,
+): Annotation | null {
+  const minBX = Math.min(start.x, end.x), minBY = Math.min(start.y, end.y);
+  const bw = Math.abs(end.x - start.x), bh = Math.abs(end.y - start.y);
+  if (bw < 5 && bh < 5) return null;
+  if (tool === "arrow") {
+    return {
+      id, type: "arrow",
+      boardX: minBX, boardY: minBY, boardW: Math.max(1, bw), boardH: Math.max(1, bh),
+      color: style.color, arrowStartX: start.x, arrowStartY: start.y, arrowEndX: end.x, arrowEndY: end.y, strokeWidth: style.strokeWidth,
+    };
+  }
+  if (tool === "circle") {
+    return {
+      id, type: "circle",
+      boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
+      color: style.color, strokeWidth: style.strokeWidth,
+    };
+  }
+  if (tool === "highlight") {
+    return {
+      id, type: "highlight",
+      boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
+      color: style.color, highlightStyle: style.highlightStyle,
+      ...(style.highlightStyle === "rect" ? {} : { strokeWidth: style.strokeWidth }),
+    };
+  }
+  return null;
+}
+
 type CharacterAction = {
   id: string;
   type: "walkTo" | "jumpTo" | "skateTo" | "flip" | "zipline" | "wallClimb" | "grapple"
@@ -6044,7 +6111,9 @@ function Board2Editor({
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [selectedAnnotationIds, setSelectedAnnotationIds] = useState<string[]>([]);
   const [annotationTool, setAnnotationTool] = useState<AnnotationTool>("pointer");
-  const [annotationColor, setAnnotationColor] = useState("#cc2200");
+  const [annotationColor, setAnnotationColor] = useState<string>(DEFAULT_ANNOTATION_COLOR);
+  const [annotationStrokeWidth, setAnnotationStrokeWidth] = useState<number>(DEFAULT_ANNOTATION_STROKE_WIDTH);
+  const [annotationDrawPreview, setAnnotationDrawPreview] = useState<Annotation | null>(null);
   const [annotationFont, setAnnotationFont] = useState("Caveat");
   const [annotationHighlightStyle, setAnnotationHighlightStyle] = useState<"rect" | "underline" | "curlyBrace">("rect");
   const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
@@ -6052,9 +6121,7 @@ function Board2Editor({
   const [annotationToolbarOpen, setAnnotationToolbarOpen] = useState(false);
   const [annotationEmoji, setAnnotationEmoji] = useState("🎯");
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
-  const [penPreset, setPenPreset] = useState<"marker" | "pen" | "fine">("pen");
   const [stylusOnly, setStylusOnly] = useState(false);
-  const penPresetRef = useRef<"marker" | "pen" | "fine">("pen");
   const stylusOnlyRef = useRef(false);
   const penOverlayRef = useRef<HTMLCanvasElement | null>(null);
   const activePenPointerRef = useRef<number | null>(null);
@@ -6438,7 +6505,8 @@ function Board2Editor({
   const ytRangeRef = useRef({ start: 0, end: 30 });
   const annotationsRef = useRef<Annotation[]>([]);
   const annotationToolRef = useRef<AnnotationTool>("pointer");
-  const annotationColorRef = useRef("#cc2200");
+  const annotationColorRef = useRef<string>(DEFAULT_ANNOTATION_COLOR);
+  const annotationStrokeWidthRef = useRef<number>(DEFAULT_ANNOTATION_STROKE_WIDTH);
   const annotationFontRef = useRef("Caveat");
   const annotationHighlightStyleRef = useRef<"rect" | "underline" | "curlyBrace">("rect");
   const editingAnnotationTextRef = useRef("");
@@ -7708,11 +7776,11 @@ function Board2Editor({
   }, [viewOnly]);
   useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
   useEffect(() => { annotationColorRef.current = annotationColor; }, [annotationColor]);
+  useEffect(() => { annotationStrokeWidthRef.current = annotationStrokeWidth; }, [annotationStrokeWidth]);
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
   useEffect(() => { annotationHighlightStyleRef.current = annotationHighlightStyle; }, [annotationHighlightStyle]);
   useEffect(() => { editingAnnotationTextRef.current = editingAnnotationText; }, [editingAnnotationText]);
   useEffect(() => { annotationEmojiRef.current = annotationEmoji; }, [annotationEmoji]);
-  useEffect(() => { penPresetRef.current = penPreset; }, [penPreset]);
   useEffect(() => { stylusOnlyRef.current = stylusOnly; }, [stylusOnly]);
   useEffect(() => {
     if (!("PerformanceObserver" in window)) return;
@@ -15173,7 +15241,7 @@ function Board2Editor({
       activePenClientPointRef.current = { x: e.clientX, y: e.clientY };
       e.preventDefault();
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      const baseWidth = penPresetRef.current === "marker" ? 14 : penPresetRef.current === "fine" ? 2.25 : 6;
+      const baseWidth = annotationStrokeWidthRef.current;
       const pts: Array<{ x: number; y: number; pressure?: number }> = [{ x: bx, y: by }];
       const overlay = penOverlayRef.current;
       const overlayCtx = overlay?.getContext("2d");
@@ -15242,42 +15310,39 @@ function Board2Editor({
     }
 
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const startBX = bx, startBY = by;
-    const onUp = (ev: PointerEvent) => {
-      window.removeEventListener("pointerup", onUp);
+    const start = { x: bx, y: by };
+    const shapeAt = (ev: PointerEvent, id: string) => {
       const r = container.getBoundingClientRect();
-      const ex = (ev.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current;
-      const ey = (ev.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current;
-      const minBX = Math.min(startBX, ex), maxBX = Math.max(startBX, ex);
-      const minBY = Math.min(startBY, ey), maxBY = Math.max(startBY, ey);
-      const bw = maxBX - minBX, bh = maxBY - minBY;
-      if (bw < 5 && bh < 5) return;
-      const t = annotationToolRef.current;
-      const id = generateId();
-      const color = annotationColorRef.current;
-      if (t === "arrow") {
-        setAnnotations((prev) => [...prev, {
-          id, type: "arrow",
-          boardX: minBX, boardY: minBY, boardW: Math.max(1, bw), boardH: Math.max(1, bh),
-          color, arrowStartX: startBX, arrowStartY: startBY, arrowEndX: ex, arrowEndY: ey, strokeWidth: 3,
-        }]);
-      } else if (t === "circle") {
-        setAnnotations((prev) => [...prev, {
-          id, type: "circle",
-          boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
-          color, strokeWidth: 3,
-        }]);
-      } else if (t === "highlight") {
-        setAnnotations((prev) => [...prev, {
-          id, type: "highlight",
-          boardX: minBX, boardY: minBY, boardW: Math.max(10, bw), boardH: Math.max(10, bh),
-          color, highlightStyle: annotationHighlightStyleRef.current,
-        }]);
-      }
-      setAnnotationSelection([id]);
+      const end = {
+        x: (ev.clientX - r.left - boardPanRef.current.x) / boardZoomRef.current,
+        y: (ev.clientY - r.top - boardPanRef.current.y) / boardZoomRef.current,
+      };
+      return buildShapeAnnotation(tool, start, end, {
+        color: annotationColorRef.current,
+        strokeWidth: annotationStrokeWidthRef.current,
+        highlightStyle: annotationHighlightStyleRef.current,
+      }, id);
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      setAnnotationDrawPreview(shapeAt(ev, ANNOTATION_DRAW_PREVIEW_ID));
+    };
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      setAnnotationDrawPreview(null);
+      if (ev.type === "pointercancel") return;
+      const annotation = shapeAt(ev, generateId());
+      if (!annotation) return;
+      setAnnotations((prev) => [...prev, annotation]);
+      setAnnotationSelection([annotation.id]);
       disarmAnnotationTool();
     };
+    window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   }
 
   // ─ Custom zoom box creation (glass pane) ──────────────────────────────────
@@ -23899,13 +23964,14 @@ function Board2Editor({
                 <svg
                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 4, overflow: "visible" }}
                 >
-                  {annotations.filter((a) => a.type !== "text").map((ann) => {
+                  {(annotationDrawPreview ? [...annotations, annotationDrawPreview] : annotations).filter((a) => a.type !== "text").map((ann) => {
+                    // Board-unit strokes scaled by zoom, as drawAnnotationsOnCanvas does for export.
+                    const sw = Math.max(1, (ann.strokeWidth ?? 3) * boardZoom);
                     if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
                       const x1 = ann.arrowStartX * boardZoom, y1 = ann.arrowStartY! * boardZoom;
                       const x2 = ann.arrowEndX! * boardZoom, y2 = ann.arrowEndY! * boardZoom;
                       const angle = Math.atan2(y2 - y1, x2 - x1);
-                      const hl = 15;
-                      const sw = ann.strokeWidth ?? 3;
+                      const hl = Math.max(12, sw * 5);
                       return (
                         <g key={ann.id}>
                           <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />
@@ -23919,7 +23985,7 @@ function Board2Editor({
                           cx={ann.boardX * boardZoom + ann.boardW * boardZoom / 2}
                           cy={ann.boardY * boardZoom + ann.boardH * boardZoom / 2}
                           rx={ann.boardW * boardZoom / 2} ry={ann.boardH * boardZoom / 2}
-                          fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3}
+                          fill="none" stroke={ann.color} strokeWidth={sw}
                         />
                       );
                     } else if (ann.type === "highlight") {
@@ -23927,10 +23993,10 @@ function Board2Editor({
                       const bx = ann.boardX * boardZoom, by = ann.boardY * boardZoom;
                       const bw = ann.boardW * boardZoom, bh = ann.boardH * boardZoom;
                       if (style === "rect") return <rect key={ann.id} x={bx} y={by} width={bw} height={bh} fill={ann.color} fillOpacity={0.3} />;
-                      if (style === "underline") return <line key={ann.id} x1={bx} y1={by + bh} x2={bx + bw} y2={by + bh} stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
+                      if (style === "underline") return <line key={ann.id} x1={bx} y1={by + bh} x2={bx + bw} y2={by + bh} stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />;
                       // curlyBrace
                       const cx = bx + bw, mid = by + bh / 2, q = Math.min(20, bh * 0.15);
-                      return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth ?? 3} strokeLinecap="round" />;
+                      return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />;
                     } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
                       return <g key={ann.id}>{ann.points.slice(1).map((point, index) => {
                         const previous = ann.points![index];
@@ -24189,172 +24255,226 @@ function Board2Editor({
                     </button>
                     {annotationToolbarOpen && (
                       <div style={{
-                        display: "flex", alignItems: "center", gap: 2,
+                        display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6,
                         background: "#fffdf5",
                         border: "1.5px solid #2a2a2a",
                         boxShadow: "2px 2px 8px rgba(0,0,0,0.18)",
-                        padding: isMobile ? "6px 8px" : "4px 8px",
+                        padding: isMobile ? "6px 8px" : "6px 8px",
                         whiteSpace: "nowrap",
                         position: "relative",
                         maxWidth: isMobile ? "100%" : undefined,
-                        overflowX: isMobile ? "auto" : undefined,
                       }}>
-                        {/* Tool buttons */}
-                        {([
-                          { id: "pointer"   as AnnotationTool, icon: "↖", title: "Select / move" },
-                          { id: "text"      as AnnotationTool, icon: "T",  title: "Text" },
-                          { id: "arrow"     as AnnotationTool, icon: "↗",  title: "Arrow" },
-                          { id: "circle"    as AnnotationTool, icon: "○",  title: "Circle / ellipse" },
-                          { id: "highlight" as AnnotationTool, icon: "▭",  title: "Highlight" },
-                          { id: "pen"       as AnnotationTool, icon: "✏",  title: "Freehand pen" },
-                          { id: "emoji"     as AnnotationTool, icon: "😀", title: "Emoji" },
-                        ]).map(({ id, icon, title }) => (
-                          <button
-                            key={id}
-                            title={title}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const nextTool = id !== "pointer" && annotationTool === id ? "pointer" : id;
-                              annotationToolRef.current = nextTool;
-                              setAnnotationTool(nextTool);
-                              if (nextTool === "emoji") setEmojiPickerOpen((v) => !v);
-                              else setEmojiPickerOpen(false);
-                            }}
-                            style={{
-                              width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, minWidth: isMobile ? 44 : undefined, border: "none", padding: 0,
-                              outline: annotationTool === id ? "2px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.25)",
-                              background: annotationTool === id ? "#2a2a2a" : "transparent",
-                              color: annotationTool === id ? "#fff" : "#2a2a2a",
-                              cursor: "pointer", fontFamily: "monospace",
-                              fontSize: id === "text" ? 13 : 15, fontWeight: 700,
-                              display: "flex", alignItems: "center", justifyContent: "center",
-                            }}
-                          >
-                            {icon}
-                          </button>
-                        ))}
-
-                        {annotationTool === "pen" && (
-                          <>
-                            <div style={{ width: 1, height: 28, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-                            {(["marker", "pen", "fine"] as const).map((preset) => (
-                              <button key={preset} type="button" onClick={(e) => { e.stopPropagation(); setPenPreset(preset); penPresetRef.current = preset; }} style={{ ...miniButton, minWidth: isMobile ? 48 : 38, minHeight: isMobile ? 44 : 28, background: penPreset === preset ? "#c8f135" : "transparent", fontSize: 9 }}>{preset}</button>
-                            ))}
-                            <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: isMobile ? 72 : 58, minHeight: isMobile ? 44 : 28, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
-                            <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: isMobile ? 48 : 34, minHeight: isMobile ? 44 : 28 }} title="Undo last stroke">↶</button>
-                            <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: isMobile ? 58 : 42, minHeight: isMobile ? 44 : 28, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
-                          </>
-                        )}
-
-                        <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-
-                        {/* Color swatches */}
-                        {(["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"]).map((c) => (
-                          <button
-                            key={c}
-                            title={c}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setAnnotationColor(c);
-                              updateSelectedAnnotations((annotation) => ({ ...annotation, color: c }));
-                            }}
-                            style={{
-                              width: 18, height: 18, padding: 0,
-                              background: c,
-                              border: annotationColor === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)",
-                              cursor: "pointer", flexShrink: 0,
-                            }}
-                          />
-                        ))}
-
-                        {/* Text controls — configure new text or edit the selected text box */}
-                        {(annotationTool === "text" || primarySelectedText) && (
-                          <>
-                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-                            <select
-                              value={primarySelectedText?.fontFamily ?? annotationFont}
-                              onChange={(e) => {
+                        {/* Row 1: tools */}
+                        <div role="toolbar" aria-label="Annotation tools" style={{ display: "flex", alignItems: "center", gap: 3, maxWidth: "100%", overflowX: isMobile ? "auto" : undefined }}>
+                          {([
+                            { id: "pointer"   as AnnotationTool, icon: "↖", title: "Select / move" },
+                            { id: "pen"       as AnnotationTool, icon: "✎", title: "Freehand pen" },
+                            { id: "arrow"     as AnnotationTool, icon: "↗", title: "Arrow" },
+                            { id: "circle"    as AnnotationTool, icon: "◯", title: "Circle / ellipse" },
+                            { id: "highlight" as AnnotationTool, icon: "▭", title: "Highlight box, underline or brace" },
+                            { id: "text"      as AnnotationTool, icon: "T", title: "Text" },
+                            { id: "emoji"     as AnnotationTool, icon: annotationTool === "emoji" ? annotationEmoji : "😀", title: "Emoji sticker" },
+                          ]).map(({ id, icon, title }) => (
+                            <button
+                              key={id}
+                              type="button"
+                              title={title}
+                              aria-label={title}
+                              aria-pressed={annotationTool === id}
+                              onClick={(e) => {
                                 e.stopPropagation();
-                                const fontFamily = e.target.value;
-                                setAnnotationFont(fontFamily);
-                                updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontFamily }));
+                                const nextTool = id !== "pointer" && annotationTool === id ? "pointer" : id;
+                                annotationToolRef.current = nextTool;
+                                setAnnotationTool(nextTool);
+                                if (nextTool === "emoji") setEmojiPickerOpen((v) => !v);
+                                else setEmojiPickerOpen(false);
                               }}
-                              style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
+                              style={{
+                                width: isMobile ? 44 : 30, height: isMobile ? 44 : 30, minWidth: isMobile ? 44 : undefined, border: "none", padding: 0, borderRadius: 6,
+                                background: annotationTool === id ? "#2a2a2a" : "transparent",
+                                color: annotationTool === id ? "#fff" : "#2a2a2a",
+                                cursor: "pointer", fontFamily: "monospace",
+                                fontSize: id === "text" ? 14 : 16, fontWeight: 700,
+                                display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                              }}
                             >
-                              <option value="Caveat">Caveat</option>
-                              <option value="Permanent Marker">Permanent Marker</option>
-                              <option value="Architects Daughter">Architects Daughter</option>
-                              <option value="Patrick Hand">Patrick Hand</option>
-                            </select>
-                            {primarySelectedText && (
-                              <>
-                                <button
-                                  type="button"
-                                  title="Make text smaller"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) - 10, 12, 300) }));
-                                  }}
-                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
-                                >A−</button>
-                                <input
-                                  type="number"
-                                  aria-label="Text size"
-                                  min={12}
-                                  max={300}
-                                  step={2}
-                                  value={Math.round(primarySelectedText.fontSize ?? 80)}
-                                  onChange={(e) => {
-                                    const fontSize = clamp(Number(e.target.value) || 12, 12, 300);
-                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize }));
-                                  }}
-                                  onClick={(e) => e.stopPropagation()}
-                                  style={{ width: 44, height: 24, boxSizing: "border-box", fontFamily: "monospace", fontSize: 9, textAlign: "center", border: "1px solid rgba(42,42,42,0.3)" }}
-                                />
-                                <button
-                                  type="button"
-                                  title="Make text larger"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) + 10, 12, 300) }));
-                                  }}
-                                  style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
-                                >A+</button>
-                                <button
-                                  type="button"
-                                  title="Toggle bold"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontWeight: annotation.fontWeight === "bold" ? "normal" : "bold" }));
-                                  }}
-                                  style={{ ...miniButton, width: 24, height: 24, padding: 0, fontSize: 11, fontWeight: "bold", background: primarySelectedText.fontWeight === "bold" ? "#2a2a2a" : "transparent", color: primarySelectedText.fontWeight === "bold" ? "#fff" : "#2a2a2a" }}
-                                >B</button>
-                              </>
-                            )}
-                          </>
-                        )}
+                              {icon}
+                            </button>
+                          ))}
+                        </div>
 
-                        {/* Highlight sub-type — highlight tool only */}
-                        {annotationTool === "highlight" && (
-                          <>
-                            <div style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 4px" }} />
-                            {(["rect", "underline", "curlyBrace"] as const).map((s) => (
-                              <button
-                                key={s}
-                                onClick={(e) => { e.stopPropagation(); setAnnotationHighlightStyle(s); }}
+                        {/* Row 2: style — color, thickness, then the active tool's own options */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 4, maxWidth: "100%", overflowX: isMobile ? "auto" : undefined, paddingBottom: isMobile ? 2 : 0 }}>
+                          {ANNOTATION_COLOR_PRESETS.map(({ color, name }) => (
+                            <button
+                              key={color}
+                              type="button"
+                              title={name}
+                              aria-label={`${name} annotation color`}
+                              aria-pressed={annotationColor === color}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setAnnotationColor(color);
+                                updateSelectedAnnotations((annotation) => ({ ...annotation, color }));
+                              }}
+                              style={swatchStyle(color, annotationColor === color)}
+                            />
+                          ))}
+                          {(() => {
+                            const isCustom = !ANNOTATION_COLOR_PRESETS.some((preset) => preset.color === annotationColor);
+                            return (
+                              <label
+                                title="Custom color"
+                                onClick={(e) => e.stopPropagation()}
                                 style={{
-                                  padding: "2px 5px", fontSize: 9, fontFamily: "monospace",
-                                  border: annotationHighlightStyle === s ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.3)",
-                                  background: annotationHighlightStyle === s ? "#2a2a2a" : "transparent",
-                                  color: annotationHighlightStyle === s ? "#fff" : "#2a2a2a",
-                                  cursor: "pointer",
+                                  ...swatchStyle("conic-gradient(#e03131, #fab005, #2f9e44, #0ca678, #1971c2, #7048e8, #e64980, #e03131)", isCustom),
+                                  position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
                                 }}
                               >
-                                {s === "rect" ? "▭" : s === "underline" ? "_" : "{}"}
-                              </button>
-                            ))}
-                          </>
-                        )}
+                                <span aria-hidden="true" style={{ width: "46%", height: "46%", borderRadius: "50%", background: isCustom ? annotationColor : "#fff", border: "1px solid rgba(0,0,0,0.25)", fontSize: 9, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#2a2a2a" }}>{isCustom ? "" : "+"}</span>
+                                <input
+                                  type="color"
+                                  aria-label="Custom annotation color"
+                                  value={annotationColor}
+                                  onChange={(e) => {
+                                    const color = e.target.value;
+                                    setAnnotationColor(color);
+                                    updateSelectedAnnotations((annotation) => ({ ...annotation, color }));
+                                  }}
+                                  style={nativeFilePickerStyle}
+                                />
+                              </label>
+                            );
+                          })()}
+
+                          {annotationTool !== "text" && annotationTool !== "emoji" && (
+                            <>
+                              {toolbarDivider}
+                              {ANNOTATION_STROKE_PRESETS.map(({ width, name }) => (
+                                <button
+                                  key={width}
+                                  type="button"
+                                  title={`${name} (${width}px)`}
+                                  aria-label={`${name} stroke`}
+                                  aria-pressed={annotationStrokeWidth === width}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setAnnotationStrokeWidth(width);
+                                    annotationStrokeWidthRef.current = width;
+                                    updateSelectedAnnotations((annotation) => annotationHasStroke(annotation) ? { ...annotation, strokeWidth: width } : annotation);
+                                  }}
+                                  style={{
+                                    width: isMobile ? 40 : 26, height: isMobile ? 40 : 26, padding: 0, borderRadius: 6, flexShrink: 0,
+                                    border: annotationStrokeWidth === width ? "1.5px solid #2a2a2a" : "1.5px solid transparent",
+                                    background: annotationStrokeWidth === width ? "rgba(42,42,42,0.08)" : "transparent",
+                                    cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+                                  }}
+                                >
+                                  <span aria-hidden="true" style={{ width: Math.min(18, 6 + width / 2), height: Math.min(12, Math.max(2, width / 2)), borderRadius: 999, background: "#2a2a2a" }} />
+                                </button>
+                              ))}
+                            </>
+                          )}
+
+                          {annotationTool === "pen" && (
+                            <>
+                              {toolbarDivider}
+                              <button type="button" onClick={(e) => { e.stopPropagation(); const next = !stylusOnly; setStylusOnly(next); stylusOnlyRef.current = next; }} style={{ ...miniButton, minWidth: isMobile ? 72 : 58, minHeight: isMobile ? 40 : 26, background: stylusOnly ? "#2a2a2a" : "transparent", color: stylusOnly ? "#fff" : "#2a2a2a", fontSize: 9 }} title="When enabled, touch navigates and only a pen draws">{stylusOnly ? "Pencil only" : "Finger draw"}</button>
+                              <button type="button" disabled={annotationUndoRef.current.length === 0} onClick={(e) => { e.stopPropagation(); const previous = annotationUndoRef.current.pop(); if (previous) setAnnotations(previous); }} style={{ ...miniButton, minWidth: isMobile ? 44 : 30, minHeight: isMobile ? 40 : 26 }} title="Undo last stroke" aria-label="Undo last stroke">↶</button>
+                              <button type="button" disabled={selectedAnnotationIds.length === 0 && !selectedAnnotationId} onClick={(e) => { e.stopPropagation(); const ids = new Set(selectedAnnotationIds.length ? selectedAnnotationIds : selectedAnnotationId ? [selectedAnnotationId] : []); setAnnotations((prev) => { annotationUndoRef.current.push(prev); return prev.filter((annotation) => !ids.has(annotation.id)); }); setAnnotationSelection([]); }} style={{ ...miniButton, minWidth: isMobile ? 58 : 42, minHeight: isMobile ? 40 : 26, color: "#cc2200" }} title="Erase selected annotation">Eraser</button>
+                            </>
+                          )}
+
+                          {/* Text controls — configure new text or edit the selected text box */}
+                          {(annotationTool === "text" || primarySelectedText) && (
+                            <>
+                              {toolbarDivider}
+                              <select
+                                value={primarySelectedText?.fontFamily ?? annotationFont}
+                                onChange={(e) => {
+                                  e.stopPropagation();
+                                  const fontFamily = e.target.value;
+                                  setAnnotationFont(fontFamily);
+                                  updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontFamily }));
+                                }}
+                                style={{ fontFamily: "monospace", fontSize: 9, border: "1px solid rgba(42,42,42,0.3)", background: "#fff", padding: "2px 4px", cursor: "pointer" }}
+                              >
+                                <option value="Caveat">Caveat</option>
+                                <option value="Permanent Marker">Permanent Marker</option>
+                                <option value="Architects Daughter">Architects Daughter</option>
+                                <option value="Patrick Hand">Patrick Hand</option>
+                              </select>
+                              {primarySelectedText && (
+                                <>
+                                  <button
+                                    type="button"
+                                    title="Make text smaller"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) - 10, 12, 300) }));
+                                    }}
+                                    style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                  >A−</button>
+                                  <input
+                                    type="number"
+                                    aria-label="Text size"
+                                    min={12}
+                                    max={300}
+                                    step={2}
+                                    value={Math.round(primarySelectedText.fontSize ?? 80)}
+                                    onChange={(e) => {
+                                      const fontSize = clamp(Number(e.target.value) || 12, 12, 300);
+                                      updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize }));
+                                    }}
+                                    onClick={(e) => e.stopPropagation()}
+                                    style={{ width: 44, height: 24, boxSizing: "border-box", fontFamily: "monospace", fontSize: 9, textAlign: "center", border: "1px solid rgba(42,42,42,0.3)" }}
+                                  />
+                                  <button
+                                    type="button"
+                                    title="Make text larger"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontSize: clamp((annotation.fontSize ?? 80) + 10, 12, 300) }));
+                                    }}
+                                    style={{ ...miniButton, width: 28, height: 24, padding: 0, fontSize: 10 }}
+                                  >A+</button>
+                                  <button
+                                    type="button"
+                                    title="Toggle bold"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      updateSelectedTextAnnotations((annotation) => ({ ...annotation, fontWeight: annotation.fontWeight === "bold" ? "normal" : "bold" }));
+                                    }}
+                                    style={{ ...miniButton, width: 24, height: 24, padding: 0, fontSize: 11, fontWeight: "bold", background: primarySelectedText.fontWeight === "bold" ? "#2a2a2a" : "transparent", color: primarySelectedText.fontWeight === "bold" ? "#fff" : "#2a2a2a" }}
+                                  >B</button>
+                                </>
+                              )}
+                            </>
+                          )}
+
+                          {/* Highlight sub-type — highlight tool only */}
+                          {annotationTool === "highlight" && (
+                            <>
+                              {toolbarDivider}
+                              {(["rect", "underline", "curlyBrace"] as const).map((s) => (
+                                <button
+                                  key={s}
+                                  onClick={(e) => { e.stopPropagation(); setAnnotationHighlightStyle(s); }}
+                                  style={{
+                                    padding: "2px 5px", fontSize: 9, fontFamily: "monospace",
+                                    border: annotationHighlightStyle === s ? "2px solid #2a2a2a" : "1px solid rgba(42,42,42,0.3)",
+                                    background: annotationHighlightStyle === s ? "#2a2a2a" : "transparent",
+                                    color: annotationHighlightStyle === s ? "#fff" : "#2a2a2a",
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  {s === "rect" ? "▭" : s === "underline" ? "_" : "{}"}
+                                </button>
+                              ))}
+                            </>
+                          )}
+
+                        </div>
 
                         {/* Emoji picker popover */}
                         {annotationTool === "emoji" && emojiPickerOpen && (
@@ -24383,12 +24503,6 @@ function Board2Editor({
                           </div>
                         )}
 
-                        {/* Selected emoji indicator */}
-                        {annotationTool === "emoji" && (
-                          <span style={{ fontSize: 18, marginLeft: 4, userSelect: "none" }} title="Active emoji">
-                            {annotationEmoji}
-                          </span>
-                        )}
                       </div>
                     )}
               </div>
@@ -25646,14 +25760,39 @@ function Board2Editor({
                   )}
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Color</div>
-                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                      {["#cc2200", "#1a6fd4", "#e8a800", "#228b22", "#e06020", "#1a1a1a"].map((c) => (
-                        <button key={c} onClick={() => setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, color: c } : a))}
-                          style={{ width: 20, height: 20, background: c, border: selectedAnnotation.color === c ? "2.5px solid #2a2a2a" : "1.5px solid rgba(0,0,0,0.2)", cursor: "pointer", padding: 0 }}
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+                      {ANNOTATION_COLOR_PRESETS.map(({ color, name }) => (
+                        <button key={color} type="button" title={name} aria-label={`${name} annotation color`} aria-pressed={selectedAnnotation.color === color}
+                          onClick={() => setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, color } : a))}
+                          style={swatchStyle(color, selectedAnnotation.color === color)}
                         />
                       ))}
+                      <label title="Custom color" style={{ ...swatchStyle("conic-gradient(#e03131, #fab005, #2f9e44, #0ca678, #1971c2, #7048e8, #e64980, #e03131)", !ANNOTATION_COLOR_PRESETS.some((preset) => preset.color === selectedAnnotation.color)), position: "relative" }}>
+                        <input type="color" aria-label="Custom annotation color" value={/^#[0-9a-f]{6}$/i.test(selectedAnnotation.color) ? selectedAnnotation.color : "#000000"}
+                          onChange={(e) => { const color = e.target.value; setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, color } : a)); }}
+                          style={nativeFilePickerStyle}
+                        />
+                      </label>
                     </div>
                   </div>
+                  {annotationHasStroke(selectedAnnotation) && (
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Thickness</div>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        {ANNOTATION_STROKE_PRESETS.map(({ width, name }) => {
+                          const active = (selectedAnnotation.strokeWidth ?? 3) === width;
+                          return (
+                            <button key={width} type="button" title={`${name} (${width}px)`} aria-label={`${name} stroke`} aria-pressed={active}
+                              onClick={() => setAnnotations((prev) => prev.map((a) => a.id === selectedAnnotation.id ? { ...a, strokeWidth: width } : a))}
+                              style={{ width: 30, height: 26, padding: 0, borderRadius: 6, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", border: active ? "1.5px solid #2a2a2a" : "1.5px solid rgba(42,42,42,0.2)", background: active ? "rgba(42,42,42,0.08)" : "transparent" }}
+                            >
+                              <span aria-hidden="true" style={{ width: Math.min(18, 6 + width / 2), height: Math.min(12, Math.max(2, width / 2)), borderRadius: 999, background: "#2a2a2a" }} />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                   <div style={{ marginTop: "auto" }}>
                     <button onClick={() => deleteAnnotation(selectedAnnotation.id)} style={{ ...miniButton, color: "#ff5e3a", borderColor: "#ff5e3a" }}>
                       ✕ Delete annotation
@@ -27422,6 +27561,19 @@ const sketchButton: React.CSSProperties = {
   cursor: "pointer",
   boxShadow: "2px 2px 0 #2a2a2a",
 };
+
+const toolbarDivider = <div aria-hidden="true" style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 3px", flexShrink: 0 }} />;
+
+// Round color swatch; the active one gets a ring separated from the fill by a white gap.
+function swatchStyle(background: string, active: boolean): React.CSSProperties {
+  return {
+    width: 20, height: 20, padding: 0, flexShrink: 0, borderRadius: "50%", cursor: "pointer",
+    background,
+    border: "1px solid rgba(0,0,0,0.22)",
+    boxShadow: active ? "0 0 0 2px #fffdf5, 0 0 0 3.5px #2a2a2a" : "none",
+    margin: active ? "0 2px" : 0,
+  };
+}
 
 const miniButton: React.CSSProperties = {
   fontFamily: "monospace",
