@@ -2076,6 +2076,9 @@ const PAN_TRAVERSAL_REFERENCE_FILL_RATIO = 0.78;
 const AMBIENT_VIDEO_STORAGE_KEY = "nb_board2_ambient_video_playback";
 const CUSTOM_ZOOM_CONTINUOUS_STORAGE_KEY = "nb_board2_custom_zoom_continuous";
 const BOARD_AUTOSAVE_STORAGE_KEY = "nb_board2_autosave";
+// "1" when the video editor (header, panels, timeline) was last left open. Absent = closed, so a
+// board opens as just the canvas until the clapperboard is clicked.
+const EDITOR_OPEN_STORAGE_KEY = "nb_editor_open";
 // Only the default tab autosaves: one key holds one board, and other tabs are opened from .nbp
 // files that already live on disk.
 const BOARD_AUTOSAVE_WORKSPACE_ID = "board-workspace-1";
@@ -5602,7 +5605,16 @@ export default function Board2Page() {
   const nextWorkspaceIndexRef = useRef(2);
   const [workspaces, setWorkspaces] = useState<BoardWorkspace[]>(() => [createBoardWorkspace(1)]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
-  const [chromeHidden, setChromeHidden] = useState(false);
+  // "Chrome hidden" is the closed-editor state: only the board (and the wider board space) shows.
+  // Read on the client's first render; the server and hydration pass render a blank shell anyway.
+  const [chromeHidden, setChromeHidden] = useState(() => {
+    if (typeof window === "undefined") return true;
+    try { return window.localStorage.getItem(EDITOR_OPEN_STORAGE_KEY) !== "1"; } catch { return true; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem(EDITOR_OPEN_STORAGE_KEY, chromeHidden ? "0" : "1"); } catch {}
+  }, [chromeHidden]);
+  const openEditor = useCallback(() => setChromeHidden(false), []);
   const [worldBoards, setWorldBoards] = useState<SimpleWorldBoard[]>([]);
   useEffect(() => {
     let cancelled = false;
@@ -5801,6 +5813,7 @@ export default function Board2Page() {
                 worldBoards={worldBoards}
                 activeWorldBoard={worldBoards.find((board) => board.fileName === workspace.sourceFileName) ?? null}
                 onToggleChrome={() => setChromeHidden((hidden) => !hidden)}
+                onOpenEditor={openEditor}
                 onEnterWorldBoard={openWorldBoard}
               />
             </div>
@@ -5910,6 +5923,7 @@ function Board2Editor({
   worldBoards,
   activeWorldBoard,
   onToggleChrome,
+  onOpenEditor,
   onEnterWorldBoard,
   viewOnly = false,
 }: {
@@ -5926,6 +5940,8 @@ function Board2Editor({
   worldBoards: SimpleWorldBoard[];
   activeWorldBoard: SimpleWorldBoard | null;
   onToggleChrome: () => void;
+  /** Opens the editor if it's closed, so AI actions that add clips show their results. */
+  onOpenEditor?: () => void;
   onEnterWorldBoard: (board: SimpleWorldBoard) => Promise<void>;
   /** A published board opened from the Home feed: look and play only — no editing, saving or uploads. */
   viewOnly?: boolean;
@@ -11048,6 +11064,7 @@ function Board2Editor({
 
   async function autoBuildFromNarration(supplied?: { narrationClips: Clip[]; transcription: ClipBoardHandoff }) {
     if (autoBuildPhase || autoBuildProgressRef.current?.status === "running") return;
+    onOpenEditor?.();
     const narrationClips = (supplied?.narrationClips ?? clipsRef.current)
       .filter((clip) => clip.type === "narration")
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
@@ -12108,6 +12125,7 @@ function Board2Editor({
     const ctx = autoBuildRetryContextRef.current;
     const progress = autoBuildProgressRef.current;
     if (!ctx || !progress || progress.status !== "partial" || autoBuildProgressRef.current?.status === "running") return;
+    onOpenEditor?.();
     const failedIndices = progress.slots.filter((slot) => slot.status === "failed").map((slot) => slot.index);
     if (!failedIndices.length) return;
 
@@ -13337,6 +13355,7 @@ function Board2Editor({
   async function runNeuralSearch() {
     const concept = neuralConcept.trim();
     if (!concept) return;
+    onOpenEditor?.();
     const controller = new AbortController();
     neuralSearchAbortRef.current?.abort();
     neuralSearchAbortRef.current = controller;
@@ -13425,6 +13444,7 @@ function Board2Editor({
   async function runTop5Search() {
     const concept = top5Concept.trim();
     if (!concept) return;
+    onOpenEditor?.();
     const controller = new AbortController();
     top5AbortRef.current?.abort();
     top5AbortRef.current = controller;
@@ -23674,13 +23694,22 @@ function Board2Editor({
                 </div>
               ) : <button
                 type="button"
-                aria-label={chromeHidden ? "Open editor chrome for centered board" : "Hide editor chrome"}
-                title={chromeHidden ? "Edit the board centered on screen" : "Explore the full board space"}
+                aria-label={chromeHidden ? "Open video editor" : "Close video editor"}
+                aria-pressed={!chromeHidden}
+                title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
-                style={{ ...sketchButton, position: "absolute", left: 12, bottom: 12, zIndex: 220, width: 42, height: 42, padding: 0, display: "grid", placeItems: "center", borderRadius: 4, background: "rgba(255,253,245,.94)", fontSize: chromeHidden ? 19 : 17 }}
+                style={{
+                  position: "absolute", left: 12, bottom: 12, zIndex: 220, width: 44, height: 44, padding: 0,
+                  display: "grid", placeItems: "center", borderRadius: "50%", cursor: "pointer",
+                  border: "1.5px solid #2a2a2a",
+                  background: chromeHidden ? "#2a2a2a" : "#c8f135",
+                  color: chromeHidden ? "#fffdf5" : "#2a2a2a",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.28)",
+                  transition: "background 160ms ease, color 160ms ease",
+                }}
               >
-                {chromeHidden ? "☰" : "∞"}
+                <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} />
               </button>}
               {visibleWorldBoards.map((board) => (
                 <WorldBoardComposite
@@ -27561,6 +27590,22 @@ const sketchButton: React.CSSProperties = {
   cursor: "pointer",
   boxShadow: "2px 2px 0 #2a2a2a",
 };
+
+// Film slate: striped clapper arm hinged at the top-left over a slate body. The arm swings open
+// while the editor is open. Stripes are cut out in the button's background color.
+function ClapperboardIcon({ open, stripe }: { open: boolean; stripe: string }) {
+  return (
+    <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+      <rect x="3" y="10" width="18" height="11" rx="1.5" />
+      <path d="M6 10h3l-2 3H4zM12 10h3l-2 3h-3zM18 10h3l-2 3h-3z" fill={stripe} />
+      <rect x="3" y="12.6" width="18" height="0.8" fill={stripe} />
+      <g style={{ transformOrigin: "3px 9.5px", transform: open ? "rotate(-22deg)" : "none", transition: "transform 180ms ease" }}>
+        <rect x="3" y="5.5" width="18" height="4" rx="1" />
+        <path d="M5.5 5.5h3l-2 4h-3zM11.5 5.5h3l-2 4h-3zM17.5 5.5h3l-2 4h-3z" fill={stripe} />
+      </g>
+    </svg>
+  );
+}
 
 const toolbarDivider = <div aria-hidden="true" style={{ width: 1, height: 20, background: "rgba(42,42,42,0.2)", margin: "0 3px", flexShrink: 0 }} />;
 
