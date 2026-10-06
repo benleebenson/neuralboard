@@ -4,14 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { signIn, useSession } from "next-auth/react";
 import { AccountControl } from "@/app/components/AccountControl";
 import { useIsPro } from "@/app/components/useIsPro";
-import { BOARD_LIBRARY_PENDING_FILE, type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory } from "@/lib/board-library";
+import { editorBoardUrl, rememberShellTab, type ShellTab } from "@/lib/app-shell";
+import { type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory } from "@/lib/board-library";
 import { normalizeJoinCode } from "@/lib/joinable-board";
 import { publishBoard, unpublishBoard, type PublishPhase } from "@/lib/published-board-package";
 import type { MyPublishedBoard, PublishedBoardCard } from "@/lib/published-boards";
 import { boardCompositePreview } from "@/lib/simple-world";
 import styles from "./AppShell.module.css";
-
-type ShellTab = "home" | "profile";
 
 // The editor reads `create` once and opens a fresh board tab; `joinable` also runs its existing "Make board joinable" flow.
 const CREATE_BLANK_URL = "/board2?create=blank&mobileEditor=1";
@@ -24,7 +23,8 @@ function tabFromLocation(): ShellTab {
 export function AppShell() {
   const { data: session, status } = useSession();
   const { isPro, isAdmin, loading: isProLoading } = useIsPro();
-  const [tab, setTab] = useState<ShellTab>("home");
+  // Null until the URL is read after hydration, so a refresh on Profile never flashes (and fetches) Home first.
+  const [tab, setTab] = useState<ShellTab | null>(null);
   const [forwarding, setForwarding] = useState(false);
 
   useEffect(() => {
@@ -36,14 +36,17 @@ export function AppShell() {
       window.location.replace(`/board2?join=${join}`);
       return;
     }
-    setTab(tabFromLocation());
-    const onPop = () => setTab(tabFromLocation());
+    const initial = tabFromLocation();
+    setTab(initial);
+    rememberShellTab(initial);
+    const onPop = () => { const next = tabFromLocation(); setTab(next); rememberShellTab(next); };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
   const selectTab = useCallback((next: ShellTab) => {
     setTab(next);
+    rememberShellTab(next);
     const url = new URL(window.location.href);
     if (next === "home") url.searchParams.delete("tab");
     else url.searchParams.set("tab", next);
@@ -82,7 +85,7 @@ export function AppShell() {
       </header>
 
       <main className={styles.main}>
-        {tab === "home" ? <HomeView onCreate={createBoard} onCreateJoinable={createJoinableBoard} /> : <ProfileView />}
+        {tab === "home" ? <HomeView onCreate={createBoard} onCreateJoinable={createJoinableBoard} /> : tab === "profile" ? <ProfileView /> : null}
       </main>
 
       <nav className={styles.tabBar} aria-label="Neural Board">
@@ -314,10 +317,7 @@ function BoardList({ directory, boards, previews }: { directory: FileSystemDirec
                 type="button"
                 className={styles.boardOpen}
                 aria-label={`Open ${board.meta.title}`}
-                onClick={() => {
-                  sessionStorage.setItem(BOARD_LIBRARY_PENDING_FILE, board.fileName);
-                  window.location.assign("/board2?mobileEditor=1");
-                }}
+                onClick={() => window.location.assign(editorBoardUrl(board.fileName))}
               >
                 <span className={styles.rowImage}>
                   {/* eslint-disable-next-line @next/next/no-img-element -- local object URL */}

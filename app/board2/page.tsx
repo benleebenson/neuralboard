@@ -24,6 +24,7 @@ import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
+import { EDITOR_BOARD_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
@@ -5577,6 +5578,83 @@ export default function Board2Page() {
     setActiveWorkspaceId(next.id);
   }, []);
 
+  // ?board=<file> names the boards-folder board open in the active tab, so a refresh (or a Profile link) reopens it.
+  // The autosaved first tab is never named: it restores from autosave on its own.
+  const [urlBoardRestoring, setUrlBoardRestoring] = useState(true);
+  const [boardReopen, setBoardReopen] = useState<{ fileName: string; message: string; canRetry: boolean } | null>(null);
+  const openFolderBoard = useCallback(async (fileName: string, prompt: boolean): Promise<boolean> => {
+    const directory = await getBoardsDirectory({ prompt, write: false });
+    if (!directory) return false;
+    const file = await (await directory.getFileHandle(fileName)).getFile();
+    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++, { file, fileName, name: fileName.replace(/\.nbp$/i, "") });
+    setWorkspaces((current) => [...current, next]);
+    setActiveWorkspaceId(next.id);
+    return true;
+  }, []);
+  const urlBoardHandledRef = useRef(false);
+  useEffect(() => {
+    if (viewBoardId !== "" || urlBoardHandledRef.current) return;
+    urlBoardHandledRef.current = true;
+    const fileName = new URLSearchParams(window.location.search).get(EDITOR_BOARD_PARAM);
+    if (!fileName) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- the URL is only readable after hydration
+      setUrlBoardRestoring(false);
+      return;
+    }
+    void openFolderBoard(fileName, false).then((opened) => {
+      if (!opened) setBoardReopen({ fileName, message: `Allow access to your boards folder to reopen “${fileName}”.`, canRetry: true });
+    }).catch(() => {
+      setBoardReopen({ fileName, message: `“${fileName}” isn’t in your boards folder any more.`, canRetry: false });
+    }).finally(() => setUrlBoardRestoring(false));
+  }, [openFolderBoard, viewBoardId]);
+  const retryBoardReopen = useCallback(() => {
+    if (!boardReopen) return;
+    const { fileName } = boardReopen;
+    void openFolderBoard(fileName, true).then((opened) => {
+      if (opened) setBoardReopen(null);
+    }).catch(() => {
+      setBoardReopen({ fileName, message: `“${fileName}” isn’t in your boards folder any more.`, canRetry: false });
+    });
+  }, [boardReopen, openFolderBoard]);
+  useEffect(() => {
+    // Hold the param while it is still being restored (or waiting on folder permission) so another refresh retries it.
+    if (viewBoardId !== "" || urlBoardRestoring || boardReopen) return;
+    const active = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+    const fileName = active && active.id !== BOARD_AUTOSAVE_WORKSPACE_ID ? active.sourceFileName : undefined;
+    const url = new URL(window.location.href);
+    if ((url.searchParams.get(EDITOR_BOARD_PARAM) ?? undefined) === fileName) return;
+    if (fileName) url.searchParams.set(EDITOR_BOARD_PARAM, fileName);
+    else url.searchParams.delete(EDITOR_BOARD_PARAM);
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [activeWorkspaceId, boardReopen, urlBoardRestoring, viewBoardId, workspaces]);
+
+  // Leaving the editor drops every open tab; only the first tab is autosaved, so the others' unsaved work (and any export) would be lost.
+  const atRiskWorkspaces = workspaces.filter((workspace) => workspace.isExporting || (workspace.isDirty && workspace.id !== BOARD_AUTOSAVE_WORKSPACE_ID));
+  const hasAtRiskWorkspaces = atRiskWorkspaces.length > 0;
+  const leavingEditorRef = useRef(false);
+  useEffect(() => {
+    if (!hasAtRiskWorkspaces) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (leavingEditorRef.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [hasAtRiskWorkspaces]);
+  const leaveEditor = useCallback(() => {
+    if (atRiskWorkspaces.length > 0) {
+      const names = atRiskWorkspaces.map((workspace) => `“${workspace.name}”`).join(", ");
+      const exporting = atRiskWorkspaces.some((workspace) => workspace.isExporting);
+      const message = exporting
+        ? `Leave the editor? ${names} ${atRiskWorkspaces.length === 1 ? "has" : "have"} an export in progress or unsaved changes that will be lost.`
+        : `Leave the editor? Unsaved changes in ${names} will be lost.`;
+      if (!window.confirm(message)) return;
+    }
+    leavingEditorRef.current = true;
+    window.location.assign(shellTabUrl(rememberedShellTab()));
+  }, [atRiskWorkspaces]);
+
   const closeWorkspace = useCallback((workspaceId: string) => {
     const closingIndex = workspaces.findIndex((workspace) => workspace.id === workspaceId);
     const closing = workspaces[closingIndex];
@@ -5614,6 +5692,7 @@ export default function Board2Page() {
     <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
         {!chromeHidden && <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
+        <button type="button" onClick={leaveEditor} aria-label="Back to Home" title="Back to Home" style={{ position: "sticky", left: 0, zIndex: 1, flexShrink: 0, marginRight: 4, padding: "0 10px", border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 11, fontWeight: 800, whiteSpace: "nowrap" }}>← Home</button>
         {workspaces.map((workspace) => {
           const active = workspace.id === activeWorkspaceId;
           const percent = Math.max(0, Math.min(100, Math.round(workspace.exportProgress * 100)));
@@ -5631,6 +5710,13 @@ export default function Board2Page() {
         })}
         <button type="button" onClick={addWorkspace} aria-label="Open a new board tab" title="New board" style={{ width: 34, minWidth: 34, border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 18 }}>+</button>
         </nav>}
+        {!chromeHidden && boardReopen && (
+          <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "6px 8px", borderBottom: "1.5px solid #2a2a2a", background: "#ffe5a8", color: "#2a2a2a", fontFamily: "monospace", fontSize: 11 }}>
+            <span style={{ minWidth: 0, flex: 1 }}>{boardReopen.message}</span>
+            {boardReopen.canRetry && <button type="button" onClick={retryBoardReopen} style={{ border: "1.5px solid #2a2a2a", background: "#c8f135", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 11, fontWeight: 700, padding: "3px 8px" }}>Reopen board</button>}
+            <button type="button" onClick={() => setBoardReopen(null)} aria-label="Dismiss" style={{ border: "1.5px solid #2a2a2a", background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 11, padding: "3px 8px" }}>Dismiss</button>
+          </div>
+        )}
         <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
           {workspaces.map((workspace) => (
             <div key={workspace.id} aria-hidden={workspace.id !== activeWorkspaceId} style={{ position: "absolute", inset: 0, display: workspace.id === activeWorkspaceId ? "block" : "none" }}>
@@ -22323,6 +22409,7 @@ function Board2Editor({
           const fileName = recipeLibraryFilenameRef.current ?? safeBoardFilename(meta.title || "board", meta.id);
           await writeBoardFile(directory, fileName, zippedBytes);
           recipeLibraryFilenameRef.current = fileName;
+          onWorkspaceSource(workspaceId, fileName);
           savedToFolder = true;
         }
       } catch (error) {
