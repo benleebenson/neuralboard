@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/board2/cleanup-expired", "schedule": "0 4 * * *" }
+  ]
+}

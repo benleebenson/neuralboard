@@ -6,15 +6,15 @@ import { AccountControl } from "@/app/components/AccountControl";
 import { useIsPro } from "@/app/components/useIsPro";
 import { editorBoardUrl, rememberShellTab, type ShellTab } from "@/lib/app-shell";
 import { type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory } from "@/lib/board-library";
-import { normalizeJoinCode } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, JOIN_CODE_LENGTH, normalizeJoinCode, readCreatedBoards } from "@/lib/joinable-board";
 import { publishBoard, unpublishBoard, type PublishPhase } from "@/lib/published-board-package";
 import type { MyPublishedBoard, PublishedBoardCard } from "@/lib/published-boards";
 import { boardCompositePreview } from "@/lib/simple-world";
 import styles from "./AppShell.module.css";
 import { shellFont } from "./shell-font";
 
-// The editor reads `create` once and opens a fresh board tab; `joinable` also runs its existing "Make board joinable" flow.
-const CREATE_BLANK_URL = "/board2?create=blank&mobileEditor=1";
+// The editor reads `create` once and opens a fresh board tab; `joinable` also makes it joinable
+// right away. Signed out, that's an anonymous board kept for ANONYMOUS_BOARD_TTL_DAYS.
 const CREATE_JOINABLE_URL = "/board2?create=joinable&mobileEditor=1";
 
 function tabFromLocation(): ShellTab {
@@ -55,20 +55,11 @@ export function AppShell() {
     window.scrollTo({ top: 0 });
   }, []);
 
-  // A new board needs no account: uploads, timeline, camera, world view and export all work signed out.
+  // A new board needs no account and is immediately joinable by code. AI features still ask
+  // for sign-in inside the editor.
   const createBoard = useCallback(() => {
-    window.location.assign(CREATE_BLANK_URL);
-  }, []);
-
-  const createJoinableBoard = useCallback(() => {
-    if (status === "loading") return;
-    if (!session?.user) {
-      // Joinable boards need an account; return straight into creation after sign-in.
-      void signIn("google", { callbackUrl: CREATE_JOINABLE_URL });
-      return;
-    }
     window.location.assign(CREATE_JOINABLE_URL);
-  }, [session, status]);
+  }, []);
 
   const [query, setQuery] = useState("");
 
@@ -106,7 +97,7 @@ export function AppShell() {
       </header>
 
       <main className={styles.main}>
-        {tab === "home" ? <HomeView query={query} onCreate={createBoard} onCreateJoinable={createJoinableBoard} /> : tab === "profile" ? <ProfileView userLabel={userLabel} onCreate={createBoard} /> : null}
+        {tab === "home" ? <HomeView query={query} onCreate={createBoard} /> : tab === "profile" ? <ProfileView userLabel={userLabel} onCreate={createBoard} /> : null}
       </main>
 
       <nav className={styles.tabBar} aria-label="Neural Board">
@@ -126,7 +117,71 @@ export function AppShell() {
 
 const viewUrl = (id: string) => `/board2?view=${id}`;
 
-function HomeView({ query, onCreate, onCreateJoinable }: { query: string; onCreate: () => void; onCreateJoinable: () => void }) {
+function JoinBoardCard() {
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  // Boards made on this device that haven't expired, newest first, for one-tap return.
+  const [recent, setRecent] = useState<Array<{ code: string; expiresAt: string | null }>>([]);
+  useEffect(() => {
+    const now = Date.now();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is read after hydration
+    setRecent(Object.entries(readCreatedBoards())
+      .filter(([, board]) => !board.expiresAt || Date.parse(board.expiresAt) > now)
+      .sort(([, a], [, b]) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
+      .slice(0, 6)
+      .map(([boardCode, board]) => ({ code: boardCode, expiresAt: board.expiresAt })));
+  }, []);
+
+  async function join(event: React.FormEvent) {
+    event.preventDefault();
+    const normalized = normalizeJoinCode(code);
+    if (normalized.length !== JOIN_CODE_LENGTH) { setError("Enter the six-character code shown on the board."); return; }
+    setChecking(true); setError("");
+    try {
+      const response = await fetch(`/api/joinable-board?code=${normalized}`, { cache: "no-store" });
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Could not join that board.");
+      window.location.assign(`/board2?join=${normalized}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not join that board.");
+      setChecking(false);
+    }
+  }
+
+  return (
+    <section className={styles.joinCard} aria-labelledby="join-board-title">
+      <h2 id="join-board-title" className={styles.joinTitle}>Join a board</h2>
+      <form className={styles.joinForm} onSubmit={join}>
+        <input
+          className={styles.joinInput}
+          inputMode="text"
+          autoCapitalize="characters"
+          autoComplete="off"
+          spellCheck={false}
+          maxLength={JOIN_CODE_LENGTH}
+          aria-label="Board code"
+          placeholder="ABC123"
+          value={code}
+          onChange={(event) => { setCode(normalizeJoinCode(event.target.value)); setError(""); }}
+        />
+        <button type="submit" className={styles.primaryButton} disabled={checking || code.length !== JOIN_CODE_LENGTH}>{checking ? "Checking…" : "Join"}</button>
+      </form>
+      {error && <p role="alert" className={styles.error}>{error}</p>}
+      {recent.length > 0 && (
+        <div className={styles.recentBoards}>
+          <span className={styles.caption}>Your boards on this device:</span>
+          {recent.map((board) => (
+            <a key={board.code} className={styles.recentBoard} href={`/board2?join=${board.code}`} title={board.expiresAt ? `Expires ${new Date(board.expiresAt).toLocaleDateString()}` : "Saved to your account"}>{board.code}</a>
+          ))}
+        </div>
+      )}
+      <p className={styles.caption}>New boards don’t need an account. Signed out, they’re kept for {ANONYMOUS_BOARD_TTL_DAYS} days unless you save them to an account.</p>
+    </section>
+  );
+}
+
+function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) {
   const [feed, setFeed] = useState<{ kind: "loading" } | { kind: "error" } | { kind: "ready"; boards: PublishedBoardCard[] }>({ kind: "loading" });
 
   useEffect(() => {
@@ -151,6 +206,7 @@ function HomeView({ query, onCreate, onCreateJoinable }: { query: string; onCrea
   return (
     <>
       <h1 className={styles.srOnly}>Public boards</h1>
+      <JoinBoardCard />
       {feed.kind === "loading" ? (
         <section className={styles.empty}>Loading boards…</section>
       ) : feed.kind === "ready" && feed.boards.length > 0 && !featured ? (
@@ -194,8 +250,6 @@ function HomeView({ query, onCreate, onCreateJoinable }: { query: string; onCrea
           <p className={styles.emptyHeading}>No public boards yet.</p>
           <p>Turn on “Public” for a board in your profile to show it here. Boards can still be edited together privately with a six-character join code.</p>
           <div className={styles.emptyActions}>
-            <a className={styles.secondaryButton} href="/public">Join with a code</a>
-            <button type="button" className={styles.secondaryButton} onClick={onCreateJoinable}>Create a joinable board</button>
             <button type="button" className={styles.primaryButton} onClick={onCreate}>New board</button>
           </div>
         </section>

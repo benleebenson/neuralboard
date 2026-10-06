@@ -18,7 +18,7 @@ import {
   Muxer as WebMMuxer,
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
+import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, rememberCreatedBoard, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
@@ -5970,6 +5970,11 @@ function Board2Editor({
 
   const [joinCode, setJoinCode] = useState("");
   const [joinOwnerToken, setJoinOwnerToken] = useState("");
+  // From the server: whether the shared board has no account owner yet, and when it expires
+  // (null = permanent). Anonymous boards show the "save to account" banner.
+  const [joinAnonymous, setJoinAnonymous] = useState(false);
+  const [joinExpiresAt, setJoinExpiresAt] = useState<string | null>(null);
+  const claimAttemptedRef = useRef<string | null>(null);
   const [joinStatus, setJoinStatus] = useState<"idle" | "connecting" | "joined" | "error">("idle");
   const joinVersionRef = useRef(0);
   const joinLastSignatureRef = useRef("");
@@ -6141,7 +6146,9 @@ function Board2Editor({
   const savedDirtySignatureRef = useRef<string | null>(null);
   const resetDirtyAfterLoadRef = useRef(false);
   const initialFileLoadStartedRef = useRef(false);
-  const autosaveEnabled = workspaceId === BOARD_AUTOSAVE_WORKSPACE_ID && !initialFile;
+  // A board opened from a join link is the shared board, not this device's local board: never
+  // let it overwrite (or be overwritten by) the local autosave.
+  const autosaveEnabled = workspaceId === BOARD_AUTOSAVE_WORKSPACE_ID && !initialFile && !initialJoinCode;
   const autosaveRestoreStartedRef = useRef(false);
   const autosaveReadyRef = useRef(false);
   const autosaveFlushRef = useRef<(() => void) | null>(null);
@@ -7487,8 +7494,35 @@ function Board2Editor({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setJoinCode(initialJoinCode);
     setJoinStatus("connecting");
+    // Back on a board created on this device: restore the creator's owner token.
+    const created = readCreatedBoards()[initialJoinCode];
+    if (created?.token) setJoinOwnerToken(created.token);
     if (isMobile) setMobileDesktopOverride(true);
   }, [initialJoinCode, isMobile, joinCode]);
+
+  // "Save to account": once the creator of an anonymous board is signed in, claim it. This covers
+  // both clicking the banner (which signs in and returns here) and signing in any other way.
+  async function claimCreatedBoard() {
+    const code = joinCode, token = joinOwnerToken;
+    claimAttemptedRef.current = code;
+    try {
+      const response = await fetch("/api/joinable-board/claim", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, token }) });
+      const result = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(result.error || "Could not save this board to your account.");
+      setJoinAnonymous(false);
+      setJoinExpiresAt(null);
+      rememberCreatedBoard(code, { token, expiresAt: null, createdAt: readCreatedBoards()[code]?.createdAt ?? new Date().toISOString() });
+      setToast("Board saved to your account");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not save this board to your account.");
+    }
+  }
+  useEffect(() => {
+    if (!session?.user?.email || !joinCode || !joinOwnerToken || !joinAnonymous || claimAttemptedRef.current === joinCode) return;
+    void claimCreatedBoard();
+    // claimCreatedBoard is component-local; it runs once per board when the creator is signed in.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joinAnonymous, joinCode, joinOwnerToken, session?.user?.email]);
 
   const autoMakeJoinableStartedRef = useRef(false);
   useEffect(() => {
@@ -7505,8 +7539,12 @@ function Board2Editor({
     const pull = async () => {
       try {
         const response = await fetch(`/api/joinable-board?code=${joinCode}`, { cache: "no-store" });
-        const result = await response.json() as { state?: JoinableBoardState; version?: number; error?: string };
+        const result = await response.json() as { state?: JoinableBoardState; version?: number; error?: string; anonymous?: boolean; expires_at?: string | null };
         if (!response.ok) throw new Error(result.error || "The shared board is unavailable.");
+        if (!cancelled) {
+          setJoinAnonymous(result.anonymous === true);
+          setJoinExpiresAt(result.expires_at ?? null);
+        }
         if (!cancelled && typeof result.version === "number" && result.version > joinVersionRef.current) applyJoinableState(result.state ?? { clips: [], annotations: [], boardDimensions: { width: BOARD_W, height: BOARD_H } }, result.version);
         if (!cancelled) setJoinStatus("joined");
       } catch (error) {
@@ -23335,12 +23373,12 @@ function Board2Editor({
     else void document.documentElement.requestFullscreen().catch(() => setToast("Fullscreen isn't available here"));
   }
 
+  // No account needed: signed out, this creates an anonymous board that expires unless saved.
   async function makeBoardJoinable() {
-    if (!session?.user) { void signIn("google", { callbackUrl: "/board2" }); return; }
     setJoinStatus("connecting");
     try {
       const response = await fetch("/api/joinable-board", { method: "POST" });
-      const result = await response.json() as { code?: string; token?: string; error?: string };
+      const result = await response.json() as { code?: string; token?: string; error?: string; expiresAt?: string | null; anonymous?: boolean };
       if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
       const sharedClips: Clip[] = [];
       for (const clip of clipsRef.current) {
@@ -23356,8 +23394,17 @@ function Board2Editor({
       joinVersionRef.current = 0;
       joinLastSignatureRef.current = "";
       setJoinOwnerToken(result.token);
+      setJoinAnonymous(result.anonymous === true);
+      setJoinExpiresAt(result.expiresAt ?? null);
+      rememberCreatedBoard(result.code, { token: result.token, expiresAt: result.expiresAt ?? null, createdAt: new Date().toISOString() });
       setJoinCode(result.code);
       setJoinStatus("joined");
+      // A refresh reopens the shared board rather than this tab's pre-sharing state.
+      if (isWorkspaceActive) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("join", result.code);
+        window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+      }
       setToast(`Board join code: ${result.code}`);
     } catch (error) {
       setJoinStatus("error");
@@ -23369,7 +23416,8 @@ function Board2Editor({
     if (!joinOwnerToken) return;
     const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, token: joinOwnerToken }) });
     if (!response.ok) { const result = await response.json().catch(() => ({})) as { error?: string }; setToast(result.error || "Could not stop sharing."); return; }
-    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); joinVersionRef.current = 0; joinLastSignatureRef.current = "";
+    forgetCreatedBoard(joinCode);
+    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = "";
     window.history.replaceState({}, "", window.location.pathname);
     setToast("Board is no longer joinable");
   }
@@ -23509,6 +23557,32 @@ function Board2Editor({
           </div>
         </div>
       )}
+      {!viewOnly && joinCode && joinAnonymous && (() => {
+        const msLeft = joinExpiresAt ? Date.parse(joinExpiresAt) - Date.now() : NaN;
+        const daysLeft = Number.isFinite(msLeft) ? Math.ceil(msLeft / 86_400_000) : null;
+        const expiry = daysLeft === null ? "soon" : daysLeft <= 1 ? (msLeft < 86_400_000 ? "in less than a day" : "in 1 day") : `in ${daysLeft} days`;
+        return (
+          <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "6px max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left))", background: "#ffe5a8", borderBottom: "1.5px solid #2a2a2a", color: "#2a2a2a", fontFamily: "monospace", fontSize: 11, position: "relative", zIndex: 440 }}>
+            <span style={{ flex: 1, minWidth: 200 }}>
+              This board expires {expiry} — {joinOwnerToken ? "create an account to save it permanently." : "only the person who created it can save it permanently."}
+            </span>
+            {joinOwnerToken && (
+              <button
+                type="button"
+                onClick={() => {
+                  // Signed in already (an earlier claim failed): retry. Otherwise sign in and come
+                  // back to this board, where the claim effect saves it.
+                  if (session?.user?.email) void claimCreatedBoard();
+                  else void signIn("google", { callbackUrl: `/board2?join=${joinCode}` });
+                }}
+                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }}
+              >
+                Save to account
+              </button>
+            )}
+          </div>
+        );
+      })()}
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (

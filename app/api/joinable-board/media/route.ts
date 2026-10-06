@@ -3,7 +3,7 @@ import sharp from "sharp";
 import { NextResponse } from "next/server";
 import { getSupabase } from "@/lib/supabase";
 import { normalizeJoinCode } from "@/lib/joinable-board";
-import { joinableBoardError } from "@/lib/joinable-board-server";
+import { joinableBoardError, unexpiredBoardFilter } from "@/lib/joinable-board-server";
 
 export async function POST(request: Request) {
   try {
@@ -13,7 +13,7 @@ export async function POST(request: Request) {
     if (code.length !== 6 || !(file instanceof File) || !file.type.startsWith("image/")) return NextResponse.json({ error: "Choose an image to share." }, { status: 400 });
     if (file.size > 15 * 1024 * 1024) return NextResponse.json({ error: "Shared images must be smaller than 15 MB." }, { status: 413 });
     const supabase = getSupabase();
-    const { data: board, error: boardError } = await supabase.from("joinable_boards").select("id").eq("code", code).eq("active", true).gt("expires_at", new Date().toISOString()).maybeSingle();
+    const { data: board, error: boardError } = await supabase.from("joinable_boards").select("id").eq("code", code).eq("active", true).or(unexpiredBoardFilter()).maybeSingle();
     if (boardError) throw boardError;
     if (!board) return NextResponse.json({ error: "That board is no longer joinable." }, { status: 404 });
     const id = crypto.randomUUID();

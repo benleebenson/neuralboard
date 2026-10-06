@@ -27,6 +27,8 @@ No test suite exists. Verify changes by running the dev server.
 | `NEURALBOARD_PASSWORD` | Password header for Railway requests |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` | Stripe subscriptions |
 | `ANTHROPIC_API_KEY` | Claude (auto-picked up by `@anthropic-ai/sdk`) |
+| `CLEANUP_SECRET` | `x-cleanup-secret` header for `/api/board2/cleanup-expired` (external cron) |
+| `CRON_SECRET` | Vercel Cron's `Authorization: Bearer` secret for the same route (`vercel.json` daily cron) |
 
 ## Architecture
 

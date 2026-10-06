@@ -167,3 +167,15 @@
   .identity{gap:16px}
   .profileName{font-size:24px}
 }
+
+/* Home: join a board by code */
+.joinCard{max-width:600px;margin:0 0 32px;padding:22px 24px;border:1px solid var(--hairline);border-radius:var(--radius-card);background:var(--ground);display:grid;gap:12px}
+.joinTitle{margin:0;color:var(--ink);font-size:20px;font-weight:600;line-height:1.3}
+.joinForm{display:flex;gap:10px;flex-wrap:wrap}
+.joinInput{flex:1;min-width:160px;min-height:44px;padding:0 18px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);color:var(--ink);font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;text-transform:uppercase}
+.joinInput:focus-visible{outline:2px solid var(--section);outline-offset:2px}
+.joinCard .primaryButton:disabled{opacity:.5;cursor:not-allowed}
+.joinCard .error,.joinCard .caption{margin:0}
+.recentBoards{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.recentBoard{padding:4px 12px;border:1px solid var(--hairline);border-radius:var(--radius-pill);color:var(--ink);font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px;text-decoration:none}
+.recentBoard:hover{background:var(--tint)}

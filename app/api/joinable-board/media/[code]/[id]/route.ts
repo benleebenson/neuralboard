@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabase } from "@/lib/supabase";
 import { normalizeJoinCode } from "@/lib/joinable-board";
-import { joinableBoardError } from "@/lib/joinable-board-server";
+import { joinableBoardError, unexpiredBoardFilter } from "@/lib/joinable-board-server";
 
 export async function GET(_request: Request, context: RouteContext<"/api/joinable-board/media/[code]/[id]">) {
   try {
@@ -9,7 +9,7 @@ export async function GET(_request: Request, context: RouteContext<"/api/joinabl
     const code = normalizeJoinCode(params.code);
     if (code.length !== 6 || !/^[0-9a-f-]{36}$/i.test(params.id)) return NextResponse.json({ error: "Image not found." }, { status: 404 });
     const supabase = getSupabase();
-    const { data: board, error } = await supabase.from("joinable_boards").select("id").eq("code", code).eq("active", true).gt("expires_at", new Date().toISOString()).maybeSingle();
+    const { data: board, error } = await supabase.from("joinable_boards").select("id").eq("code", code).eq("active", true).or(unexpiredBoardFilter()).maybeSingle();
     if (error) throw error;
     if (!board) return NextResponse.json({ error: "Image not found." }, { status: 404 });
     const signed = await supabase.storage.from("joinable-board-media").createSignedUrl(`${board.id}/${params.id}.webp`, 300);
