@@ -8,7 +8,6 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ProGated, UpgradeModal } from "@/app/components/ProGated";
 import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
-import { MainSectionNav } from "@/app/components/MainSectionNav";
 import { listSimpleWorldBoards, openSimpleWorldBoardFile, openSimpleWorldPreviewFile, type SimpleWorldBoard } from "@/lib/simple-world";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
@@ -5787,8 +5786,7 @@ export default function Board2Page() {
   return (
     <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
-        {!chromeHidden && <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
-        <button type="button" onClick={leaveEditor} aria-label="Back to Home" title="Back to Home" style={{ position: "sticky", left: 0, zIndex: 1, flexShrink: 0, marginRight: 4, padding: "0 10px", border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 11, fontWeight: 800, whiteSpace: "nowrap" }}>← Home</button>
+        {!chromeHidden && workspaces.length > 1 && <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
         {workspaces.map((workspace) => {
           const active = workspace.id === activeWorkspaceId;
           const percent = Math.max(0, Math.min(100, Math.round(workspace.exportProgress * 100)));
@@ -5831,6 +5829,7 @@ export default function Board2Page() {
                 activeWorldBoard={worldBoards.find((board) => board.fileName === workspace.sourceFileName) ?? null}
                 onToggleChrome={() => setChromeHidden((hidden) => !hidden)}
                 onOpenEditor={openEditor}
+                onLeaveEditor={leaveEditor}
                 onEnterWorldBoard={openWorldBoard}
               />
             </div>
@@ -5941,6 +5940,7 @@ function Board2Editor({
   activeWorldBoard,
   onToggleChrome,
   onOpenEditor,
+  onLeaveEditor,
   onEnterWorldBoard,
   viewOnly = false,
 }: {
@@ -5959,6 +5959,8 @@ function Board2Editor({
   onToggleChrome: () => void;
   /** Opens the editor if it's closed, so AI actions that add clips show their results. */
   onOpenEditor?: () => void;
+  /** Back to the app shell (Home); guards unsaved work across open boards. */
+  onLeaveEditor?: () => void;
   onEnterWorldBoard: (board: SimpleWorldBoard) => Promise<void>;
   /** A published board opened from the Home feed: look and play only — no editing, saving or uploads. */
   viewOnly?: boolean;
@@ -6119,6 +6121,12 @@ function Board2Editor({
   const [isPortrait, setIsPortrait] = useState(false);
   const [mobileDrawer, setMobileDrawer] = useState<"media" | "props" | null>(null);
   const [mobileEditorMenuOpen, setMobileEditorMenuOpen] = useState(false);
+  const [boardSettingsOpen, setBoardSettingsOpen] = useState(false);
+  const [boardCodeCopied, setBoardCodeCopied] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Anonymous presence: one random token per editor session, never tied to the account.
+  const presenceTokenRef = useRef("");
+  const [presencePeers, setPresencePeers] = useState<string[]>([]);
   const [mobileAccountOpen, setMobileAccountOpen] = useState(false);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
@@ -7593,6 +7601,33 @@ function Board2Editor({
     try { window.localStorage.setItem(AMBIENT_VIDEO_STORAGE_KEY, ambientVideoEnabled ? "1" : "0"); } catch {}
   }, [ambientVideoEnabled]);
   useEffect(() => { boardColorRef.current = boardColor; }, [boardColor]);
+  useEffect(() => {
+    const sync = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+  // Who else is on this board. Only joinable boards can have anyone else on them, and the join
+  // code is the id every participant shares, so it names the channel. Each tab tracks only a
+  // random token as its presence key: no name, email or account id.
+  useEffect(() => {
+    if (!joinCode || viewOnly) return;
+    const supabase = getBrowserSupabase();
+    if (!supabase) return;
+    if (!presenceTokenRef.current) presenceTokenRef.current = generatePresenceToken();
+    const token = presenceTokenRef.current;
+    const channel = supabase.channel(`board:${joinCode}`, { config: { presence: { key: token } } });
+    channel
+      .on("presence", { event: "sync" }, () => {
+        setPresencePeers(Object.keys(channel.presenceState()).filter((key) => key !== token).sort());
+      })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") void channel.track({});
+      });
+    return () => {
+      void supabase.removeChannel(channel);
+      setPresencePeers([]);
+    };
+  }, [joinCode, viewOnly]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
@@ -21808,10 +21843,6 @@ function Board2Editor({
                       {!autoBuildPhase && <div style={{ fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
                     </ProGated>
                     <div style={{ width: "100%", height: 1, background: "rgba(42,42,42,0.15)", margin: "4px 0" }} />
-                    <label style={{ ...sketchButton, width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", fontSize: 13 }}>
-                      <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={22} />
-                      Board color
-                    </label>
                     <button
                       onClick={() => { setSaveModalOpen(true); setMobileDrawer(null); }}
                       style={{ ...sketchButton, width: "100%", textAlign: "left", padding: "10px 14px", fontSize: 13 }}
@@ -23289,6 +23320,21 @@ function Board2Editor({
     );
   }
 
+  async function copyBoardCode() {
+    try {
+      await navigator.clipboard.writeText(joinCode);
+      setBoardCodeCopied(true);
+      window.setTimeout(() => setBoardCodeCopied(false), 1400);
+    } catch {
+      setToast(`Board code: ${joinCode}`);
+    }
+  }
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+    else void document.documentElement.requestFullscreen().catch(() => setToast("Fullscreen isn't available here"));
+  }
+
   async function makeBoardJoinable() {
     if (!session?.user) { void signIn("google", { callbackUrl: "/board2" }); return; }
     setJoinStatus("connecting");
@@ -23328,11 +23374,6 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
-  async function copyJoinCode() {
-    await navigator.clipboard.writeText(joinCode);
-    setToast(`Copied join code ${joinCode}`);
-  }
-
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
@@ -23357,94 +23398,121 @@ function Board2Editor({
       )}
 
       {/* ── Header ── */}
-      {!chromeHidden && <header style={{ ...headerStyle, ...(isMobile ? { minHeight: isPortrait ? 44 : 34, boxSizing: "border-box", padding: `${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-right)) ${isPortrait ? 5 : 2}px max(6px, env(safe-area-inset-left))`, paddingTop: `max(${isPortrait ? 5 : 2}px, env(safe-area-inset-top))`, gap: 6 } : {}) }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: isMobile ? 5 : 12, minWidth: 0 }}>
-          {isMobile && <button type="button" aria-label="Open editor menu" onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, flexShrink: 0, background: mobileEditorMenuOpen ? "#2a2a2a" : "#fffdf5", color: mobileEditorMenuOpen ? "#c8f135" : "#2a2a2a", fontSize: 17 }}>☰</button>}
-          <span style={{ fontFamily: "'Caveat', cursive", fontSize: 28, fontWeight: 700, color: "#2a2a2a" }}>Neural Board</span>
-          {!isMobile && <details style={{ position: "relative", zIndex: 400, alignSelf: "center" }}>
-            <summary style={{ ...sketchButton, padding: "4px 8px", fontSize: 11, listStyle: "none" }}>↑ Upload files</summary>
-            <div style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, width: 270, maxWidth: "calc(100vw - 24px)", display: "grid", gap: 12, padding: 12, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "3px 3px 0 #2a2a2a" }}>
-              <label style={uploadControlStyle}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media from header" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
-              <label style={uploadControlStyle}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration from header" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
-            </div>
-          </details>}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 4 : 14 }}>
-          {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
-          {!isMobile && <>
-          <div aria-hidden="true" style={{ display: "none" }}>
-            <button
-              onClick={generateCameraKeyframes}
-              disabled={!canGenerateCamera || !!cameraGenerationPhase}
-              title={canGenerateCamera ? "Generate camera keyframes from board positions and the clip schedule" : "Upload and place media first"}
-              style={{
-                ...sketchButton,
-                padding: "4px 10px",
-                fontSize: 11,
-                opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : 0.45,
-                cursor: canGenerateCamera && !cameraGenerationPhase ? "pointer" : "not-allowed",
-              }}
-            >
-              {cameraGenerationPhase ? `⟳ ${cameraGenerationPhase}` : "⬡ Generate camera keyframes"}
-            </button>
-            <span role="status" aria-live="polite" title={cameraGenerationMessage?.text} style={{ fontSize: 9, fontFamily: "monospace", color: keyframesOutOfDate ? "#ff5e3a" : cameraKeyframes.length ? "#496700" : "#6a6a6a", border: "1px solid currentColor", padding: "2px 5px", whiteSpace: "nowrap" }}>
-              Camera: {keyframesOutOfDate ? "⚠ stale" : cameraKeyframes.length ? `✓ ${cameraKeyframes.length} keyframes` : "none"}
-            </span>
-            {cameraGenerationMessage?.kind === "error" && <span style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 9, fontFamily: "monospace", color: "#a32916" }}>✗ {cameraGenerationMessage.text}</span>}
-            <span
-              role="status"
-              aria-live="polite"
-              title={bridgeStatus === "offline"
-                ? (bridgeStatusDetail ?? "Bridge unreachable — is the Mac mini awake and the tunnel running?")
-                : "Mac-mini image finder bridge — also used by lip sync and YouTube search/download"}
-              style={{
-                fontSize: 9,
-                fontFamily: "monospace",
-                color: bridgeStatus === "online" ? "#496700" : bridgeStatus === "offline" ? "#a32916" : "#6a6a6a",
-                border: "1px solid currentColor",
-                padding: "2px 5px",
-                whiteSpace: "nowrap",
-              }}
-            >
-              Bridge: {bridgeStatus === "online" ? "● online" : bridgeStatus === "offline" ? "● offline" : bridgeStatus === "checking" ? "… checking" : "○ unknown"}
-            </span>
+      {!viewOnly && (
+        <div
+          role="toolbar"
+          aria-label="Board"
+          style={{
+            height: "calc(44px + env(safe-area-inset-top))", paddingTop: "env(safe-area-inset-top)", boxSizing: "border-box",
+            paddingLeft: "max(8px, env(safe-area-inset-left))", paddingRight: "max(8px, env(safe-area-inset-right))",
+            flexShrink: 0, display: "flex", alignItems: "center", gap: 8, position: "relative", zIndex: 450,
+            background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace",
+          }}
+        >
+          {/* Left: home (+ mobile editor menu and play) */}
+          <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
+            <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home" style={topBarIconButton(false)}><HomeIcon /></button>
+            {isMobile && !chromeHidden && (
+              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...topBarIconButton(mobileEditorMenuOpen), fontSize: 17 }}>☰</button>
+            )}
+            {isMobile && !chromeHidden && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
-          {LIVE_FEATURES_ENABLED && (
-            <ProGated featureName="Play Mode">
-              <button onClick={enterPlayMode} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }} title="Full-window direct character control">▶ Play</button>
-            </ProGated>
-          )}
-          {!joinCode ? (
-            <button onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#a8d8ff", opacity: joinStatus === "connecting" ? .55 : 1 }} title="Let another device edit this board using a private code">
-              {joinStatus === "connecting" ? "Making joinable…" : "Make board joinable"}
+
+          {/* Center: the board's share code */}
+          <div style={{ flexShrink: 0, position: "relative" }}>
+            {joinCode ? (
+              <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
+                style={{ height: 28, padding: "0 10px", borderRadius: 999, border: "1px solid rgba(255,253,245,0.35)", background: joinStatus === "joined" ? "rgba(200,241,53,0.16)" : "rgba(255,253,245,0.08)", color: "#fffdf5", fontFamily: "monospace", fontSize: 12, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+              >
+                {joinCode}
+                <CopyIcon />
+              </button>
+            ) : (
+              <button type="button" onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} title="Make this board joinable and get a code to share"
+                style={{ height: 28, padding: "0 12px", borderRadius: 999, border: "1px dashed rgba(255,253,245,0.4)", background: "transparent", color: "rgba(255,253,245,0.8)", fontFamily: "monospace", fontSize: 11, cursor: joinStatus === "connecting" ? "wait" : "pointer", opacity: joinStatus === "connecting" ? 0.6 : 1 }}
+              >
+                {joinStatus === "connecting" ? "Getting code…" : "Get board code"}
+              </button>
+            )}
+            {boardCodeCopied && (
+              <span role="status" style={{ position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)", padding: "3px 8px", borderRadius: 4, background: "#c8f135", color: "#2a2a2a", fontSize: 10, fontWeight: 700, whiteSpace: "nowrap", pointerEvents: "none" }}>Copied!</span>
+            )}
+          </div>
+
+          {/* Right: presence, settings, fullscreen, video editor */}
+          <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+            {joinCode && presencePeers.length > 0 && (
+              <div role="img" aria-label={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} on this board`} title={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} here`} style={{ display: "flex", alignItems: "center", marginRight: 4 }}>
+                {presencePeers.slice(0, 5).map((token, index) => (
+                  <span key={token} style={{ width: 12, height: 12, borderRadius: "50%", background: presenceColor(token), border: "2px solid #2a2a2a", marginLeft: index ? -3 : 0 }} />
+                ))}
+                {presencePeers.length > 5 && <span style={{ marginLeft: 4, fontSize: 10, color: "rgba(255,253,245,0.8)" }}>+{presencePeers.length - 5}</span>}
+              </div>
+            )}
+            <div style={{ position: "relative" }}>
+              <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen)}><GearIcon /></button>
+              {boardSettingsOpen && (
+                <>
+                  <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
+                  <div role="dialog" aria-label="Board settings" style={{ position: "absolute", top: "calc(100% + 8px)", right: 0, zIndex: 1, width: 240, maxWidth: "calc(100vw - 16px)", display: "grid", gap: 12, padding: 12, background: "#fffdf5", color: "#2a2a2a", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", fontFamily: "monospace", fontSize: 11 }}>
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Board color</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={28} />
+                        <span style={{ flex: 1, textTransform: "uppercase" }}>{boardColor}</span>
+                        {boardColor !== BOARD_SURFACE_COLOR && <button type="button" onClick={() => setBoardColor(BOARD_SURFACE_COLOR)} style={miniButton}>Reset</button>}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Board file</div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button type="button" onClick={() => { setBoardSettingsOpen(false); setSaveModalOpen(true); }} style={{ ...sketchButton, flex: 1, padding: "6px 8px", fontSize: 11 }} title="Save board to file">💾 Save</button>
+                        <button type="button" onClick={() => { setBoardSettingsOpen(false); projectFileInputRef.current?.click(); }} disabled={isLoadingProject} style={{ ...sketchButton, flex: 1, padding: "6px 8px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
+                      </div>
+                    </div>
+                    {joinCode && joinOwnerToken && (
+                      <div>
+                        <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Sharing</div>
+                        <button type="button" onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }} style={{ ...miniButton, width: "100%", padding: "6px 8px", color: "#a32916", borderColor: "#a32916" }}>Stop sharing {joinCode}</button>
+                      </div>
+                    )}
+                    {LIVE_FEATURES_ENABLED && (
+                      <ProGated featureName="Play Mode">
+                        <button onClick={enterPlayMode} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }} title="Full-window direct character control">▶ Play</button>
+                      </ProGated>
+                    )}
+                    <div>
+                      <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Account</div>
+                      {session?.user?.email ? (
+                        <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setBoardSettingsOpen(false)} />
+                      ) : (
+                        <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...miniButton, width: "100%", padding: "6px 8px" }}>Sign in →</button>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+            <button type="button" onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} style={topBarIconButton(isFullscreen)}>
+              {isFullscreen ? <CompressIcon /> : <ExpandIcon />}
             </button>
-          ) : (
-            <span style={{ display: "flex", alignItems: "stretch", gap: 3 }}>
-              <button onClick={() => { void copyJoinCode(); }} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: joinStatus === "joined" ? "#c8f135" : "#ffe5a8", letterSpacing: 1 }} title="Copy this code">Code: {joinCode}</button>
-              {joinOwnerToken && <button onClick={() => { void stopBoardJoinability(); }} style={{ ...miniButton, color: "#a32916" }} title="Stop anyone else from joining">×</button>}
-            </span>
-          )}
-          <BoardColorSwatch color={boardColor} onChange={setBoardColor} />
-          <button onClick={() => setSaveModalOpen(true)} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11 }} title="Save board to file">💾 Save</button>
-          <button onClick={() => projectFileInputRef.current?.click()} disabled={isLoadingProject} style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
-          <MainSectionNav active="board" desktopOnly />
-          {session?.user?.email ? (
-            <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} />
-          ) : (
             <button
-              onClick={() => signIn("google", { callbackUrl: "/board2" })}
-              style={{ fontFamily: "monospace", background: "transparent", border: "1px solid #2a2a2a", padding: "3px 8px", cursor: "pointer", fontSize: 10 }}
+              type="button"
+              aria-label={chromeHidden ? "Open video editor" : "Close video editor"}
+              aria-pressed={!chromeHidden}
+              title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
+              onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
+              style={{ ...topBarIconButton(!chromeHidden), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? "#fffdf5" : "#2a2a2a" }}
             >
-              sign in →
+              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} />
             </button>
-          )}
-          </>}
+          </div>
         </div>
-      </header>}
+      )}
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (
-        <div style={{ position: "fixed", top: isPortrait ? "calc(max(44px, env(safe-area-inset-top) + 44px))" : "calc(max(34px, env(safe-area-inset-top) + 34px))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
+        <div style={{ position: "fixed", top: "calc(48px + env(safe-area-inset-top))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
           {session?.user?.email && (
             <AccountControl
               email={session.user.email}
@@ -23457,7 +23525,6 @@ function Board2Editor({
           )}
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
-          <label style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><BoardColorSwatch color={boardColor} onChange={setBoardColor} size={18} />Board color</label>
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
@@ -23768,25 +23835,7 @@ function Board2Editor({
                   <strong style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{initialName}</strong>
                   <span style={{ flexShrink: 0, padding: "2px 6px", border: "1px solid #2a2a2a", fontSize: 9, fontWeight: 800, letterSpacing: 1 }}>VIEW ONLY</span>
                 </div>
-              ) : <button
-                type="button"
-                aria-label={chromeHidden ? "Open video editor" : "Close video editor"}
-                aria-pressed={!chromeHidden}
-                title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
-                style={{
-                  position: "absolute", left: 12, bottom: 12, zIndex: 220, width: 44, height: 44, padding: 0,
-                  display: "grid", placeItems: "center", borderRadius: "50%", cursor: "pointer",
-                  border: "1.5px solid #2a2a2a",
-                  background: chromeHidden ? "#2a2a2a" : "#c8f135",
-                  color: chromeHidden ? "#fffdf5" : "#2a2a2a",
-                  boxShadow: "0 2px 8px rgba(0,0,0,0.28)",
-                  transition: "background 160ms ease, color 160ms ease",
-                }}
-              >
-                <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} />
-              </button>}
+              ) : null}
               {visibleWorldBoards.map((board) => (
                 <WorldBoardComposite
                   key={board.id}
@@ -27598,16 +27647,6 @@ const pageStyle: React.CSSProperties = {
   overflow: "hidden",
 };
 
-const headerStyle: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "space-between",
-  padding: "14px 22px",
-  borderBottom: "1.5px dashed #2a2a2a",
-  background: "rgba(255,253,245,0.75)",
-  flexShrink: 0,
-};
-
 const panelLabelStyle: React.CSSProperties = {
   fontSize: 9,
   fontFamily: "monospace",
@@ -27667,6 +27706,72 @@ const sketchButton: React.CSSProperties = {
   cursor: "pointer",
   boxShadow: "2px 2px 0 #2a2a2a",
 };
+
+const PRESENCE_COLORS = ["#e03131", "#f76707", "#fab005", "#2f9e44", "#0ca678", "#1c7ed6", "#4263eb", "#7048e8", "#d6336c", "#868e96"];
+
+function generatePresenceToken(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+// Stable color per anonymous presence token (FNV-1a), so a dot keeps its color across syncs.
+function presenceColor(token: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < token.length; i++) hash = Math.imul(hash ^ token.charCodeAt(i), 0x01000193);
+  return PRESENCE_COLORS[(hash >>> 0) % PRESENCE_COLORS.length];
+}
+
+function topBarIconButton(active: boolean): React.CSSProperties {
+  return {
+    width: 32, height: 32, padding: 0, flexShrink: 0, borderRadius: 8, cursor: "pointer",
+    display: "grid", placeItems: "center",
+    border: "1px solid " + (active ? "rgba(255,253,245,0.5)" : "transparent"),
+    background: active ? "rgba(255,253,245,0.14)" : "transparent",
+    color: "#fffdf5",
+  };
+}
+
+function HomeIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" />
+    </svg>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+    </svg>
+  );
+}
+
+function ExpandIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5" />
+    </svg>
+  );
+}
+
+function CompressIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 8h5V3M21 8h-5V3M16 21v-5h5M8 21v-5H3" />
+    </svg>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1" />
+    </svg>
+  );
+}
 
 // Film slate: striped clapper arm hinged at the top-left over a slate body. The arm swings open
 // while the editor is open. Stripes are cut out in the button's background color.
