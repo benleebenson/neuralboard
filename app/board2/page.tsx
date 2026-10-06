@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useSession, signIn } from "next-auth/react";
+import Link from "next/link";
 import rough from "roughjs";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ProGated, UpgradeModal } from "@/app/components/ProGated";
@@ -19,6 +20,7 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
+import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
@@ -5518,9 +5520,17 @@ function createBoardWorkspace(index: number, source?: { file: File; fileName: st
 
 export default function Board2Page() {
   const [initialJoinCode, setInitialJoinCode] = useState("");
+  // A published board id (?view=) opens the read-only viewer instead of the editor tabs. Null until
+  // hydrated, so the autosaved editor tab never mounts — even briefly — underneath a viewer.
+  const [viewBoardId, setViewBoardId] = useState<string | null>(null);
   // Query-derived initial state is applied after hydration so server/client markup stays aligned.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { setInitialJoinCode(normalizeJoinCode(new URLSearchParams(window.location.search).get("join"))); }, []);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setInitialJoinCode(normalizeJoinCode(params.get("join")));
+    const view = params.get("view");
+    setViewBoardId(validPublishedBoardId(view) ? view : "");
+  }, []);
   const nextWorkspaceIndexRef = useRef(2);
   const [workspaces, setWorkspaces] = useState<BoardWorkspace[]>(() => [createBoardWorkspace(1)]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
@@ -5597,6 +5607,9 @@ export default function Board2Page() {
     setChromeHidden(false);
   }, [activeWorkspaceId, workspaces]);
 
+  if (viewBoardId === null) return <div style={{ height: "100dvh", background: BOARD_SURFACE_COLOR }} />;
+  if (viewBoardId) return <PublishedBoardViewer id={viewBoardId} />;
+
   return (
     <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -5645,6 +5658,91 @@ export default function Board2Page() {
   );
 }
 
+const PUBLISHED_VIEW_WORKSPACE_ID = "published-board-view";
+const NO_WORLD_BOARDS: SimpleWorldBoard[] = [];
+const ignoreWorkspaceStatus = () => {};
+const ignoreWorkspaceSource = () => {};
+const ignoreEnterWorldBoard = async () => {};
+
+type PublishedViewState =
+  | { kind: "loading"; fraction: number | null }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; file: File; title: string };
+
+/** Read-only view of a board from the Home feed: downloads its published package and shows it in a locked editor. */
+function PublishedBoardViewer({ id }: { id: string }) {
+  const [state, setState] = useState<PublishedViewState>({ kind: "loading", fraction: null });
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const metaResponse = await fetch(`/api/published-boards/${id}`, { cache: "no-store", signal: controller.signal });
+        const meta = await metaResponse.json().catch(() => null) as { title?: string; sizeBytes?: number; packageUrl?: string; error?: string } | null;
+        if (!metaResponse.ok || !meta?.packageUrl) throw new Error(meta?.error || "This board isn’t available.");
+        const response = await fetch(meta.packageUrl, { signal: controller.signal });
+        if (!response.ok || !response.body) throw new Error("This board could not be downloaded.");
+        const total = Number(response.headers.get("content-length")) || Number(meta.sizeBytes) || 0;
+        const reader = response.body.getReader();
+        const chunks: Uint8Array<ArrayBuffer>[] = [];
+        let loaded = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          loaded += value.byteLength;
+          if (total) setState({ kind: "loading", fraction: Math.min(1, loaded / total) });
+        }
+        const title = meta.title || "Board";
+        setState({ kind: "ready", title, file: new File(chunks, `${title.replace(/[^a-z0-9_-]+/gi, "_") || "board"}.nbp`, { type: "application/zip" }) });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setState({ kind: "error", message: error instanceof Error ? error.message : "This board isn’t available." });
+      }
+    })();
+    return () => controller.abort();
+  }, [id]);
+
+  if (state.kind !== "ready") {
+    return (
+      <main style={{ height: "100dvh", display: "grid", placeItems: "center", padding: 16, background: BOARD_SURFACE_COLOR, color: "#2a2a2a", fontFamily: "monospace" }}>
+        <div style={{ width: "min(360px, 100%)", textAlign: "center", fontSize: 13, lineHeight: 1.6 }}>
+          {state.kind === "loading" ? (
+            <>
+              <div style={{ fontWeight: 800 }}>Loading board{state.fraction === null ? "…" : ` ${Math.round(state.fraction * 100)}%`}</div>
+              <div aria-hidden="true" style={{ height: 6, marginTop: 10, border: "1.5px solid #2a2a2a", background: "#fffdf5" }}>
+                <div style={{ width: `${Math.round((state.fraction ?? 0) * 100)}%`, height: "100%", background: "#c8f135", transition: "width .2s ease" }} />
+              </div>
+            </>
+          ) : (
+            <div role="alert" style={{ fontWeight: 800 }}>{state.message}</div>
+          )}
+          <Link href="/" style={{ display: "inline-block", marginTop: 16, color: "#2a2a2a", fontWeight: 800 }}>← Home</Link>
+        </div>
+      </main>
+    );
+  }
+  return (
+    <div style={{ position: "relative", height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
+      <Board2Editor
+        viewOnly
+        workspaceId={PUBLISHED_VIEW_WORKSPACE_ID}
+        isWorkspaceActive
+        initialName={state.title}
+        initialJoinCode=""
+        initialFile={state.file}
+        initialFileName={state.file.name}
+        onWorkspaceStatus={ignoreWorkspaceStatus}
+        onWorkspaceSource={ignoreWorkspaceSource}
+        chromeHidden
+        worldBoards={NO_WORLD_BOARDS}
+        activeWorldBoard={null}
+        onToggleChrome={ignoreWorkspaceStatus}
+        onEnterWorldBoard={ignoreEnterWorldBoard}
+      />
+    </div>
+  );
+}
+
 function Board2Editor({
   workspaceId,
   isWorkspaceActive,
@@ -5660,6 +5758,7 @@ function Board2Editor({
   activeWorldBoard,
   onToggleChrome,
   onEnterWorldBoard,
+  viewOnly = false,
 }: {
   workspaceId: string;
   isWorkspaceActive: boolean;
@@ -5675,6 +5774,8 @@ function Board2Editor({
   activeWorldBoard: SimpleWorldBoard | null;
   onToggleChrome: () => void;
   onEnterWorldBoard: (board: SimpleWorldBoard) => Promise<void>;
+  /** A published board opened from the Home feed: look and play only — no editing, saving or uploads. */
+  viewOnly?: boolean;
 }) {
   const { data: session, status: sessionStatus } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
@@ -5728,7 +5829,8 @@ function Board2Editor({
   const [smartPanStartIndex, setSmartPanStartIndex] = useState(0);
   const [smartPanEndIndex, setSmartPanEndIndex] = useState(1);
   const [smartPanUpgradeOpen, setSmartPanUpgradeOpen] = useState(false);
-  const [previewHeight, setPreviewHeight] = useState(PREVIEW_DEFAULT_H_PX);
+  // The viewer opens after hydration, so it can size its larger preview to fit a phone (16:9 worst case).
+  const [previewHeight, setPreviewHeight] = useState(() => viewOnly ? Math.min(PREVIEW_DEFAULT_H_PX * 2, Math.round((window.innerWidth - 24) * 9 / 16)) : PREVIEW_DEFAULT_H_PX);
   const [previewVisible, setPreviewVisible] = useState(true);
   const [ambientVideoEnabled, setAmbientVideoEnabled] = useState(() => {
     if (typeof window === "undefined") return true;
@@ -6012,7 +6114,7 @@ function Board2Editor({
   type MobileTop5ApiData = { title: string; items: MobileTop5ItemData[]; };
   type MobileAcceptedVideo = { videoId: string; trimStart: number; trimEnd: number; title: string; };
 
-  const [mobileDesktopOverride, setMobileDesktopOverride] = useState(false);
+  const [mobileDesktopOverride, setMobileDesktopOverride] = useState(viewOnly);
   const [mobileTop5Screen, setMobileTop5Screen] = useState<"prompt" | "loading" | "swipe" | "build" | "done">("prompt");
   const [mobileTop5Concept, setMobileTop5Concept] = useState("");
   const [mobileTop5Data, setMobileTop5Data] = useState<MobileTop5ApiData | null>(null);
@@ -7243,7 +7345,7 @@ function Board2Editor({
   // harmless no-op upsert. Local blobs are uploaded as compressed cloud assets by the API.
   useEffect(() => {
     const email = session?.user?.email;
-    if (!email) return;
+    if (!email || viewOnly) return;
     for (const clip of clips) {
       if (clip.boardX === undefined || savedAssetIdsRef.current.has(clip.id) || clip.imageSearchSource === "library") continue;
       // sourceUrl is usually a tab-scoped blob: URL (the downloaded bytes); sourceAttributionUrl,
@@ -7275,7 +7377,7 @@ function Board2Editor({
         }).catch(() => {});
       }
     }
-  }, [clips, session?.user?.email]);
+  }, [clips, session?.user?.email, viewOnly]);
   useEffect(() => { narrationVisemeTrackRef.current = narrationVisemeTrack; }, [narrationVisemeTrack]);
   useEffect(() => { narrationVisemeTrackSourceRef.current = narrationVisemeTrackSource; }, [narrationVisemeTrackSource]);
   useEffect(() => { narrationGestureTrackRef.current = narrationGestureTrack; }, [narrationGestureTrack]);
@@ -7490,6 +7592,34 @@ function Board2Editor({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [undoBoard]);
+  const viewerPlayButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!viewOnly) return;
+    // The viewer is locked: window capture listeners run before every editor shortcut, paste and
+    // drop handler (all registered without capture), so none of them can change the board.
+    // Only focus moves, button activation and leaving fullscreen keep their browser defaults.
+    const onKeyDown = (event: KeyboardEvent) => {
+      event.stopImmediatePropagation();
+      const onButton = event.target instanceof HTMLButtonElement || event.target instanceof HTMLAnchorElement;
+      if (!(event.key === "Tab" || event.key === "Escape" || (onButton && (event.key === "Enter" || event.code === "Space")))) event.preventDefault();
+      if (event.code === "Space" && !onButton) {
+        event.preventDefault();
+        if (!event.repeat) viewerPlayButtonRef.current?.click();
+      }
+    };
+    // Keyup only stops propagation: its default action is what activates a focused button on Space.
+    const onKeyUp = (event: KeyboardEvent) => event.stopImmediatePropagation();
+    const swallow = (event: Event) => { event.preventDefault(); event.stopImmediatePropagation(); };
+    const inputEvents = ["paste", "drop", "dragover", "dragenter"] as const;
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    for (const type of inputEvents) window.addEventListener(type, swallow, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      for (const type of inputEvents) window.removeEventListener(type, swallow, true);
+    };
+  }, [viewOnly]);
   useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
   useEffect(() => { annotationColorRef.current = annotationColor; }, [annotationColor]);
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
@@ -7745,6 +7875,7 @@ function Board2Editor({
     return () => window.removeEventListener("pagehide", onPageHide);
   }, [autosaveEnabled]);
   useEffect(() => {
+    if (viewOnly) return;
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
     sessionStorage.removeItem(BOARD_LIBRARY_PENDING_FILE);
@@ -7898,7 +8029,8 @@ function Board2Editor({
     const check = () => {
       const mobile = window.innerWidth < 768 || window.matchMedia("(pointer: coarse)").matches;
       const params = new URLSearchParams(window.location.search);
-      const mobileEditorRequested = params.get("mobileEditor") === "1" || !!params.get("join");
+      // A published board view (?view=) is explicit too: phones show the read-only viewer, not the library.
+      const mobileEditorRequested = params.get("mobileEditor") === "1" || !!params.get("join") || !!params.get("view");
       if (mobile && !mobileEditorRequested) {
         window.location.replace("/board2/library?tab=assets&curate=1");
         return;
@@ -21815,7 +21947,7 @@ function Board2Editor({
 
         {/* ── Toast ── */}
         {toast && (
-          <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
+          <div style={{ position: "fixed", bottom: viewOnly ? 84 : 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
             {toast}
           </div>
         )}
@@ -23367,7 +23499,28 @@ function Board2Editor({
               onPointerUp={isMobile ? handleMobileBoardPointerUp : undefined}
               onPointerCancel={isMobile ? handleMobileBoardPointerUp : undefined}
             >
-              <button
+              {viewOnly ? (
+                <div
+                  data-viewer-bar
+                  onPointerDown={(event) => event.stopPropagation()}
+                  style={{ position: "absolute", left: "50%", bottom: "max(14px, env(safe-area-inset-bottom))", transform: "translateX(-50%)", zIndex: 220, display: "flex", alignItems: "center", gap: 10, maxWidth: "calc(100% - 24px)", padding: "6px 8px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 11 }}
+                >
+                  <Link href="/" style={{ ...sketchButton, padding: "6px 10px", color: "#2a2a2a", textDecoration: "none", whiteSpace: "nowrap" }}>← Home</Link>
+                  <button
+                    ref={viewerPlayButtonRef}
+                    type="button"
+                    aria-label={isPlaying ? "Pause" : "Play"}
+                    onClick={togglePlay}
+                    disabled={clips.length === 0}
+                    style={{ ...sketchButton, minWidth: 74, padding: "6px 10px", background: "#c8f135", fontWeight: 800 }}
+                  >
+                    {isPlaying ? "❚❚ Pause" : "▶ Play"}
+                  </button>
+                  <span style={{ whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>{formatClipMMSS(playhead)} / {formatClipMMSS(currentPlaybackDuration(clips))}</span>
+                  <strong style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{initialName}</strong>
+                  <span style={{ flexShrink: 0, padding: "2px 6px", border: "1px solid #2a2a2a", fontSize: 9, fontWeight: 800, letterSpacing: 1 }}>VIEW ONLY</span>
+                </div>
+              ) : <button
                 type="button"
                 aria-label={chromeHidden ? "Open editor chrome for centered board" : "Hide editor chrome"}
                 title={chromeHidden ? "Edit the board centered on screen" : "Explore the full board space"}
@@ -23376,7 +23529,7 @@ function Board2Editor({
                 style={{ ...sketchButton, position: "absolute", left: 12, bottom: 12, zIndex: 220, width: 42, height: 42, padding: 0, display: "grid", placeItems: "center", borderRadius: 4, background: "rgba(255,253,245,.94)", fontSize: chromeHidden ? 19 : 17 }}
               >
                 {chromeHidden ? "☰" : "∞"}
-              </button>
+              </button>}
               {visibleWorldBoards.map((board) => (
                 <WorldBoardComposite
                   key={board.id}
@@ -23454,13 +23607,14 @@ function Board2Editor({
                           <button
                             type="button"
                             data-video-redownload={clip.id}
-                            aria-label={`Re-download ${clip.name}`}
+                            aria-label={viewOnly ? `${clip.name} (video not included)` : `Re-download ${clip.name}`}
+                            disabled={viewOnly}
                             style={{ width: "100%", height: "100%", border: 0, padding: 0, backgroundColor: "#1a1a2e", backgroundImage: clip.thumbnailBlobUrl ? `linear-gradient(rgba(10,10,20,.38), rgba(10,10,20,.62)), url(${clip.thumbnailBlobUrl})` : undefined, backgroundSize: "cover", backgroundPosition: "center", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", gap: 4, touchAction: "manipulation" }}
                             onPointerDown={(e) => e.stopPropagation()}
                             onClick={(e) => { e.stopPropagation(); void redownloadYtClip(clip.id); }}
                           >
                             <span style={{ color: "#ff9f5e", fontSize: 18, pointerEvents: "none" }}>▶</span>
-                            <span style={{ color: "#ff9f5e", fontSize: 8, fontFamily: "monospace", textAlign: "center", pointerEvents: "none", padding: "0 4px" }}>click to re-download</span>
+                            <span style={{ color: "#ff9f5e", fontSize: 8, fontFamily: "monospace", textAlign: "center", pointerEvents: "none", padding: "0 4px" }}>{viewOnly ? "video not included" : "click to re-download"}</span>
                           </button>
                         ) : clip.type === "image" ? (
                           <canvas
@@ -24510,7 +24664,7 @@ function Board2Editor({
                 zIndex: 20,
                 pointerEvents: isMobile ? "none" : "auto",
                 touchAction: "none",
-                display: chromeHidden || isMobile ? "none" : "block",
+                display: viewOnly ? "block" : chromeHidden || isMobile ? "none" : "block",
               }}
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
@@ -26940,7 +27094,7 @@ function Board2Editor({
 
       {/* Toast */}
       {toast && (
-        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
+        <div style={{ position: "fixed", bottom: viewOnly ? 84 : 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
           {toast}
         </div>
       )}
