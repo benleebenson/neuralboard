@@ -1881,6 +1881,7 @@ type CharTimelineDrag = {
   origStartTime: number;
   origDuration: number;
   pointerStartClientX: number;
+  pointerStartScrollLeft: number;
   pixelsPerSecond: number;
 };
 
@@ -1912,8 +1913,24 @@ type TimelineDrag = {
   origSourceOffsetSec?: number;
   pointerStartClientX: number;
   pointerStartClientY: number;
+  pointerStartScrollLeft: number;
   pixelsPerSecond: number;
 };
+
+// Premiere-style auto-scroll while dragging a timeline block near either edge of the scroller.
+const TIMELINE_EDGE_SCROLL_ZONE_PX = 60;
+const TIMELINE_EDGE_SCROLL_MAX_PX = 8; // per animation frame
+
+// Pixels to scroll this frame: 0 at the zone's inner boundary, ramping linearly to the max at the
+// edge (and staying at max past it). Negative scrolls left.
+function timelineEdgeScrollVelocity(clientX: number, left: number, right: number): number {
+  const zone = Math.min(TIMELINE_EDGE_SCROLL_ZONE_PX, (right - left) / 3);
+  if (zone <= 0) return 0;
+  const fromLeft = clientX - left, fromRight = right - clientX;
+  if (fromLeft < zone) return -TIMELINE_EDGE_SCROLL_MAX_PX * Math.min(1, (zone - fromLeft) / zone);
+  if (fromRight < zone) return TIMELINE_EDGE_SCROLL_MAX_PX * Math.min(1, (zone - fromRight) / zone);
+  return 0;
+}
 
 type BoardMarquee = {
   startX: number;
@@ -15501,6 +15518,42 @@ function Board2Editor({
 
   // ─ Timeline drag with cursor-anchored magnetic snap ───────────────────────
 
+  // Drives edge auto-scroll for one drag. `update` follows the pointer; while it sits in an edge
+  // zone a rAF loop scrolls the timeline and calls `onScrolled`, so the drag can re-apply the last
+  // pointer position against the new scroll offset and the block stays under the cursor.
+  function startTimelineEdgeScroll(onScrolled: () => void) {
+    let frame: number | null = null;
+    let velocity = 0;
+    let carry = 0; // scrollLeft snaps to whole pixels; accumulate slow sub-pixel speeds
+    const tick = () => {
+      frame = null;
+      const scroller = scrollerRef.current;
+      if (!scroller || velocity === 0) return;
+      carry += velocity;
+      const step = Math.trunc(carry);
+      if (step !== 0) {
+        carry -= step;
+        const before = scroller.scrollLeft;
+        scroller.scrollLeft = before + step;
+        if (scroller.scrollLeft !== before) onScrolled();
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    return {
+      update(clientX: number) {
+        const rect = scrollerRef.current?.getBoundingClientRect();
+        velocity = rect ? timelineEdgeScrollVelocity(clientX, rect.left, rect.right) : 0;
+        if (velocity === 0) carry = 0;
+        else if (frame === null) frame = requestAnimationFrame(tick);
+      },
+      stop() {
+        velocity = 0;
+        if (frame !== null) cancelAnimationFrame(frame);
+        frame = null;
+      },
+    };
+  }
+
   function handleClipPointerDown(
     e: React.PointerEvent,
     clip: Clip,
@@ -15519,14 +15572,18 @@ function Board2Editor({
       origSourceOffsetSec: clip.sourceOffsetSec,
       pointerStartClientX: e.clientX,
       pointerStartClientY: e.clientY,
+      pointerStartScrollLeft: scrollerRef.current?.scrollLeft ?? timelineScrollRef.current,
       pixelsPerSecond: pxPerSecRef.current,
     };
-    const onMove = (ev: PointerEvent) => {
+    let lastPointer = { x: e.clientX, y: e.clientY };
+    const applyDrag = () => {
       const drag = timelineDragRef.current;
       if (!drag) return;
-      const deltaSeconds = (ev.clientX - drag.pointerStartClientX) / drag.pixelsPerSecond;
+      // Scrolling since the drag began moves the content under a still cursor, so it counts too.
+      const scrolledPx = (scrollerRef.current?.scrollLeft ?? timelineScrollRef.current) - drag.pointerStartScrollLeft;
+      const deltaSeconds = (lastPointer.x - drag.pointerStartClientX + scrolledPx) / drag.pixelsPerSecond;
       const targetLayer = clamp(
-        drag.origLayer + Math.round((ev.clientY - drag.pointerStartClientY) / LAYER_H),
+        drag.origLayer + Math.round((lastPointer.y - drag.pointerStartClientY) / LAYER_H),
         0,
         N_LAYERS - 1,
       );
@@ -15544,7 +15601,15 @@ function Board2Editor({
         snapThresholdSeconds: MAGNETIC_SNAP_PX / drag.pixelsPerSecond,
       }));
     };
+    const edgeScroll = startTimelineEdgeScroll(applyDrag);
+    const onMove = (ev: PointerEvent) => {
+      if (!timelineDragRef.current) return;
+      lastPointer = { x: ev.clientX, y: ev.clientY };
+      applyDrag();
+      edgeScroll.update(ev.clientX);
+    };
     const onEnd = () => {
+      edgeScroll.stop();
       timelineDragRef.current = null;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
@@ -15571,12 +15636,15 @@ function Board2Editor({
       kind, actionId: action.id,
       origStartTime: action.startTime, origDuration: action.duration,
       pointerStartClientX: e.clientX,
+      pointerStartScrollLeft: scrollerRef.current?.scrollLeft ?? timelineScrollRef.current,
       pixelsPerSecond: pxPerSecRef.current,
     };
-    const onMove = (ev: PointerEvent) => {
+    let lastClientX = e.clientX;
+    const applyDrag = () => {
       const drag = charActionDragRef.current;
       if (!drag) return;
-      const deltaSeconds = (ev.clientX - drag.pointerStartClientX) / drag.pixelsPerSecond;
+      const scrolledPx = (scrollerRef.current?.scrollLeft ?? timelineScrollRef.current) - drag.pointerStartScrollLeft;
+      const deltaSeconds = (lastClientX - drag.pointerStartClientX + scrolledPx) / drag.pixelsPerSecond;
       updateCharacterActionsFor(owner, (prev) =>
         prev.map((a) => {
           if (a.id !== drag.actionId) return a;
@@ -15616,7 +15684,15 @@ function Board2Editor({
         })
       );
     };
+    const edgeScroll = startTimelineEdgeScroll(applyDrag);
+    const onMove = (ev: PointerEvent) => {
+      if (!charActionDragRef.current) return;
+      lastClientX = ev.clientX;
+      applyDrag();
+      edgeScroll.update(ev.clientX);
+    };
     const onEnd = () => {
+      edgeScroll.stop();
       charActionDragRef.current = null;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
@@ -26254,7 +26330,8 @@ function Board2Editor({
               setContextMenu({ x: e.clientX, y: e.clientY, timeSec, clipId });
             }}
           >
-            <div style={{ position: "relative", width: timelineWidth, height: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 12 }}>
+            {/* minWidth: lanes span the visible timeline even when the content is shorter than it. */}
+            <div style={{ position: "relative", width: timelineWidth, minWidth: "100%", height: TRACK_H + NARRATION_TRACK_H + CHARACTER_TRACK_H * (showCharacter2 ? 2 : 1) + 12 }}>
               {/* Layer row backgrounds (L0–L4) */}
               {Array.from({ length: N_LAYERS }, (_, i) => (
                 <div key={i} style={{ position: "absolute", left: 0, right: 0, top: i * LAYER_H, height: LAYER_H, background: i % 2 === 0 ? "rgba(100,130,180,0.04)" : "rgba(100,130,180,0.08)", borderTop: i === 0 ? "1px solid rgba(42,42,42,0.08)" : "1px solid rgba(42,42,42,0.05)" }} />
