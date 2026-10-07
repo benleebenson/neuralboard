@@ -23400,7 +23400,7 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
-  const topBar = chromeHidden ? BOARD_TOP_BAR : EDITOR_TOP_BAR;
+  const topBar = chromeHidden ? boardTopBarTheme(boardColor) : EDITOR_TOP_BAR;
 
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
@@ -23460,7 +23460,7 @@ function Board2Editor({
           <div style={{ flexShrink: 0, position: "relative" }}>
             {joinCode ? (
               <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
-                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: joinStatus === "joined" && chromeHidden ? "rgba(200,241,53,0.16)" : topBar.pillBg, color: chromeHidden ? topBar.ink : topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 12 : 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: topBar.pillBg, color: chromeHidden ? topBar.ink : topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 12 : 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
               >
                 {joinCode}
                 <CopyIcon />
@@ -23540,9 +23540,9 @@ function Board2Editor({
               aria-pressed={!chromeHidden}
               title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
               onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
-              style={{ ...topBarIconButton(!chromeHidden, topBar), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? topBar.ink : "#2a2a2a" }}
+              style={{ ...topBarIconButton(!chromeHidden, topBar), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? topBar.muted : "#2a2a2a" }}
             >
-              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} size={chromeHidden ? 24 : 19} />
+              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? topBar.background : "#c8f135"} size={chromeHidden ? 20 : 19} />
             </button>
           </div>
         </div>
@@ -27794,12 +27794,25 @@ type TopBarTheme = {
   background: string; borderBottom: string; ink: string; muted: string;
   activeBg: string; activeBorder: string; pillBorder: string; pillBg: string; dotRing: string;
 };
-const BOARD_TOP_BAR: TopBarTheme = {
-  height: 44, button: 32, icon: 18,
-  background: "#2a2a2a", borderBottom: "none", ink: "#fffdf5", muted: "rgba(255,253,245,0.8)",
-  activeBg: "rgba(255,253,245,0.14)", activeBorder: "rgba(255,253,245,0.5)",
-  pillBorder: "rgba(255,253,245,0.35)", pillBg: "rgba(255,253,245,0.08)", dotRing: "#2a2a2a",
-};
+// Blend two #rrggbb colors; `amount` is the share of `b`.
+function mixHexColors(a: string, b: string, amount: number): string {
+  const channel = (hex: string, index: number) => parseInt(hex.slice(1 + index * 2, 3 + index * 2), 16);
+  if (!/^#[0-9a-f]{6}$/i.test(a) || !/^#[0-9a-f]{6}$/i.test(b)) return b;
+  return `#${[0, 1, 2].map((index) => Math.round(channel(a, index) * (1 - amount) + channel(b, index) * amount).toString(16).padStart(2, "0")).join("")}`;
+}
+
+// Board view (editor closed): a barely-there strip in a lightened tint of the board's own color,
+// so it reads as part of the parchment. Solid rather than translucent so the clapperboard's
+// stripes, cut out in the bar color, line up.
+function boardTopBarTheme(boardColor: string): TopBarTheme {
+  const background = mixHexColors(boardColor, "#fffdf5", 0.45);
+  return {
+    height: 36, button: 28, icon: 16,
+    background, borderBottom: "1px solid rgba(42,42,42,0.12)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.6)",
+    activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
+    pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: background,
+  };
+}
 const EDITOR_TOP_BAR: TopBarTheme = {
   height: 34, button: 26, icon: 15,
   background: "rgba(255,253,245,0.65)", borderBottom: "1.5px solid rgba(42,42,42,0.15)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.55)",
@@ -27807,7 +27820,7 @@ const EDITOR_TOP_BAR: TopBarTheme = {
   pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
 };
 
-function topBarIconButton(active: boolean, theme: TopBarTheme = BOARD_TOP_BAR): React.CSSProperties {
+function topBarIconButton(active: boolean, theme: TopBarTheme): React.CSSProperties {
   return {
     width: theme.button, height: theme.button, padding: 0, flexShrink: 0, borderRadius: 7, cursor: "pointer",
     display: "grid", placeItems: "center",
