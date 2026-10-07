@@ -2095,8 +2095,8 @@ const BOARD_AUTOSAVE_STORAGE_KEY = "nb_board2_autosave";
 // "1" when the video editor (header, panels, timeline) was last left open. Absent = closed, so a
 // board opens as just the canvas until the clapperboard is clicked.
 const EDITOR_OPEN_STORAGE_KEY = "nb_editor_open";
-// Only the default tab autosaves: one key holds one board, and other tabs are opened from .nbp
-// files that already live on disk.
+// Only this device's default board autosaves: one key holds one board, and the other boards the
+// editor opens (board files, fresh boards from the shell's +) are saved to files or synced instead.
 const BOARD_AUTOSAVE_WORKSPACE_ID = "board-workspace-1";
 
 // Cache keys for media bytes written to (or restored from) IndexedDB this session, by Blob
@@ -5585,42 +5585,55 @@ type BoardWorkspaceStatus = {
   isDirty: boolean;
 };
 
-type BoardWorkspace = BoardWorkspaceStatus & {
+// The one board open in the editor. By default it's this device's autosaved board; a board
+// file, a board from the board space, or a fresh board (the shell's +) replaces it.
+type ActiveBoard = BoardWorkspaceStatus & {
   sourceFileName?: string;
   initialFile?: File;
-  /** Opened by the app shell's "Create a joinable board": run "Make board joinable" once on mount. */
+  /** Opened by the app shell's +: run "Make board joinable" once on mount. */
   makeJoinable?: boolean;
 };
 
-function createBoardWorkspace(index: number, source?: { file: File; fileName: string; name: string }): BoardWorkspace {
+function createActiveBoard(
+  source?: { file: File; fileName: string; name: string },
+  options: { fresh?: boolean; makeJoinable?: boolean } = {},
+): ActiveBoard {
+  const local = !source && !options.fresh;
   return {
-    id: index === 1 ? BOARD_AUTOSAVE_WORKSPACE_ID : `board-workspace-${Date.now()}-${index}`,
-    name: source?.name ?? (index === 1 ? "My Board" : `Board ${index}`),
+    id: local ? BOARD_AUTOSAVE_WORKSPACE_ID : `board-${Date.now()}`,
+    name: source?.name ?? (local ? "My Board" : "New Board"),
     isExporting: false,
     exportProgress: 0,
     hasContent: false,
     isDirty: false,
     sourceFileName: source?.fileName,
     initialFile: source?.file,
+    makeJoinable: options.makeJoinable,
   };
 }
 
 export default function Board2Page() {
   const [initialJoinCode, setInitialJoinCode] = useState("");
-  // A published board id (?view=) opens the read-only viewer instead of the editor tabs. Null until
-  // hydrated, so the autosaved editor tab never mounts — even briefly — underneath a viewer.
+  // A published board id (?view=) opens the read-only viewer instead of the editor. Null until
+  // hydrated, so the autosaved board never mounts — even briefly — underneath a viewer.
   const [viewBoardId, setViewBoardId] = useState<string | null>(null);
+  const [board, setBoard] = useState<ActiveBoard>(() => createActiveBoard());
   // Query-derived initial state is applied after hydration so server/client markup stays aligned.
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
+    const url = new URL(window.location.href);
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setInitialJoinCode(normalizeJoinCode(params.get("join")));
-    const view = params.get("view");
+    setInitialJoinCode(normalizeJoinCode(url.searchParams.get("join")));
+    // The app shell's + opens /board2?create=joinable (older links: ?create=blank): a fresh board
+    // instead of the autosaved one, chosen before the editor first mounts.
+    const create = url.searchParams.get("create");
+    if (create === "blank" || create === "joinable") {
+      setBoard(createActiveBoard(undefined, { fresh: true, makeJoinable: create === "joinable" }));
+      url.searchParams.delete("create");
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    const view = url.searchParams.get("view");
     setViewBoardId(validPublishedBoardId(view) ? view : "");
   }, []);
-  const nextWorkspaceIndexRef = useRef(2);
-  const [workspaces, setWorkspaces] = useState<BoardWorkspace[]>(() => [createBoardWorkspace(1)]);
-  const [activeWorkspaceId, setActiveWorkspaceId] = useState(() => workspaces[0].id);
   // "Chrome hidden" is the closed-editor state: only the board (and the wider board space) shows.
   // Read on the client's first render; the server and hydration pass render a blank shell anyway.
   const [chromeHidden, setChromeHidden] = useState(() => {
@@ -5631,59 +5644,53 @@ export default function Board2Page() {
     try { window.localStorage.setItem(EDITOR_OPEN_STORAGE_KEY, chromeHidden ? "0" : "1"); } catch {}
   }, [chromeHidden]);
   const openEditor = useCallback(() => setChromeHidden(false), []);
+  const toggleChrome = useCallback(() => setChromeHidden((hidden) => !hidden), []);
   const [worldBoards, setWorldBoards] = useState<SimpleWorldBoard[]>([]);
   useEffect(() => {
     let cancelled = false;
     void listSimpleWorldBoards().then((boards) => {
-      if (!cancelled) setWorldBoards(boards.map((board) => ({ ...board, width: board.width || 4000, height: board.height || 3000 })));
+      if (!cancelled) setWorldBoards(boards.map((world) => ({ ...world, width: world.width || 4000, height: world.height || 3000 })));
     }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
-  const updateWorkspace = useCallback((status: BoardWorkspaceStatus) => {
-    setWorkspaces((current) => current.map((workspace) => {
-      if (workspace.id !== status.id) return workspace;
+  const updateBoardStatus = useCallback((status: BoardWorkspaceStatus) => {
+    setBoard((current) => {
+      if (current.id !== status.id) return current;
       if (
-        workspace.name === status.name && workspace.isExporting === status.isExporting &&
-        workspace.exportProgress === status.exportProgress && workspace.hasContent === status.hasContent &&
-        workspace.isDirty === status.isDirty
-      ) return workspace;
-      return { ...workspace, ...status };
-    }));
+        current.name === status.name && current.isExporting === status.isExporting &&
+        current.exportProgress === status.exportProgress && current.hasContent === status.hasContent &&
+        current.isDirty === status.isDirty
+      ) return current;
+      return { ...current, ...status };
+    });
   }, []);
-  const updateWorkspaceSource = useCallback((workspaceId: string, fileName: string) => {
-    setWorkspaces((current) => current.map((workspace) => workspace.id === workspaceId ? { ...workspace, sourceFileName: fileName } : workspace));
-  }, []);
-
-  const addWorkspace = useCallback(() => {
-    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++);
-    setWorkspaces((current) => [...current, next]);
-    setActiveWorkspaceId(next.id);
-  }, []);
-  const createRequestHandledRef = useRef(false);
-  useEffect(() => {
-    // The app shell opens /board2?create=blank (its + button) or ?create=joinable: a fresh tab beside the autosaved board.
-    const url = new URL(window.location.href);
-    const create = url.searchParams.get("create");
-    if (createRequestHandledRef.current || (create !== "blank" && create !== "joinable")) return;
-    createRequestHandledRef.current = true;
-    url.searchParams.delete("create");
-    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
-    const next = { ...createBoardWorkspace(nextWorkspaceIndexRef.current++), makeJoinable: create === "joinable" };
-    setWorkspaces((current) => [...current, next]);
-    setActiveWorkspaceId(next.id);
+  const updateBoardSource = useCallback((boardId: string, fileName: string) => {
+    setBoard((current) => current.id === boardId ? { ...current, sourceFileName: fileName } : current);
   }, []);
 
-  // ?board=<file> names the boards-folder board open in the active tab, so a refresh (or a Profile link) reopens it.
-  // The autosaved first tab is never named: it restores from autosave on its own.
+  // Only the autosaved board survives being replaced or left; any other board's unsaved changes
+  // (and any running export) would be lost.
+  const boardAtRisk = board.isExporting || (board.isDirty && board.id !== BOARD_AUTOSAVE_WORKSPACE_ID);
+  const confirmDiscardBoard = useCallback((action: string): boolean => {
+    if (board.isExporting) {
+      window.alert(`“${board.name}” is still exporting. Wait for the export to finish first.`);
+      return false;
+    }
+    if (board.isDirty && board.id !== BOARD_AUTOSAVE_WORKSPACE_ID) {
+      return window.confirm(`${action}? Unsaved changes in “${board.name}” will be lost.`);
+    }
+    return true;
+  }, [board.id, board.isDirty, board.isExporting, board.name]);
+
+  // ?board=<file> names the boards-folder board that's open, so a refresh (or a Profile link) reopens it.
+  // The autosaved board is never named: it restores from autosave on its own.
   const [urlBoardRestoring, setUrlBoardRestoring] = useState(true);
   const [boardReopen, setBoardReopen] = useState<{ fileName: string; message: string; canRetry: boolean } | null>(null);
   const openFolderBoard = useCallback(async (fileName: string, prompt: boolean): Promise<boolean> => {
     const directory = await getBoardsDirectory({ prompt, write: false });
     if (!directory) return false;
     const file = await (await directory.getFileHandle(fileName)).getFile();
-    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++, { file, fileName, name: fileName.replace(/\.nbp$/i, "") });
-    setWorkspaces((current) => [...current, next]);
-    setActiveWorkspaceId(next.id);
+    setBoard(createActiveBoard({ file, fileName, name: fileName.replace(/\.nbp$/i, "") }));
     return true;
   }, []);
   const urlBoardHandledRef = useRef(false);
@@ -5714,21 +5721,17 @@ export default function Board2Page() {
   useEffect(() => {
     // Hold the param while it is still being restored (or waiting on folder permission) so another refresh retries it.
     if (viewBoardId !== "" || urlBoardRestoring || boardReopen) return;
-    const active = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
-    const fileName = active && active.id !== BOARD_AUTOSAVE_WORKSPACE_ID ? active.sourceFileName : undefined;
+    const fileName = board.id !== BOARD_AUTOSAVE_WORKSPACE_ID ? board.sourceFileName : undefined;
     const url = new URL(window.location.href);
     if ((url.searchParams.get(EDITOR_BOARD_PARAM) ?? undefined) === fileName) return;
     if (fileName) url.searchParams.set(EDITOR_BOARD_PARAM, fileName);
     else url.searchParams.delete(EDITOR_BOARD_PARAM);
     window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
-  }, [activeWorkspaceId, boardReopen, urlBoardRestoring, viewBoardId, workspaces]);
+  }, [board.id, board.sourceFileName, boardReopen, urlBoardRestoring, viewBoardId]);
 
-  // Leaving the editor drops every open tab; only the first tab is autosaved, so the others' unsaved work (and any export) would be lost.
-  const atRiskWorkspaces = workspaces.filter((workspace) => workspace.isExporting || (workspace.isDirty && workspace.id !== BOARD_AUTOSAVE_WORKSPACE_ID));
-  const hasAtRiskWorkspaces = atRiskWorkspaces.length > 0;
   const leavingEditorRef = useRef(false);
   useEffect(() => {
-    if (!hasAtRiskWorkspaces) return;
+    if (!boardAtRisk) return;
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
       if (leavingEditorRef.current) return;
       event.preventDefault();
@@ -5736,49 +5739,26 @@ export default function Board2Page() {
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [hasAtRiskWorkspaces]);
+  }, [boardAtRisk]);
   const leaveEditor = useCallback(() => {
-    if (atRiskWorkspaces.length > 0) {
-      const names = atRiskWorkspaces.map((workspace) => `“${workspace.name}”`).join(", ");
-      const exporting = atRiskWorkspaces.some((workspace) => workspace.isExporting);
-      const message = exporting
-        ? `Leave the editor? ${names} ${atRiskWorkspaces.length === 1 ? "has" : "have"} an export in progress or unsaved changes that will be lost.`
-        : `Leave the editor? Unsaved changes in ${names} will be lost.`;
-      if (!window.confirm(message)) return;
-    }
+    if (board.isExporting
+      ? !window.confirm(`Leave the editor? “${board.name}” has an export in progress that will be lost.`)
+      : !confirmDiscardBoard("Leave the editor")) return;
     leavingEditorRef.current = true;
     window.location.assign(shellTabUrl(rememberedShellTab()));
-  }, [atRiskWorkspaces]);
+  }, [board.isExporting, board.name, confirmDiscardBoard]);
 
-  const closeWorkspace = useCallback((workspaceId: string) => {
-    const closingIndex = workspaces.findIndex((workspace) => workspace.id === workspaceId);
-    const closing = workspaces[closingIndex];
-    if (!closing || closing.isExporting || workspaces.length === 1) return;
-    if (closing.isDirty && !window.confirm(`Close “${closing.name}”? Unsaved changes in this tab will be lost.`)) return;
-    const remaining = workspaces.filter((workspace) => workspace.id !== workspaceId);
-    setWorkspaces(remaining);
-    if (activeWorkspaceId === workspaceId) {
-      setActiveWorkspaceId(remaining[Math.min(closingIndex, remaining.length - 1)].id);
-    }
-  }, [activeWorkspaceId, workspaces]);
-
-  const openWorldBoard = useCallback(async (board: SimpleWorldBoard) => {
-    const existing = workspaces.find((workspace) => workspace.sourceFileName === board.fileName);
-    if (existing?.id === activeWorkspaceId) {
+  // Opening a centered board from the board space loads it into the editor in place of this one.
+  const openWorldBoard = useCallback(async (world: SimpleWorldBoard) => {
+    if (world.fileName === board.sourceFileName) {
       setChromeHidden(false);
       return;
     }
-    if (existing) {
-      setActiveWorkspaceId(existing.id);
-      setChromeHidden(false);
-      return;
-    }
-    const file = await openSimpleWorldBoardFile(board);
-    const next = createBoardWorkspace(nextWorkspaceIndexRef.current++, { file, fileName: board.fileName, name: board.name });
-    setWorkspaces((items) => [...items, next]);
-    setActiveWorkspaceId(next.id);
+    if (!confirmDiscardBoard(`Open “${world.name}”`)) return;
+    const file = await openSimpleWorldBoardFile(world);
+    setBoard(createActiveBoard({ file, fileName: world.fileName, name: world.name }));
     setChromeHidden(false);
-  }, [activeWorkspaceId, workspaces]);
+  }, [board.sourceFileName, confirmDiscardBoard]);
 
   if (viewBoardId === null) return <div style={{ height: "100dvh", background: BOARD_SURFACE_COLOR }} />;
   if (viewBoardId) return <PublishedBoardViewer id={viewBoardId} />;
@@ -5786,24 +5766,6 @@ export default function Board2Page() {
   return (
     <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <div style={{ height: "100%", minHeight: 0, display: "flex", flexDirection: "column" }}>
-        {!chromeHidden && workspaces.length > 1 && <nav aria-label="Open boards" style={{ height: 38, flexShrink: 0, display: "flex", alignItems: "stretch", gap: 2, padding: "4px 6px 0", overflowX: "auto", borderBottom: "1.5px solid #2a2a2a", background: "#ddd5c6" }}>
-        {workspaces.map((workspace) => {
-          const active = workspace.id === activeWorkspaceId;
-          const percent = Math.max(0, Math.min(100, Math.round(workspace.exportProgress * 100)));
-          return (
-            <div key={workspace.id} style={{ position: "relative", minWidth: 150, maxWidth: 230, display: "flex", alignItems: "center", border: "1.5px solid #2a2a2a", borderBottom: active ? "1.5px solid #fffdf5" : "1.5px solid #2a2a2a", background: active ? "#fffdf5" : "#eee8dc", transform: active ? "translateY(1.5px)" : undefined }}>
-              <button type="button" onClick={() => setActiveWorkspaceId(workspace.id)} title={workspace.name} style={{ minWidth: 0, flex: 1, height: "100%", padding: "0 8px", border: 0, background: "transparent", color: "#2a2a2a", cursor: "pointer", textAlign: "left", fontFamily: "monospace", fontSize: 10, fontWeight: active ? 800 : 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {workspace.isExporting ? `● Exporting ${percent}% · ` : ""}{workspace.name}
-              </button>
-              {workspaces.length > 1 && (
-                <button type="button" aria-label={`Close ${workspace.name}`} title={workspace.isExporting ? "An exporting board cannot be closed" : `Close ${workspace.name}`} disabled={workspace.isExporting} onClick={() => closeWorkspace(workspace.id)} style={{ width: 28, height: "100%", padding: 0, border: 0, background: "transparent", color: workspace.isExporting ? "#9a6500" : "#6a6a6a", cursor: workspace.isExporting ? "not-allowed" : "pointer", fontSize: 13 }}>×</button>
-              )}
-              {workspace.isExporting && <span aria-hidden="true" style={{ position: "absolute", left: 0, right: `${100 - percent}%`, bottom: 0, height: 2, background: "#7da300", pointerEvents: "none" }} />}
-            </div>
-          );
-        })}
-        <button type="button" onClick={addWorkspace} aria-label="Open a new board tab" title="New board" style={{ width: 34, minWidth: 34, border: "1.5px solid #2a2a2a", borderBottom: 0, background: "#fffdf5", color: "#2a2a2a", cursor: "pointer", fontFamily: "monospace", fontSize: 18 }}>+</button>
-        </nav>}
         {!chromeHidden && boardReopen && (
           <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "6px 8px", borderBottom: "1.5px solid #2a2a2a", background: "#ffe5a8", color: "#2a2a2a", fontFamily: "monospace", fontSize: 11 }}>
             <span style={{ minWidth: 0, flex: 1 }}>{boardReopen.message}</span>
@@ -5812,28 +5774,26 @@ export default function Board2Page() {
           </div>
         )}
         <div style={{ position: "relative", flex: 1, minHeight: 0, overflow: "hidden" }}>
-          {workspaces.map((workspace) => (
-            <div key={workspace.id} aria-hidden={workspace.id !== activeWorkspaceId} style={{ position: "absolute", inset: 0, display: workspace.id === activeWorkspaceId ? "block" : "none" }}>
-              <Board2Editor
-                workspaceId={workspace.id}
-                isWorkspaceActive={workspace.id === activeWorkspaceId}
-                initialName={workspace.name}
-                initialJoinCode={workspace.id === workspaces[0].id ? initialJoinCode : ""}
-                initialFile={workspace.initialFile}
-                initialFileName={workspace.sourceFileName}
-                autoMakeJoinable={workspace.makeJoinable === true}
-                onWorkspaceStatus={updateWorkspace}
-                onWorkspaceSource={updateWorkspaceSource}
-                chromeHidden={chromeHidden}
-                worldBoards={worldBoards}
-                activeWorldBoard={worldBoards.find((board) => board.fileName === workspace.sourceFileName) ?? null}
-                onToggleChrome={() => setChromeHidden((hidden) => !hidden)}
-                onOpenEditor={openEditor}
-                onLeaveEditor={leaveEditor}
-                onEnterWorldBoard={openWorldBoard}
-              />
-            </div>
-          ))}
+          {/* Keyed by board: replacing the board mounts a fresh editor. */}
+          <Board2Editor
+            key={board.id}
+            workspaceId={board.id}
+            isWorkspaceActive
+            initialName={board.name}
+            initialJoinCode={board.id === BOARD_AUTOSAVE_WORKSPACE_ID ? initialJoinCode : ""}
+            initialFile={board.initialFile}
+            initialFileName={board.sourceFileName}
+            autoMakeJoinable={board.makeJoinable === true}
+            onWorkspaceStatus={updateBoardStatus}
+            onWorkspaceSource={updateBoardSource}
+            chromeHidden={chromeHidden}
+            worldBoards={worldBoards}
+            activeWorldBoard={worldBoards.find((world) => world.fileName === board.sourceFileName) ?? null}
+            onToggleChrome={toggleChrome}
+            onOpenEditor={openEditor}
+            onLeaveEditor={leaveEditor}
+            onEnterWorldBoard={openWorldBoard}
+          />
         </div>
       </div>
     </div>
@@ -23422,6 +23382,8 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
+  const topBar = chromeHidden ? BOARD_TOP_BAR : EDITOR_TOP_BAR;
+
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
@@ -23451,33 +23413,43 @@ function Board2Editor({
           role="toolbar"
           aria-label="Board"
           style={{
-            height: "calc(44px + env(safe-area-inset-top))", paddingTop: "env(safe-area-inset-top)", boxSizing: "border-box",
+            height: `calc(${topBar.height}px + env(safe-area-inset-top))`, paddingTop: "env(safe-area-inset-top)", boxSizing: "border-box",
             paddingLeft: "max(8px, env(safe-area-inset-left))", paddingRight: "max(8px, env(safe-area-inset-right))",
             flexShrink: 0, display: "flex", alignItems: "center", gap: 8, position: "relative", zIndex: 450,
-            background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace",
+            background: topBar.background, borderBottom: topBar.borderBottom, color: topBar.ink, fontFamily: "monospace",
           }}
         >
-          {/* Left: home (+ mobile editor menu and play) */}
+          {/* Left: home (+ mobile editor menu and play). In the editor it's a quiet back arrow +
+              wordmark rather than an icon button. */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
-            <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home" style={topBarIconButton(false)}><HomeIcon /></button>
-            {isMobile && !chromeHidden && (
-              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...topBarIconButton(mobileEditorMenuOpen), fontSize: 17 }}>☰</button>
+            {chromeHidden ? (
+              <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home" style={topBarIconButton(false, topBar)}><HomeIcon size={topBar.icon} /></button>
+            ) : (
+              <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home"
+                style={{ display: "flex", alignItems: "center", gap: 2, height: topBar.button, padding: "0 6px 0 2px", border: 0, borderRadius: 7, background: "transparent", color: topBar.muted, cursor: "pointer", whiteSpace: "nowrap" }}
+              >
+                <BackIcon />
+                <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>
+              </button>
             )}
-            {isMobile && !chromeHidden && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: isPortrait ? 36 : 30, height: isPortrait ? 36 : 28, padding: 0, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 13 }}>{isPlaying ? "⏸" : "▶"}</button>}
+            {isMobile && !chromeHidden && (
+              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...topBarIconButton(mobileEditorMenuOpen, topBar), fontSize: 15 }}>☰</button>
+            )}
+            {isMobile && !chromeHidden && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
 
           {/* Center: the board's share code */}
           <div style={{ flexShrink: 0, position: "relative" }}>
             {joinCode ? (
               <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
-                style={{ height: 28, padding: "0 10px", borderRadius: 999, border: "1px solid rgba(255,253,245,0.35)", background: joinStatus === "joined" ? "rgba(200,241,53,0.16)" : "rgba(255,253,245,0.08)", color: "#fffdf5", fontFamily: "monospace", fontSize: 12, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: joinStatus === "joined" && chromeHidden ? "rgba(200,241,53,0.16)" : topBar.pillBg, color: chromeHidden ? topBar.ink : topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 12 : 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
               >
                 {joinCode}
                 <CopyIcon />
               </button>
             ) : (
               <button type="button" onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} title="Make this board joinable and get a code to share"
-                style={{ height: 28, padding: "0 12px", borderRadius: 999, border: "1px dashed rgba(255,253,245,0.4)", background: "transparent", color: "rgba(255,253,245,0.8)", fontFamily: "monospace", fontSize: 11, cursor: joinStatus === "connecting" ? "wait" : "pointer", opacity: joinStatus === "connecting" ? 0.6 : 1 }}
+                style={{ height: topBar.button - 2, padding: "0 12px", borderRadius: 999, border: `1px dashed ${topBar.pillBorder}`, background: "transparent", color: topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 11 : 10, cursor: joinStatus === "connecting" ? "wait" : "pointer", opacity: joinStatus === "connecting" ? 0.6 : 1 }}
               >
                 {joinStatus === "connecting" ? "Getting code…" : "Get board code"}
               </button>
@@ -23492,13 +23464,13 @@ function Board2Editor({
             {joinCode && presencePeers.length > 0 && (
               <div role="img" aria-label={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} on this board`} title={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} here`} style={{ display: "flex", alignItems: "center", marginRight: 4 }}>
                 {presencePeers.slice(0, 5).map((token, index) => (
-                  <span key={token} style={{ width: 12, height: 12, borderRadius: "50%", background: presenceColor(token), border: "2px solid #2a2a2a", marginLeft: index ? -3 : 0 }} />
+                  <span key={token} style={{ width: chromeHidden ? 12 : 10, height: chromeHidden ? 12 : 10, borderRadius: "50%", background: presenceColor(token), border: `2px solid ${topBar.dotRing}`, marginLeft: index ? -3 : 0 }} />
                 ))}
-                {presencePeers.length > 5 && <span style={{ marginLeft: 4, fontSize: 10, color: "rgba(255,253,245,0.8)" }}>+{presencePeers.length - 5}</span>}
+                {presencePeers.length > 5 && <span style={{ marginLeft: 4, fontSize: 10, color: topBar.muted }}>+{presencePeers.length - 5}</span>}
               </div>
             )}
             <div style={{ position: "relative" }}>
-              <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen)}><GearIcon /></button>
+              <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen, topBar)}><GearIcon size={topBar.icon} /></button>
               {boardSettingsOpen && (
                 <>
                   <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
@@ -23541,8 +23513,8 @@ function Board2Editor({
                 </>
               )}
             </div>
-            <button type="button" onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} style={topBarIconButton(isFullscreen)}>
-              {isFullscreen ? <CompressIcon /> : <ExpandIcon />}
+            <button type="button" onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} style={topBarIconButton(isFullscreen, topBar)}>
+              {isFullscreen ? <CompressIcon size={topBar.icon} /> : <ExpandIcon size={topBar.icon} />}
             </button>
             <button
               type="button"
@@ -23550,9 +23522,9 @@ function Board2Editor({
               aria-pressed={!chromeHidden}
               title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
               onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
-              style={{ ...topBarIconButton(!chromeHidden), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? "#fffdf5" : "#2a2a2a" }}
+              style={{ ...topBarIconButton(!chromeHidden, topBar), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? topBar.ink : "#2a2a2a" }}
             >
-              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} />
+              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? "#2a2a2a" : "#c8f135"} size={chromeHidden ? 24 : 19} />
             </button>
           </div>
         </div>
@@ -23586,7 +23558,7 @@ function Board2Editor({
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (
-        <div style={{ position: "fixed", top: "calc(48px + env(safe-area-inset-top))", left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
+        <div style={{ position: "fixed", top: `calc(${topBar.height + 4}px + env(safe-area-inset-top))`, left: "max(6px, env(safe-area-inset-left))", right: "max(6px, env(safe-area-inset-right))", zIndex: 200, display: "grid", gridTemplateColumns: isPortrait ? "repeat(2, minmax(0, 1fr))" : "repeat(4, minmax(0, 1fr))", gap: 7, padding: 9, maxHeight: "calc(100dvh - 52px - env(safe-area-inset-top) - env(safe-area-inset-bottom))", overflowY: "auto", border: "2px solid #2a2a2a", borderRadius: 8, background: "rgba(255,253,245,.98)", boxShadow: "3px 3px 0 #2a2a2a" }}>
           {session?.user?.email && (
             <AccountControl
               email={session.user.email}
@@ -27796,45 +27768,74 @@ function presenceColor(token: string): string {
   return PRESENCE_COLORS[(hash >>> 0) % PRESENCE_COLORS.length];
 }
 
-function topBarIconButton(active: boolean): React.CSSProperties {
+// Top bar palettes. The board view keeps its dark bar; in the video editor the bar takes the
+// editor's own look — the cream panel surface and hairline borders of the side panels, with
+// charcoal ink at reduced contrast — and shrinks so it reads as part of the editor.
+type TopBarTheme = {
+  height: number; button: number; icon: number;
+  background: string; borderBottom: string; ink: string; muted: string;
+  activeBg: string; activeBorder: string; pillBorder: string; pillBg: string; dotRing: string;
+};
+const BOARD_TOP_BAR: TopBarTheme = {
+  height: 44, button: 32, icon: 18,
+  background: "#2a2a2a", borderBottom: "none", ink: "#fffdf5", muted: "rgba(255,253,245,0.8)",
+  activeBg: "rgba(255,253,245,0.14)", activeBorder: "rgba(255,253,245,0.5)",
+  pillBorder: "rgba(255,253,245,0.35)", pillBg: "rgba(255,253,245,0.08)", dotRing: "#2a2a2a",
+};
+const EDITOR_TOP_BAR: TopBarTheme = {
+  height: 34, button: 26, icon: 15,
+  background: "rgba(255,253,245,0.65)", borderBottom: "1.5px solid rgba(42,42,42,0.15)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.55)",
+  activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
+  pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
+};
+
+function topBarIconButton(active: boolean, theme: TopBarTheme = BOARD_TOP_BAR): React.CSSProperties {
   return {
-    width: 32, height: 32, padding: 0, flexShrink: 0, borderRadius: 8, cursor: "pointer",
+    width: theme.button, height: theme.button, padding: 0, flexShrink: 0, borderRadius: 7, cursor: "pointer",
     display: "grid", placeItems: "center",
-    border: "1px solid " + (active ? "rgba(255,253,245,0.5)" : "transparent"),
-    background: active ? "rgba(255,253,245,0.14)" : "transparent",
-    color: "#fffdf5",
+    border: "1px solid " + (active ? theme.activeBorder : "transparent"),
+    background: active ? theme.activeBg : "transparent",
+    color: active ? theme.ink : theme.muted,
   };
 }
 
-function HomeIcon() {
+function HomeIcon({ size = 18 }: { size?: number }) {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" />
     </svg>
   );
 }
 
-function GearIcon() {
+function GearIcon({ size = 18 }: { size?: number }) {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
     </svg>
   );
 }
 
-function ExpandIcon() {
+function ExpandIcon({ size = 18 }: { size?: number }) {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5" />
     </svg>
   );
 }
 
-function CompressIcon() {
+function CompressIcon({ size = 18 }: { size?: number }) {
   return (
-    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3 8h5V3M21 8h-5V3M16 21v-5h5M8 21v-5H3" />
+    </svg>
+  );
+}
+
+function BackIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M15 18l-6-6 6-6" />
     </svg>
   );
 }
@@ -27849,9 +27850,9 @@ function CopyIcon() {
 
 // Film slate: striped clapper arm hinged at the top-left over a slate body. The arm swings open
 // while the editor is open. Stripes are cut out in the button's background color.
-function ClapperboardIcon({ open, stripe }: { open: boolean; stripe: string }) {
+function ClapperboardIcon({ open, stripe, size = 24 }: { open: boolean; stripe: string; size?: number }) {
   return (
-    <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
       <rect x="3" y="10" width="18" height="11" rx="1.5" />
       <path d="M6 10h3l-2 3H4zM12 10h3l-2 3h-3zM18 10h3l-2 3h-3z" fill={stripe} />
       <rect x="3" y="12.6" width="18" height="0.8" fill={stripe} />

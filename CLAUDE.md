@@ -81,7 +81,7 @@ The complete product is a single large client component. Key subsystems:
 
 ### Infinite board space (`lib/simple-world.ts`, `app/board2/page.tsx`)
 
-The editor board and every Library-added `.nbp` share the editor's existing parchment coordinate space. The bottom-left control hides editor chrome without changing the board; normal wheel zoom and direct drag-panning then reveal other boards. Inactive boards are each one flattened PNG generated once when added and written to `.neuralboard-space/` inside the chosen boards folder. Only on-screen composites mount, failed composites are not retried, and opening a centered board swaps its composite for that board's live editor while mounted workspaces preserve unsaved state.
+The editor board and every Library-added `.nbp` share the editor's existing parchment coordinate space. The bottom-left control hides editor chrome without changing the board; normal wheel zoom and direct drag-panning then reveal other boards. Inactive boards are each one flattened PNG generated once when added and written to `.neuralboard-space/` inside the chosen boards folder. Only on-screen composites mount, failed composites are not retried, and opening a centered board loads it into the editor in place of the current board (only one board is open at a time; unsaved changes to a non-autosaved board prompt before being replaced).
 
 ### AI pipeline (`/api/transcribe`)
 
