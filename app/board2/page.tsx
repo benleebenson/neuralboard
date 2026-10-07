@@ -2085,6 +2085,24 @@ const PAN_CLIP_COLOR = "#f0e6a8";
 const CHARACTER_FOCUS_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
+const DEFAULT_CUSTOM_ZOOM_HOLD_FRACTION = 0.25;
+
+// A new custom zoom copies the hold/transition split of the custom zoom right before it on the
+// timeline: the one with the latest start strictly before `startTime` (ties: the later end, then
+// the most recently added). Copied once at creation, so editing an earlier zoom later only
+// affects zooms created after it, one step at a time. The first zoom uses the default.
+function inheritedCustomZoomHoldFraction(clips: readonly Clip[], startTime: number): number {
+  let previous: Clip | null = null;
+  for (const clip of clips) {
+    if (clip.type !== "customZoom" || clip.featured === false || clip.startTime >= startTime - 1e-6) continue;
+    if (
+      !previous || clip.startTime > previous.startTime ||
+      (clip.startTime === previous.startTime && clip.startTime + clip.duration >= previous.startTime + previous.duration)
+    ) previous = clip;
+  }
+  // An older zoom without an explicit value plays with HOLD_FRACTION, so that's what it passes on.
+  return previous ? previous.holdFraction ?? HOLD_FRACTION : DEFAULT_CUSTOM_ZOOM_HOLD_FRACTION;
+}
 const FRAME_ALL_PADDING = 0.1;
 // Pan traversal intentionally retains its wider historical scale; focused stops use the shared
 // high-fill ratio above, while cluster-wide establishing beats keep their own wide framing.
@@ -10430,7 +10448,7 @@ function Board2Editor({
     );
     const clip: Clip = {
       id, type: "customZoom", name: "Custom Zoom", sourceUrl: "",
-      startTime: placement.startTime, duration, holdFraction: 0.25, layer: placement.layer,
+      startTime: placement.startTime, duration, holdFraction: inheritedCustomZoomHoldFraction(existingClips, placement.startTime), layer: placement.layer,
       boardX: Math.round(boardX), boardY: Math.round(boardY),
       boardW: Math.max(10, Math.round(boardW)), boardH: Math.max(10, Math.round(boardH)),
     };
