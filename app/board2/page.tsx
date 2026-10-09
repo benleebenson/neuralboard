@@ -134,6 +134,13 @@ import {
   type GestureTrackPoint,
 } from "@/lib/character/gestures";
 import {
+  BLEEP_DEFAULT_DURATION,
+  bleepRanges,
+  createBleepToneBuffer,
+  cutSegmentsForBleeps,
+  isBleepedAt,
+} from "@/lib/board2/bleep";
+import {
   activeNarrationClipIdAtTime,
   assertSingleActiveNarrationSource,
   exclusiveNarrationSegments,
@@ -443,7 +450,7 @@ function recipeProvenance(source?: ClipSource): RecipeProvenance {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration" | "flash";
+  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration" | "flash" | "bleep";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -1325,6 +1332,7 @@ function drawZoomNarrationTypewriter(
 // Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets.
 const FLASH_CUT_DEFAULT_DURATION = 0.6;
 const FLASH_CLIP_COLOR = "#ffe14d";
+const BLEEP_CLIP_COLOR = "#ff6b6b";
 type FlashAsset = { name: string; url: string };
 
 const flashCutImageCache = new Map<string, HTMLImageElement>();
@@ -7545,6 +7553,7 @@ function Board2Editor({
   useEffect(() => {
     const flashIds = new Set<string>();
     for (const clip of clips) {
+      if (clip.type === "bleep") flashIds.add(clip.id);
       if (clip.type !== "flash") continue;
       flashIds.add(clip.id);
       if (clip.flashImageUrl) flashCutImage(clip.flashImageUrl);
@@ -10641,16 +10650,20 @@ function Board2Editor({
     return list?.find((asset) => asset.url === url)?.name ?? decodeURIComponent(url.split("/").pop() ?? url).replace(/\.[^.]+$/, "");
   }
 
+  // The first visual layer that is free for the whole [startTime, startTime + duration) span.
+  function freeVisualLayerAt(startTime: number, duration: number): number {
+    const overlaps = (layer: number) => clipsRef.current.some((clip) =>
+      clip.type !== "narration" && isFeaturedTimelineClip(clip) && (clip.layer ?? 1) === layer &&
+      clip.startTime < startTime + duration && startTime < clip.startTime + clip.duration);
+    return Array.from({ length: N_LAYERS }, (_, index) => index).find((candidate) => !overlaps(candidate)) ?? 0;
+  }
+
   function insertFlashCut(imageUrl: string, soundUrl: string) {
     const id = generateId();
     const startTime = Math.max(0, playheadRef.current);
     const duration = FLASH_CUT_DEFAULT_DURATION;
     const existingClips = clipsRef.current;
-    // Same time as the playhead, on the first visual layer that is free for the whole block.
-    const overlaps = (layer: number) => existingClips.some((clip) =>
-      clip.type !== "narration" && isFeaturedTimelineClip(clip) && (clip.layer ?? 1) === layer &&
-      clip.startTime < startTime + duration && startTime < clip.startTime + clip.duration);
-    const layer = Array.from({ length: N_LAYERS }, (_, index) => index).find((candidate) => !overlaps(candidate)) ?? 0;
+    const layer = freeVisualLayerAt(startTime, duration);
     const clip: Clip = {
       id, type: "flash", name: "Flash", sourceUrl: "",
       startTime, duration, layer,
@@ -10664,9 +10677,34 @@ function Board2Editor({
     setToast(`⚡ Flash added at ${formatTime(startTime)}`);
   }
 
+  // ─ Bleep blocks ───────────────────────────────────────────────────────────
+
+  function insertBleep() {
+    const id = generateId();
+    const startTime = Math.max(0, playheadRef.current);
+    const duration = BLEEP_DEFAULT_DURATION;
+    const clip: Clip = {
+      id, type: "bleep", name: "Bleep", sourceUrl: "",
+      startTime, duration, layer: freeVisualLayerAt(startTime, duration),
+    };
+    clipsRef.current = [...clipsRef.current, clip];
+    setClips((prev) => [...prev, clip]);
+    selectionSurfaceRef.current = "timeline";
+    setClipSelection([id]);
+    setToast(`🔇 Bleep added at ${formatTime(startTime)}`);
+  }
+
   function updateFlashCut(clipId: string, patch: { flashImageUrl?: string; flashSoundUrl?: string }) {
     if (patch.flashImageUrl) flashCutImage(patch.flashImageUrl);
     setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...patch } : clip));
+  }
+
+  function renderBleepProperties() {
+    return (
+      <div style={{ fontSize: 9, fontFamily: "monospace", color: "#7a1010", background: BLEEP_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+        Narration is silenced under this block and replaced by a bleep tone. Drag the edges to cover the word. Volume 0 gives a silent cut, and muting the block turns it off.
+      </div>
+    );
   }
 
   // Properties-panel editor for a selected flash block (desktop and mobile drawers).
@@ -10970,7 +11008,10 @@ function Board2Editor({
   }
 
   function updateNarrationAudioSettings(clip: Clip, element: HTMLAudioElement) {
-    element.muted = !!clip.muted || !!mutedLayersRef.current[clip.layer ?? 0];
+    // Bleep blocks silence narration for their span; this runs every playback frame via
+    // syncNarrationAudioAtTime, so the mute follows the playhead in and out of each bleep.
+    element.muted = !!clip.muted || !!mutedLayersRef.current[clip.layer ?? 0] ||
+      isBleepedAt(bleepRanges(clipsRef.current), playheadRef.current);
     element.volume = clamp(clip.volume ?? 1, 0, 1);
   }
 
@@ -11187,14 +11228,44 @@ function Board2Editor({
     }).catch((error) => console.warn("[flash-cut] sound failed", clip.flashSoundUrl, error));
   }
 
-  // Fires every flash whose start lies in (previous, next]. With `startingAt`, also fires a block
-  // the playhead starts inside of (or exactly on), offset into its sound.
+  // A bleep tone shares the flash-sound node list, so pause, seek, end and block deletion all
+  // silence it the same way. Its narration mute is handled by updateNarrationAudioSettings.
+  function playBleepTone(clip: Clip, triggeredAtTimeline: number) {
+    const ctx = audioCtxRef.current;
+    if (!ctx || ctx.state === "closed" || isExportingRef.current) return;
+    flashFiredIdsRef.current.add(clip.id);
+    const remaining = clip.startTime + clip.duration - triggeredAtTimeline;
+    const volume = effectiveClipVolume(clip);
+    if (remaining <= 0 || volume <= 0) return;
+    const gain = ctx.createGain();
+    gain.gain.value = volume;
+    gain.connect(ctx.destination);
+    const source = ctx.createBufferSource();
+    source.buffer = createBleepToneBuffer(ctx, remaining);
+    source.connect(gain);
+    const node = { clipId: clip.id, source, gain };
+    source.onended = () => {
+      flashSoundNodesRef.current = flashSoundNodesRef.current.filter((candidate) => candidate !== node);
+      try { gain.disconnect(); } catch {}
+    };
+    source.start();
+    flashSoundNodesRef.current.push(node);
+  }
+
+  // Fires every flash or bleep whose start lies in (previous, next]. With `startingAt`, also fires
+  // a block the playhead starts inside of (or exactly on), offset into its sound.
   function triggerFlashCutSounds(previous: number, next: number, startingAt = false) {
-    for (const clip of flashCutSoundClips(clipsRef.current)) {
-      if (flashFiredIdsRef.current.has(clip.id)) continue;
+    const fires = (clip: Clip) => {
+      if (flashFiredIdsRef.current.has(clip.id)) return false;
       const crossed = clip.startTime > previous && clip.startTime <= next;
       const inside = startingAt && next >= clip.startTime && next < clip.startTime + clip.duration;
-      if (crossed || inside) playFlashCutSound(clip, next);
+      return crossed || inside;
+    };
+    for (const clip of flashCutSoundClips(clipsRef.current)) {
+      if (fires(clip)) playFlashCutSound(clip, next);
+    }
+    for (const clip of clipsRef.current) {
+      if (clip.type === "bleep" && !clip.muted && clip.duration > 0 && fires(clip)) playBleepTone(clip, next);
     }
   }
 
@@ -17154,7 +17225,10 @@ function Board2Editor({
         .map(({ source }) => source);
       const narrationSources = decodedSources.filter(({ clip }) => clip.type === "narration");
       const narrationById = new Map(narrationSources.map((item) => [item.clip.id, item]));
-      const exclusiveNarration = exclusiveNarrationSegments(narrationSources.map(({ clip }) => clip)).flatMap((segment) => {
+      const exclusiveNarration = cutSegmentsForBleeps(
+        exclusiveNarrationSegments(narrationSources.map(({ clip }) => clip)),
+        bleepRanges(currentClips),
+      ).flatMap((segment) => {
         const item = narrationById.get(segment.clipId);
         if (!item) return [];
         const duration = Math.min(segment.duration, Math.max(0, item.source.buffer.duration - segment.sourceOffsetSec));
@@ -17179,7 +17253,14 @@ function Board2Editor({
         }
         flashSources.push({ startTime: clip.startTime, duration: buffer.duration, sourceOffsetSec: 0, volume, buffer });
       }
-      return [...videoSources, ...exclusiveNarration, ...flashSources];
+      // Bleep tones fill exactly the span cut out of the narration above.
+      const bleepSources: OfflineAudioSource[] = currentClips.flatMap((clip) => {
+        const volume = effectiveClipVolume(clip);
+        if (clip.type !== "bleep" || clip.duration <= 0 || volume <= 0) return [];
+        const buffer = createBleepToneBuffer(context, clip.duration);
+        return [{ startTime: clip.startTime, duration: buffer.duration, sourceOffsetSec: 0, volume, buffer }];
+      });
+      return [...videoSources, ...exclusiveNarration, ...flashSources, ...bleepSources];
     } finally {
       await context.close().catch(() => {});
     }
@@ -17306,7 +17387,9 @@ function Board2Editor({
       let flashSoundBuffers: AudioItem[] = [];
       const flashSoundClips = flashCutSoundClips(currentClips).filter((clip) =>
         clip.startTime < rangeEnd && effectiveClipVolume(clip) > 0);
-      if (audioClips.length > 0 || flashSoundClips.length > 0) {
+      const bleepToneClips = currentClips.filter((clip) =>
+        clip.type === "bleep" && clip.duration > 0 && effectiveClipVolume(clip) > 0);
+      if (audioClips.length > 0 || flashSoundClips.length > 0 || bleepToneClips.length > 0) {
         exportAudioCtx = new AudioContext();
         await exportAudioCtx.resume();
         exportAudioDest = exportAudioCtx.createMediaStreamDestination();
@@ -17419,7 +17502,10 @@ function Board2Editor({
 
           const narrationItems = audioBuffers.filter((item) => item.clip.type === "narration");
           const narrationById = new Map(narrationItems.map((item) => [item.clip.id, item]));
-          const narrationSegments = exclusiveNarrationSegments(narrationItems.map(({ clip }) => clip));
+          const narrationSegments = cutSegmentsForBleeps(
+            exclusiveNarrationSegments(narrationItems.map(({ clip }) => clip)),
+            bleepRanges(currentClips),
+          );
           console.info("[board2:audio-source]", {
             action: "schedule",
             kind: "narration-export",
@@ -17470,6 +17556,20 @@ function Board2Editor({
               visibleStart - clip.startTime,
               visibleEnd - visibleStart,
               `export-flash-${clip.id}`,
+            );
+          }
+          // Bleep tones fill exactly the span cut out of the narration above.
+          for (const clip of bleepToneClips) {
+            const visibleStart = Math.max(clip.startTime, rangeStart);
+            const visibleEnd = Math.min(clip.startTime + clip.duration, rangeEnd);
+            if (visibleEnd <= visibleStart) continue;
+            scheduleSource(
+              clip,
+              createBleepToneBuffer(audioContext, visibleEnd - visibleStart),
+              visibleStart - rangeStart,
+              0,
+              visibleEnd - visibleStart,
+              `export-bleep-${clip.id}`,
             );
           }
         }
@@ -17645,7 +17745,8 @@ function Board2Editor({
       const audioIsExpected = currentClips.some((clip) =>
         (clip.type === "narration" || (clip.type === "video" && isFeaturedTimelineClip(clip))) &&
         effectiveClipVolume(clip) > 0 && clip.duration > 0
-      ) || flashCutSoundClips(currentClips).some((clip) => effectiveClipVolume(clip) > 0);
+      ) || flashCutSoundClips(currentClips).some((clip) => effectiveClipVolume(clip) > 0) ||
+        currentClips.some((clip) => clip.type === "bleep" && clip.duration > 0 && effectiveClipVolume(clip) > 0);
       const candidates = buildExportEncodingCandidates({ quality: exportQuality, aspect: canvasAspect, fps: exportFps });
       const preferredCandidate = candidates[0];
       const audioSupportByCodec = new Map<string, boolean>();
@@ -22014,7 +22115,7 @@ function Board2Editor({
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -22039,7 +22140,7 @@ function Board2Editor({
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -22231,7 +22332,7 @@ function Board2Editor({
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     {isBoardMediaClip(selectedClip) && (
@@ -22245,6 +22346,7 @@ function Board2Editor({
                       </button>
                     )}
                     {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, true)}
+                    {selectedClip.type === "bleep" && renderBleepProperties()}
                     <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Duration (s)</div>
                       <input
@@ -22254,7 +22356,7 @@ function Board2Editor({
                         style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" } as React.CSSProperties}
                       />
                     </div>
-                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && (
+                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>
                           Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
@@ -22350,7 +22452,7 @@ function Board2Editor({
                         )}
                       </div>
                     )}
-                    {(selectedClip.type === "video" || selectedClip.type === "narration") && (
+                    {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep") && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Volume {Math.round((selectedClip.muted ? 0 : (selectedClip.volume ?? 1)) * 100)}%</div>
                         <input
@@ -26392,7 +26494,7 @@ function Board2Editor({
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {isBoardMediaClip(selectedClip) && (
                   <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "7px 10px", fontSize: 11, background: "#ffd45c" }}>
@@ -26415,6 +26517,7 @@ function Board2Editor({
                   </div>
                 )}
                 {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, false)}
+                {selectedClip.type === "bleep" && renderBleepProperties()}
                 {selectedClip.type === "customZoom" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#1c6fc9", background: CUSTOM_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
                     Zooms into a hand-drawn region of the board — drag the corners to adjust it
@@ -26505,7 +26608,7 @@ function Board2Editor({
                   </div>
                 )}
 
-                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && (
+                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
                     <input
@@ -26587,7 +26690,7 @@ function Board2Editor({
                   </div>
                 )}
 
-                {(selectedClip.type === "video" || selectedClip.type === "narration") && (
+                {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep") && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Volume</div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -26732,6 +26835,13 @@ function Board2Editor({
                 </div>
               </>
             )}
+            <button
+              onClick={insertBleep}
+              title="Insert a bleep at the playhead: silences the narration under it and plays a censor tone"
+              style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11, background: BLEEP_CLIP_COLOR, flexShrink: 0 }}
+            >
+              🔇 Bleep
+            </button>
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ fontSize: 9, fontFamily: "monospace", color: "#9a9a9a" }}>zoom</span>
               <button onClick={() => { const n = clamp(pxPerSec / 1.5, MIN_PX_PER_SEC, MAX_PX_PER_SEC); pxPerSecRef.current = n; setPxPerSec(n); }} style={miniButton}>−</button>
@@ -26934,11 +27044,11 @@ function Board2Editor({
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const isCharacterFocus = clip.type === "characterFocus";
-                const isFlash = clip.type === "flash";
+                const isFlash = clip.type === "flash" || clip.type === "bleep";
                 const hf = isCharacterFocus || isFlash ? 1 : clip.holdFraction ?? HOLD_FRACTION;
                 const innerW = clipPx - HANDLE_W * 2;
                 const holdW = Math.max(0, innerW * hf);
@@ -26995,7 +27105,7 @@ function Board2Editor({
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
