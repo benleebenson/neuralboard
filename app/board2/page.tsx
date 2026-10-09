@@ -2086,6 +2086,13 @@ const CHARACTER_FOCUS_CLIP_COLOR = "#c9d4ff";
 const CUSTOM_ZOOM_CLIP_COLOR = "#b8e2ff";
 const HOLD_FRACTION = 0.6;
 const DEFAULT_CUSTOM_ZOOM_HOLD_FRACTION = 0.25;
+const MAX_HOLD_FRACTION = 0.95;
+
+// Custom zooms may drop to a 0% hold, turning the block into a pure transition that glides
+// straight from its framing to the next one. Other blocks keep a short minimum hold.
+function minHoldFraction(clip: Pick<Clip, "type">): number {
+  return clip.type === "customZoom" ? 0 : 0.1;
+}
 
 // A new custom zoom copies the hold/transition split of the custom zoom right before it on the
 // timeline: the one with the latest start strictly before `startTime` (ties: the later end, then
@@ -16270,8 +16277,9 @@ function Board2Editor({
       if (!drag) return;
       const rect = scrollerRef.current!.getBoundingClientRect();
       const cursorX = ev.clientX - rect.left + timelineScrollRef.current;
-      let fraction = clamp((cursorX - drag.innerStartPx) / drag.innerWidthPx, 0.1, 0.95);
-      for (const sp of [0.25, 0.5, 0.75]) {
+      const minFraction = minHoldFraction(clip);
+      let fraction = clamp((cursorX - drag.innerStartPx) / drag.innerWidthPx, minFraction, MAX_HOLD_FRACTION);
+      for (const sp of minFraction === 0 ? [0, 0.25, 0.5, 0.75] : [0.25, 0.5, 0.75]) {
         if (Math.abs(fraction - sp) < 0.05) { fraction = sp; break; }
       }
       const pct = Math.round(fraction * 100);
@@ -21906,7 +21914,7 @@ function Board2Editor({
                           Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
                         </div>
                         <input
-                          type="range" min={0.1} max={0.95} step={0.01}
+                          type="range" min={minHoldFraction(selectedClip)} max={MAX_HOLD_FRACTION} step={0.01}
                           value={selectedClip.holdFraction ?? HOLD_FRACTION}
                           onChange={(e) => { const v = parseFloat(e.target.value); if (cameraKeyframesRef.current.length > 0) setKeyframesOutOfDate(true); setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, holdFraction: v } : c)); }}
                           style={{ width: "100%", accentColor: "#c8f135" }}
@@ -26147,8 +26155,8 @@ function Board2Editor({
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
                     <input
                       type="range"
-                      min={0.1}
-                      max={0.95}
+                      min={minHoldFraction(selectedClip)}
+                      max={MAX_HOLD_FRACTION}
                       step={0.01}
                       value={selectedClip.holdFraction ?? HOLD_FRACTION}
                       onChange={(e) => {
