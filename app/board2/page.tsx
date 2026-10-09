@@ -2076,6 +2076,7 @@ function rocketTerrainClips(clips: readonly Clip[]): TerrainClip[] {
 }
 const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
+const SAVE_BUTTON_COLOR = "#ffb347";
 const BOARD_RESIZE_PX = 10;
 const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
@@ -23595,9 +23596,9 @@ function Board2Editor({
               onAction={() => setMobileEditorMenuOpen(false)}
             />
           )}
+          <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: SAVE_BUTTON_COLOR, fontWeight: 700 }}>💾 Save</button>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
-          <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>💾 Save</button>
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
@@ -23626,6 +23627,14 @@ function Board2Editor({
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: chromeHidden || isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
             <div style={panelLabelStyle}>Media Library</div>
+            <button
+              onClick={() => setSaveModalOpen(true)}
+              disabled={isSaving}
+              style={{ ...sketchButton, flexShrink: 0, background: SAVE_BUTTON_COLOR, fontSize: 12, padding: "8px 10px", fontWeight: 700, opacity: isSaving ? 0.6 : 1 }}
+              title="Save board to library"
+            >
+              {isSaving ? "Saving…" : "💾 Save board"}
+            </button>
             <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
             <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
             <button
