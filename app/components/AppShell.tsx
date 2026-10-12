@@ -569,7 +569,7 @@ function Avatar({ label, large = false }: { label: string; large?: boolean }) {
   );
 }
 
-function LogoMark() {
+export function LogoMark() {
   return (
     <span className={styles.logo} aria-hidden="true">
       <svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="2.5" /><path d="M10.5 9.75v4.5l4-2.25Z" /></svg>

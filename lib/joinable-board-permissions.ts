@@ -1,4 +1,5 @@
 import { stableStringify, type JoinableBoardState } from "./joinable-board.ts";
+import { isStickyNoteColor, STICKY_NOTE_MAX_TEXT } from "./sticky-notes.ts";
 
 // Owner vs joiner on a joinable board. The owner can change anything. A joiner adds to the board
 // and changes only what they added; whole-board settings belong to the owner. The server applies
@@ -29,6 +30,14 @@ function comparable(item: Item): string {
   return stableStringify(copy);
 }
 
+// A sticky note a joiner adds or changes must use the shared palette and carry plain text.
+function stickyNoteError(item: Item): string | null {
+  if (item.type !== "sticky") return null;
+  if (!isStickyNoteColor(item.noteColor)) return "Sticky notes must use one of the note colors.";
+  if (item.text !== undefined && (typeof item.text !== "string" || item.text.length > STICKY_NOTE_MAX_TEXT)) return "That sticky note's text is too long.";
+  return null;
+}
+
 function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string): { ok: true; items: Item[] } | { ok: false; error: string } {
   const prevById = new Map(previous.filter((item) => typeof item.id === "string").map((item) => [item.id as string, item]));
   const nextIds = new Set<string>();
@@ -42,11 +51,15 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
       if (kind === "clips" && (!JOINER_CLIP_TYPES.has(String(item.type)) || typeof item.boardX !== "number")) {
         return { ok: false, error: "You can add images, video and text to the board; only the owner can change the video timeline." };
       }
+      const stickyError = stickyNoteError(item);
+      if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
     } else if (comparable(before) === comparable(item)) {
       items.push(before); // unchanged: keep exactly what's stored
     } else {
       if (before.addedBy !== participantId || item.addedBy !== participantId) return { ok: false, error: "You can only move or change what you added." };
+      const stickyError = stickyNoteError(item);
+      if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
     }
   }

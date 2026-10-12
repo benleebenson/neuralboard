@@ -10,6 +10,9 @@ import { useIsPro } from "@/app/components/useIsPro";
 import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { listSimpleWorldBoards, openSimpleWorldBoardFile, openSimpleWorldPreviewFile, type SimpleWorldBoard } from "@/lib/simple-world";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
+import { LogoMark } from "@/app/components/AppShell";
+import shellStyles from "@/app/components/AppShell.module.css";
+import { shellFont } from "@/app/components/shell-font";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import { ArrayBufferTarget, FileSystemWritableFileStreamTarget, Muxer } from "mp4-muxer";
 import {
@@ -21,6 +24,7 @@ import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
+import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { EDITOR_BOARD_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
@@ -1671,7 +1675,7 @@ function exportStatusTitle(status: OfflineExportStatus | null): string {
 type Annotation = {
   id: string;
   addedBy?: string; // joinable boards: participant id of whoever added it
-  type: "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
+  type: "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji" | "sticky";
   boardX: number;
   boardY: number;
   boardW: number;
@@ -1692,6 +1696,7 @@ type Annotation = {
   opacity?: number;
   points?: Array<{ x: number; y: number; pressure?: number }>;  // pen, in board space
   emoji?: string;                              // emoji
+  noteColor?: string;                          // sticky: the note's color, one of STICKY_NOTE_COLORS
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
   autoLayoutSeed?: number;
@@ -2915,11 +2920,20 @@ function annotationLinesForEditor(annotation: Annotation): string[] {
     : (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
 }
 
+// A sticky note's text sits inset from its edges by a share of its font size.
+const STICKY_NOTE_PADDING_EM = 0.45;
+
+/** The box a sticky note's text wraps in: the note less its padding. Used on screen and in export. */
+function stickyNoteTextBox(annotation: Annotation): Annotation {
+  const pad = (annotation.fontSize ?? 80) * STICKY_NOTE_PADDING_EM;
+  return { ...annotation, boardX: annotation.boardX + pad, boardY: annotation.boardY + pad, boardW: Math.max(1, annotation.boardW - pad * 2) };
+}
+
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
   if (typeof document === "undefined" || !document.fonts) return;
   const fonts = new Set(
     annotations
-      .filter((annotation) => annotation.type === "text")
+      .filter((annotation) => annotation.type === "text" || annotation.type === "sticky")
       .map((annotation) => annotationFontCss(
         annotation.fontSize ?? 80,
         annotation.fontFamily ?? "Caveat",
@@ -3030,6 +3044,35 @@ function drawAnnotationsToCanvas(
       lines.forEach((line, index) => {
         ctx.fillText(line, toSX(textX), toSY(ann.boardY) + index * lineHeight);
       });
+      ctx.restore();
+    } else if (ann.type === "sticky") {
+      const x = toSX(ann.boardX), y = toSY(ann.boardY), w = ann.boardW * sf, h = ann.boardH * sf;
+      ctx.save();
+      if (ann.rotationDeg) {
+        ctx.translate(x + w / 2, y + h / 2);
+        ctx.rotate(ann.rotationDeg * Math.PI / 180);
+        ctx.translate(-(x + w / 2), -(y + h / 2));
+      }
+      ctx.shadowColor = "rgba(42,42,42,0.2)";
+      ctx.shadowBlur = 18 * sf;
+      ctx.shadowOffsetY = 8 * sf;
+      ctx.fillStyle = ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR;
+      ctx.fillRect(x, y, w, h);
+      ctx.shadowColor = "transparent";
+      if (ann.text) {
+        ctx.beginPath();
+        ctx.rect(x, y, w, h);
+        ctx.clip();
+        const box = stickyNoteTextBox(ann);
+        const boardFontSize = ann.fontSize ?? 80;
+        const lines = annotationLinesForContext(box, ctx);
+        ctx.font = annotationFontCss(boardFontSize * sf, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
+        ctx.fillStyle = ann.color || STICKY_NOTE_INK;
+        ctx.textBaseline = "top";
+        ctx.textAlign = "left";
+        const lineHeight = boardFontSize * ANNOTATION_LINE_HEIGHT * sf;
+        lines.forEach((line, index) => ctx.fillText(line, toSX(box.boardX), toSY(box.boardY) + index * lineHeight));
+      }
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
       const ax = toSX(ann.arrowStartX), ay = toSY(ann.arrowStartY!);
@@ -5722,7 +5765,7 @@ type ActiveBoard = BoardWorkspaceStatus & {
 };
 
 function isTextDraft(annotation: Annotation): boolean {
-  return annotation.type === "text" && !annotation.text?.trim();
+  return (annotation.type === "text" || annotation.type === "sticky") && !annotation.text?.trim();
 }
 
 /** Who added each item in a shared board state (undefined: unmarked, i.e. the owner's). */
@@ -6098,6 +6141,8 @@ function Board2Editor({
   // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
   const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
   const boardAddImageInputRef = useRef<HTMLInputElement | null>(null);
+  // The color the next sticky note gets: the last one picked.
+  const [stickyColor, setStickyColor] = useState<string>(DEFAULT_STICKY_NOTE_COLOR);
   const boardAddPointRef = useRef<{ x: number; y: number } | null>(null);
   // Touch pan/pinch preview: the layer the transform goes on, and the view React last rendered
   // (the transform's starting point) while a preview is showing.
@@ -7234,7 +7279,8 @@ function Board2Editor({
       board: { width: BOARD_W, height: BOARD_H, backgroundColor: boardColorRef.current },
       spawnDoor: spawnDoorRef.current,
       clips: await buildStreamClips(maxLongEdge),
-      annotations: annotationsRef.current,
+      // Stream viewers don't draw sticky notes; they're for shared boards.
+      annotations: annotationsRef.current.filter((annotation): annotation is Annotation & { type: StreamSnapshotMessage["annotations"][number]["type"] } => annotation.type !== "sticky"),
       craters: streamCratersRef.current,
       characters: [
         { id: "c1", enabled: showCharacterRef.current, name: "HOST", skin: "stick", physique: "slim", faceDataUrl: face1, faceAspect: characterFaceRef.current?.faceAspect, mouthAnchor: characterFaceRef.current?.mouthAnchor },
@@ -15717,6 +15763,32 @@ function Board2Editor({
     setEditingAnnotationText("");
   }
 
+  function addStickyFromBoardPrompt() {
+    if (!boardAddPrompt) return;
+    // Text reads at about 22px at the current zoom; the note is a square about 7 lines tall,
+    // centered where the person tapped.
+    const fontSize = Math.round(Math.min(400, Math.max(32, 22 / Math.max(0.05, boardZoomRef.current))));
+    const size = fontSize * 7;
+    const annotation: Annotation = {
+      id: generateId(), type: "sticky",
+      boardX: boardAddPrompt.boardX - size / 2, boardY: boardAddPrompt.boardY - size / 2,
+      boardW: size, boardH: size,
+      color: STICKY_NOTE_INK, noteColor: stickyColor,
+      text: "", fontFamily: "Caveat", fontSize, fontWeight: "normal",
+    };
+    setBoardAddPrompt(null);
+    disarmAnnotationTool();
+    setAnnotations((prev) => [...prev, annotation]);
+    setAnnotationSelection([annotation.id]);
+    setEditingAnnotationId(annotation.id);
+    setEditingAnnotationText("");
+  }
+
+  function setStickyNoteColor(id: string, noteColor: string) {
+    setStickyColor(noteColor);
+    setAnnotations((prev) => prev.map((annotation) => annotation.id === id && annotation.type === "sticky" ? { ...annotation, noteColor } : annotation));
+  }
+
   function addImageFromBoardPrompt() {
     if (!boardAddPrompt) return;
     boardAddPointRef.current = { x: boardAddPrompt.boardX, y: boardAddPrompt.boardY };
@@ -15847,7 +15919,8 @@ function Board2Editor({
       setAnnotations((prev) => prev.map((a) => (a.id === annId ? {
         ...a,
         text,
-        boardW: Math.max(a.boardW, measuredWidth),
+        // A sticky note's text wraps inside the note, so only its height grows to fit.
+        boardW: a.type === "sticky" ? a.boardW : Math.max(a.boardW, measuredWidth),
         boardH: Math.max(a.boardH, measuredHeight),
       } : a)));
       setEditingAnnotationId(null);
@@ -20501,6 +20574,12 @@ function Board2Editor({
         setMobileDrawer("props");
       } else if (g.hitAnnotationId) {
         setAnnotationSelection([g.hitAnnotationId]);
+        // A tap on a sticky note that's already selected opens it for typing (double-click on desktop).
+        const tapped = annotationsRef.current.find((annotation) => annotation.id === g.hitAnnotationId);
+        if (g.hitAnnotationIsSelected && tapped?.type === "sticky") {
+          setEditingAnnotationId(tapped.id);
+          setEditingAnnotationText(tapped.text ?? "");
+        }
       } else if (boardViewEditable) {
         handleBoardViewTap(e.clientX, e.clientY);
       } else {
@@ -24285,7 +24364,20 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
-  const topBar = touchSizedTopBar(chromeHidden ? boardTopBarTheme(boardColor) : EDITOR_TOP_BAR, isMobile);
+  const topBar = touchSizedTopBar(EDITOR_TOP_BAR, isMobile);
+  // An anonymous board expires unless its creator saves it to an account (a quiet top-bar button).
+  const canSaveBoardToAccount = !viewOnly && !!joinCode && joinAnonymous && !!joinOwnerToken;
+  const boardExpiryLabel = (() => {
+    const msLeft = joinExpiresAt ? Date.parse(joinExpiresAt) - Date.now() : NaN;
+    const daysLeft = Number.isFinite(msLeft) ? Math.ceil(msLeft / 86_400_000) : null;
+    return `This board expires ${daysLeft === null ? "soon" : daysLeft <= 1 ? (msLeft < 86_400_000 ? "in less than a day" : "in 1 day") : `in ${daysLeft} days`}`;
+  })();
+  function saveBoardToAccount() {
+    // Signed in already (an earlier claim failed): retry. Otherwise sign in and come back to this
+    // board, where the claim effect saves it.
+    if (session?.user?.email) void claimCreatedBoard();
+    else void signIn("google", { callbackUrl: `/board2?join=${joinCode}` });
+  }
 
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
@@ -24310,8 +24402,99 @@ function Board2Editor({
         />
       )}
 
-      {/* ── Header ── */}
-      {!viewOnly && (
+      {/* ── Header ──
+          Board view: the app shell's header (AppShell.module.css), so a shared board looks like Home
+          and Profile. The parchment board below keeps its own look. */}
+      {!viewOnly && chromeHidden && (
+        <header role="toolbar" aria-label="Board" className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.header} ${shellStyles.boardHeader}`}>
+          <div className={shellStyles.headerInner}>
+            <div className={shellStyles.boardHeaderSide}>
+              <button type="button" className={shellStyles.brand} onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home"><LogoMark /><span>NeuralBoard</span></button>
+            </div>
+            <div className={shellStyles.boardHeaderCenter}>
+              {joinCode ? (
+                <button type="button" className={shellStyles.recentBoard} onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}>
+                  {joinCode}
+                  <CopyIcon />
+                </button>
+              ) : (
+                <button type="button" className={shellStyles.outlineButton} onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} title="Make this board joinable and get a code to share" style={{ cursor: joinStatus === "connecting" ? "wait" : undefined, opacity: joinStatus === "connecting" ? 0.6 : 1 }}>
+                  {joinStatus === "connecting" ? "Getting code…" : "Get board code"}
+                </button>
+              )}
+              {boardCodeCopied && <span role="status" className={shellStyles.statusBubble}>Copied!</span>}
+            </div>
+            <div className={`${shellStyles.headerActions} ${shellStyles.boardHeaderSide}`}>
+              {canSaveBoardToAccount && (
+                <button type="button" className={shellStyles.ghostButton} onClick={saveBoardToAccount} aria-label="Save board to account" title={`${boardExpiryLabel}. Save it to your account to keep it.`}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 8.5a4.5 4.5 0 0 1-1 8.9" /><path d="M12 12v8M9 15l3-3 3 3" /></svg>
+                  <span>{isMobile ? "Save" : "Save to account"}</span>
+                </button>
+              )}
+              <div style={{ position: "relative" }}>
+                <button type="button" className={shellStyles.iconButton} onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings"><GearIcon size={22} /></button>
+                {boardSettingsOpen && (
+                  <>
+                    <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
+                    <div role="dialog" aria-label="Board settings" className={shellStyles.popover}>
+                      {/* Whole-board settings are the owner's; joiners only add to the board. */}
+                      {isBoardOwner && (
+                        <div className={shellStyles.popoverSection}>
+                          <span className={shellStyles.caption}>Board color</span>
+                          <div className={shellStyles.popoverRow}>
+                            <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={32} />
+                            <span style={{ flex: 1, color: "var(--ink)", fontWeight: 600, textTransform: "uppercase" }}>{boardColor}</span>
+                            {boardColor !== BOARD_SURFACE_COLOR && <button type="button" className={shellStyles.outlineButton} onClick={() => setBoardColor(BOARD_SURFACE_COLOR)} style={{ width: "auto" }}>Reset</button>}
+                          </div>
+                        </div>
+                      )}
+                      {isBoardOwner && (
+                        <div className={shellStyles.popoverSection}>
+                          <span className={shellStyles.caption}>Board file</span>
+                          <div className={shellStyles.popoverRow}>
+                            <button type="button" className={shellStyles.outlineButton} onClick={() => { setBoardSettingsOpen(false); setSaveModalOpen(true); }} title="Save board to file">Save</button>
+                            <button type="button" className={shellStyles.outlineButton} onClick={() => { setBoardSettingsOpen(false); projectFileInputRef.current?.click(); }} disabled={isLoadingProject} style={{ opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">Load</button>
+                          </div>
+                        </div>
+                      )}
+                      {joinCode && (joinOwnerToken || joinAnonymous) && (
+                        <div className={shellStyles.popoverSection}>
+                          <span className={shellStyles.caption}>Sharing</span>
+                          {joinAnonymous && <p className={shellStyles.caption} style={{ color: "var(--body)" }}>{boardExpiryLabel}{joinOwnerToken ? "." : ". Only the person who created it can save it permanently."}</p>}
+                          {joinOwnerToken && <button type="button" className={`${shellStyles.outlineButton} ${shellStyles.dangerButton}`} onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }}>Stop sharing {joinCode}</button>}
+                        </div>
+                      )}
+                      {LIVE_FEATURES_ENABLED && (
+                        <ProGated featureName="Play Mode">
+                          <button type="button" className={shellStyles.outlineButton} onClick={enterPlayMode} title="Full-window direct character control">▶ Play</button>
+                        </ProGated>
+                      )}
+                      <div className={shellStyles.popoverSection}>
+                        <span className={shellStyles.caption}>Account</span>
+                        {session?.user?.email ? (
+                          <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setBoardSettingsOpen(false)} />
+                        ) : (
+                          <button type="button" className={shellStyles.gradientButton} onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })}>Sign in</button>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+              <button type="button" className={shellStyles.iconButton} onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+                {isFullscreen ? <CompressIcon size={22} /> : <ExpandIcon size={22} />}
+              </button>
+              {isBoardOwner && (
+                <button type="button" className={shellStyles.iconButton} aria-label="Open video editor" aria-pressed={false} title="Open the video editor for the board centered on screen" onClick={restoreChromeForCenteredBoard}>
+                  <ClapperboardIcon open={false} stripe="#ffffff" size={22} />
+                </button>
+              )}
+            </div>
+          </div>
+        </header>
+      )}
+      {/* Video editor: its own compact bar. */}
+      {!viewOnly && !chromeHidden && (
         <div
           role="toolbar"
           aria-label="Board"
@@ -24322,37 +24505,32 @@ function Board2Editor({
             background: topBar.background, borderBottom: topBar.borderBottom, color: topBar.ink, fontFamily: "monospace",
           }}
         >
-          {/* Left: home (+ mobile editor menu and play). In the editor it's a quiet back arrow +
-              wordmark rather than an icon button. */}
+          {/* Left: a quiet back arrow + wordmark (+ mobile editor menu and play). */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
-            {chromeHidden ? (
-              <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home" style={topBarIconButton(false, topBar)}><HomeIcon size={topBar.icon} /></button>
-            ) : (
-              <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home"
-                style={{ display: "flex", alignItems: "center", gap: 2, height: topBar.button, padding: "0 6px 0 2px", border: 0, borderRadius: 7, background: "transparent", color: topBar.muted, cursor: "pointer", whiteSpace: "nowrap" }}
-              >
-                <BackIcon />
-                <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>
-              </button>
-            )}
-            {isMobile && !chromeHidden && (
+            <button type="button" onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home"
+              style={{ display: "flex", alignItems: "center", gap: 2, height: topBar.button, padding: "0 6px 0 2px", border: 0, borderRadius: 7, background: "transparent", color: topBar.muted, cursor: "pointer", whiteSpace: "nowrap" }}
+            >
+              <BackIcon />
+              <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>
+            </button>
+            {isMobile && (
               <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...topBarIconButton(mobileEditorMenuOpen, topBar), fontSize: 15 }}>☰</button>
             )}
-            {isMobile && !chromeHidden && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
+            {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
 
           {/* Center: the board's share code */}
           <div style={{ flexShrink: 0, position: "relative" }}>
             {joinCode ? (
               <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
-                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: topBar.pillBg, color: chromeHidden ? topBar.ink : topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 12 : 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: topBar.pillBg, color: topBar.muted, fontFamily: "monospace", fontSize: 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
               >
                 {joinCode}
                 <CopyIcon />
               </button>
             ) : (
               <button type="button" onClick={() => { void makeBoardJoinable(); }} disabled={joinStatus === "connecting"} title="Make this board joinable and get a code to share"
-                style={{ height: topBar.button - 2, padding: "0 12px", borderRadius: 999, border: `1px dashed ${topBar.pillBorder}`, background: "transparent", color: topBar.muted, fontFamily: "monospace", fontSize: chromeHidden ? 11 : 10, cursor: joinStatus === "connecting" ? "wait" : "pointer", opacity: joinStatus === "connecting" ? 0.6 : 1 }}
+                style={{ height: topBar.button - 2, padding: "0 12px", borderRadius: 999, border: `1px dashed ${topBar.pillBorder}`, background: "transparent", color: topBar.muted, fontFamily: "monospace", fontSize: 10, cursor: joinStatus === "connecting" ? "wait" : "pointer", opacity: joinStatus === "connecting" ? 0.6 : 1 }}
               >
                 {joinStatus === "connecting" ? "Getting code…" : "Get board code"}
               </button>
@@ -24362,8 +24540,15 @@ function Board2Editor({
             )}
           </div>
 
-          {/* Right: presence, settings, fullscreen, video editor */}
+          {/* Right: save to account, settings, fullscreen, close the video editor */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+            {canSaveBoardToAccount && (
+              <button type="button" onClick={saveBoardToAccount} title={`${boardExpiryLabel}. Save it to your account to keep it.`}
+                style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: "transparent", color: topBar.muted, fontFamily: "monospace", fontSize: 10, cursor: "pointer", whiteSpace: "nowrap" }}
+              >
+                Save to account
+              </button>
+            )}
             <div style={{ position: "relative" }}>
               <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen, topBar)}><GearIcon size={topBar.icon} /></button>
               {boardSettingsOpen && (
@@ -24414,43 +24599,17 @@ function Board2Editor({
             </button>
             {isBoardOwner && <button
               type="button"
-              aria-label={chromeHidden ? "Open video editor" : "Close video editor"}
-              aria-pressed={!chromeHidden}
-              title={chromeHidden ? "Open the video editor for the board centered on screen" : "Close the video editor"}
-              onClick={chromeHidden ? restoreChromeForCenteredBoard : onToggleChrome}
-              style={{ ...topBarIconButton(!chromeHidden, topBar), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? topBar.muted : "#2a2a2a" }}
+              aria-label="Close video editor"
+              aria-pressed
+              title="Close the video editor"
+              onClick={onToggleChrome}
+              style={{ ...topBarIconButton(true, topBar), background: "#c8f135", color: "#2a2a2a" }}
             >
-              <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? topBar.background : "#c8f135"} size={chromeHidden ? 20 : 19} />
+              <ClapperboardIcon open stripe="#c8f135" size={19} />
             </button>}
           </div>
         </div>
       )}
-      {!viewOnly && joinCode && joinAnonymous && (() => {
-        const msLeft = joinExpiresAt ? Date.parse(joinExpiresAt) - Date.now() : NaN;
-        const daysLeft = Number.isFinite(msLeft) ? Math.ceil(msLeft / 86_400_000) : null;
-        const expiry = daysLeft === null ? "soon" : daysLeft <= 1 ? (msLeft < 86_400_000 ? "in less than a day" : "in 1 day") : `in ${daysLeft} days`;
-        return (
-          <div role="status" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "6px max(10px, env(safe-area-inset-right)) 6px max(10px, env(safe-area-inset-left))", background: "#ffe5a8", borderBottom: "1.5px solid #2a2a2a", color: "#2a2a2a", fontFamily: "monospace", fontSize: 11, position: "relative", zIndex: 440 }}>
-            <span style={{ flex: 1, minWidth: 200 }}>
-              This board expires {expiry} — {joinOwnerToken ? "create an account to save it permanently." : "only the person who created it can save it permanently."}
-            </span>
-            {joinOwnerToken && (
-              <button
-                type="button"
-                onClick={() => {
-                  // Signed in already (an earlier claim failed): retry. Otherwise sign in and come
-                  // back to this board, where the claim effect saves it.
-                  if (session?.user?.email) void claimCreatedBoard();
-                  else void signIn("google", { callbackUrl: `/board2?join=${joinCode}` });
-                }}
-                style={{ ...sketchButton, padding: "4px 10px", minHeight: isMobile ? 44 : undefined, fontSize: 11, background: "#c8f135", fontWeight: 700 }}
-              >
-                Save to account
-              </button>
-            )}
-          </div>
-        );
-      })()}
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (
@@ -24802,11 +24961,11 @@ function Board2Editor({
                 const count = presencePeople.length;
                 const label = `${count} ${count === 1 ? "person" : "people"} on this board (including you)`;
                 return (
-                  <div role="img" aria-label={label} title={label} data-presence-count={count} style={{ position: "absolute", top: 10, right: "max(10px, env(safe-area-inset-right))", zIndex: 250, display: "flex", alignItems: "center", gap: 5, padding: "6px 9px", borderRadius: 999, background: "rgba(255,253,245,0.88)", boxShadow: "0 1px 4px rgba(42,42,42,0.18)", pointerEvents: "none" }}>
-                    {presencePeople.slice(0, PRESENCE_MAX_DOTS).map((token, index) => (
-                      <span key={token} data-presence-dot style={{ width: 12, height: 12, borderRadius: "50%", background: presenceColor(token), boxShadow: index === 0 ? "0 0 0 2px #fffdf5, 0 0 0 3.5px #2a2a2a" : "0 0 0 2px #fffdf5", marginRight: index === 0 ? 3 : 0 }} />
+                  <div role="img" aria-label={label} title={label} data-presence-count={count} className={`${shellStyles.theme} ${shellStyles.presence}`}>
+                    {presencePeople.slice(0, PRESENCE_MAX_DOTS).map((token) => (
+                      <span key={token} data-presence-dot className={shellStyles.presenceDot} style={{ background: presenceColor(token) }} />
                     ))}
-                    {count > PRESENCE_MAX_DOTS && <span style={{ marginLeft: 2, fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: "#2a2a2a" }}>+{count - PRESENCE_MAX_DOTS}</span>}
+                    {count > PRESENCE_MAX_DOTS && <span>+{count - PRESENCE_MAX_DOTS}</span>}
                   </div>
                 );
               })()}
@@ -24816,24 +24975,25 @@ function Board2Editor({
               {boardViewEditable && boardAddPrompt && (() => {
                 // Opens just above the tapped point (below it near the top edge), kept inside the board area.
                 const container = boardContainerRef.current;
-                const width = 196, height = 56;
+                const width = 300, height = 58;
                 const maxX = (container?.clientWidth ?? 0) - width - 8;
                 const left = Math.max(8, Math.min(boardAddPrompt.x - width / 2, maxX));
                 const top = boardAddPrompt.y - height - 14 < 8 ? boardAddPrompt.y + 14 : boardAddPrompt.y - height - 14;
-                const choice: React.CSSProperties = { flex: 1, minWidth: 44, minHeight: 44, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: "1.5px solid #2a2a2a", borderRadius: 8, background: "#fffdf5", color: "#2a2a2a", fontFamily: "monospace", fontSize: 13, fontWeight: 700, cursor: "pointer", touchAction: "manipulation" };
                 return (
                   <>
-                    <div aria-hidden="true" style={{ position: "absolute", left: boardAddPrompt.x - 5, top: boardAddPrompt.y - 5, width: 10, height: 10, borderRadius: "50%", background: "#ff5e3a", boxShadow: "0 0 0 3px rgba(255,94,58,.25)", zIndex: 260, pointerEvents: "none" }} />
+                    <div aria-hidden="true" className={`${shellStyles.theme} ${shellStyles.addMarker}`} style={{ left: boardAddPrompt.x, top: boardAddPrompt.y }} />
                     <div
                       role="menu"
                       aria-label="Add to the board here"
                       data-board-add-prompt
+                      className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.addMenu}`}
                       onPointerDown={(event) => event.stopPropagation()}
                       onKeyDown={(event) => { if (event.key === "Escape") setBoardAddPrompt(null); }}
-                      style={{ position: "absolute", left, top, width, height, zIndex: 261, display: "flex", gap: 6, padding: 6, boxSizing: "border-box", background: "#2a2a2a", borderRadius: 12, boxShadow: "0 6px 20px rgba(42,42,42,.3)" }}
+                      style={{ left, top, width, height, boxSizing: "border-box" }}
                     >
-                      <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} style={choice}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>
-                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} style={choice}><span aria-hidden="true">🖼</span>Image</button>
+                      <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>
+                      <button type="button" role="menuitem" onClick={addStickyFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 2, background: stickyColor, boxShadow: "inset 0 0 0 1px rgba(42,42,42,.25)" }} />Sticky</button>
+                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true">🖼</span>Image</button>
                     </div>
                   </>
                 );
@@ -25216,7 +25376,7 @@ function Board2Editor({
                         pointerEvents: annotationTool === "pointer" || isEditing ? "auto" : "none",
                       }}
                       onDoubleClick={(e) => {
-                        if (ann.type === "text" && annotationTool === "pointer" && canEditBoardItem(ann)) {
+                        if ((ann.type === "text" || ann.type === "sticky") && annotationTool === "pointer" && canEditBoardItem(ann)) {
                           e.stopPropagation();
                           setEditingAnnotationId(ann.id);
                           setEditingAnnotationText(ann.text ?? "");
@@ -25280,6 +25440,81 @@ function Board2Editor({
                             whiteSpace: "pre-wrap",
                           }}
                         />
+                      )}
+                      {ann.type === "sticky" && (() => {
+                        const box = stickyNoteTextBox(ann);
+                        const pad = (ann.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
+                        const text: React.CSSProperties = {
+                          fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
+                          fontSize: (ann.fontSize ?? 80) * boardZoom,
+                          fontWeight: ann.fontWeight ?? "normal",
+                          color: ann.color || STICKY_NOTE_INK,
+                          lineHeight: ANNOTATION_LINE_HEIGHT,
+                        };
+                        return (
+                          <div data-sticky-note style={{
+                            position: "absolute", inset: 0, boxSizing: "border-box", padding: pad, overflow: "hidden",
+                            background: ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR,
+                            boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
+                            pointerEvents: isEditing ? "auto" : "none", userSelect: "none",
+                          }}>
+                            {isEditing ? (
+                              <textarea
+                                ref={(el) => { if (isEditing) editingTextareaRef.current = el; }}
+                                aria-label="Sticky note text"
+                                placeholder="Write a note…"
+                                value={editingAnnotationText}
+                                onChange={(e) => setEditingAnnotationText(e.target.value)}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                // Reopening a note continues its text rather than starting before it.
+                                onFocus={(e) => { const end = e.currentTarget.value.length; e.currentTarget.setSelectionRange(end, end); }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextEdit(ann.id); }
+                                  else if (e.key === "Escape") { if (!ann.text) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
+                                }}
+                                onBlur={() => commitTextEdit(ann.id)}
+                                style={{
+                                  ...text,
+                                  // The note's full height, so commitTextEdit's scrollHeight is the height the note needs.
+                                  position: "absolute", inset: 0, width: "100%", height: "100%", boxSizing: "border-box", padding: pad,
+                                  background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflow: "hidden",
+                                }}
+                              />
+                            ) : ann.text ? (
+                              <div style={text}>
+                                {annotationLinesForEditor(box).map((line, index) => (
+                                  <span key={index} style={{ display: "block", whiteSpace: "pre", height: `${ANNOTATION_LINE_HEIGHT}em` }}>{line || "\u00a0"}</span>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })()}
+                      {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
+                      {ann.type === "sticky" && (showHandles || isEditing) && canEditBoardItem(ann) && (
+                        <div
+                          role="radiogroup"
+                          aria-label="Note color"
+                          data-sticky-colors
+                          onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                          style={{ position: "absolute", left: "50%", top: `calc(100% + ${isMobile ? 14 : 10}px)`, transform: "translateX(-50%)", zIndex: 25, display: "flex", gap: isMobile ? 2 : 6, padding: isMobile ? 2 : 6, borderRadius: 999, background: "#fff", boxShadow: "0 4px 14px rgba(42,42,42,.18)", touchAction: "manipulation" }}
+                        >
+                          {STICKY_NOTE_COLORS.map(({ color, name }) => {
+                            const checked = (ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR) === color;
+                            return (
+                              <button
+                                key={color}
+                                type="button"
+                                role="radio"
+                                aria-checked={checked}
+                                aria-label={name}
+                                title={name}
+                                onClick={(e) => { e.stopPropagation(); setStickyNoteColor(ann.id, color); }}
+                                style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
+                              />
+                            );
+                          })}
+                        </div>
                       )}
                       {/* Resize handles */}
                       {showHandles && (
@@ -26910,7 +27145,7 @@ function Board2Editor({
               if (selectedAnnotation) return (
                 <>
                   <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700 }}>
-                    {selectedAnnotation.type === "text" ? "T Text" : selectedAnnotation.type === "arrow" ? "↗ Arrow" : selectedAnnotation.type === "circle" ? "○ Circle" : selectedAnnotation.type === "highlight" ? "▭ Highlight" : selectedAnnotation.type === "pen" ? "✏ Pen" : `${selectedAnnotation.emoji ?? "😀"} Emoji`}
+                    {selectedAnnotation.type === "text" ? "T Text" : selectedAnnotation.type === "arrow" ? "↗ Arrow" : selectedAnnotation.type === "circle" ? "○ Circle" : selectedAnnotation.type === "highlight" ? "▭ Highlight" : selectedAnnotation.type === "pen" ? "✏ Pen" : selectedAnnotation.type === "sticky" ? "▢ Sticky note" : `${selectedAnnotation.emoji ?? "😀"} Emoji`}
                   </div>
                   {(selectedAnnotation.type === "text" || selectedAnnotation.type === "emoji") && (
                     <div>
@@ -28580,8 +28815,11 @@ function Board2Editor({
         </div>
       )}
 
-      {/* Toast */}
-      {toast && (
+      {/* Toast: the app shell's in board view, the editor's own otherwise */}
+      {toast && chromeHidden && !viewOnly && (
+        <div role="status" className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.toast}`}>{toast}</div>
+      )}
+      {toast && !(chromeHidden && !viewOnly) && (
         <div style={{ position: "fixed", bottom: viewOnly ? 84 : 24, left: "50%", transform: "translateX(-50%)", background: "#2a2a2a", color: "#c8f135", fontFamily: "monospace", fontSize: 11, padding: "8px 16px", border: "1.5px solid #c8f135", boxShadow: "2px 2px 0 #c8f135", zIndex: 9999, pointerEvents: "none", whiteSpace: "nowrap" }}>
           {toast}
         </div>
@@ -28837,33 +29075,14 @@ function presenceColor(token: string): string {
   return PRESENCE_COLORS[(hash >>> 0) % PRESENCE_COLORS.length];
 }
 
-// Top bar palettes. The board view keeps its dark bar; in the video editor the bar takes the
-// editor's own look — the cream panel surface and hairline borders of the side panels, with
-// charcoal ink at reduced contrast — and shrinks so it reads as part of the editor.
+// The video editor's top bar takes the editor's own look — the cream panel surface and hairline
+// borders of the side panels, with charcoal ink at reduced contrast — and is compact so it reads as
+// part of the editor. (Board view uses the app shell's header instead.)
 type TopBarTheme = {
   height: number; button: number; icon: number;
   background: string; borderBottom: string; ink: string; muted: string;
   activeBg: string; activeBorder: string; pillBorder: string; pillBg: string; dotRing: string;
 };
-// Blend two #rrggbb colors; `amount` is the share of `b`.
-function mixHexColors(a: string, b: string, amount: number): string {
-  const channel = (hex: string, index: number) => parseInt(hex.slice(1 + index * 2, 3 + index * 2), 16);
-  if (!/^#[0-9a-f]{6}$/i.test(a) || !/^#[0-9a-f]{6}$/i.test(b)) return b;
-  return `#${[0, 1, 2].map((index) => Math.round(channel(a, index) * (1 - amount) + channel(b, index) * amount).toString(16).padStart(2, "0")).join("")}`;
-}
-
-// Board view (editor closed): a barely-there strip in a lightened tint of the board's own color,
-// so it reads as part of the parchment. Solid rather than translucent so the clapperboard's
-// stripes, cut out in the bar color, line up.
-function boardTopBarTheme(boardColor: string): TopBarTheme {
-  const background = mixHexColors(boardColor, "#fffdf5", 0.45);
-  return {
-    height: 36, button: 28, icon: 16,
-    background, borderBottom: "1px solid rgba(42,42,42,0.12)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.6)",
-    activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
-    pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: background,
-  };
-}
 const EDITOR_TOP_BAR: TopBarTheme = {
   height: 34, button: 26, icon: 15,
   background: "rgba(255,253,245,0.65)", borderBottom: "1.5px solid rgba(42,42,42,0.15)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.55)",
@@ -28897,14 +29116,6 @@ function topBarIconButton(active: boolean, theme: TopBarTheme): React.CSSPropert
     background: active ? theme.activeBg : "transparent",
     color: active ? theme.ink : theme.muted,
   };
-}
-
-function HomeIcon({ size = 18 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" />
-    </svg>
-  );
 }
 
 function GearIcon({ size = 18 }: { size?: number }) {
