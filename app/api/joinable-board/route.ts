@@ -4,7 +4,8 @@ import { NextResponse } from "next/server";
 import { authOptions } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
 import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
-import { joinableBoardError, joinTokenHash, unexpiredBoardFilter } from "@/lib/joinable-board-server";
+import { joinableBoardError, joinTokenHash, participantIdFromToken, unexpiredBoardFilter } from "@/lib/joinable-board-server";
+import { checkJoinerUpdate } from "@/lib/joinable-board-permissions";
 
 const active = () => new Date().toISOString();
 
@@ -34,19 +35,39 @@ export async function GET(request: Request) {
     const { data, error } = await getSupabase().from("joinable_boards").select("code,state,version,expires_at,owner_email").eq("code", code).eq("active", true).or(unexpiredBoardFilter()).maybeSingle();
     if (error) throw error;
     if (!data) return NextResponse.json({ error: "That board code is invalid or no longer active." }, { status: 404 });
-    // Participants learn only whether the board is anonymous, never who owns it.
+    // Participants learn only whether the board is anonymous and whether they own it, never who does.
     const { owner_email: ownerEmail, ...board } = data;
-    return NextResponse.json({ ...board, anonymous: ownerEmail === null }, { headers: { "Cache-Control": "private, no-store" } });
+    const viewerEmail = ownerEmail ? (await getServerSession(authOptions))?.user?.email : null;
+    return NextResponse.json({ ...board, anonymous: ownerEmail === null, owner: !!viewerEmail && viewerEmail === ownerEmail }, { headers: { "Cache-Control": "private, no-store" } });
   } catch (error) { return joinableBoardError(error); }
 }
 
+// Owners (owner token, or the signed-in owning account) may save anything. Everyone else is a
+// joiner: checkJoinerUpdate rejects changes to board settings or to other people's items, and
+// what's stored keeps everyone else's items exactly as they were.
 export async function PATCH(request: Request) {
   try {
-    const body = await request.json() as { code?: string; state?: JoinableBoardState; version?: number };
+    const body = await request.json() as { code?: string; state?: JoinableBoardState; version?: number; ownerToken?: string; participantToken?: string };
     const code = normalizeJoinCode(body.code);
     if (code.length !== 6 || !body.state || typeof body.state !== "object") return NextResponse.json({ error: "Invalid board update." }, { status: 400 });
-    const nextVersion = Math.max(1, Math.floor(Number(body.version) || 0) + 1);
-    const { data, error } = await getSupabase().from("joinable_boards").update({ state: body.state, version: nextVersion, updated_at: active() }).eq("code", code).eq("active", true).or(unexpiredBoardFilter()).lte("version", Math.floor(Number(body.version) || 0)).select("version").maybeSingle();
+    const baseVersion = Math.floor(Number(body.version) || 0);
+    const supabase = getSupabase();
+    const { data: board, error: readError } = await supabase.from("joinable_boards").select("id,state,version,owner_email,owner_token_hash").eq("code", code).eq("active", true).or(unexpiredBoardFilter()).maybeSingle();
+    if (readError) throw readError;
+    if (!board) return NextResponse.json({ error: "That board is no longer joinable." }, { status: 404 });
+    if (baseVersion !== board.version) return NextResponse.json({ conflict: true }, { status: 409 });
+    const ownerByToken = typeof body.ownerToken === "string" && body.ownerToken.length > 0 && joinTokenHash(body.ownerToken) === board.owner_token_hash;
+    const ownerByAccount = !ownerByToken && board.owner_email !== null && (await getServerSession(authOptions))?.user?.email === board.owner_email;
+    let state = body.state;
+    if (!ownerByToken && !ownerByAccount) {
+      const participantId = participantIdFromToken(body.participantToken);
+      if (!participantId) return NextResponse.json({ error: "Missing participant identity.", forbidden: true }, { status: 403 });
+      const check = checkJoinerUpdate((board.state ?? {}) as JoinableBoardState, body.state, participantId);
+      if (!check.ok) return NextResponse.json({ error: check.error, forbidden: true }, { status: 403 });
+      state = check.state;
+    }
+    // Only applies if nobody saved since this board was read.
+    const { data, error } = await supabase.from("joinable_boards").update({ state, version: board.version + 1, updated_at: active() }).eq("id", board.id).eq("version", board.version).select("version").maybeSingle();
     if (error) throw error;
     if (!data) return NextResponse.json({ conflict: true }, { status: 409 });
     return NextResponse.json(data);

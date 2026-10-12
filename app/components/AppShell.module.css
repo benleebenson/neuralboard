@@ -67,22 +67,9 @@
 .sectionTitle{margin:0 0 16px;color:var(--section);font-size:26px;font-weight:600;line-height:1.2}
 .caption{margin:0;color:var(--caption);font-size:13px;line-height:1.4}
 
-/* Home: featured hero */
-.hero{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);align-items:center;gap:40px;margin-bottom:48px}
-.heroImage{position:relative;display:block;aspect-ratio:16/9;overflow:hidden;border-radius:var(--radius-hero);background:var(--tint);box-shadow:0 12px 32px rgba(47,53,51,.12)}
-.heroImage img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transition:transform .3s ease}
-.heroImage:hover img{transform:scale(1.02)}
-.heroImage:focus-visible{outline:3px solid var(--section);outline-offset:3px}
-.heroText{display:flex;flex-direction:column;gap:12px;min-width:0}
-.eyebrow{margin:0;color:var(--link);font-size:13px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase}
-.heroTitle{margin:0;color:var(--ink);font-size:40px;font-weight:700;line-height:1.12;overflow-wrap:anywhere}
-.heroActions{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px}
-
-/* Home: horizontal rows */
-.rowSection{margin-bottom:40px}
-.row{display:flex;gap:20px;margin:0 calc(-1 * var(--gutter));padding:4px var(--gutter) 8px;overflow-x:auto;scroll-snap-type:x proximity;scroll-padding-inline:var(--gutter);scrollbar-width:none}
-.row::-webkit-scrollbar{display:none}
-.card{flex:0 0 260px;display:flex;flex-direction:column;gap:10px;scroll-snap-align:start;color:var(--ink);text-decoration:none}
+/* Home: every public board in one uniform grid */
+.feedGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px 24px;margin:0;padding:0;list-style:none}
+.card{display:flex;flex-direction:column;gap:10px;min-width:0;color:var(--ink);text-decoration:none}
 .card:focus-visible{outline:none}
 .card:focus-visible .thumb{outline:3px solid var(--section);outline-offset:3px}
 .card:hover .thumb img{transform:scale(1.03)}
@@ -151,8 +138,7 @@
 .tab.createTab:hover{color:var(--on-gradient);transform:translateY(-1px)}
 
 @media(max-width:900px){
-  .hero{grid-template-columns:1fr;gap:20px}
-  .heroTitle{font-size:32px}
+  .feedGrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:24px 16px}
 }
 @media(max-width:600px){
   .shell{--gutter:16px}
@@ -161,21 +147,35 @@
   .search + .headerActions{margin-left:auto}
   .brand{font-size:18px}
   .main{padding-top:24px}
-  .heroTitle{font-size:28px}
-  .card{flex-basis:220px}
   .boardGrid{grid-template-columns:1fr}
   .identity{gap:16px}
   .profileName{font-size:24px}
 }
 
-/* Home: join a board by code */
-.joinCard{max-width:600px;margin:0 0 32px;padding:22px 24px;border:1px solid var(--hairline);border-radius:var(--radius-card);background:var(--ground);display:grid;gap:12px}
-.joinTitle{margin:0;color:var(--ink);font-size:20px;font-weight:600;line-height:1.3}
+/* Join overlay: a centered dialog in front of the Home grid, which stays visible behind it */
+.joinBackdrop{position:fixed;inset:0;z-index:50;display:grid;grid-template-columns:minmax(0,1fr);place-items:center;overflow-y:auto;padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom));background:rgba(255,255,255,.5);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.joinCard{position:relative;width:min(460px,100%);padding:32px 28px 26px;border:1px solid var(--hairline);border-radius:var(--radius-hero);background:var(--ground);box-shadow:0 24px 60px rgba(47,53,51,.22);display:grid;grid-template-columns:minmax(0,1fr);gap:14px}
+.joinClose{position:absolute;top:10px;right:10px;display:grid;place-items:center;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--icon-muted);cursor:pointer}
+.joinClose:hover{background:var(--tint);color:var(--ink)}
+.joinClose:focus-visible{outline:2px solid var(--section);outline-offset:2px}
+.joinClose svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
+.joinTitle{margin:0;padding-right:40px;color:var(--ink);font-size:26px;font-weight:700;line-height:1.2}
+.joinLead{margin:-6px 0 4px;color:var(--body);font-size:15px}
 .joinForm{display:flex;gap:10px;flex-wrap:wrap}
-.joinInput{flex:1;min-width:160px;min-height:44px;padding:0 18px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);color:var(--ink);font:600 18px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;text-transform:uppercase}
-.joinInput:focus-visible{outline:2px solid var(--section);outline-offset:2px}
+/* 24px text: large to read and type, and over 16px so iOS doesn't zoom on focus. */
+.joinInput{flex:1 1 200px;width:100%;min-width:0;height:60px;padding:0 20px;border:2px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);color:var(--ink);font:700 24px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:6px;text-align:center;text-transform:uppercase}
+.joinInput::placeholder{color:#C3CBC8}
+.joinInput:focus-visible{outline:none;border-color:var(--section)}
+.joinForm .primaryButton{flex:0 0 auto;height:60px;padding:0 30px;font-size:17px}
 .joinCard .primaryButton:disabled{opacity:.5;cursor:not-allowed}
 .joinCard .error,.joinCard .caption{margin:0}
+.inlineLink{padding:0;border:0;background:none;color:var(--link);font:inherit;font-weight:600;text-decoration:underline;text-underline-offset:3px;cursor:pointer}
 .recentBoards{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
-.recentBoard{padding:4px 12px;border:1px solid var(--hairline);border-radius:var(--radius-pill);color:var(--ink);font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px;text-decoration:none}
+.recentBoard{display:inline-flex;align-items:center;min-height:36px;padding:0 12px;border:1px solid var(--hairline);border-radius:var(--radius-pill);color:var(--ink);font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px;text-decoration:none}
 .recentBoard:hover{background:var(--tint)}
+@media(max-width:560px){
+  .feedGrid{grid-template-columns:1fr}
+  .joinCard{padding:28px 20px 22px}
+  .joinTitle{font-size:22px}
+  .joinForm .primaryButton{flex:1 1 100%}
+}

@@ -17,6 +17,10 @@ import { shellFont } from "./shell-font";
 // right away. Signed out, that's an anonymous board kept for ANONYMOUS_BOARD_TTL_DAYS.
 const CREATE_JOINABLE_URL = "/board2?create=joinable&mobileEditor=1";
 
+// Dismissing the join overlay keeps it closed for the rest of this tab's visit; the header's
+// "Join with code" brings it back.
+const JOIN_OVERLAY_DISMISSED_KEY = "nb_join_overlay_dismissed";
+
 function tabFromLocation(): ShellTab {
   return new URLSearchParams(window.location.search).get("tab") === "profile" ? "profile" : "home";
 }
@@ -62,6 +66,18 @@ export function AppShell() {
   }, []);
 
   const [query, setQuery] = useState("");
+  // Null until read after hydration so the overlay never flashes for someone who dismissed it.
+  const [joinOpen, setJoinOpen] = useState<boolean | null>(null);
+  useEffect(() => {
+    let dismissed = false;
+    try { dismissed = window.sessionStorage.getItem(JOIN_OVERLAY_DISMISSED_KEY) === "1"; } catch {}
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sessionStorage is read after hydration
+    setJoinOpen(!dismissed && tabFromLocation() === "home");
+  }, []);
+  const closeJoin = useCallback(() => {
+    setJoinOpen(false);
+    try { window.sessionStorage.setItem(JOIN_OVERLAY_DISMISSED_KEY, "1"); } catch {}
+  }, []);
 
   if (forwarding) return <main className={`${styles.shell} ${shellFont.variable}`} />;
 
@@ -80,7 +96,7 @@ export function AppShell() {
             </label>
           )}
           <div className={styles.headerActions}>
-            {tab === "profile" && <a className={styles.outlineButton} href="/public">Join with code</a>}
+            {tab !== null && <button type="button" className={styles.outlineButton} onClick={() => setJoinOpen(true)}>Join with code</button>}
             {user?.email ? (
               tab === "home" ? (
                 <button type="button" className={styles.avatarButton} aria-label="Your profile" title="Your profile" onClick={() => selectTab("profile")}>
@@ -99,6 +115,8 @@ export function AppShell() {
       <main className={styles.main}>
         {tab === "home" ? <HomeView query={query} onCreate={createBoard} /> : tab === "profile" ? <ProfileView userLabel={userLabel} onCreate={createBoard} /> : null}
       </main>
+      {/* Shown on arrival at Home (and from "Join with code" anywhere), in front of the boards. */}
+      {joinOpen && tab !== null && <JoinOverlay onClose={closeJoin} onCreate={createBoard} />}
 
       <nav className={styles.tabBar} aria-label="Neural Board">
         <button type="button" className={styles.tab} aria-label="Home" title="Home" aria-current={tab === "home" ? "page" : undefined} onClick={() => selectTab("home")}>
@@ -117,12 +135,17 @@ export function AppShell() {
 
 const viewUrl = (id: string) => `/board2?view=${id}`;
 
-function JoinBoardCard() {
+function JoinOverlay({ onClose, onCreate }: { onClose: () => void; onCreate: () => void }) {
   const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [checking, setChecking] = useState(false);
   // Boards made on this device that haven't expired, newest first, for one-tap return.
   const [recent, setRecent] = useState<Array<{ code: string; expiresAt: string | null }>>([]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   useEffect(() => {
     const now = Date.now();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is read after hydration
@@ -150,10 +173,14 @@ function JoinBoardCard() {
   }
 
   return (
-    <section className={styles.joinCard} aria-labelledby="join-board-title">
+    <div className={styles.joinBackdrop} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className={styles.joinCard} role="dialog" aria-modal="true" aria-labelledby="join-board-title">
+      <button type="button" className={styles.joinClose} aria-label="Close" title="Close" onClick={onClose}><CloseIcon /></button>
       <h2 id="join-board-title" className={styles.joinTitle}>Join a board</h2>
+      <p className={styles.joinLead}>Type the code shown on the board.</p>
       <form className={styles.joinForm} onSubmit={join}>
         <input
+          autoFocus
           className={styles.joinInput}
           inputMode="text"
           autoCapitalize="characters"
@@ -176,8 +203,11 @@ function JoinBoardCard() {
           ))}
         </div>
       )}
-      <p className={styles.caption}>New boards don’t need an account. Signed out, they’re kept for {ANONYMOUS_BOARD_TTL_DAYS} days unless you save them to an account.</p>
+      <p className={styles.caption}>
+        Or <button type="button" className={styles.inlineLink} onClick={onCreate}>start a new board</button>. No account needed: signed out, boards are kept for {ANONYMOUS_BOARD_TTL_DAYS} days unless you save them to an account.
+      </p>
     </section>
+    </div>
   );
 }
 
@@ -193,57 +223,31 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
     return () => { cancelled = true; };
   }, []);
 
-  const [copiedId, setCopiedId] = useState<string | null>(null);
-  const copyLink = (id: string) => {
-    void navigator.clipboard.writeText(new URL(viewUrl(id), window.location.origin).href).then(() => setCopiedId(id), () => {});
-  };
-
   const needle = query.trim().toLowerCase();
   const boards = feed.kind === "ready" ? feed.boards.filter((board) => !needle || board.title.toLowerCase().includes(needle)) : [];
-  // The feed arrives newest first, so the featured board is the most recent publication.
-  const [featured, ...rest] = boards;
 
   return (
     <>
       <h1 className={styles.srOnly}>Public boards</h1>
-      <JoinBoardCard />
       {feed.kind === "loading" ? (
         <section className={styles.empty}>Loading boards…</section>
-      ) : feed.kind === "ready" && feed.boards.length > 0 && !featured ? (
+      ) : boards.length > 0 ? (
+        // Every board is equal: one grid, newest first, nothing featured.
+        <ul className={styles.feedGrid}>
+          {boards.map((board) => (
+            <li key={board.id}>
+              <a className={styles.card} href={viewUrl(board.id)} aria-label={`View ${board.title}`}>
+                <span className={styles.thumb}>
+                  {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
+                  <img src={`/api/published-boards/${board.id}/preview`} alt="" loading="lazy" />
+                </span>
+                <span className={styles.cardTitle}>{board.title}</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      ) : feed.kind === "ready" && feed.boards.length > 0 ? (
         <section className={styles.empty}><p className={styles.emptyHeading}>No public boards match “{query.trim()}”.</p></section>
-      ) : featured ? (
-        <>
-          <section className={styles.hero}>
-            <a className={styles.heroImage} href={viewUrl(featured.id)} aria-label={`Watch ${featured.title}`}>
-              {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
-              <img src={`/api/published-boards/${featured.id}/preview`} alt="" />
-            </a>
-            <div className={styles.heroText}>
-              <p className={styles.eyebrow}>Featured</p>
-              <h2 className={styles.heroTitle}>{featured.title}</h2>
-              <div className={styles.heroActions}>
-                <a className={styles.gradientButton} href={viewUrl(featured.id)}><PlayIcon />Watch</a>
-                <button type="button" className={styles.outlineButton} onClick={() => copyLink(featured.id)}>{copiedId === featured.id ? "Link copied" : "Copy link"}</button>
-              </div>
-            </div>
-          </section>
-          {rest.length > 0 && (
-            <section className={styles.rowSection}>
-              <h2 className={styles.sectionTitle}>New on the board</h2>
-              <div className={styles.row}>
-                {rest.map((board) => (
-                  <a key={board.id} className={styles.card} href={viewUrl(board.id)} aria-label={`View ${board.title}`}>
-                    <span className={styles.thumb}>
-                      {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
-                      <img src={`/api/published-boards/${board.id}/preview`} alt="" loading="lazy" />
-                    </span>
-                    <span className={styles.cardTitle}>{board.title}</span>
-                  </a>
-                ))}
-              </div>
-            </section>
-          )}
-        </>
       ) : (
         <section className={styles.empty}>
           {feed.kind === "error" && <p role="alert" className={styles.error}>Public boards couldn’t be loaded right now.</p>}
@@ -575,8 +579,8 @@ function LogoMark() {
 function SearchIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4.5 4.5" /></svg>;
 }
-function PlayIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5Z" /></svg>;
+function CloseIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>;
 }
 function HouseIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11 12 3.5l8.5 7.5" /><path d="M5.5 9.5V20h13V9.5" /><path d="M10 20v-5.5h4V20" /></svg>;

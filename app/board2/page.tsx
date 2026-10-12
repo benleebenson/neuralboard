@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
 import { useSession, signIn } from "next-auth/react";
 import Link from "next/link";
 import rough from "roughjs";
@@ -18,7 +18,7 @@ import {
   Muxer as WebMMuxer,
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
+import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
@@ -501,6 +501,7 @@ type Clip = {
   // automated narration draft provenance:
   provenance?: "browserFound";
   sourceAttributionUrl?: string;
+  addedBy?: string;           // joinable boards: participant id of whoever put it on the board (see lib/joinable-board-permissions)
   imageSearchSource?: "google" | "bing" | "openverse" | "library";
   searchQuery?: string;
   imagePlanReason?: string;
@@ -1669,6 +1670,7 @@ function exportStatusTitle(status: OfflineExportStatus | null): string {
 
 type Annotation = {
   id: string;
+  addedBy?: string; // joinable boards: participant id of whoever added it
   type: "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
   boardX: number;
   boardY: number;
@@ -5719,6 +5721,19 @@ type ActiveBoard = BoardWorkspaceStatus & {
   makeJoinable?: boolean;
 };
 
+function isTextDraft(annotation: Annotation): boolean {
+  return annotation.type === "text" && !annotation.text?.trim();
+}
+
+/** Who added each item in a shared board state (undefined: unmarked, i.e. the owner's). */
+function boardItemAuthors(state: JoinableBoardState): ReadonlyMap<string, string | undefined> {
+  const authors = new Map<string, string | undefined>();
+  for (const item of [...(state.clips ?? []), ...(state.annotations ?? [])]) {
+    if (typeof item.id === "string") authors.set(item.id, typeof item.addedBy === "string" ? item.addedBy : undefined);
+  }
+  return authors;
+}
+
 /** Where sign-in returns to: this exact editor URL, so a shared board (?join=) or open board file isn't lost. */
 function currentEditorUrl(): string {
   return `${window.location.pathname}${window.location.search}`;
@@ -5768,6 +5783,10 @@ export default function Board2Page() {
   // Read on the client's first render; the server and hydration pass render a blank shell anyway.
   const [chromeHidden, setChromeHidden] = useState(() => {
     if (typeof window === "undefined") return true;
+    // Shared boards are boards first: a new one (+) and a joined one open on the board, not the
+    // video editor, which the owner can open from the top bar.
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("join") || params.get("create") === "joinable") return true;
     try { return window.localStorage.getItem(EDITOR_OPEN_STORAGE_KEY) !== "1"; } catch { return true; }
   });
   useEffect(() => {
@@ -6064,6 +6083,31 @@ function Board2Editor({
   // (null = permanent). Anonymous boards show the "save to account" banner.
   const [joinAnonymous, setJoinAnonymous] = useState(false);
   const [joinExpiresAt, setJoinExpiresAt] = useState<string | null>(null);
+  // Whether the server recognises this signed-in user as the board's account owner.
+  const [joinServerOwner, setJoinServerOwner] = useState(false);
+  // This browser's identity on shared boards: the secret token goes with every save, its hash
+  // (participantId) marks the items this browser adds.
+  const participantTokenRef = useRef("");
+  const [participantId, setParticipantId] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    participantTokenRef.current = readParticipantToken();
+    void participantIdFor(participantTokenRef.current).then((id) => { if (!cancelled) setParticipantId(id); });
+    return () => { cancelled = true; };
+  }, []);
+  // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
+  const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
+  const boardAddImageInputRef = useRef<HTMLInputElement | null>(null);
+  const boardAddPointRef = useRef<{ x: number; y: number } | null>(null);
+  // Touch pan/pinch preview: the layer the transform goes on, and the view React last rendered
+  // (the transform's starting point) while a preview is showing.
+  const boardGestureLayerRef = useRef<HTMLDivElement | null>(null);
+  const gestureBaseViewRef = useRef<{ zoom: number; pan: { x: number; y: number } } | null>(null);
+  // Who added each item in the server state local edits are based on. Local items carry no mark
+  // of their own until synced back, so the mark comes from here; items not in it are new here.
+  const [joinBaseAuthors, setJoinBaseAuthors] = useState<ReadonlyMap<string, string | undefined>>(() => new Map());
+  const itemAuthor = useCallback((item: { id: string; addedBy?: string }) =>
+    item.addedBy ?? (joinBaseAuthors.has(item.id) ? joinBaseAuthors.get(item.id) : participantId || undefined), [joinBaseAuthors, participantId]);
   const claimAttemptedRef = useRef<string | null>(null);
   const [joinStatus, setJoinStatus] = useState<"idle" | "connecting" | "joined" | "error">("idle");
   const joinVersionRef = useRef(0);
@@ -6074,6 +6118,14 @@ function Board2Editor({
   const joinBaseRef = useRef<JoinableBoardState | null>(null);
   const joinableSnapshotRef = useRef<JoinableBoardState | null>(null);
   const joinConflictCountRef = useRef(0);
+  // Real-time sync: the board's Realtime channel (shared with presence), whether it's connected,
+  // and the pull to run when another participant announces a save.
+  const joinChannelRef = useRef<RealtimeChannel | null>(null);
+  const [joinRealtimeLive, setJoinRealtimeLive] = useState(false);
+  const joinPullRef = useRef<(() => void) | null>(null);
+  const joinWriteInFlightRef = useRef(false);
+  // Bumped when a save finishes, so anything edited meanwhile goes out next.
+  const [joinWriteTick, setJoinWriteTick] = useState(0);
 
   const [clips, setClips] = useState<Clip[]>([]);
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
@@ -6231,7 +6283,8 @@ function Board2Editor({
   const [isFullscreen, setIsFullscreen] = useState(false);
   // Anonymous presence: one random token per editor session, never tied to the account.
   const presenceTokenRef = useRef("");
-  const [presencePeers, setPresencePeers] = useState<string[]>([]);
+  // Everyone on this board right now, one presence key per open tab, this tab's key first.
+  const [presencePeople, setPresencePeople] = useState<string[]>([]);
   const [mobileAccountOpen, setMobileAccountOpen] = useState(false);
   const [mobileLongPressClipId, setMobileLongPressClipId] = useState<string | null>(null);
 
@@ -6256,6 +6309,16 @@ function Board2Editor({
 
   // ── Annotations ──
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  // The owner made this board here (owner token), owns it by account, or it isn't shared at all.
+  // Everyone else on a shared board is a joiner: they add to the board but don't control it.
+  const isBoardOwner = !joinCode || !!joinOwnerToken || joinServerOwner;
+  // A joiner can move, edit and delete only what they added (the server enforces the same rule).
+  // Unmarked items not yet synced are new here, so they're theirs too.
+  const canEditBoardItem = (item: { id: string; addedBy?: string }) =>
+    isBoardOwner || (!!participantId && itemAuthor(item) === participantId);
+  // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
+  const boardViewEditable = chromeHidden && !viewOnly;
+  const boardHasContent = annotations.length > 0 || clips.some((clip) => clip.boardX !== undefined);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [selectedAnnotationIds, setSelectedAnnotationIds] = useState<string[]>([]);
   const [annotationTool, setAnnotationTool] = useState<AnnotationTool>("pointer");
@@ -6690,6 +6753,8 @@ function Board2Editor({
     annotationOrigArrowEndX?: number; annotationOrigArrowEndY?: number;
     annotationOrigPoints?: Array<{ x: number; y: number; pressure?: number }>;
     pinchStartDist: number; pinchStartZoom: number; pinchStartPan: { x: number; y: number };
+    /** The two fingers driving a pinch, and their midpoint (container px) when it started. */
+    pinchIds: [number, number]; pinchStartMid: { x: number; y: number };
     longPressTimer: ReturnType<typeof setTimeout> | null;
   }>({
     type: "idle", hitClipId: null, hitAnnotationId: null, hitClipIsSelected: false, hitAnnotationIsSelected: false,
@@ -6698,6 +6763,7 @@ function Board2Editor({
     clipOrigX: 0, clipOrigY: 0,
     annotationOrigX: 0, annotationOrigY: 0,
     pinchStartDist: 1, pinchStartZoom: 0.18, pinchStartPan: { x: 0, y: 0 },
+    pinchIds: [-1, -1], pinchStartMid: { x: 0, y: 0 },
     longPressTimer: null,
   });
   const activeNarrationRef = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -7576,9 +7642,16 @@ function Board2Editor({
   // Lists the asset folders the first time a flash block is selected.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFlashClipId]);
-  const joinableSnapshot = useMemo<JoinableBoardState>(() => ({
-    clips: clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, previewUrl: _previewUrl, thumbnailBlobUrl: _thumbnailBlobUrl, ...clip }) => clip as unknown as Record<string, unknown>),
-    annotations: annotations as unknown as Array<Record<string, unknown>>,
+  const joinableSnapshot = useMemo<JoinableBoardState>(() => {
+    // Items added here since the last sync are marked as this participant's.
+    const mark = <T extends { id: string; addedBy?: string }>(item: T): T => {
+      const addedBy = itemAuthor(item);
+      return addedBy === item.addedBy ? item : { ...item, addedBy };
+    };
+    return {
+    clips: clips.map(({ sourceBlob: _sourceBlob, audioBlob: _audioBlob, previewUrl: _previewUrl, thumbnailBlobUrl: _thumbnailBlobUrl, ...clip }) => mark(clip) as unknown as Record<string, unknown>),
+    // A text box still empty is a draft on this device; it's shared once it has text.
+    annotations: annotations.filter((annotation) => !isTextDraft(annotation)).map(mark) as unknown as Array<Record<string, unknown>>,
     boardDimensions,
     cameraKeyframes: cameraKeyframes as unknown as Array<Record<string, unknown>>,
     characterActions: characterActions as unknown as Array<Record<string, unknown>>,
@@ -7586,7 +7659,9 @@ function Board2Editor({
     showCharacter,
     showCharacter2,
     canvasAspect,
-  }), [annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2]);
+    boardColor,
+    };
+  }, [annotations, boardColor, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, itemAuthor, showCharacter, showCharacter2]);
   const joinableSignature = useMemo(() => stableStringify(joinableSnapshot), [joinableSnapshot]);
   useEffect(() => { joinableSnapshotRef.current = joinableSnapshot; }, [joinableSnapshot]);
 
@@ -7604,10 +7679,15 @@ function Board2Editor({
     joinVersionRef.current = version;
     joinBaseRef.current = serverState;
     joinLastSignatureRef.current = stableStringify(serverState);
+    setJoinBaseAuthors(boardItemAuthors(serverState));
     clipsRef.current = incomingClips;
     setClips(incomingClips);
     setMediaLibrary(incomingClips.filter((clip) => (clip.type === "image" || clip.type === "video") && !!clip.sourceUrl).map((clip) => ({ id: clip.mediaId ?? clip.id, name: clip.name, type: clip.type as "image" | "video", url: clip.sourceUrl, duration: clip.duration })));
-    setAnnotations(Array.isArray(state.annotations) ? state.annotations as unknown as Annotation[] : []);
+    // Keep this device's unshared drafts (empty text boxes, possibly being typed in) through a sync.
+    const incomingAnnotations = Array.isArray(state.annotations) ? state.annotations as unknown as Annotation[] : [];
+    const incomingIds = new Set(incomingAnnotations.map((annotation) => annotation.id));
+    const drafts = annotationsRef.current.filter((annotation) => isTextDraft(annotation) && !incomingIds.has(annotation.id));
+    setAnnotations([...incomingAnnotations, ...drafts]);
     if (state.boardDimensions?.width >= BOARD_W && state.boardDimensions?.height >= BOARD_H) {
       boardDimensionsRef.current = state.boardDimensions;
       setBoardDimensions(state.boardDimensions);
@@ -7617,6 +7697,10 @@ function Board2Editor({
     if (Array.isArray(state.characterActions2)) setCharacterActions2(state.characterActions2 as unknown as CharacterAction[]);
     if (typeof state.showCharacter === "boolean") setShowCharacter(state.showCharacter);
     if (typeof state.showCharacter2 === "boolean") setShowCharacter2(state.showCharacter2);
+    if (typeof state.boardColor === "string" && /^#[0-9a-f]{6}$/i.test(state.boardColor)) {
+      boardColorRef.current = state.boardColor;
+      setBoardColor(state.boardColor);
+    }
     if (state.canvasAspect === "16:9" || state.canvasAspect === "9:16") setCanvasAspect(state.canvasAspect);
   }, []);
 
@@ -7667,19 +7751,23 @@ function Board2Editor({
 
   useEffect(() => {
     if (!joinCode) return;
-    let cancelled = false;
+    let cancelled = false, inFlight = false, again = false;
+    // One pull at a time; a request that arrives meanwhile runs once it finishes.
     const pull = async () => {
+      if (inFlight) { again = true; return; }
+      inFlight = true;
       try {
         const response = await fetch(`/api/joinable-board?code=${joinCode}`, { cache: "no-store" });
-        const result = await response.json() as { state?: JoinableBoardState; version?: number; error?: string; anonymous?: boolean; expires_at?: string | null };
+        const result = await response.json() as { state?: JoinableBoardState; version?: number; error?: string; anonymous?: boolean; owner?: boolean; expires_at?: string | null };
         if (!response.ok) throw new Error(result.error || "The shared board is unavailable.");
         if (!cancelled) {
           setJoinAnonymous(result.anonymous === true);
+          setJoinServerOwner(result.owner === true);
           setJoinExpiresAt(result.expires_at ?? null);
         }
         if (!cancelled && typeof result.version === "number" && result.version > joinVersionRef.current) {
           const incoming = result.state ?? { clips: [], annotations: [], boardDimensions: { width: BOARD_W, height: BOARD_H } };
-          // Edits not yet sent (the write debounce) are merged onto the newer state instead of lost.
+          // Edits not yet sent (the write batch) are merged onto the newer state instead of lost.
           const base = joinBaseRef.current, local = joinableSnapshotRef.current;
           const unsent = base && local && stableStringify(local) !== joinLastSignatureRef.current;
           applyJoinableState(unsent ? mergeJoinableStates(base, local, incoming) : incoming, result.version, incoming);
@@ -7687,26 +7775,53 @@ function Board2Editor({
         if (!cancelled) setJoinStatus("joined");
       } catch (error) {
         if (!cancelled) { setJoinStatus("error"); setToast(error instanceof Error ? error.message : "The shared board is unavailable."); }
+      } finally {
+        inFlight = false;
+        if (again && !cancelled) { again = false; void pull(); }
       }
     };
+    joinPullRef.current = () => { void pull(); };
     void pull();
-    const timer = window.setInterval(() => { void pull(); }, 1200);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [applyJoinableState, joinCode]);
+    // Others' saves arrive through the Realtime nudge (see the channel effect); polling is the
+    // fallback, quick while Realtime is down and a slow safety net while it's up.
+    const timer = window.setInterval(() => { void pull(); }, joinRealtimeLive ? JOIN_POLL_LIVE_MS : JOIN_POLL_FALLBACK_MS);
+    return () => { cancelled = true; window.clearInterval(timer); joinPullRef.current = null; };
+  }, [applyJoinableState, joinCode, joinRealtimeLive]);
 
   useEffect(() => {
-    if (!joinCode || joinStatus !== "joined" || joinableSignature === joinLastSignatureRef.current) return;
-    if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current);
+    if (!joinCode || joinStatus !== "joined" || !participantId || joinableSignature === joinLastSignatureRef.current) return;
+    // Throttled, not debounced, so a drag streams out while it happens: one save at a time, each
+    // sending the latest board; when it finishes, joinWriteTick brings this back for anything newer.
+    if (joinWriteInFlightRef.current || joinWriteTimerRef.current) return;
     joinWriteTimerRef.current = window.setTimeout(async () => {
-      const sent = joinableSnapshot;
+      joinWriteTimerRef.current = null;
+      const sent = joinableSnapshotRef.current;
+      if (!sent) return;
+      const sentSignature = stableStringify(sent);
+      if (sentSignature === joinLastSignatureRef.current) return;
+      joinWriteInFlightRef.current = true;
       try {
-        const response = await fetch("/api/joinable-board", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, version: joinVersionRef.current, state: sent }) });
+        const response = await fetch("/api/joinable-board", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, version: joinVersionRef.current, state: sent, ownerToken: joinOwnerToken || undefined, participantToken: participantTokenRef.current }) });
         if (response.ok) {
           const result = await response.json() as { version: number };
           joinVersionRef.current = result.version;
           joinBaseRef.current = sent;
-          joinLastSignatureRef.current = joinableSignature;
+          setJoinBaseAuthors(boardItemAuthors(sent));
+          joinLastSignatureRef.current = sentSignature;
           joinConflictCountRef.current = 0;
+          // Tell everyone else to pull now. Only the version goes out: the board itself always
+          // comes from the server, which checks every save.
+          void joinChannelRef.current?.send({ type: "broadcast", event: "board-saved", payload: { version: result.version } });
+          return;
+        }
+        if (response.status === 403) {
+          // Not allowed for a joiner (board settings, or someone else's item): undo it here by
+          // going back to the board as stored, and say why.
+          const result = await response.json().catch(() => ({})) as { error?: string };
+          const latestResponse = await fetch(`/api/joinable-board?code=${joinCode}`, { cache: "no-store" });
+          const latest = await latestResponse.json().catch(() => ({})) as { state?: JoinableBoardState; version?: number };
+          if (latestResponse.ok && latest.state && typeof latest.version === "number") applyJoinableState(latest.state, latest.version);
+          setToast(result.error || "Only the board owner can make that change.");
           return;
         }
         if (response.status !== 409) {
@@ -7729,10 +7844,17 @@ function Board2Editor({
       } catch (error) {
         // Unsent changes stay local and go out with the next save.
         setToast(`Your last change wasn't saved to the shared board (${error instanceof Error ? error.message : "network error"}). It will retry with your next edit.`);
+      } finally {
+        joinWriteInFlightRef.current = false;
+        setJoinWriteTick((tick) => tick + 1);
       }
-    }, 450);
-    return () => { if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current); };
-  }, [applyJoinableState, joinCode, joinStatus, joinableSignature, joinableSnapshot]);
+    }, JOIN_WRITE_BATCH_MS);
+  }, [applyJoinableState, joinCode, joinOwnerToken, joinStatus, joinableSignature, joinWriteTick, participantId]);
+  // A pending save belongs to the board it was made on.
+  useEffect(() => () => {
+    if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current);
+    joinWriteTimerRef.current = null;
+  }, [joinCode]);
   // Asset library: fire-and-forget save of every board-placed image/YouTube clip so it can be
   // reused from the Library panel later. A single effect over `clips` (rather than instrumenting
   // every clip-creation call site — manual upload, auto-build, Top 5, Neural Search, YouTube
@@ -7808,8 +7930,9 @@ function Board2Editor({
     document.addEventListener("fullscreenchange", sync);
     return () => document.removeEventListener("fullscreenchange", sync);
   }, []);
-  // Who else is on this board. Only joinable boards can have anyone else on them, and the join
-  // code is the id every participant shares, so it names the channel. Each tab tracks only a
+  // The board's Realtime channel: who else is on it (presence) and "board-saved" nudges that make
+  // everyone pull a new save at once. Only joinable boards can have anyone else on them, and the
+  // join code is the id every participant shares, so it names the channel. Each tab tracks only a
   // random token as its presence key: no name, email or account id.
   useEffect(() => {
     if (!joinCode || viewOnly) return;
@@ -7819,20 +7942,44 @@ function Board2Editor({
     const token = presenceTokenRef.current;
     const channel = supabase.channel(`board:${joinCode}`, { config: { presence: { key: token } } });
     channel
+      .on("broadcast", { event: "board-saved" }, ({ payload }) => {
+        const version = (payload as { version?: unknown } | undefined)?.version;
+        if (typeof version === "number" && version > joinVersionRef.current) joinPullRef.current?.();
+      })
       .on("presence", { event: "sync" }, () => {
-        setPresencePeers(Object.keys(channel.presenceState()).filter((key) => key !== token).sort());
+        const others = Object.keys(channel.presenceState()).filter((key) => key !== token).sort();
+        // Counted only once this tab is itself tracked, so the number never excludes you.
+        setPresencePeople(token in channel.presenceState() ? [token, ...others] : others);
       })
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") void channel.track({});
+        if (status === "SUBSCRIBED") {
+          void channel.track({});
+          setJoinRealtimeLive(true);
+          joinPullRef.current?.(); // catch up on anything missed while disconnected
+        } else {
+          setJoinRealtimeLive(false); // CHANNEL_ERROR, TIMED_OUT or CLOSED: polling takes over
+        }
       });
+    joinChannelRef.current = channel;
     return () => {
+      joinChannelRef.current = null;
+      setJoinRealtimeLive(false);
       void supabase.removeChannel(channel);
-      setPresencePeers([]);
+      setPresencePeople([]);
     };
   }, [joinCode, viewOnly]);
   useEffect(() => { canvasWRef.current = canvasW; canvasHRef.current = canvasH; }, [canvasW, canvasH]);
   useEffect(() => { boardZoomRef.current = boardZoom; }, [boardZoom]);
   useEffect(() => { boardPanRef.current = boardPan; }, [boardPan]);
+  // Once React has rendered the view a touch gesture ended on, drop that gesture's preview transform.
+  useLayoutEffect(() => {
+    const base = gestureBaseViewRef.current;
+    if (!base) return;
+    if (boardZoom === boardZoomRef.current && boardPan.x === boardPanRef.current.x && boardPan.y === boardPanRef.current.y) {
+      gestureBaseViewRef.current = null;
+      if (boardGestureLayerRef.current) boardGestureLayerRef.current.style.transform = "";
+    }
+  }, [boardPan, boardZoom]);
   useEffect(() => {
     if (isWorkspaceActive && (!chromeHidden || activeBoardOnScreen)) return;
     for (const image of [...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()]) image.src = "";
@@ -10246,6 +10393,9 @@ function Board2Editor({
     if (pending) return pending;
     const promise = new Promise<void>((resolve, reject) => {
       const image = new Image();
+      // Remote images (a shared board's Storage links) must load with CORS, or drawing them taints
+      // the export canvas and the encoder refuses its frames. Local blob:/data: URLs don't need it.
+      if (!/^(blob|data):/.test(clip.sourceUrl)) image.crossOrigin = "anonymous";
       image.onload = async () => {
         try {
           await image.decode();
@@ -15337,6 +15487,8 @@ function Board2Editor({
   // ─ Board clip drag ────────────────────────────────────────────────────────
 
   function handleBoardClipPointerDown(e: React.PointerEvent, clip: Clip) {
+    // Someone else's item: not grabbable, so the press falls through to the board (pan in board view).
+    if (!canEditBoardItem(clip)) return;
     if (e.altKey && clip.type !== "customZoom") {
       const point = clientToBoardPoint(e.clientX, e.clientY);
       const focusArea = [...boardEntitiesForDisplay(clipsRef.current)].reverse().find((candidate) =>
@@ -15523,6 +15675,113 @@ function Board2Editor({
     window.addEventListener("pointerup", onUp);
   }
 
+  // A text box being edited commits on blur (see commitTextEdit).
+  function blurBoardTextEditor() {
+    const active = document.activeElement;
+    if (active instanceof HTMLTextAreaElement && boardContainerRef.current?.contains(active)) active.blur();
+  }
+
+  // A click or tap on empty board in board view: if anything is selected (or the prompt is open),
+  // it just clears that; otherwise it offers to add text or an image right there.
+  function handleBoardViewTap(clientX: number, clientY: number) {
+    blurBoardTextEditor();
+    const hadSelection = selectedClipIdsRef.current.length > 0 || selectedAnnotationIdsRef.current.length > 0 || selectedClipId !== null || editingAnnotationId !== null;
+    clearBoardSelection();
+    if (hadSelection || boardAddPrompt) { setBoardAddPrompt(null); return; }
+    const container = boardContainerRef.current;
+    if (!container) return;
+    // Anywhere on screen counts: the board space has no visible edge (on a phone most of the
+    // screen is outside the board's original rectangle), and new items aren't clamped to it.
+    const point = clientToBoardPoint(clientX, clientY);
+    const rect = container.getBoundingClientRect();
+    setBoardAddPrompt({ x: clientX - rect.left, y: clientY - rect.top, boardX: point.x, boardY: point.y });
+  }
+
+  function addTextFromBoardPrompt() {
+    if (!boardAddPrompt) return;
+    // Sized to read at about 28px at the current zoom, starting where the person tapped.
+    const fontSize = Math.round(Math.min(400, Math.max(40, 28 / Math.max(0.05, boardZoomRef.current))));
+    const annotation: Annotation = {
+      id: generateId(), type: "text",
+      boardX: boardAddPrompt.boardX, boardY: boardAddPrompt.boardY - fontSize * 0.6,
+      // About 12 characters wide (~336px on the creator's screen) before wrapping.
+      boardW: fontSize * 12, boardH: fontSize * 1.3,
+      color: annotationColorRef.current,
+      text: "", fontFamily: annotationFontRef.current, fontSize, fontWeight: "normal",
+    };
+    setBoardAddPrompt(null);
+    disarmAnnotationTool();
+    setAnnotations((prev) => [...prev, annotation]);
+    setAnnotationSelection([annotation.id]);
+    setEditingAnnotationId(annotation.id);
+    setEditingAnnotationText("");
+  }
+
+  function addImageFromBoardPrompt() {
+    if (!boardAddPrompt) return;
+    boardAddPointRef.current = { x: boardAddPrompt.boardX, y: boardAddPrompt.boardY };
+    setBoardAddPrompt(null);
+    // Opened inside the tap's handler so mobile browsers allow the file picker.
+    boardAddImageInputRef.current?.click();
+  }
+
+  async function handleBoardPromptImages(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith("image/"));
+    event.target.value = "";
+    const point = boardAddPointRef.current;
+    boardAddPointRef.current = null;
+    if (!point || files.length === 0) return;
+    setToast(files.length === 1 ? `Adding ${files[0].name}…` : `Adding ${files.length} images…`);
+    try {
+      // Several images fan out from the tapped point instead of stacking exactly on top of each other.
+      for (const [index, file] of files.entries()) await ingestMediaFile(file, file.name, { x: point.x + index * 60, y: point.y + index * 60 });
+      setToast(files.length === 1 ? "Image added" : `${files.length} images added`);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not add that image");
+    }
+  }
+
+  // In board view, a press pans the board unless it's on something this person can grab.
+  function isBoardViewPanTarget(target: HTMLElement, container: HTMLElement): boolean {
+    if (target === container || target.dataset.boardSurface !== undefined) return true;
+    const clipId = (target.closest("[data-mbclipid]") as HTMLElement | null)?.dataset.mbclipid;
+    const clip = clipId ? clipsRef.current.find((c) => c.id === clipId) : undefined;
+    if (clip) return !canEditBoardItem(clip);
+    const annotationId = (target.closest("[data-mbannotationid]") as HTMLElement | null)?.dataset.mbannotationid;
+    const annotation = annotationId ? annotationsRef.current.find((a) => a.id === annotationId) : undefined;
+    return !!annotation && !canEditBoardItem(annotation);
+  }
+
+  // Board view (editor closed): dragging empty space pans the board space; a click without a drag
+  // is a tap on the board (see handleBoardViewTap).
+  function handleBoardViewEmptyPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    // preventDefault below also stops the browser moving focus, so finish any text edit by hand.
+    blurBoardTextEditor();
+    e.preventDefault();
+    const pointerId = e.pointerId, startX = e.clientX, startY = e.clientY;
+    const origPan = { ...boardPanRef.current };
+    let moved = false;
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      if (!moved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < BOARD_TOUCH_DRAG_THRESHOLD_PX) return;
+      if (!moved) setBoardAddPrompt(null);
+      moved = true;
+      const np = { x: origPan.x + ev.clientX - startX, y: origPan.y + ev.clientY - startY };
+      boardPanRef.current = np;
+      setBoardPan(np);
+    };
+    const finish = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      if (ev.type === "pointerup" && !moved) handleBoardViewTap(ev.clientX, ev.clientY);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  }
+
   function handleBoardSurfacePointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (e.target !== e.currentTarget) return;
     if (isSpaceDownRef.current || annotationToolRef.current !== "pointer") {
@@ -15595,6 +15854,9 @@ function Board2Editor({
     }
     annotationToolRef.current = "pointer";
     setAnnotationTool("pointer");
+    // In board view, finishing a text leaves nothing selected, so the next tap on the board
+    // offers to add again instead of only deselecting.
+    if (chromeHidden) clearBoardSelection();
   }
 
   function updateSelectedAnnotations(update: (annotation: Annotation) => Annotation) {
@@ -15621,6 +15883,7 @@ function Board2Editor({
   // ─ Annotation drag (pointer tool) ────────────────────────────────────────
 
   function handleAnnotationPointerDown(e: React.PointerEvent, ann: Annotation) {
+    if (!canEditBoardItem(ann)) return;
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -20056,30 +20319,81 @@ function Board2Editor({
 
   // ─── Mobile gesture handlers ──────────────────────────────────────────────
 
+  // ─── Touch gestures on the board ──────────────────────────────────────────
+  // One finger: tap (select / add here), drag a selected item, or pan. Two fingers: pinch-zoom
+  // anchored between them (they also pan). A second finger can land at any point, lifting one hands
+  // back to a one-finger pan, a third is ignored, and pointercancel ends things without a tap.
+  // Pans and pinches are previewed as one CSS transform and committed to state when they end.
+
+  function containerPoint(x: number, y: number): { x: number; y: number } {
+    const rect = boardContainerRef.current?.getBoundingClientRect();
+    return { x: x - (rect?.left ?? 0), y: y - (rect?.top ?? 0) };
+  }
+
+  function startPinch(g: typeof mobileGestureRef.current, pointers: Map<number, { x: number; y: number }>) {
+    const [[idA, a], [idB, b]] = [...pointers.entries()];
+    if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+    g.type = "pinch";
+    g.pinchIds = [idA, idB];
+    g.pinchStartDist = Math.max(Math.hypot(b.x - a.x, b.y - a.y), 1);
+    g.pinchStartMid = containerPoint((a.x + b.x) / 2, (a.y + b.y) / 2);
+    g.pinchStartZoom = boardZoomRef.current;
+    g.pinchStartPan = { ...boardPanRef.current };
+    setBoardAddPrompt(null);
+  }
+
+  function startPanFrom(g: typeof mobileGestureRef.current, point: { x: number; y: number }) {
+    g.type = "pan";
+    g.startX = point.x;
+    g.startY = point.y;
+    g.origPan = { ...boardPanRef.current };
+  }
+
+  // Shows the board at `zoom`/`pan` without re-rendering: the board layer is transformed from
+  // the view React last rendered. Event handlers read boardZoomRef/boardPanRef, which stay live.
+  function previewBoardView(zoom: number, pan: { x: number; y: number }) {
+    const layer = boardGestureLayerRef.current;
+    if (!gestureBaseViewRef.current) gestureBaseViewRef.current = { zoom: boardZoom, pan: boardPan };
+    boardZoomRef.current = zoom;
+    boardPanRef.current = pan;
+    if (!layer) return;
+    const base = gestureBaseViewRef.current;
+    const k = zoom / base.zoom;
+    layer.style.transform = `translate(${pan.x - k * base.pan.x}px, ${pan.y - k * base.pan.y}px) scale(${k})`;
+  }
+
+  // Ends a previewed pan/pinch: the transform comes off in the layout effect after React has
+  // rendered this view, so there's no frame at the old position.
+  function commitBoardView() {
+    if (!gestureBaseViewRef.current) return;
+    setBoardZoom(boardZoomRef.current);
+    setBoardPan({ ...boardPanRef.current });
+  }
+
   function handleMobileBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && mobileBoardPointersRef.current.size === 0)) return;
     e.stopPropagation();
     const pointers = mobileBoardPointersRef.current;
+    const g = mobileGestureRef.current;
+    if (pointers.size >= 2) return; // a third finger doesn't take part
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const g = mobileGestureRef.current;
 
     if (pointers.size === 2) {
-      if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
-      const pts = [...pointers.values()];
-      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-      g.type = "pinch";
-      g.pinchStartDist = Math.max(dist, 1);
-      g.pinchStartZoom = boardZoomRef.current;
-      g.pinchStartPan = { ...boardPanRef.current };
+      // Second finger: whatever the first was doing (deciding, panning, moving an item) becomes a pinch.
+      startPinch(g, pointers);
       return;
     }
 
     const target = e.target as HTMLElement;
     const clipEl = target.closest("[data-mbclipid]");
     const annotationEl = target.closest("[data-mbannotationid]");
-    const hitClipId = clipEl ? (clipEl as HTMLElement).dataset.mbclipid ?? null : null;
-    const hitAnnotationId = annotationEl ? (annotationEl as HTMLElement).dataset.mbannotationid ?? null : null;
+    // Items a joiner can't edit act like empty board: dragging on them pans.
+    const editableClipId = (id: string | undefined) => { const clip = id ? clipsRef.current.find((c) => c.id === id) : undefined; return clip && canEditBoardItem(clip) ? clip.id : null; };
+    const editableAnnotationId = (id: string | undefined) => { const annotation = id ? annotationsRef.current.find((a) => a.id === id) : undefined; return annotation && canEditBoardItem(annotation) ? annotation.id : null; };
+    // The published viewer is look-only: every touch there is on empty board.
+    const hitClipId = clipEl && !viewOnly ? editableClipId((clipEl as HTMLElement).dataset.mbclipid) : null;
+    const hitAnnotationId = annotationEl && !viewOnly ? editableAnnotationId((annotationEl as HTMLElement).dataset.mbannotationid) : null;
     if (hitClipId) selectionSurfaceRef.current = "board";
 
     g.type = "deciding";
@@ -20120,26 +20434,19 @@ function Board2Editor({
   function handleMobileBoardPointerMove(e: React.PointerEvent<HTMLDivElement>) {
     if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && mobileBoardPointersRef.current.size === 0)) return;
     const pointers = mobileBoardPointersRef.current;
+    if (!pointers.has(e.pointerId)) return; // not a finger this gesture is tracking
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const g = mobileGestureRef.current;
 
-    if (g.type === "pinch" && pointers.size === 2) {
-      const pts = [...pointers.values()];
-      const container = boardContainerRef.current;
-      if (!container) return;
-      const rect = container.getBoundingClientRect();
-      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
-      const scale = dist / g.pinchStartDist;
-      const nz = Math.max(0.05, Math.min(3, g.pinchStartZoom * scale));
-      const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
-      const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
-      const pz = g.pinchStartZoom;
-      const pp = g.pinchStartPan;
-      const np = { x: cx - (cx - pp.x) * (nz / pz), y: cy - (cy - pp.y) * (nz / pz) };
-      boardZoomRef.current = nz;
-      boardPanRef.current = np;
-      setBoardZoom(nz);
-      setBoardPan(np);
+    if (g.type === "pinch") {
+      const a = pointers.get(g.pinchIds[0]), b = pointers.get(g.pinchIds[1]);
+      if (!a || !b) return;
+      // Keep the board point that was under the fingers' starting midpoint under their current midpoint.
+      const zoom = Math.max(0.05, Math.min(3, g.pinchStartZoom * Math.hypot(b.x - a.x, b.y - a.y) / g.pinchStartDist));
+      const mid = containerPoint((a.x + b.x) / 2, (a.y + b.y) / 2);
+      const anchorX = (g.pinchStartMid.x - g.pinchStartPan.x) / g.pinchStartZoom;
+      const anchorY = (g.pinchStartMid.y - g.pinchStartPan.y) / g.pinchStartZoom;
+      previewBoardView(zoom, { x: mid.x - anchorX * zoom, y: mid.y - anchorY * zoom });
       return;
     }
 
@@ -20149,13 +20456,12 @@ function Board2Editor({
       if (Math.hypot(dx, dy) >= BOARD_TOUCH_DRAG_THRESHOLD_PX) {
         if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
         g.type = g.hitClipIsSelected || g.hitAnnotationIsSelected ? "move" : "pan";
+        if (g.type === "pan") setBoardAddPrompt(null);
       }
     }
 
     if (g.type === "pan") {
-      const np = { x: g.origPan.x + e.clientX - g.startX, y: g.origPan.y + e.clientY - g.startY };
-      boardPanRef.current = np;
-      setBoardPan(np);
+      previewBoardView(boardZoomRef.current, { x: g.origPan.x + e.clientX - g.startX, y: g.origPan.y + e.clientY - g.startY });
     } else if (g.type === "move" && g.hitClipId) {
       const zoom = boardZoomRef.current;
       const dx = (e.clientX - g.startX) / zoom;
@@ -20185,15 +20491,18 @@ function Board2Editor({
   function handleMobileBoardPointerUp(e: React.PointerEvent<HTMLDivElement>) {
     if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && !mobileBoardPointersRef.current.has(e.pointerId))) return;
     const pointers = mobileBoardPointersRef.current;
+    if (!pointers.has(e.pointerId)) return;
     const g = mobileGestureRef.current;
     if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
 
-    if (g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
+    if (e.type !== "pointercancel" && g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
       if (g.hitClipId) {
         setClipSelection([g.hitClipId]);
         setMobileDrawer("props");
       } else if (g.hitAnnotationId) {
         setAnnotationSelection([g.hitAnnotationId]);
+      } else if (boardViewEditable) {
+        handleBoardViewTap(e.clientX, e.clientY);
       } else {
         clearBoardSelection();
         setMobileDrawer(null);
@@ -20201,8 +20510,13 @@ function Board2Editor({
     }
 
     pointers.delete(e.pointerId);
-    if (pointers.size < 2 && g.type === "pinch") g.type = "idle";
-    else if (pointers.size === 0) g.type = "idle";
+    if (g.type === "pinch" && pointers.size === 1) {
+      // One finger lifted: carry on as a one-finger pan from where the other finger is now.
+      startPanFrom(g, [...pointers.values()][0]);
+    } else if (pointers.size === 0) {
+      if (g.type === "pan" || g.type === "pinch") commitBoardView();
+      g.type = "idle";
+    }
   }
 
   // ─── Download toast stack (bottom-right, stacked) ──────────────────────────
@@ -23933,6 +24247,7 @@ function Board2Editor({
       setClips(sharedClips);
       joinVersionRef.current = 0;
       joinBaseRef.current = null;
+      setJoinBaseAuthors(new Map());
       joinLastSignatureRef.current = "";
       setJoinOwnerToken(result.token);
       setJoinAnonymous(result.anonymous === true);
@@ -23960,7 +24275,7 @@ function Board2Editor({
     const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, token: joinOwnerToken }) });
     if (!response.ok) { const result = await response.json().catch(() => ({})) as { error?: string }; setToast(result.error || "Could not stop sharing."); return; }
     forgetCreatedBoard(joinCode);
-    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = ""; joinBaseRef.current = null;
+    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = ""; joinBaseRef.current = null; setJoinBaseAuthors(new Map());
     // Drop only the code. Without ?join, a phone needs mobileEditor=1 to stay in the editor rather
     // than being sent to the library on the next resize (see the isMobile check).
     const url = new URL(window.location.href);
@@ -23970,7 +24285,7 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
-  const topBar = chromeHidden ? boardTopBarTheme(boardColor) : EDITOR_TOP_BAR;
+  const topBar = touchSizedTopBar(chromeHidden ? boardTopBarTheme(boardColor) : EDITOR_TOP_BAR, isMobile);
 
   return (
     <div data-board2-exporting={isExporting || undefined} style={{ ...pageStyle, height: "100%", minHeight: 0 }}>
@@ -24049,35 +24364,28 @@ function Board2Editor({
 
           {/* Right: presence, settings, fullscreen, video editor */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
-            {joinCode && presencePeers.length > 0 && (
-              <div role="img" aria-label={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} on this board`} title={`${presencePeers.length} other ${presencePeers.length === 1 ? "person" : "people"} here`} style={{ display: "flex", alignItems: "center", marginRight: 4 }}>
-                {presencePeers.slice(0, 5).map((token, index) => (
-                  <span key={token} style={{ width: chromeHidden ? 12 : 10, height: chromeHidden ? 12 : 10, borderRadius: "50%", background: presenceColor(token), border: `2px solid ${topBar.dotRing}`, marginLeft: index ? -3 : 0 }} />
-                ))}
-                {presencePeers.length > 5 && <span style={{ marginLeft: 4, fontSize: 10, color: topBar.muted }}>+{presencePeers.length - 5}</span>}
-              </div>
-            )}
             <div style={{ position: "relative" }}>
               <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen, topBar)}><GearIcon size={topBar.icon} /></button>
               {boardSettingsOpen && (
                 <>
                   <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
                   <div role="dialog" aria-label="Board settings" style={{ position: "absolute", top: "calc(100% + 8px)", right: 0, zIndex: 1, width: 240, maxWidth: "calc(100vw - 16px)", display: "grid", gap: 12, padding: 12, background: "#fffdf5", color: "#2a2a2a", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", fontFamily: "monospace", fontSize: 11 }}>
-                    <div>
+                    {/* Whole-board settings are the owner's; joiners only add to the board. */}
+                    {isBoardOwner && <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Board color</div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={28} />
                         <span style={{ flex: 1, textTransform: "uppercase" }}>{boardColor}</span>
                         {boardColor !== BOARD_SURFACE_COLOR && <button type="button" onClick={() => setBoardColor(BOARD_SURFACE_COLOR)} style={miniButton}>Reset</button>}
                       </div>
-                    </div>
-                    <div>
+                    </div>}
+                    {isBoardOwner && <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Board file</div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button type="button" onClick={() => { setBoardSettingsOpen(false); setSaveModalOpen(true); }} style={{ ...sketchButton, flex: 1, padding: "6px 8px", fontSize: 11 }} title="Save board to file">💾 Save</button>
                         <button type="button" onClick={() => { setBoardSettingsOpen(false); projectFileInputRef.current?.click(); }} disabled={isLoadingProject} style={{ ...sketchButton, flex: 1, padding: "6px 8px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
                       </div>
-                    </div>
+                    </div>}
                     {joinCode && joinOwnerToken && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Sharing</div>
@@ -24104,7 +24412,7 @@ function Board2Editor({
             <button type="button" onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} style={topBarIconButton(isFullscreen, topBar)}>
               {isFullscreen ? <CompressIcon size={topBar.icon} /> : <ExpandIcon size={topBar.icon} />}
             </button>
-            <button
+            {isBoardOwner && <button
               type="button"
               aria-label={chromeHidden ? "Open video editor" : "Close video editor"}
               aria-pressed={!chromeHidden}
@@ -24113,7 +24421,7 @@ function Board2Editor({
               style={{ ...topBarIconButton(!chromeHidden, topBar), background: chromeHidden ? "transparent" : "#c8f135", color: chromeHidden ? topBar.muted : "#2a2a2a" }}
             >
               <ClapperboardIcon open={!chromeHidden} stripe={chromeHidden ? topBar.background : "#c8f135"} size={chromeHidden ? 20 : 19} />
-            </button>
+            </button>}
           </div>
         </div>
       )}
@@ -24135,7 +24443,7 @@ function Board2Editor({
                   if (session?.user?.email) void claimCreatedBoard();
                   else void signIn("google", { callbackUrl: `/board2?join=${joinCode}` });
                 }}
-                style={{ ...sketchButton, padding: "4px 10px", fontSize: 11, background: "#c8f135", fontWeight: 700 }}
+                style={{ ...sketchButton, padding: "4px 10px", minHeight: isMobile ? 44 : undefined, fontSize: 11, background: "#c8f135", fontWeight: 700 }}
               >
                 Save to account
               </button>
@@ -24450,6 +24758,9 @@ function Board2Editor({
               onPointerDown={(e) => {
                 if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e);
                 else if (isSpaceDownRef.current) handleBoardPointerDown(e);
+                else if (boardViewEditable) {
+                  if (isBoardViewPanTarget(e.target as HTMLElement, e.currentTarget)) handleBoardViewEmptyPointerDown(e);
+                }
                 else handleBoardSurfacePointerDown(e);
               }}
               onPointerMove={isMobile ? handleMobileBoardPointerMove : undefined}
@@ -24478,6 +24789,64 @@ function Board2Editor({
                   <span style={{ flexShrink: 0, padding: "2px 6px", border: "1px solid #2a2a2a", fontSize: 9, fontWeight: 800, letterSpacing: 1 }}>VIEW ONLY</span>
                 </div>
               ) : null}
+              {chromeHidden && !boardViewEditable && (
+                <div
+                  aria-label="Pan infinite board space"
+                  onPointerDown={(e) => { if (!(isMobile && e.pointerType !== "mouse")) handleBoardPointerDown(e); }}
+                  style={{ position: "absolute", inset: 0, zIndex: 200, cursor: "grab", touchAction: "none" }}
+                />
+              )}
+              {/* Who's on the board, in its top-right corner: one dot per person, you first (ringed).
+                  Five people, five dots. */}
+              {joinCode && !viewOnly && presencePeople.length > 0 && (() => {
+                const count = presencePeople.length;
+                const label = `${count} ${count === 1 ? "person" : "people"} on this board (including you)`;
+                return (
+                  <div role="img" aria-label={label} title={label} data-presence-count={count} style={{ position: "absolute", top: 10, right: "max(10px, env(safe-area-inset-right))", zIndex: 250, display: "flex", alignItems: "center", gap: 5, padding: "6px 9px", borderRadius: 999, background: "rgba(255,253,245,0.88)", boxShadow: "0 1px 4px rgba(42,42,42,0.18)", pointerEvents: "none" }}>
+                    {presencePeople.slice(0, PRESENCE_MAX_DOTS).map((token, index) => (
+                      <span key={token} data-presence-dot style={{ width: 12, height: 12, borderRadius: "50%", background: presenceColor(token), boxShadow: index === 0 ? "0 0 0 2px #fffdf5, 0 0 0 3.5px #2a2a2a" : "0 0 0 2px #fffdf5", marginRight: index === 0 ? 3 : 0 }} />
+                    ))}
+                    {count > PRESENCE_MAX_DOTS && <span style={{ marginLeft: 2, fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: "#2a2a2a" }}>+{count - PRESENCE_MAX_DOTS}</span>}
+                  </div>
+                );
+              })()}
+              {boardViewEditable && (
+                <input ref={boardAddImageInputRef} type="file" accept="image/*" multiple aria-hidden="true" tabIndex={-1} style={{ display: "none" }} onChange={(event) => { void handleBoardPromptImages(event); }} />
+              )}
+              {boardViewEditable && boardAddPrompt && (() => {
+                // Opens just above the tapped point (below it near the top edge), kept inside the board area.
+                const container = boardContainerRef.current;
+                const width = 196, height = 56;
+                const maxX = (container?.clientWidth ?? 0) - width - 8;
+                const left = Math.max(8, Math.min(boardAddPrompt.x - width / 2, maxX));
+                const top = boardAddPrompt.y - height - 14 < 8 ? boardAddPrompt.y + 14 : boardAddPrompt.y - height - 14;
+                const choice: React.CSSProperties = { flex: 1, minWidth: 44, minHeight: 44, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, border: "1.5px solid #2a2a2a", borderRadius: 8, background: "#fffdf5", color: "#2a2a2a", fontFamily: "monospace", fontSize: 13, fontWeight: 700, cursor: "pointer", touchAction: "manipulation" };
+                return (
+                  <>
+                    <div aria-hidden="true" style={{ position: "absolute", left: boardAddPrompt.x - 5, top: boardAddPrompt.y - 5, width: 10, height: 10, borderRadius: "50%", background: "#ff5e3a", boxShadow: "0 0 0 3px rgba(255,94,58,.25)", zIndex: 260, pointerEvents: "none" }} />
+                    <div
+                      role="menu"
+                      aria-label="Add to the board here"
+                      data-board-add-prompt
+                      onPointerDown={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => { if (event.key === "Escape") setBoardAddPrompt(null); }}
+                      style={{ position: "absolute", left, top, width, height, zIndex: 261, display: "flex", gap: 6, padding: 6, boxSizing: "border-box", background: "#2a2a2a", borderRadius: 12, boxShadow: "0 6px 20px rgba(42,42,42,.3)" }}
+                    >
+                      <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} style={choice}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>
+                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} style={choice}><span aria-hidden="true">🖼</span>Image</button>
+                    </div>
+                  </>
+                );
+              })()}
+              {pendingMediaPlacement && (
+                <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+                  <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
+                  <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
+                </div>
+              )}
+              {/* Everything that sits at board coordinates. During a touch pan or pinch it moves as one
+                  CSS transform (previewBoardView) and React catches up once, when the gesture ends. */}
+              <div ref={boardGestureLayerRef} data-board-gesture-layer style={{ position: "absolute", inset: 0, transformOrigin: "0 0", pointerEvents: "none" }}>
               {visibleWorldBoards.map((board) => (
                 <WorldBoardComposite
                   key={board.id}
@@ -24492,19 +24861,6 @@ function Board2Editor({
                   }}
                 />
               ))}
-              {chromeHidden && (
-                <div
-                  aria-label="Pan infinite board space"
-                  onPointerDown={handleBoardPointerDown}
-                  style={{ position: "absolute", inset: 0, zIndex: 200, cursor: "grab", touchAction: "none" }}
-                />
-              )}
-              {pendingMediaPlacement && (
-                <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
-                  <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
-                  <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
-                </div>
-              )}
               {/* Board surface */}
               <div
                 style={{
@@ -24514,9 +24870,26 @@ function Board2Editor({
                   width: boardDimensions.width * boardZoom,
                   height: boardDimensions.height * boardZoom,
                   background: "transparent",
+                  pointerEvents: "auto",
                 }}
-                onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else handleBoardSurfacePointerDown(e); }}
+                data-board-surface
+                onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e); else if (!boardViewEditable) handleBoardSurfacePointerDown(e); }}
               >
+                {/* An empty shared board shows its code, large and faint, as part of the canvas: the
+                    invitation to share. It fades away once anything is on the board. */}
+                {joinCode && !viewOnly && (
+                  <div
+                    aria-hidden={boardHasContent}
+                    style={{
+                      position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                      pointerEvents: "none", userSelect: "none", color: "rgba(42,42,42,0.16)", fontFamily: "monospace", textAlign: "center",
+                      opacity: boardHasContent ? 0 : 1, transition: "opacity 600ms ease", zIndex: 0,
+                    }}
+                  >
+                    <div style={{ fontSize: boardDimensions.height * 0.16 * boardZoom, fontWeight: 800, letterSpacing: "0.12em", lineHeight: 1 }}>{joinCode}</div>
+                    <div style={{ marginTop: boardDimensions.height * 0.025 * boardZoom, fontSize: boardDimensions.height * 0.028 * boardZoom, fontWeight: 600 }}>Share this code to add to the board together</div>
+                  </div>
+                )}
                 {boardMarquee && (() => {
                   const x = Math.min(boardMarquee.startX, boardMarquee.currentX) * boardZoom;
                   const y = Math.min(boardMarquee.startY, boardMarquee.currentY) * boardZoom;
@@ -24603,25 +24976,26 @@ function Board2Editor({
                           onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                         />
                       ))}
-                      {isSel && (["nw", "ne", "sw", "se"] as const).map((corner) => (
+                      {isSel && (["nw", "ne", "sw", "se"] as const).map((corner) => {
+                        const { half, ...handle } = boardHandleStyle(isMobile, BOARD_RESIZE_PX);
+                        return (
                         <div
                           key={corner}
+                          data-resize-handle
                           style={{
                             position: "absolute",
-                            width: BOARD_RESIZE_PX,
-                            height: BOARD_RESIZE_PX,
-                            background: "#ff5e3a",
-                            border: "1.5px solid #fff",
+                            ...handle,
                             cursor: (corner === "nw" || corner === "se") ? "nwse-resize" : "nesw-resize",
                             zIndex: 10,
-                            ...(corner === "nw" ? { left: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
-                                corner === "ne" ? { right: -BOARD_RESIZE_PX / 2, top: -BOARD_RESIZE_PX / 2 } :
-                                corner === "sw" ? { left: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 } :
-                                                 { right: -BOARD_RESIZE_PX / 2, bottom: -BOARD_RESIZE_PX / 2 }),
+                            ...(corner === "nw" ? { left: -half, top: -half } :
+                                corner === "ne" ? { right: -half, top: -half } :
+                                corner === "sw" ? { left: -half, bottom: -half } :
+                                                 { right: -half, bottom: -half }),
                           }}
                           onPointerDown={(e) => handleBoardResizePointerDown(e, clip, corner)}
                         />
-                      ))}
+                        );
+                      })}
                       {isSel && (isBoardMediaClip(clip) || clip.type === "customZoom") && (
                         <button
                           type="button"
@@ -24842,7 +25216,7 @@ function Board2Editor({
                         pointerEvents: annotationTool === "pointer" || isEditing ? "auto" : "none",
                       }}
                       onDoubleClick={(e) => {
-                        if (ann.type === "text" && annotationTool === "pointer") {
+                        if (ann.type === "text" && annotationTool === "pointer" && canEditBoardItem(ann)) {
                           e.stopPropagation();
                           setEditingAnnotationId(ann.id);
                           setEditingAnnotationText(ann.text ?? "");
@@ -24914,11 +25288,11 @@ function Board2Editor({
                           (["start", "end"] as const).map((which) => {
                             const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
                             const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
+                            const { half, ...handle } = boardHandleStyle(isMobile, 12, true);
                             return (
-                              <div key={which} style={{
-                                position: "absolute", left: hx - 6, top: hy - 6,
-                                width: 12, height: 12, background: "#ff5e3a",
-                                border: "2px solid #fff", borderRadius: "50%",
+                              <div key={which} data-resize-handle style={{
+                                position: "absolute", left: hx - half, top: hy - half,
+                                ...handle,
                                 cursor: "move", zIndex: 20,
                               }}
                               onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
@@ -24926,20 +25300,22 @@ function Board2Editor({
                           })
                         ) : (
                           // All other types: four corner handles
-                          (["nw", "ne", "sw", "se"] as const).map((corner) => (
-                            <div key={corner} style={{
+                          (["nw", "ne", "sw", "se"] as const).map((corner) => {
+                            const { half, ...handle } = boardHandleStyle(isMobile, 10);
+                            return (
+                            <div key={corner} data-resize-handle style={{
                               position: "absolute",
-                              ...(corner === "nw" ? { left: -5, top: -5 } :
-                                  corner === "ne" ? { right: -5, top: -5 } :
-                                  corner === "sw" ? { left: -5, bottom: -5 } :
-                                                    { right: -5, bottom: -5 }),
-                              width: 10, height: 10, background: "#ff5e3a",
-                              border: "1.5px solid #fff",
+                              ...(corner === "nw" ? { left: -half, top: -half } :
+                                  corner === "ne" ? { right: -half, top: -half } :
+                                  corner === "sw" ? { left: -half, bottom: -half } :
+                                                    { right: -half, bottom: -half }),
+                              ...handle,
                               cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
                               zIndex: 20,
                             }}
                             onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
-                          ))
+                            );
+                          })
                         )
                       )}
                       {showHandles && (
@@ -25012,7 +25388,7 @@ function Board2Editor({
                   );
                 })()}
               </div>
-
+              </div>
               {/* Empty state */}
               {!chromeHidden && clips.filter((c) => c.boardX !== undefined).length === 0 && (!AI_FEATURES_ENABLED || (neuralPlaceholders.length === 0 && imagePlaceholders.length === 0)) && (
                 <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
@@ -28447,6 +28823,14 @@ function generatePresenceToken(): string {
 }
 
 // Stable color per anonymous presence token (FNV-1a), so a dot keeps its color across syncs.
+const PRESENCE_MAX_DOTS = 8;
+// Joinable-board sync: a change goes out on the next frame when no save is in flight; changes made
+// while one is in flight go together once it returns. Polling is the fallback for the Realtime
+// "board-saved" nudge.
+const JOIN_WRITE_BATCH_MS = 16;
+const JOIN_POLL_LIVE_MS = 5000;
+const JOIN_POLL_FALLBACK_MS = 1200;
+
 function presenceColor(token: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < token.length; i++) hash = Math.imul(hash ^ token.charCodeAt(i), 0x01000193);
@@ -28486,6 +28870,24 @@ const EDITOR_TOP_BAR: TopBarTheme = {
   activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
   pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
 };
+
+// On touch screens every top-bar control is at least 44×44 (buttons 46, so the code pill at
+// button - 2 is 44 too).
+function touchSizedTopBar(theme: TopBarTheme, touch: boolean): TopBarTheme {
+  return touch ? { ...theme, height: Math.max(theme.height, 52), button: 46, icon: Math.max(theme.icon, 20) } : theme;
+}
+
+// A resize/drag handle on a board item. On touch screens the hit area is 44×44 with the same small
+// orange dot drawn at its center; `offset` is how far the handle's center sits from its anchor.
+function boardHandleStyle(touch: boolean, visible: number, round = false): React.CSSProperties & { half: number } {
+  if (!touch) return { width: visible, height: visible, background: "#ff5e3a", border: "1.5px solid #fff", borderRadius: round ? "50%" : undefined, half: visible / 2 };
+  const r = visible / 2;
+  return {
+    width: 44, height: 44, border: 0, touchAction: "none",
+    background: `radial-gradient(${round ? "circle" : "closest-side"}, #ff5e3a 0 ${r}px, #fff ${r}px ${r + 1.5}px, transparent ${r + 1.5}px)`,
+    half: 22,
+  };
+}
 
 function topBarIconButton(active: boolean, theme: TopBarTheme): React.CSSProperties {
   return {

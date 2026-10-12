@@ -8,6 +8,12 @@ export function joinTokenHash(token: string): string {
   return crypto.createHmac("sha256", secret).update(token).digest("hex");
 }
 
+/** A joiner's public id: the SHA-256 of their secret participant token (see participantIdFor). */
+export function participantIdFromToken(token: unknown): string | null {
+  if (typeof token !== "string" || token.length < 16 || token.length > 200) return null;
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
 // PostgREST `or` filter for boards that haven't expired: account-owned boards have no expiry.
 export function unexpiredBoardFilter(): string {
   return `expires_at.is.null,expires_at.gt.${new Date().toISOString()}`;

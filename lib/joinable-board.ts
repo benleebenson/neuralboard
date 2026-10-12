@@ -49,6 +49,7 @@ export type JoinableBoardState = {
   showCharacter?: boolean;
   showCharacter2?: boolean;
   canvasAspect?: "16:9" | "9:16";
+  boardColor?: string;
 };
 
 /**
@@ -64,7 +65,7 @@ export function stableStringify(value: unknown): string {
 }
 
 const MERGED_LISTS = ["clips", "annotations", "characterActions", "characterActions2"] as const;
-const MERGED_VALUES = ["boardDimensions", "cameraKeyframes", "showCharacter", "showCharacter2", "canvasAspect"] as const;
+const MERGED_VALUES = ["boardDimensions", "cameraKeyframes", "showCharacter", "showCharacter2", "canvasAspect", "boardColor"] as const;
 
 type Identified = Record<string, unknown> & { id?: unknown };
 
@@ -103,6 +104,29 @@ export function mergeJoinableStates(base: JoinableBoardState, mine: JoinableBoar
     if (stableStringify(mine[field]) !== stableStringify(base[field])) merged[field] = mine[field];
   }
   return merged as JoinableBoardState;
+}
+
+// Each browser's secret participant token. Its SHA-256 (the participant id) marks the items this
+// browser adds to a joinable board; the server recomputes it from the token on every save, so
+// nobody can act as another participant.
+const PARTICIPANT_TOKEN_STORAGE_KEY = "nb_participant_token";
+
+export function readParticipantToken(): string {
+  try {
+    const existing = window.localStorage.getItem(PARTICIPANT_TOKEN_STORAGE_KEY);
+    if (existing && existing.length >= 16) return existing;
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(24)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    window.localStorage.setItem(PARTICIPANT_TOKEN_STORAGE_KEY, token);
+    return token;
+  } catch {
+    // No storage (private mode): a per-tab identity still works for this visit.
+    return Array.from(crypto.getRandomValues(new Uint8Array(24)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+}
+
+export async function participantIdFor(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 // The creator's owner token for each board made on this device, so they can come back to it,
