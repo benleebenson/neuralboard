@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { useEffect } from "react";
 import { useSession } from "next-auth/react";
 import { ADMIN_EMAIL } from "@/lib/admin";
 import styles from "./MainSectionNav.module.css";
@@ -19,12 +18,11 @@ const sections: Array<{ id: MainSection; href: string; label: string; icon: stri
 
 export function MainSectionNav({ active, desktopOnly = false }: { active: MainSection; desktopOnly?: boolean }) {
   const [open, setOpen] = useState(false);
-  const { data: session } = useSession(); const owner = session?.user?.email === ADMIN_EMAIL; const [pending,setPending]=useState(0);
-  useEffect(()=>{if(!owner)return;void fetch("/api/public-board/moderation?count=1").then(response=>response.ok?response.json():null).then(data=>setPending(data?.count??0)).catch(()=>{})},[owner]);
+  const { data: session } = useSession(); const owner = session?.user?.email === ADMIN_EMAIL;
   const visibleSections = owner ? sections : sections.filter((section) => section.id === "public");
   const links = visibleSections.map((section) => (
     <Link key={section.id} href={section.href} aria-current={section.id === active ? "page" : undefined} className={styles.link} onClick={() => setOpen(false)}>
-      <span aria-hidden="true">{section.icon}</span> {section.label}{section.id==="public"&&pending>0?<span className={styles.badge}>{pending}</span>:null}
+      <span aria-hidden="true">{section.icon}</span> {section.label}
     </Link>
   ));
 
@@ -35,7 +33,6 @@ export function MainSectionNav({ active, desktopOnly = false }: { active: MainSe
         <button type="button" className={styles.trigger} aria-label="Open main menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>☰</button>
         {open && <nav className={styles.menu} aria-label="Main sections">{links}</nav>}
       </div>}
-      {owner&&pending>0?<Link className={styles.moderate} href="/public/moderate">Review {pending}</Link>:null}
     </div>
   );
 }

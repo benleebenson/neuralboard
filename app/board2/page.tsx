@@ -18,7 +18,7 @@ import {
   Muxer as WebMMuxer,
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, rememberCreatedBoard, type JoinableBoardState } from "@/lib/joinable-board";
+import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
@@ -5719,6 +5719,11 @@ type ActiveBoard = BoardWorkspaceStatus & {
   makeJoinable?: boolean;
 };
 
+/** Where sign-in returns to: this exact editor URL, so a shared board (?join=) or open board file isn't lost. */
+function currentEditorUrl(): string {
+  return `${window.location.pathname}${window.location.search}`;
+}
+
 function createActiveBoard(
   source?: { file: File; fileName: string; name: string },
   options: { fresh?: boolean; makeJoinable?: boolean } = {},
@@ -6064,6 +6069,11 @@ function Board2Editor({
   const joinVersionRef = useRef(0);
   const joinLastSignatureRef = useRef("");
   const joinWriteTimerRef = useRef<number | null>(null);
+  // The server state local edits are based on (for merging with a newer one), the latest local
+  // snapshot (read from async sync callbacks), and consecutive save conflicts.
+  const joinBaseRef = useRef<JoinableBoardState | null>(null);
+  const joinableSnapshotRef = useRef<JoinableBoardState | null>(null);
+  const joinConflictCountRef = useRef(0);
 
   const [clips, setClips] = useState<Clip[]>([]);
   const [mediaLibrary, setMediaLibrary] = useState<MediaItem[]>([]);
@@ -7577,12 +7587,23 @@ function Board2Editor({
     showCharacter2,
     canvasAspect,
   }), [annotations, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, showCharacter, showCharacter2]);
-  const joinableSignature = useMemo(() => JSON.stringify(joinableSnapshot), [joinableSnapshot]);
+  const joinableSignature = useMemo(() => stableStringify(joinableSnapshot), [joinableSnapshot]);
+  useEffect(() => { joinableSnapshotRef.current = joinableSnapshot; }, [joinableSnapshot]);
 
-  const applyJoinableState = useCallback((state: JoinableBoardState, version: number) => {
-    const incomingClips = Array.isArray(state.clips) ? state.clips as unknown as Clip[] : [];
+  // `state` is what this tab shows; `serverState` is what the server holds at `version` (they differ
+  // when local edits were merged on top, which the write effect then sends).
+  const applyJoinableState = useCallback((state: JoinableBoardState, version: number, serverState: JoinableBoardState = state) => {
+    // Shared state carries no local bytes; keep this tab's blobs and previews for clips whose media is unchanged.
+    const localClips = new Map(clipsRef.current.map((clip) => [clip.id, clip]));
+    const incomingClips = (Array.isArray(state.clips) ? state.clips as unknown as Clip[] : []).map((clip) => {
+      const local = localClips.get(clip.id);
+      return local && local.sourceUrl === clip.sourceUrl
+        ? { ...clip, sourceBlob: local.sourceBlob, audioBlob: local.audioBlob, previewUrl: local.previewUrl, thumbnailBlobUrl: local.thumbnailBlobUrl }
+        : clip;
+    });
     joinVersionRef.current = version;
-    joinLastSignatureRef.current = JSON.stringify(state);
+    joinBaseRef.current = serverState;
+    joinLastSignatureRef.current = stableStringify(serverState);
     clipsRef.current = incomingClips;
     setClips(incomingClips);
     setMediaLibrary(incomingClips.filter((clip) => (clip.type === "image" || clip.type === "video") && !!clip.sourceUrl).map((clip) => ({ id: clip.mediaId ?? clip.id, name: clip.name, type: clip.type as "image" | "video", url: clip.sourceUrl, duration: clip.duration })));
@@ -7656,7 +7677,13 @@ function Board2Editor({
           setJoinAnonymous(result.anonymous === true);
           setJoinExpiresAt(result.expires_at ?? null);
         }
-        if (!cancelled && typeof result.version === "number" && result.version > joinVersionRef.current) applyJoinableState(result.state ?? { clips: [], annotations: [], boardDimensions: { width: BOARD_W, height: BOARD_H } }, result.version);
+        if (!cancelled && typeof result.version === "number" && result.version > joinVersionRef.current) {
+          const incoming = result.state ?? { clips: [], annotations: [], boardDimensions: { width: BOARD_W, height: BOARD_H } };
+          // Edits not yet sent (the write debounce) are merged onto the newer state instead of lost.
+          const base = joinBaseRef.current, local = joinableSnapshotRef.current;
+          const unsent = base && local && stableStringify(local) !== joinLastSignatureRef.current;
+          applyJoinableState(unsent ? mergeJoinableStates(base, local, incoming) : incoming, result.version, incoming);
+        }
         if (!cancelled) setJoinStatus("joined");
       } catch (error) {
         if (!cancelled) { setJoinStatus("error"); setToast(error instanceof Error ? error.message : "The shared board is unavailable."); }
@@ -7671,15 +7698,41 @@ function Board2Editor({
     if (!joinCode || joinStatus !== "joined" || joinableSignature === joinLastSignatureRef.current) return;
     if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current);
     joinWriteTimerRef.current = window.setTimeout(async () => {
-      const response = await fetch("/api/joinable-board", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, version: joinVersionRef.current, state: joinableSnapshot }) });
-      if (response.ok) {
-        const result = await response.json() as { version: number };
-        joinVersionRef.current = result.version;
-        joinLastSignatureRef.current = joinableSignature;
+      const sent = joinableSnapshot;
+      try {
+        const response = await fetch("/api/joinable-board", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, version: joinVersionRef.current, state: sent }) });
+        if (response.ok) {
+          const result = await response.json() as { version: number };
+          joinVersionRef.current = result.version;
+          joinBaseRef.current = sent;
+          joinLastSignatureRef.current = joinableSignature;
+          joinConflictCountRef.current = 0;
+          return;
+        }
+        if (response.status !== 409) {
+          const result = await response.json().catch(() => ({})) as { error?: string };
+          throw new Error(result.error || `error ${response.status}`);
+        }
+        // Someone else saved first: merge this tab's changes onto their version; applying it
+        // changes the signature, so this effect sends the merged board again.
+        const latestResponse = await fetch(`/api/joinable-board?code=${joinCode}`, { cache: "no-store" });
+        const latest = await latestResponse.json().catch(() => ({})) as { state?: JoinableBoardState; version?: number; error?: string };
+        if (!latestResponse.ok || !latest.state || typeof latest.version !== "number") throw new Error(latest.error || "the shared board is unavailable");
+        const base = joinBaseRef.current, local = joinableSnapshotRef.current;
+        if (++joinConflictCountRef.current > 3 || !base || !local) {
+          joinConflictCountRef.current = 0;
+          applyJoinableState(latest.state, latest.version);
+          setToast("Your last change couldn't be saved — others kept editing the same board. Please make it again.");
+          return;
+        }
+        applyJoinableState(mergeJoinableStates(base, local, latest.state), latest.version, latest.state);
+      } catch (error) {
+        // Unsent changes stay local and go out with the next save.
+        setToast(`Your last change wasn't saved to the shared board (${error instanceof Error ? error.message : "network error"}). It will retry with your next edit.`);
       }
     }, 450);
     return () => { if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current); };
-  }, [joinCode, joinStatus, joinableSignature, joinableSnapshot]);
+  }, [applyJoinableState, joinCode, joinStatus, joinableSignature, joinableSnapshot]);
   // Asset library: fire-and-forget save of every board-placed image/YouTube clip so it can be
   // reused from the Library panel later. A single effect over `clips` (rather than instrumenting
   // every clip-creation call site — manual upload, auto-build, Top 5, Neural Search, YouTube
@@ -8250,6 +8303,13 @@ function Board2Editor({
     const pendingFile = sessionStorage.getItem(BOARD_LIBRARY_PENDING_FILE);
     if (!pendingFile) return;
     sessionStorage.removeItem(BOARD_LIBRARY_PENDING_FILE);
+    // A joined board's contents come only from the server: loading a library board here would be
+    // synced over everyone's shared board.
+    if (initialJoinCode) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time mount notice
+      setToast(`Didn't open ${pendingFile}: this tab is on shared board ${initialJoinCode}.`);
+      return;
+    }
     void (async () => {
       try {
         const directory = await getBoardsDirectory({ prompt: false, write: false });
@@ -11410,12 +11470,22 @@ function Board2Editor({
         media.src = sourceUrl;
       });
       if (dur < 0.1) throw new Error("No audio found in file");
+      // On a joinable board the clip points at the shared copy so collaborators can play it; this
+      // device keeps playing from audioBlob.
+      let clipSourceUrl = sourceUrl;
+      let notShared = "";
+      if (joinCode) {
+        setToast("Sharing narration…");
+        try { clipSourceUrl = await uploadJoinableAv(audioBlob); } catch (error) {
+          notShared = `Narration is only on this device — ${error instanceof Error ? error.message : "it couldn't be shared"}. Others on this board won't hear it.`;
+        }
+      }
       const clipId = generateId();
       setClips((prev) => [...prev, {
         id: clipId,
         type: "narration" as const,
         name: file.name.replace(/\.[^.]+$/, "").slice(0, 40),
-        sourceUrl,
+        sourceUrl: clipSourceUrl,
         audioBlob,
         startTime: playheadRef.current,
         duration: dur,
@@ -11427,7 +11497,7 @@ function Board2Editor({
           setClips((current) => current.map((clip) => clip.id === clipId ? { ...clip, waveform } : clip));
         }).catch(() => {});
       }
-      setToast(isVideoFile ? "Video narration added" : "Narration added");
+      setToast(notShared || (isVideoFile ? "Video narration added" : "Narration added"));
     } catch (err) {
       if (blobUrl) URL.revokeObjectURL(blobUrl);
       setToast(err instanceof Error ? err.message : "Failed to process file");
@@ -13274,7 +13344,7 @@ function Board2Editor({
   }
 
   function requireProForClips(): boolean {
-    if (!session?.user) { signIn("google", { callbackUrl: "/board2" }); return false; }
+    if (!session?.user) { signIn("google", { callbackUrl: currentEditorUrl() }); return false; }
     if (!isProUser) { setClipsUpgradeOpen(true); return false; }
     return true;
   }
@@ -13386,6 +13456,23 @@ function Board2Editor({
     return result.url;
   }
 
+  // Video and narration bytes go straight to Storage through a signed upload URL (too large for a
+  // function body). Throws with a user-facing reason, e.g. over SHARED_AV_MAX_BYTES.
+  async function uploadJoinableAv(file: Blob, code = joinCode): Promise<string> {
+    const mime = (file.type || "").split(";")[0].trim().toLowerCase();
+    if (!SHARED_AV_EXTENSIONS[mime]) throw new Error(`${mime || "This file type"} can't be shared`);
+    if (file.size > SHARED_AV_MAX_BYTES) throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is over the ${SHARED_AV_MAX_BYTES / 1024 / 1024} MB sharing limit`);
+    const response = await fetch("/api/joinable-board/media/upload-url", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, mime, size: file.size }) });
+    const result = await response.json().catch(() => ({})) as { uploadUrl?: string; url?: string; error?: string };
+    if (!response.ok || !result.uploadUrl || !result.url) throw new Error(result.error || "Could not share that file");
+    const form = new FormData();
+    form.append("cacheControl", "3600");
+    form.append("", file);
+    const upload = await fetch(result.uploadUrl, { method: "PUT", headers: { "x-upsert": "false" }, body: form });
+    if (!upload.ok) throw new Error(upload.status === 413 ? "The file is larger than storage allows" : `Upload failed (${upload.status})`);
+    return result.url;
+  }
+
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
   // in the media library, and places it on the board via addClipAndPlaceOnBoard.
   async function ingestMediaFile(input: File | Blob, name: string, center?: { x: number; y: number }) {
@@ -13396,7 +13483,16 @@ function Board2Editor({
       if (video) file = video;
     }
     const type: "image" | "video" = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(name)) ? "video" : "image";
-    const url = type === "image" && joinCode ? await uploadJoinableImage(file, name) : URL.createObjectURL(file);
+    let url: string;
+    let notShared = "";
+    if (type === "image" && joinCode) url = await uploadJoinableImage(file, name);
+    else if (type === "video" && joinCode) {
+      setToast(`Sharing ${name}…`);
+      try { url = await uploadJoinableAv(file); } catch (error) {
+        url = URL.createObjectURL(file);
+        notShared = `${name} is only on this device — ${error instanceof Error ? error.message : "it couldn't be shared"}. Others on this board won't see it.`;
+      }
+    } else url = URL.createObjectURL(file);
     let duration: number | undefined;
     if (type === "video") {
       loadMedia(url, type);
@@ -13414,6 +13510,7 @@ function Board2Editor({
     setMediaLibrary((prev) => [...prev, item]);
     if (playModeRef.current && !center) queueMediaPlacement(item);
     else await addClipAndPlaceOnBoard(item, center);
+    if (notShared) setToast(notShared);
   }
 
   async function ingestRevealImageFile(file: File | Blob, name: string, actionId: string) {
@@ -14478,7 +14575,7 @@ function Board2Editor({
               {session?.user?.email ? (
                 <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setMobileAccountOpen(false)} />
               ) : (
-                <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
+                <button type="button" onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
               )}
             </div>
           )}
@@ -21278,7 +21375,7 @@ function Board2Editor({
                   <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.6 }}>
                     Sign in to save and access your library.
                     <div style={{ marginTop: 10 }}>
-                      <button onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...sketchButton, padding: "6px 12px", fontSize: 11, fontWeight: 700 }}>
+                      <button onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, padding: "6px 12px", fontSize: 11, fontWeight: 700 }}>
                         Sign in →
                       </button>
                     </div>
@@ -21376,7 +21473,7 @@ function Board2Editor({
   }
 
   function requireProForSmartPan(): boolean {
-    if (!session?.user) { signIn("google", { callbackUrl: "/board2" }); return false; }
+    if (!session?.user) { signIn("google", { callbackUrl: currentEditorUrl() }); return false; }
     if (!isProUser) { setSmartPanUpgradeOpen(true); return false; }
     return true;
   }
@@ -23815,10 +23912,19 @@ function Board2Editor({
       const result = await response.json() as { code?: string; token?: string; error?: string; expiresAt?: string | null; anonymous?: boolean };
       if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
       const sharedClips: Clip[] = [];
+      const notShared: string[] = [];
       for (const clip of clipsRef.current) {
+        const avBlob = clip.type === "video" ? clip.sourceBlob : clip.type === "narration" ? clip.audioBlob : undefined;
         if (clip.type === "image" && clip.sourceBlob?.size) {
           const sourceUrl = await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code);
           sharedClips.push({ ...clip, sourceUrl });
+        } else if (avBlob?.size && clip.sourceUrl.startsWith("blob:")) {
+          try {
+            sharedClips.push({ ...clip, sourceUrl: await uploadJoinableAv(avBlob, result.code) });
+          } catch (error) {
+            notShared.push(`${clip.name || clip.type} (${error instanceof Error ? error.message : "upload failed"})`);
+            sharedClips.push(clip);
+          }
         } else {
           sharedClips.push(clip);
         }
@@ -23826,6 +23932,7 @@ function Board2Editor({
       clipsRef.current = sharedClips;
       setClips(sharedClips);
       joinVersionRef.current = 0;
+      joinBaseRef.current = null;
       joinLastSignatureRef.current = "";
       setJoinOwnerToken(result.token);
       setJoinAnonymous(result.anonymous === true);
@@ -23839,7 +23946,9 @@ function Board2Editor({
         url.searchParams.set("join", result.code);
         window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
       }
-      setToast(`Board join code: ${result.code}`);
+      setToast(notShared.length
+        ? `Board join code: ${result.code}. Only on this device, not shared: ${notShared.join(", ")}`
+        : `Board join code: ${result.code}`);
     } catch (error) {
       setJoinStatus("error");
       setToast(error instanceof Error ? error.message : "Could not make this board joinable.");
@@ -23851,8 +23960,13 @@ function Board2Editor({
     const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, token: joinOwnerToken }) });
     if (!response.ok) { const result = await response.json().catch(() => ({})) as { error?: string }; setToast(result.error || "Could not stop sharing."); return; }
     forgetCreatedBoard(joinCode);
-    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = "";
-    window.history.replaceState({}, "", window.location.pathname);
+    setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = ""; joinBaseRef.current = null;
+    // Drop only the code. Without ?join, a phone needs mobileEditor=1 to stay in the editor rather
+    // than being sent to the library on the next resize (see the isMobile check).
+    const url = new URL(window.location.href);
+    url.searchParams.delete("join");
+    if (isMobile) url.searchParams.set("mobileEditor", "1");
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
     setToast("Board is no longer joinable");
   }
 
@@ -23980,7 +24094,7 @@ function Board2Editor({
                       {session?.user?.email ? (
                         <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setBoardSettingsOpen(false)} />
                       ) : (
-                        <button type="button" onClick={() => signIn("google", { callbackUrl: "/board2" })} style={{ ...miniButton, width: "100%", padding: "6px 8px" }}>Sign in →</button>
+                        <button type="button" onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...miniButton, width: "100%", padding: "6px 8px" }}>Sign in →</button>
                       )}
                     </div>
                   </div>
