@@ -316,6 +316,26 @@ import {
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
+const FULLSCREEN_REQUEST_TIMEOUT_MS = 1500;
+
+// Runs a Fullscreen API request and reports how it went: "entered", "failed" (threw or rejected)
+// or "timeout" (still pending — some embedded browsers never settle the promise).
+function requestFullscreenWithin(request: () => Promise<void> | void, ms: number): Promise<"entered" | "failed" | "timeout"> {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve("timeout"), ms);
+    const settle = (outcome: "entered" | "failed") => { window.clearTimeout(timer); resolve(outcome); };
+    try {
+      Promise.resolve(request()).then(() => settle("entered"), () => settle("failed"));
+    } catch {
+      settle("failed");
+    }
+  });
+}
+
+// iPhone/iPod/iPad, including iPadOS reporting itself as a Mac.
+function isIOSDevice(): boolean {
+  return /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
 const BOARD_TOUCH_DRAG_THRESHOLD_PX = 8;
 const BOARD_TOUCH_TAP_MAX_MS = 350;
 
@@ -6325,7 +6345,12 @@ function Board2Editor({
   const [mobileEditorMenuOpen, setMobileEditorMenuOpen] = useState(false);
   const [boardSettingsOpen, setBoardSettingsOpen] = useState(false);
   const [boardCodeCopied, setBoardCodeCopied] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Native (Fullscreen API) vs CSS fullscreen: iPhone Safari has no element fullscreen, so there the
+  // board fills the viewport with every other piece of UI hidden instead.
+  const [nativeFullscreen, setNativeFullscreen] = useState(false);
+  const [pseudoFullscreen, setPseudoFullscreen] = useState(false);
+  const isFullscreen = nativeFullscreen || pseudoFullscreen;
+  const reopenEditorAfterFullscreenRef = useRef(false);
   // Anonymous presence: one random token per editor session, never tied to the account.
   const presenceTokenRef = useRef("");
   // Everyone on this board right now, one presence key per open tab, this tab's key first.
@@ -7972,10 +7997,34 @@ function Board2Editor({
   }, [ambientVideoEnabled]);
   useEffect(() => { boardColorRef.current = boardColor; }, [boardColor]);
   useEffect(() => {
-    const sync = () => setIsFullscreen(!!document.fullscreenElement);
+    const sync = () => {
+      const native = !!(document.fullscreenElement || (document as BoardFullscreenDocument).webkitFullscreenElement);
+      setNativeFullscreen(native);
+      // A slow native request that lands after the CSS fallback took over replaces it.
+      if (native) setPseudoFullscreen(false);
+    };
     document.addEventListener("fullscreenchange", sync);
-    return () => document.removeEventListener("fullscreenchange", sync);
+    document.addEventListener("webkitfullscreenchange", sync);
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      document.removeEventListener("webkitfullscreenchange", sync);
+    };
   }, []);
+  useEffect(() => {
+    if (!pseudoFullscreen) return;
+    const root = document.documentElement;
+    root.classList.add("nb-fullscreen-mode");
+    // iOS collapses the URL bar after a small scroll.
+    if (isIOSDevice()) window.setTimeout(() => window.scrollTo(0, 1), 50);
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") exitPseudoFullscreen(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      root.classList.remove("nb-fullscreen-mode");
+      window.removeEventListener("keydown", onKeyDown);
+    };
+    // exitPseudoFullscreen is component-local; this only follows the mode flag.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pseudoFullscreen]);
   // The board's Realtime channel: who else is on it (presence) and "board-saved" nudges that make
   // everyone pull a new save at once. Only joinable boards can have anyone else on them, and the
   // join code is the id every participant shares, so it names the channel. Each tab tracks only a
@@ -24292,9 +24341,47 @@ function Board2Editor({
     }
   }
 
-  function toggleFullscreen() {
-    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
-    else void document.documentElement.requestFullscreen().catch(() => setToast("Fullscreen isn't available here"));
+  // Fullscreen: the Fullscreen API where the browser allows it (Android Chrome, desktop), trying the
+  // standard then the webkit-prefixed call on <html>, then <body>; anything else (iPhone Safari,
+  // in-app browsers, a refused request) gets the CSS fullscreen mode.
+  async function toggleFullscreen() {
+    const doc = document as BoardFullscreenDocument & { webkitFullscreenEnabled?: boolean };
+    if (pseudoFullscreen) { exitPseudoFullscreen(); return; }
+    if (document.fullscreenElement || doc.webkitFullscreenElement) {
+      try {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else await doc.webkitExitFullscreen?.();
+      } catch {}
+      return;
+    }
+    if (document.fullscreenEnabled || doc.webkitFullscreenEnabled) {
+      for (const target of [document.documentElement, document.body] as BoardFullscreenElement[]) {
+        // Unsupported methods are skipped rather than called; thrown and rejected failures try the
+        // next option. A request that never settles (seen in embedded browsers) goes straight to
+        // the CSS mode — the next element would hang the same way.
+        const request = typeof target.requestFullscreen === "function"
+          ? () => target.requestFullscreen()
+          : typeof target.webkitRequestFullscreen === "function" ? () => target.webkitRequestFullscreen!() : null;
+        if (!request) continue;
+        const outcome = await requestFullscreenWithin(request, FULLSCREEN_REQUEST_TIMEOUT_MS);
+        if (outcome === "entered") return;
+        if (outcome === "timeout") break;
+      }
+    }
+    enterPseudoFullscreen();
+  }
+
+  function enterPseudoFullscreen() {
+    reopenEditorAfterFullscreenRef.current = !chromeHidden;
+    if (!chromeHidden) onToggleChrome();
+    setBoardSettingsOpen(false);
+    setPseudoFullscreen(true);
+  }
+
+  function exitPseudoFullscreen() {
+    setPseudoFullscreen(false);
+    if (reopenEditorAfterFullscreenRef.current) onOpenEditor?.();
+    reopenEditorAfterFullscreenRef.current = false;
   }
 
   // No account needed: signed out, this creates an anonymous board that expires unless saved.
@@ -24384,6 +24471,8 @@ function Board2Editor({
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        /* CSS fullscreen (no Fullscreen API, e.g. iPhone Safari): the page is exactly the viewport and never scrolls. */
+        html.nb-fullscreen-mode, html.nb-fullscreen-mode body { height: 100dvh; overflow: hidden; overscroll-behavior: none; }
         [data-board2-exporting] > :not(style):not([aria-hidden="true"]):not([data-export-progress]) { visibility: hidden !important; }
         @media (pointer: coarse) {
           .nb-custom-zoom-trigger { min-height: 44px !important; }
@@ -24405,13 +24494,19 @@ function Board2Editor({
       {/* ── Header ──
           Board view: the app shell's header (AppShell.module.css), so a shared board looks like Home
           and Profile. The parchment board below keeps its own look. */}
-      {!viewOnly && chromeHidden && (
+      {pseudoFullscreen && (
+        <button type="button" className={shellStyles.glassButton} onClick={exitPseudoFullscreen} aria-label="Exit fullscreen" title="Exit fullscreen"
+          style={{ position: "fixed", top: "max(8px, env(safe-area-inset-top))", left: "max(8px, env(safe-area-inset-left))", zIndex: 10060 }}
+        >
+          <CompressIcon size={18} />
+        </button>
+      )}
+      {!viewOnly && chromeHidden && !pseudoFullscreen && (
         <header role="toolbar" aria-label="Board" className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.header} ${shellStyles.boardHeader}`}>
           <div className={shellStyles.headerInner}>
-            <div className={shellStyles.boardHeaderSide}>
+            <div className={shellStyles.boardHeaderLead}>
               <button type="button" className={shellStyles.brand} onClick={onLeaveEditor} aria-label="Back to Home" title="Back to Home"><LogoMark /><span>NeuralBoard</span></button>
-            </div>
-            <div className={shellStyles.boardHeaderCenter}>
+              <div className={shellStyles.boardCode}>
               {joinCode ? (
                 <button type="button" className={shellStyles.recentBoard} onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}>
                   {joinCode}
@@ -24422,17 +24517,19 @@ function Board2Editor({
                   {joinStatus === "connecting" ? "Getting code…" : "Get board code"}
                 </button>
               )}
-              {boardCodeCopied && <span role="status" className={shellStyles.statusBubble}>Copied!</span>}
+                {boardCodeCopied && <span role="status" className={shellStyles.statusBubble}>Copied!</span>}
+              </div>
             </div>
-            <div className={`${shellStyles.headerActions} ${shellStyles.boardHeaderSide}`}>
+            <div className={`${shellStyles.headerActions} ${shellStyles.boardHeaderActions}`}>
               {canSaveBoardToAccount && (
-                <button type="button" className={shellStyles.ghostButton} onClick={saveBoardToAccount} aria-label="Save board to account" title={`${boardExpiryLabel}. Save it to your account to keep it.`}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 8.5a4.5 4.5 0 0 1-1 8.9" /><path d="M12 12v8M9 15l3-3 3 3" /></svg>
-                  <span>{isMobile ? "Save" : "Save to account"}</span>
+                // Icon-only glass button on phones, where the one-row bar has no room for the label.
+                <button type="button" className={isMobile ? shellStyles.glassButton : shellStyles.ghostButton} onClick={saveBoardToAccount} aria-label="Save board to account" title={`${boardExpiryLabel}. Save it to your account to keep it.`}>
+                  <svg viewBox="0 0 24 24" width={isMobile ? 18 : undefined} height={isMobile ? 18 : undefined} aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 8.5a4.5 4.5 0 0 1-1 8.9" /><path d="M12 12v8M9 15l3-3 3 3" /></svg>
+                  {!isMobile && <span>Save to account</span>}
                 </button>
               )}
               <div style={{ position: "relative" }}>
-                <button type="button" className={shellStyles.iconButton} onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings"><GearIcon size={22} /></button>
+                <button type="button" className={shellStyles.glassButton} onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings"><GearIcon size={18} /></button>
                 {boardSettingsOpen && (
                   <>
                     <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
@@ -24481,12 +24578,12 @@ function Board2Editor({
                   </>
                 )}
               </div>
-              <button type="button" className={shellStyles.iconButton} onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
-                {isFullscreen ? <CompressIcon size={22} /> : <ExpandIcon size={22} />}
+              <button type="button" className={shellStyles.glassButton} onClick={() => { void toggleFullscreen(); }} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+                {isFullscreen ? <CompressIcon size={18} /> : <ExpandIcon size={18} />}
               </button>
               {isBoardOwner && (
-                <button type="button" className={shellStyles.iconButton} aria-label="Open video editor" aria-pressed={false} title="Open the video editor for the board centered on screen" onClick={restoreChromeForCenteredBoard}>
-                  <ClapperboardIcon open={false} stripe="#ffffff" size={22} />
+                <button type="button" className={shellStyles.glassButton} aria-label="Open video editor" aria-pressed={false} title="Open the video editor for the board centered on screen" onClick={restoreChromeForCenteredBoard}>
+                  <ClapperboardIcon open={false} stripe="#ffffff" size={19} />
                 </button>
               )}
             </div>
@@ -24494,7 +24591,7 @@ function Board2Editor({
         </header>
       )}
       {/* Video editor: its own compact bar. */}
-      {!viewOnly && !chromeHidden && (
+      {!viewOnly && !chromeHidden && !pseudoFullscreen && (
         <div
           role="toolbar"
           aria-label="Board"
@@ -24514,7 +24611,7 @@ function Board2Editor({
               <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>
             </button>
             {isMobile && (
-              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} style={{ ...topBarIconButton(mobileEditorMenuOpen, topBar), fontSize: 15 }}>☰</button>
+              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} className={shellStyles.glassButton} style={{ fontSize: 15 }}><span>☰</span></button>
             )}
             {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
@@ -24550,7 +24647,7 @@ function Board2Editor({
               </button>
             )}
             <div style={{ position: "relative" }}>
-              <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" style={topBarIconButton(boardSettingsOpen, topBar)}><GearIcon size={topBar.icon} /></button>
+              <button type="button" onClick={() => setBoardSettingsOpen((open) => !open)} aria-label="Board settings" aria-expanded={boardSettingsOpen} title="Board settings" className={shellStyles.glassButton}><GearIcon size={topBar.icon} /></button>
               {boardSettingsOpen && (
                 <>
                   <div aria-hidden="true" onClick={() => setBoardSettingsOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 0 }} />
@@ -24594,7 +24691,7 @@ function Board2Editor({
                 </>
               )}
             </div>
-            <button type="button" onClick={toggleFullscreen} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} style={topBarIconButton(isFullscreen, topBar)}>
+            <button type="button" onClick={() => { void toggleFullscreen(); }} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"} className={shellStyles.glassButton}>
               {isFullscreen ? <CompressIcon size={topBar.icon} /> : <ExpandIcon size={topBar.icon} />}
             </button>
             {isBoardOwner && <button
@@ -24603,9 +24700,9 @@ function Board2Editor({
               aria-pressed
               title="Close the video editor"
               onClick={onToggleChrome}
-              style={{ ...topBarIconButton(true, topBar), background: "#c8f135", color: "#2a2a2a" }}
+              className={`${shellStyles.glassButton} ${shellStyles.glassAccent}`}
             >
-              <ClapperboardIcon open stripe="#c8f135" size={19} />
+              <ClapperboardIcon open stripe="#d2f356" size={19} />
             </button>}
           </div>
         </div>
@@ -29084,7 +29181,7 @@ type TopBarTheme = {
   activeBg: string; activeBorder: string; pillBorder: string; pillBg: string; dotRing: string;
 };
 const EDITOR_TOP_BAR: TopBarTheme = {
-  height: 34, button: 26, icon: 15,
+  height: 44, button: 44, icon: 17,
   background: "rgba(255,253,245,0.65)", borderBottom: "1.5px solid rgba(42,42,42,0.15)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.55)",
   activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
   pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
@@ -29105,16 +29202,6 @@ function boardHandleStyle(touch: boolean, visible: number, round = false): React
     width: 44, height: 44, border: 0, touchAction: "none",
     background: `radial-gradient(${round ? "circle" : "closest-side"}, #ff5e3a 0 ${r}px, #fff ${r}px ${r + 1.5}px, transparent ${r + 1.5}px)`,
     half: 22,
-  };
-}
-
-function topBarIconButton(active: boolean, theme: TopBarTheme): React.CSSProperties {
-  return {
-    width: theme.button, height: theme.button, padding: 0, flexShrink: 0, borderRadius: 7, cursor: "pointer",
-    display: "grid", placeItems: "center",
-    border: "1px solid " + (active ? theme.activeBorder : "transparent"),
-    background: active ? theme.activeBg : "transparent",
-    color: active ? theme.ink : theme.muted,
   };
 }
 

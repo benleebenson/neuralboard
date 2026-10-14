@@ -33,9 +33,8 @@
 .header{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.94);backdrop-filter:blur(10px);border-bottom:1px solid var(--hairline);padding-top:env(safe-area-inset-top)}
 .headerInner{display:flex;align-items:center;gap:20px;max-width:var(--content-max);margin:0 auto;padding:14px var(--gutter)}
 .brand{display:flex;align-items:center;gap:10px;flex:0 0 auto;color:var(--ink);font-weight:700;font-size:20px;letter-spacing:-.2px;white-space:nowrap}
-.logo{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:var(--brand-gradient)}
-.logo svg{width:22px;height:22px;fill:none;stroke:var(--on-gradient);stroke-width:2;stroke-linejoin:round}
-.logo svg path{fill:var(--on-gradient);stroke:none}
+.logo{display:grid;place-items:center;width:32px;height:32px}
+.logo svg{width:30px;height:30px}
 .search{display:flex;align-items:center;gap:10px;flex:1 1 auto;max-width:520px;margin:0 auto;height:44px;padding:0 18px;border-radius:var(--radius-pill);background:var(--tint);color:var(--link)}
 .search:focus-within{outline:2px solid var(--section);outline-offset:2px}
 .search svg{width:18px;height:18px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
@@ -187,9 +186,11 @@
 .boardHeader .headerInner{max-width:none;padding-top:8px;padding-bottom:8px;gap:12px}
 .boardHeader .brand{padding:0 6px 0 0;border:0;border-radius:var(--radius-pill);background:transparent;cursor:pointer}
 .boardHeader .brand:focus-visible{outline:2px solid var(--section);outline-offset:2px}
-.boardHeaderSide{display:flex;align-items:center;flex:1 1 0;min-width:0}
-.boardHeader .headerActions.boardHeaderSide{gap:2px}
-.boardHeaderCenter{position:relative;display:flex;justify-content:center;flex:0 1 auto;min-width:0}
+/* One row at every width: [logo][code] ··· [actions]. Overrides .headerInner's mobile wrap (that's for Home's search row). */
+.boardHeader .headerInner{flex-wrap:nowrap}
+.boardHeaderLead{display:flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0}
+.boardCode{position:relative;flex:0 1 auto;min-width:0}
+.boardHeader .headerActions.boardHeaderActions{gap:2px;flex:0 0 auto}
 .boardHeader .recentBoard{min-height:44px;gap:8px;background:var(--ground);cursor:pointer}
 .boardHeader .recentBoard svg{width:14px;height:14px;fill:none;stroke:var(--icon-muted);stroke-width:2}
 .iconButton[aria-pressed="true"],.iconButton[aria-expanded="true"]{background:var(--tint);color:var(--link)}
@@ -214,8 +215,20 @@
 @media(max-width:600px){
   .boardHeader .brand > span:last-child{display:none}
   .boardHeader .headerInner{gap:6px}
-  .boardHeaderSide{flex:0 0 auto}
-  .boardHeaderCenter{flex:1 1 auto}
-  .boardHeaderCenter .outlineButton{padding:0 14px}
+  .boardHeaderLead{gap:4px}
+  .boardCode .outlineButton{padding:0 12px;font-size:13px}
+  .boardHeader .recentBoard{padding:0 10px;letter-spacing:1px}
   .ghostButton{padding:0 10px}
 }
+
+/* Liquid Glass icon buttons (Apple Maps style) for the board and video-editor top bars: a 36px
+   frosted circle drawn by ::before inside a 44px hit area, with the icon in near-black above it. */
+.glassButton{position:relative;display:grid;place-items:center;flex:0 0 auto;width:44px;height:44px;padding:0;border:0;background:transparent;color:#1c1c1e;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.glassButton::before{content:"";position:absolute;inset:4px;border-radius:50%;background:rgba(255,255,255,.75);-webkit-backdrop-filter:blur(8px) saturate(1.2);backdrop-filter:blur(8px) saturate(1.2);border:1px solid rgba(255,255,255,.4);box-shadow:0 1px 4px rgba(0,0,0,.12);transition:background .15s ease,box-shadow .15s ease}
+.glassButton > *{position:relative}
+.glassButton:hover::before{background:rgba(255,255,255,.92)}
+.glassButton[aria-pressed="true"]::before,.glassButton[aria-expanded="true"]::before{background:rgba(255,255,255,.96);box-shadow:0 0 0 1.5px rgba(28,28,30,.28),0 1px 4px rgba(0,0,0,.12)}
+.glassButton.glassAccent::before{background:rgba(200,241,53,.88)}
+.glassButton:focus-visible{outline:none}
+.glassButton:focus-visible::before{box-shadow:0 0 0 2px #1e8c83,0 1px 4px rgba(0,0,0,.12)}
+.glassButton svg{display:block}
