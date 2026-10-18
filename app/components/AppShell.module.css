@@ -205,9 +205,17 @@
 .popoverRow{display:flex;align-items:center;gap:8px}
 .dangerButton{color:var(--error)}
 .statusBubble{position:absolute;top:calc(100% + 6px);left:50%;transform:translateX(-50%);padding:4px 12px;border-radius:var(--radius-pill);background:var(--ink);color:var(--ground);font-size:12px;font-weight:600;white-space:nowrap;pointer-events:none}
-.presence{position:absolute;top:12px;right:max(12px,env(safe-area-inset-right));z-index:250;display:flex;align-items:center;gap:6px;padding:7px 11px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);box-shadow:var(--dock-shadow);color:var(--ink);font-size:12px;font-weight:600;pointer-events:none}
-.presenceDot{width:12px;height:12px;border-radius:50%;box-shadow:0 0 0 2px var(--ground)}
+/* Presence pill: sits inline in the board and video-editor top bars, never over the board. */
+.presence{display:flex;flex:0 0 auto;align-items:center;gap:6px;height:32px;padding:0 11px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);color:var(--ink);font-size:12px;font-weight:600;white-space:nowrap;pointer-events:none;box-sizing:border-box}
+.presenceDot{flex:0 0 auto;width:12px;height:12px;border-radius:50%;box-shadow:0 0 0 2px var(--ground)}
 .presenceDot:first-child{margin-right:3px;box-shadow:0 0 0 2px var(--ground),0 0 0 3.5px var(--section)}
+/* Phones: no room in the one-row bar, so the dots become a badge pinned to the board-code pill's
+   top-right corner (still inside the bar, zero row width at any people count). */
+.presenceCompact{position:absolute;top:-4px;right:-6px;z-index:1;gap:0;height:16px;padding:0 4px;font-size:10px;line-height:1}
+.presenceCompact .presenceDot{width:8px;height:8px;box-shadow:0 0 0 1.5px var(--ground)}
+.presenceCompact .presenceDot + .presenceDot{margin-left:-2px}
+.presenceCompact .presenceDot:first-child{margin-right:3px;box-shadow:0 0 0 1.5px var(--ground),0 0 0 2.5px var(--section)}
+.presenceCompact > span:not(.presenceDot){margin-left:3px}
 .addMarker{position:absolute;z-index:260;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;background:var(--brand-gradient);box-shadow:0 0 0 3px rgba(30,140,131,.25);pointer-events:none}
 .addMenu{position:absolute;z-index:261;display:flex;gap:6px;padding:6px;border:1px solid var(--hairline);border-radius:var(--radius-card);background:var(--ground);box-shadow:var(--dock-shadow)}
 .addMenu .outlineButton{flex:1;padding:0 12px;gap:6px;font-size:14px;touch-action:manipulation}

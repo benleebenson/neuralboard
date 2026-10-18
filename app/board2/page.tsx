@@ -24451,6 +24451,25 @@ function Board2Editor({
     setToast("Board is no longer joinable");
   }
 
+  // Who's on the board: one dot per person, you first (ringed). Lives in the top bar (both the
+  // board header and the video editor's bar) so it never covers the board. On phones it's a small
+  // badge on the board-code pill (fewer, overlapping dots plus "+N"), since the one-row bar has no
+  // spare width.
+  const presenceIndicator = (() => {
+    if (!joinCode || viewOnly || presencePeople.length === 0) return null;
+    const count = presencePeople.length;
+    const maxDots = isMobile ? PRESENCE_MAX_DOTS_COMPACT : PRESENCE_MAX_DOTS;
+    const label = `${count} ${count === 1 ? "person" : "people"} on this board (including you)`;
+    return (
+      <div role="img" aria-label={label} title={label} data-presence-count={count} className={`${shellStyles.theme} ${shellStyles.presence}${isMobile ? ` ${shellStyles.presenceCompact}` : ""}`}>
+        {presencePeople.slice(0, maxDots).map((token) => (
+          <span key={token} data-presence-dot className={shellStyles.presenceDot} style={{ background: presenceColor(token) }} />
+        ))}
+        {count > maxDots && <span>+{count - maxDots}</span>}
+      </div>
+    );
+  })();
+
   const topBar = touchSizedTopBar(EDITOR_TOP_BAR, isMobile);
   // An anonymous board expires unless its creator saves it to an account (a quiet top-bar button).
   const canSaveBoardToAccount = !viewOnly && !!joinCode && joinAnonymous && !!joinOwnerToken;
@@ -24518,7 +24537,9 @@ function Board2Editor({
                 </button>
               )}
                 {boardCodeCopied && <span role="status" className={shellStyles.statusBubble}>Copied!</span>}
+                {isMobile && presenceIndicator}
               </div>
+              {!isMobile && presenceIndicator}
             </div>
             <div className={`${shellStyles.headerActions} ${shellStyles.boardHeaderActions}`}>
               {canSaveBoardToAccount && (
@@ -24616,8 +24637,8 @@ function Board2Editor({
             {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
 
-          {/* Center: the board's share code */}
-          <div style={{ flexShrink: 0, position: "relative" }}>
+          {/* Center: the board's share code and who's on the board */}
+          <div style={{ flexShrink: 0, position: "relative", display: "flex", alignItems: "center", gap: 6 }}>
             {joinCode ? (
               <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
                 style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: topBar.pillBg, color: topBar.muted, fontFamily: "monospace", fontSize: 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
@@ -24635,6 +24656,7 @@ function Board2Editor({
             {boardCodeCopied && (
               <span role="status" style={{ position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)", padding: "3px 8px", borderRadius: 4, background: "#c8f135", color: "#2a2a2a", fontSize: 10, fontWeight: 700, whiteSpace: "nowrap", pointerEvents: "none" }}>Copied!</span>
             )}
+            {presenceIndicator}
           </div>
 
           {/* Right: save to account, settings, fullscreen, close the video editor */}
@@ -25052,20 +25074,6 @@ function Board2Editor({
                   style={{ position: "absolute", inset: 0, zIndex: 200, cursor: "grab", touchAction: "none" }}
                 />
               )}
-              {/* Who's on the board, in its top-right corner: one dot per person, you first (ringed).
-                  Five people, five dots. */}
-              {joinCode && !viewOnly && presencePeople.length > 0 && (() => {
-                const count = presencePeople.length;
-                const label = `${count} ${count === 1 ? "person" : "people"} on this board (including you)`;
-                return (
-                  <div role="img" aria-label={label} title={label} data-presence-count={count} className={`${shellStyles.theme} ${shellStyles.presence}`}>
-                    {presencePeople.slice(0, PRESENCE_MAX_DOTS).map((token) => (
-                      <span key={token} data-presence-dot className={shellStyles.presenceDot} style={{ background: presenceColor(token) }} />
-                    ))}
-                    {count > PRESENCE_MAX_DOTS && <span>+{count - PRESENCE_MAX_DOTS}</span>}
-                  </div>
-                );
-              })()}
               {boardViewEditable && (
                 <input ref={boardAddImageInputRef} type="file" accept="image/*" multiple aria-hidden="true" tabIndex={-1} style={{ display: "none" }} onChange={(event) => { void handleBoardPromptImages(event); }} />
               )}
@@ -27593,7 +27601,9 @@ function Board2Editor({
                   aria-label="Flash cut picker"
                   style={{
                     position: "fixed", left: isMobile ? 8 : 120, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
-                    width: isMobile ? undefined : 380, maxHeight: "60vh", overflowY: "auto", zIndex: 901,
+                    // Grows upward from the timeline; cap it to the room under the top bar so a large
+                    // library scrolls inside the picker instead of pushing its header off-screen.
+                    width: isMobile ? undefined : 380, maxHeight: `min(60vh, calc(100dvh - ${(isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8 + topBar.height + 8}px - env(safe-area-inset-top)))`, overflowY: "auto", zIndex: 901, boxSizing: "border-box",
                     background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
                     fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 10,
                   }}
@@ -29159,6 +29169,7 @@ function generatePresenceToken(): string {
 
 // Stable color per anonymous presence token (FNV-1a), so a dot keeps its color across syncs.
 const PRESENCE_MAX_DOTS = 8;
+const PRESENCE_MAX_DOTS_COMPACT = 3;
 // Joinable-board sync: a change goes out on the next frame when no save is in flight; changes made
 // while one is in flight go together once it returns. Polling is the fallback for the Realtime
 // "board-saved" nudge.
