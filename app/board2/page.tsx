@@ -11,6 +11,7 @@ import { ActionWheel, wheelTriggerStyle } from "@/app/components/ActionWheel";
 import { listSimpleWorldBoards, openSimpleWorldBoardFile, openSimpleWorldPreviewFile, type SimpleWorldBoard } from "@/lib/simple-world";
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { LogoMark } from "@/app/components/AppShell";
+import { EmojiPicker } from "@/app/components/EmojiPicker";
 import shellStyles from "@/app/components/AppShell.module.css";
 import { shellFont } from "@/app/components/shell-font";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
@@ -32,6 +33,7 @@ import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSu
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
 import { layoutUploadedImageBatch } from "@/lib/board2/batch-media-layout";
+import { flashCutExposure } from "@/lib/board2/flash-cut";
 import {
   selectStyleExemplars,
   STYLE_EXEMPLAR_TOKEN_BUDGET,
@@ -260,6 +262,7 @@ import {
   SUPPORTED_EXPORT_FPS,
   deterministicVideoSourceTime,
   encodeOfflineAudioTrack,
+  expectedAacPacketCount,
   exportFrameCount,
   exportFrameTime,
   exportFrameTimestampUs,
@@ -1352,8 +1355,9 @@ function drawZoomNarrationTypewriter(
 
 // ─── Flash cut ─────────────────────────────────────────────────────────────────
 // A "flash" clip slams a full-screen meme image over everything (board, camera, captions) for its
-// whole duration and plays a sound effect from its start. The cut is deliberately a hard on/off —
-// no fade, scale or easing — so it lands within a single frame in preview and export alike.
+// whole duration and plays a sound effect from its start. It hits on a white frame, drops through
+// a couple of blown-out frames to the clean image, and leaves on one overexposed frame — stepped,
+// never eased (see lib/board2/flash-cut.ts) — so preview and export land on the same frames.
 // Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets.
 const FLASH_CUT_DEFAULT_DURATION = 0.6;
 const FLASH_CLIP_COLOR = "#ffe14d";
@@ -1398,11 +1402,33 @@ function decodeFlashCutSound(context: BaseAudioContext, url: string): Promise<Au
       bytes.catch(() => flashCutSoundBytes.delete(url));
     }
     // decodeAudioData detaches its input, so every context decodes its own copy.
-    pending = bytes.then((data) => context.decodeAudioData(data.slice(0)));
+    pending = bytes.then((data) => context.decodeAudioData(data.slice(0))).then((buffer) => trimLeadingSilence(context, buffer));
     decoded.set(url, pending);
     pending.catch(() => decoded!.delete(url));
   }
   return pending;
+}
+
+// Meme sound files often open with silence (the stock vine boom has ~190 ms). Starting the sound
+// at its first audible sample puts the hit on the block start, where the white flash frame lands.
+// Preview and both export paths get their buffers here, so they all stay in sync.
+const FLASH_SOUND_ONSET_THRESHOLD = 0.02; // ≈ -34 dBFS
+const FLASH_SOUND_ONSET_LEAD_SECONDS = 0.002;
+function trimLeadingSilence(context: BaseAudioContext, buffer: AudioBuffer): AudioBuffer {
+  let onset = buffer.length;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const data = buffer.getChannelData(channel);
+    for (let i = 0; i < onset; i++) {
+      if (Math.abs(data[i]) > FLASH_SOUND_ONSET_THRESHOLD) { onset = i; break; }
+    }
+  }
+  const start = Math.max(0, onset - Math.round(FLASH_SOUND_ONSET_LEAD_SECONDS * buffer.sampleRate));
+  if (start === 0 || onset >= buffer.length) return buffer;
+  const trimmed = context.createBuffer(buffer.numberOfChannels, buffer.length - start, buffer.sampleRate);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    trimmed.copyToChannel(buffer.getChannelData(channel).subarray(start), channel);
+  }
+  return trimmed;
 }
 
 function flashCutSoundClips(clips: readonly Clip[]): Array<Clip & { flashSoundUrl: string }> {
@@ -1425,17 +1451,32 @@ function drawFlashCutOverlay(
   }
   if (!flash?.flashImageUrl) return;
   const image = flashCutImage(flash.flashImageUrl);
+  const exposure = flashCutExposure(time - flash.startTime, flash.duration);
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = "source-over";
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, width, height);
-  if (image.complete && image.naturalWidth > 0) {
+  if (exposure.showImage && image.complete && image.naturalWidth > 0) {
     // Cover: scale to fill the frame and crop the overflow, centered.
     const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
     const sw = width / scale;
     const sh = height / scale;
-    ctx.drawImage(image, (image.naturalWidth - sw) / 2, (image.naturalHeight - sh) / 2, sw, sh, 0, 0, width, height);
+    const sx = (image.naturalWidth - sw) / 2;
+    const sy = (image.naturalHeight - sh) / 2;
+    ctx.drawImage(image, sx, sy, sw, sh, 0, 0, width, height);
+    if (exposure.boost > 0) {
+      // Additive self-overlay blows out highlights like an exposure punch.
+      ctx.globalCompositeOperation = "lighter";
+      ctx.globalAlpha = exposure.boost;
+      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, width, height);
+      ctx.globalCompositeOperation = "source-over";
+    }
+  }
+  if (exposure.white > 0) {
+    ctx.globalAlpha = exposure.white;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, width, height);
   }
   ctx.restore();
 }
@@ -10254,6 +10295,11 @@ function Board2Editor({
         drawFrame(maxEnd); return;
       }
       triggerFlashCutSounds(previous, next);
+      // The tick that crosses a flash cut's start always draws, so its white hit frame is never
+      // skipped by the frame cap below.
+      if (clipsRef.current.some((clip) => clip.type === "flash" && clip.startTime > previous && clip.startTime <= next)) {
+        lastEditorFrameTimeRef.current = 0;
+      }
       playheadRef.current = next;
       if (now - lastPlayheadUiTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
         lastPlayheadUiTimeRef.current = now;
@@ -10267,7 +10313,9 @@ function Board2Editor({
     // This shared ownership rule also drives the export schedule below. The second sync handles a
     // media-clock sample that crossed a clip boundary during this animation frame.
     syncNarrationAudioAtTime(t);
-    if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS) {
+    // A few ms of slack: on a ~30 Hz requestAnimationFrame the strict check failed every other
+    // tick and halved the preview to 15 fps. At 60 Hz and above it still caps at 30 fps.
+    if (now - lastEditorFrameTimeRef.current >= EDITOR_FRAME_INTERVAL_MS - 4) {
       lastEditorFrameTimeRef.current = now;
       drawFrame(t);
     }
@@ -18377,7 +18425,7 @@ function Board2Editor({
         const target = writable
           ? new FileSystemWritableFileStreamTarget(writable, { chunkSize: 16 * 1024 * 1024 })
           : memoryTarget!;
-        const expectedAudioChunks = audioSources.length > 0 ? Math.ceil(totalDur * 48_000 / 1024) : 0;
+        const expectedAudioChunks = audioSources.length > 0 ? expectedAacPacketCount(totalDur) : 0;
         muxer = new Muxer({
           target,
           video: { codec: "avc", width: W, height: H, frameRate: fps },
@@ -18404,14 +18452,19 @@ function Board2Editor({
       }
 
       let codecError: Error | null = null;
+      // A muxer error thrown inside an encoder callback never reaches this function; record it so
+      // the export fails instead of finishing with packets missing.
+      const muxOrFail = (add: () => void) => {
+        try { add(); } catch (error) { codecError ??= error instanceof Error ? error : new Error(String(error)); }
+      };
       videoEncoder = new VideoEncoder({
-        output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+        output: (chunk, metadata) => muxOrFail(() => muxer.addVideoChunk(chunk, metadata)),
         error: (error) => { codecError = error; },
       });
       videoEncoder.configure(selectedCandidate.videoConfig);
       if (audioSources.length > 0) {
         audioEncoder = new AudioEncoder({
-          output: (chunk, metadata) => muxer.addAudioChunk(chunk, metadata),
+          output: (chunk, metadata) => muxOrFail(() => muxer.addAudioChunk(chunk, metadata)),
           error: (error) => { codecError = error; },
         });
         audioEncoder.configure(selectedCandidate.audioConfig);
@@ -25990,29 +26043,15 @@ function Board2Editor({
 
                         {/* Emoji picker popover */}
                         {annotationTool === "emoji" && emojiPickerOpen && (
-                          <div style={{
-                            position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
-                            background: "#fffdf5", border: "1.5px solid #2a2a2a",
-                            boxShadow: "3px 3px 0 #2a2a2a", padding: 8, zIndex: 50,
-                            display: "grid", gridTemplateColumns: "repeat(9, 28px)", gap: 2,
-                          }}>
-                            {EMOJI_SET.map((em) => (
-                              <button
-                                key={em}
-                                title={em}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setAnnotationEmoji(em);
-                                  setEmojiPickerOpen(false);
-                                }}
-                                style={{
-                                  width: 28, height: 28, fontSize: 16, border: "none", padding: 0,
-                                  background: annotationEmoji === em ? "#c8f135" : "transparent",
-                                  cursor: "pointer", borderRadius: 2,
-                                }}
-                              >{em}</button>
-                            ))}
-                          </div>
+                          <EmojiPicker
+                            selected={annotationEmoji}
+                            compact={isMobile}
+                            onPick={(em) => {
+                              setAnnotationEmoji(em);
+                              setEmojiPickerOpen(false);
+                            }}
+                            onClose={() => setEmojiPickerOpen(false)}
+                          />
                         )}
 
                       </div>

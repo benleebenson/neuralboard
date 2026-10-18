@@ -1,0 +1,29 @@
+/* Emoji picker for board annotations. Lives inside .theme (AppShell.module.css) for its tokens. */
+.picker{--cell:36px;position:fixed;z-index:1000;display:flex;flex-direction:column;gap:10px;width:360px;max-width:calc(100vw - 32px);max-height:min(440px,calc(100dvh - 120px));padding:12px;box-sizing:border-box;border:1px solid var(--hairline);border-radius:var(--radius-card);background:var(--ground);box-shadow:var(--dock-shadow);color:var(--body);white-space:normal}
+/* Phones and touch: a bottom sheet with 44px targets, pinned inside the 16px gutters. */
+.sheet{--cell:44px;position:fixed;top:auto;left:16px;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));width:auto;max-width:none;max-height:min(70dvh,520px);z-index:1000}
+@media (pointer:coarse){.picker{--cell:44px}}
+.searchRow{display:flex;align-items:center;gap:6px}
+.search.search{order:0;flex:1 1 auto;max-width:none;height:44px;margin:0;padding:0 14px}
+/* 16px so iOS doesn't zoom on focus. */
+.search.search input{font-size:16px}
+.search input::-webkit-search-cancel-button{cursor:pointer}
+.close{display:grid;place-items:center;flex:0 0 auto;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--icon-muted);cursor:pointer}
+.close:hover{background:var(--tint);color:var(--ink)}
+.close:focus-visible{outline:2px solid var(--section);outline-offset:2px}
+.close svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
+.recent{display:grid;gap:4px;flex:0 0 auto}
+.recentRow{display:flex;gap:2px;overflow-x:auto;scrollbar-width:none}
+.recentRow::-webkit-scrollbar{display:none}
+.tabs{display:flex;gap:2px;flex:0 0 auto;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--hairline);padding-bottom:6px}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;display:grid;place-items:center;width:var(--cell);height:var(--cell);padding:0;border:0;border-radius:var(--radius-pill);background:transparent;font-size:18px;cursor:pointer;touch-action:manipulation;filter:grayscale(.5);opacity:.8}
+.tab:hover{background:var(--tint);filter:none;opacity:1}
+.tab:focus-visible{outline:2px solid var(--section);outline-offset:-2px;filter:none;opacity:1}
+.scroll{flex:1 1 auto;min-height:120px;overflow-y:auto;overscroll-behavior:contain;margin:0 -4px;padding:0 4px;position:relative}
+.groupTitle{position:sticky;top:0;z-index:1;margin:0;padding:6px 0 4px;background:var(--ground);color:var(--caption);font-size:12px;font-weight:600;letter-spacing:.2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--cell),1fr));gap:2px;padding-bottom:8px}
+.cell{flex:0 0 auto;display:grid;place-items:center;min-width:var(--cell);height:var(--cell);padding:0;border:0;border-radius:10px;background:transparent;font-size:calc(var(--cell) * .58);line-height:1;cursor:pointer;touch-action:manipulation;font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif}
+.cell:hover{background:var(--tint)}
+.cell[aria-pressed="true"]{background:var(--tint);box-shadow:inset 0 0 0 1.5px var(--section)}
+.cell:focus-visible{outline:2px solid var(--section);outline-offset:-2px}

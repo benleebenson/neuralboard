@@ -23,6 +23,16 @@ export function exportFrameTimestampUs(frameIndex: number, fps: number): number 
   return Math.round(exportFrameTime(frameIndex, fps) * 1_000_000);
 }
 
+// AAC encoders emit a little more than the input: Chrome's adds 2112 samples of priming (about
+// three 1024-sample packets) plus a padded final packet. The MP4 muxer's fast-start layout
+// reserves room for a fixed packet count and rejects any packet past it, which silently cut the
+// end of every export's audio. Unused reservations cost a few bytes each.
+export const AAC_PACKET_HEADROOM = 16;
+
+export function expectedAacPacketCount(durationSeconds: number, sampleRate = 48_000, packetFrames = 1024): number {
+  return Math.ceil(Math.max(1, Math.ceil(Math.max(0, durationSeconds) * sampleRate)) / packetFrames) + AAC_PACKET_HEADROOM;
+}
+
 export function snapshotDimensions(
   boardWidth: number,
   boardHeight: number,
