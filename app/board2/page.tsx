@@ -3560,6 +3560,32 @@ function cameraViewport(
   };
 }
 
+// Camera audio focus: when the camera has zoomed onto a board video so that it fills the whole
+// view, that video plays with sound (see evaluateVideoPlaybackStates).
+const CAMERA_AUDIO_FOCUS_TOLERANCE = 0.05; // of the viewport's width/height, per side
+const CAMERA_AUDIO_FADE_OUT_SECONDS = 0.3;
+
+// The board video whose rect covers the whole camera viewport — left ≤ view left, right ≥ view
+// right, top ≤ view top, bottom ≥ view bottom, each allowed to fall short by 5% of the view's size.
+// Returns the board entity id (timeline appearances of one board video count as one video);
+// null when none covers it, or when two different videos both do (ambiguous).
+function getVideoInFocus(viewport: CameraViewport, clips: readonly Clip[]): string | null {
+  const tolX = (viewport.right - viewport.left) * CAMERA_AUDIO_FOCUS_TOLERANCE;
+  const tolY = (viewport.bottom - viewport.top) * CAMERA_AUDIO_FOCUS_TOLERANCE;
+  let focused: string | null = null;
+  for (const clip of clips) {
+    if (clip.type !== "video" || clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+    const covers =
+      clip.boardX <= viewport.left + tolX && clip.boardX + clip.boardW >= viewport.right - tolX &&
+      clip.boardY <= viewport.top + tolY && clip.boardY + clip.boardH >= viewport.bottom - tolY;
+    if (!covers) continue;
+    const entity = boardEntityId(clip);
+    if (focused && focused !== entity) return null;
+    focused = entity;
+  }
+  return focused;
+}
+
 function viewportEntranceSpawn(
   landingX: number,
   landingY: number,
@@ -6894,6 +6920,10 @@ function Board2Editor({
     executed: Set<number>;
   }>({ active: false, generated: 0, seen: new Set(), executed: new Set() });
   const videoAudioNodesRef = useRef<Map<string, { sourceNode: MediaElementAudioSourceNode; gainNode: GainNode }>>(new Map());
+  // The board video currently unmuted because it fills the camera's view, and videos still fading
+  // out after losing that focus (clip id → performance.now() when the fade ends).
+  const focusedVideoRef = useRef<string | null>(null);
+  const videoFocusFadeUntilRef = useRef<Map<string, number>>(new Map());
   const videoDimsRef = useRef<Map<string, { w: number; h: number }>>(new Map());
   const showCharacterRef = useRef(false);
   const showCharacter2Ref = useRef(false);
@@ -9973,6 +10003,8 @@ function Board2Editor({
     const effectiveVolume = effectiveClipVolume(clip);
     const nodes = videoAudioNodesRef.current.get(clip.id);
     if (nodes) {
+      // A camera-focus fade-out still scheduled would otherwise ramp this level back to 0.
+      nodes.gainNode.gain.cancelScheduledValues(0);
       nodes.gainNode.gain.value = effectiveVolume;
     } else {
       vid.muted = false;
@@ -9983,6 +10015,7 @@ function Board2Editor({
   function setVideoGain(clipId: string, vid: HTMLVideoElement, gain: number) {
     const nodes = videoAudioNodesRef.current.get(clipId);
     if (nodes) {
+      nodes.gainNode.gain.cancelScheduledValues(0);
       nodes.gainNode.gain.value = gain;
     } else {
       vid.muted = false;
@@ -10014,7 +10047,30 @@ function Board2Editor({
     pauseAndReset(vid);
   }
 
+  // Fades a video's audio out over CAMERA_AUDIO_FADE_OUT_SECONDS when the camera moves off it.
+  function fadeOutFocusedVideoAudio(clipId: string, now: number) {
+    const nodes = videoAudioNodesRef.current.get(clipId);
+    const ctx = audioCtxRef.current;
+    if (nodes && ctx && ctx.state !== "closed") {
+      const gain = nodes.gainNode.gain;
+      gain.cancelScheduledValues(ctx.currentTime);
+      gain.setValueAtTime(gain.value, ctx.currentTime);
+      gain.linearRampToValueAtTime(0, ctx.currentTime + CAMERA_AUDIO_FADE_OUT_SECONDS);
+      videoFocusFadeUntilRef.current.set(clipId, now + CAMERA_AUDIO_FADE_OUT_SECONDS * 1000);
+    } else {
+      const vid = videoElsRef.current.get(clipId);
+      if (vid) setClipAudioOff(clipId, vid);
+    }
+  }
+
+  // Playback stopped: the stop paths silence every video; forget camera focus and any fades.
+  function clearCameraAudioFocus() {
+    focusedVideoRef.current = null;
+    videoFocusFadeUntilRef.current.clear();
+  }
+
   function stopAllVideoPlayback(reason: string) {
+    clearCameraAudioFocus();
     for (const nodes of videoAudioNodesRef.current.values()) {
       try { nodes.gainNode.gain.value = 0; } catch {}
     }
@@ -10089,7 +10145,7 @@ function Board2Editor({
     currentCameraKeyframes: CameraKeyframe[],
     W: number,
     H: number,
-    options: { force?: boolean; audioMode?: "preview" | "silent" | "focused"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null } = {}
+    options: { force?: boolean; audioMode?: "preview" | "silent" | "focused"; overrideCamera?: { cameraX: number; cameraY: number; boardZoom: number } | null; focusedVideoId?: string | null; cameraAudioFocus?: boolean } = {}
   ) {
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
@@ -10104,6 +10160,27 @@ function Board2Editor({
     const activeIds = new Set(activeWindows.keys());
     const foregroundIds = new Set(activeIds);
     if (options.focusedVideoId) foregroundIds.add(options.focusedVideoId);
+
+    // Camera audio focus (editor preview playback only): the board video filling the camera's
+    // view plays with sound. A video already on the timeline here is audible already, so it
+    // needs nothing; otherwise one appearance of the focused video (its board record when
+    // present) is unmuted. Losing focus fades it out.
+    let cameraFocusClipId: string | null = null;
+    if (options.cameraAudioFocus && isPlayingRef.current && (options.audioMode ?? "preview") === "preview") {
+      const cam = options.overrideCamera ?? editorCameraAtTime(time, currentClips, currentCameraKeyframes, W, H);
+      const entity = getVideoInFocus(cameraViewport(cam, W, H, boardDimensionsRef.current.width), videoClips);
+      const appearances = entity ? videoClips.filter((clip) => boardEntityId(clip) === entity) : [];
+      if (appearances.length && !appearances.some((clip) => activeIds.has(clip.id))) {
+        cameraFocusClipId = (appearances.find((clip) => clip.id === entity) ?? appearances[0]).id;
+      }
+    }
+    if (focusedVideoRef.current !== cameraFocusClipId) {
+      if (focusedVideoRef.current) fadeOutFocusedVideoAudio(focusedVideoRef.current, now);
+      if (cameraFocusClipId) videoFocusFadeUntilRef.current.delete(cameraFocusClipId);
+      console.log("[video] camera audio focus", focusedVideoRef.current, "→", cameraFocusClipId);
+      focusedVideoRef.current = cameraFocusClipId;
+    }
+    if (cameraFocusClipId) foregroundIds.add(cameraFocusClipId);
 
     if (options.force || now - lastAmbientEvalAtRef.current >= AMBIENT_STATE_EVAL_INTERVAL_MS) {
       lastAmbientEvalAtRef.current = now;
@@ -10143,10 +10220,14 @@ function Board2Editor({
       const runtime = videoRuntimeFor(clip.id);
       const isActive = activeIds.has(clip.id);
       const isFocused = options.focusedVideoId === clip.id;
-      const isAmbient = !isActive && ambientVideoEnabledRef.current && ambientCandidateIdsRef.current.has(clip.id);
+      const isCameraFocused = cameraFocusClipId === clip.id;
+      // A camera-focused video plays even past the ambient budget or with ambient video off.
+      const isAmbient = !isActive && (isCameraFocused || (ambientVideoEnabledRef.current && ambientCandidateIdsRef.current.has(clip.id)));
       const desired: VideoPlaybackMode = isActive || isFocused ? "active" : isAmbient ? "ambient" : "dormant";
       const reason = isFocused
         ? "play-media-focus"
+        : isCameraFocused && !isActive
+        ? "camera-audio-focus"
         : isActive
         ? "timeline-active"
         : !ambientVideoEnabledRef.current
@@ -10191,7 +10272,14 @@ function Board2Editor({
       } else if (desired === "ambient") {
         ambientCount++;
         vid.loop = true;
-        setClipAudioOff(clip.id, vid);
+        if (isCameraFocused) {
+          setVideoGain(clip.id, vid, effectiveClipVolume(clip));
+        } else if ((videoFocusFadeUntilRef.current.get(clip.id) ?? 0) > now) {
+          // Fading out after losing camera focus; the scheduled ramp ends at silence.
+        } else {
+          videoFocusFadeUntilRef.current.delete(clip.id);
+          setClipAudioOff(clip.id, vid);
+        }
         if (vid.paused || vid.ended) {
           if (vid.ended) vid.currentTime = 0;
           vid.play().catch(() => {});
@@ -10279,6 +10367,7 @@ function Board2Editor({
         playheadRef.current = maxEnd; setPlayhead(maxEnd); setIsPlaying(false);
         isPlayingRef.current = false;
         // Switch off any clip still active or ambient — timeline ended mid-clip
+        clearCameraAudioFocus();
         for (const clip of clipsRef.current) {
           if (clip.type !== "video") continue;
           const vid = videoElsRef.current.get(clip.id);
@@ -10308,7 +10397,7 @@ function Board2Editor({
     }
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
-    evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+    evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { cameraAudioFocus: true });
     // Narration has one owner at every timeline instant, including when duplicate clips overlap.
     // This shared ownership rule also drives the export schedule below. The second sync handles a
     // media-clock sample that crossed a clip boundary during this animation frame.
@@ -10345,6 +10434,7 @@ function Board2Editor({
     } else {
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null;
       // Switch off every clip's video (paused clips render their frozen thumbnail)
+      clearCameraAudioFocus();
       for (const nodes of videoAudioNodesRef.current.values()) { try { nodes.gainNode.gain.value = 0; } catch {} }
       for (const clip of clipsRef.current) {
         if (clip.type !== "video") continue;
