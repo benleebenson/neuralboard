@@ -106,7 +106,7 @@ export function AppShell() {
                 <AccountControl email={user.email} isPro={isPro} isAdmin={isAdmin} isProLoading={isProLoading} />
               )
             ) : status === "unauthenticated" ? (
-              <button type="button" className={styles.gradientButton} onClick={() => { void signIn("google"); }}>Sign in</button>
+              <button type="button" className={styles.gradientButton} onClick={() => { void signIn(); }}>Sign in</button>
             ) : null}
           </div>
         </div>
@@ -429,7 +429,7 @@ function BoardList({ directory, boards, previews, onCreate, onPublicCount }: {
     if (inFlight) { inFlight.controller.abort(); clearProgress(board.fileName); return; }
     const publication = published?.[board.fileName];
     if (publication) { void unpublish(board, publication); return; }
-    if (status !== "authenticated") { void signIn("google", { callbackUrl: "/?tab=profile" }); return; }
+    if (status !== "authenticated") { void signIn(undefined, { callbackUrl: "/?tab=profile" }); return; }
     setConfirming(board);
   };
 

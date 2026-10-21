@@ -14150,7 +14150,7 @@ function Board2Editor({
   }
 
   function requireProForClips(): boolean {
-    if (!session?.user) { signIn("google", { callbackUrl: currentEditorUrl() }); return false; }
+    if (!session?.user) { signIn(undefined, { callbackUrl: currentEditorUrl() }); return false; }
     if (!isProUser) { setClipsUpgradeOpen(true); return false; }
     return true;
   }
@@ -15432,7 +15432,7 @@ function Board2Editor({
               {session?.user?.email ? (
                 <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setMobileAccountOpen(false)} />
               ) : (
-                <button type="button" onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
+                <button type="button" onClick={() => signIn(undefined, { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, width: "100%", minHeight: 44, background: "#fffdf5" }}>Sign in →</button>
               )}
             </div>
           )}
@@ -22690,7 +22690,7 @@ function Board2Editor({
                   <div style={{ fontSize: 11, color: "#6a6a6a", lineHeight: 1.6 }}>
                     Sign in to save and access your library.
                     <div style={{ marginTop: 10 }}>
-                      <button onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, padding: "6px 12px", fontSize: 11, fontWeight: 700 }}>
+                      <button onClick={() => signIn(undefined, { callbackUrl: currentEditorUrl() })} style={{ ...sketchButton, padding: "6px 12px", fontSize: 11, fontWeight: 700 }}>
                         Sign in →
                       </button>
                     </div>
@@ -22788,7 +22788,7 @@ function Board2Editor({
   }
 
   function requireProForSmartPan(): boolean {
-    if (!session?.user) { signIn("google", { callbackUrl: currentEditorUrl() }); return false; }
+    if (!session?.user) { signIn(undefined, { callbackUrl: currentEditorUrl() }); return false; }
     if (!isProUser) { setSmartPanUpgradeOpen(true); return false; }
     return true;
   }
@@ -25428,7 +25428,7 @@ function Board2Editor({
     // Signed in already (an earlier claim failed): retry. Otherwise sign in and come back to this
     // board, where the claim effect saves it.
     if (session?.user?.email) void claimCreatedBoard();
-    else void signIn("google", { callbackUrl: `/board2?join=${joinCode}` });
+    else void signIn(undefined, { callbackUrl: `/board2?join=${joinCode}` });
   }
 
   return (
@@ -25538,7 +25538,7 @@ function Board2Editor({
                         {session?.user?.email ? (
                           <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setBoardSettingsOpen(false)} />
                         ) : (
-                          <button type="button" className={shellStyles.gradientButton} onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })}>Sign in</button>
+                          <button type="button" className={shellStyles.gradientButton} onClick={() => signIn(undefined, { callbackUrl: currentEditorUrl() })}>Sign in</button>
                         )}
                       </div>
                     </div>
@@ -25652,7 +25652,7 @@ function Board2Editor({
                       {session?.user?.email ? (
                         <AccountControl email={session.user.email} isPro={isProUser} isAdmin={isAdminUser} isProLoading={isProLoading} variant="inline" onAction={() => setBoardSettingsOpen(false)} />
                       ) : (
-                        <button type="button" onClick={() => signIn("google", { callbackUrl: currentEditorUrl() })} style={{ ...miniButton, width: "100%", padding: "6px 8px" }}>Sign in →</button>
+                        <button type="button" onClick={() => signIn(undefined, { callbackUrl: currentEditorUrl() })} style={{ ...miniButton, width: "100%", padding: "6px 8px" }}>Sign in →</button>
                       )}
                     </div>
                   </div>

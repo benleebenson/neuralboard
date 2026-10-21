@@ -240,3 +240,17 @@
 .glassButton:focus-visible{outline:none}
 .glassButton:focus-visible::before{box-shadow:0 0 0 2px #1e8c83,0 1px 4px rgba(0,0,0,.12)}
 .glassButton svg{display:block}
+
+/* Sign-in page (/signin): the join card on its own, with Google and magic-link email options. */
+.signInPage{display:grid;place-items:center;padding:24px var(--gutter)}
+.signInPage .joinCard{box-shadow:var(--dock-shadow)}
+.signInPage .brand{margin-bottom:4px}
+.signInPage .outlineButton,.signInPage .gradientButton{width:100%}
+.signInPage .gradientButton:disabled{opacity:.5;cursor:not-allowed}
+.signInPage .error{margin:0}
+.signInDivider{display:flex;align-items:center;gap:12px;color:var(--caption);font-size:13px}
+.signInDivider::before,.signInDivider::after{content:"";flex:1;height:1px;background:var(--hairline)}
+.signInForm{display:grid;gap:10px}
+.emailInput{width:100%;min-width:0;height:48px;padding:0 18px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);color:var(--ink);font:inherit;font-size:16px}
+.emailInput::placeholder{color:#a3aba8}
+.emailInput:focus-visible{outline:2px solid var(--section);outline-offset:1px}

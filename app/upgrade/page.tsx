@@ -107,7 +107,7 @@ export default function UpgradePage() {
           {isLoading ? (
             <div style={{ textAlign: "center", fontSize: 12, color: "#6a6a6a" }}>loading...</div>
           ) : !session ? (
-            <button onClick={() => signIn("google")} style={btnStyle}>
+            <button onClick={() => signIn()} style={btnStyle}>
               Sign in to subscribe
             </button>
           ) : isSubscribed ? (

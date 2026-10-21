@@ -19,6 +19,7 @@ No test suite exists. Verify changes by running the dev server.
 | Variable | Purpose |
 |---|---|
 | `AUTH_GOOGLE_ID`, `AUTH_GOOGLE_SECRET` | Google OAuth (NextAuth) |
+| `RESEND_API_KEY`, `EMAIL_FROM` | Magic-link email sign-in via Resend (both required; without them only Google shows). `EMAIL_FROM` must be on a domain verified in Resend, e.g. `Neural Board <noreply@neuralboard.org>` |
 | `AUTH_SECRET` | NextAuth secret |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Supabase DB |
 | `OPENAI_API_KEY` | Whisper transcription + GPT-4o beat planning |
@@ -97,7 +98,7 @@ The `/api/arrange` route uses Claude (`claude-sonnet-4-6`) to position beat card
 
 ### Auth + access control
 
-- Google OAuth only. `ADMIN_EMAIL = "bbtvhq@gmail.com"` in `lib/auth.ts`.
+- Google OAuth, plus passwordless magic-link email (NextAuth `EmailProvider`, sent through Resend) when `RESEND_API_KEY` and `EMAIL_FROM` are set. Sign-in page: `app/signin`. Sessions are JWT and users are keyed by email; the minimal adapter in `lib/auth-email.ts` only stores verification tokens (`public.verification_tokens`). `ADMIN_EMAIL = "bbtvhq@gmail.com"` in `lib/auth.ts`.
 - Non-admin users get **1 free render**: gating logic is `renderCount > 0 && !isSubscribed` → 403. The first render is free; all subsequent ones require a subscription.
 - Subscription status stored in `nb_users.subscription_status` + `subscription_period_end`.
 - `/editor` and `/builder` permanently redirect to `/board2`.

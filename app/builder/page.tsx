@@ -408,7 +408,7 @@ export default function BuilderPage() {
         sessionStorage.setItem("nb_pending_action", "director");
       } catch {}
     }
-    signIn("google", { callbackUrl: "/builder" });
+    signIn(undefined, { callbackUrl: "/builder" });
   }
 
   async function startRecording() {
@@ -1946,7 +1946,7 @@ export default function BuilderPage() {
           {session?.user?.email ? (
             <AccountControl email={session.user.email} isPro={isSubscribed} isAdmin={session.user.email === ADMIN_EMAIL} />
           ) : (
-            <button onClick={() => signIn("google", { callbackUrl: "/builder" })} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign in →</button>
+            <button onClick={() => signIn(undefined, { callbackUrl: "/builder" })} style={{ ...miniButton, fontSize: 10, padding: "3px 8px" }}>sign in →</button>
           )}
         </div>
       </header>
