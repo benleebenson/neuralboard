@@ -25334,6 +25334,9 @@ function Board2Editor({
       const response = await fetch("/api/joinable-board", { method: "POST" });
       const result = await response.json() as { code?: string; token?: string; error?: string; expiresAt?: string | null; anonymous?: boolean };
       if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
+      // Persist the owner token the moment the board exists: the uploads below can take a while,
+      // and a refresh or closed tab before they finish must not lose ownership of the board.
+      rememberCreatedBoard(result.code, { token: result.token, expiresAt: result.expiresAt ?? null, createdAt: new Date().toISOString() });
       const sharedClips: Clip[] = [];
       const notShared: string[] = [];
       for (const clip of clipsRef.current) {
@@ -25361,7 +25364,6 @@ function Board2Editor({
       setJoinOwnerToken(result.token);
       setJoinAnonymous(result.anonymous === true);
       setJoinExpiresAt(result.expiresAt ?? null);
-      rememberCreatedBoard(result.code, { token: result.token, expiresAt: result.expiresAt ?? null, createdAt: new Date().toISOString() });
       setJoinCode(result.code);
       setJoinStatus("joined");
       // A refresh reopens the shared board rather than this tab's pre-sharing state.
@@ -25379,9 +25381,10 @@ function Board2Editor({
     }
   }
 
+  // Owners only: the owner token from creation, or the signed-in owning account (the server checks).
   async function stopBoardJoinability() {
-    if (!joinOwnerToken) return;
-    const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, token: joinOwnerToken }) });
+    if (!joinOwnerToken && !joinServerOwner) return;
+    const response = await fetch("/api/joinable-board", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, ...(joinOwnerToken ? { token: joinOwnerToken } : {}) }) });
     if (!response.ok) { const result = await response.json().catch(() => ({})) as { error?: string }; setToast(result.error || "Could not stop sharing."); return; }
     forgetCreatedBoard(joinCode);
     setJoinCode(""); setJoinOwnerToken(""); setJoinStatus("idle"); setJoinAnonymous(false); setJoinExpiresAt(null); joinVersionRef.current = 0; joinLastSignatureRef.current = ""; joinBaseRef.current = null; setJoinBaseAuthors(new Map());
@@ -25518,11 +25521,11 @@ function Board2Editor({
                           </div>
                         </div>
                       )}
-                      {joinCode && (joinOwnerToken || joinAnonymous) && (
+                      {joinCode && (joinOwnerToken || joinServerOwner || joinAnonymous) && (
                         <div className={shellStyles.popoverSection}>
                           <span className={shellStyles.caption}>Sharing</span>
                           {joinAnonymous && <p className={shellStyles.caption} style={{ color: "var(--body)" }}>{boardExpiryLabel}{joinOwnerToken ? "." : ". Only the person who created it can save it permanently."}</p>}
-                          {joinOwnerToken && <button type="button" className={`${shellStyles.outlineButton} ${shellStyles.dangerButton}`} onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }}>Stop sharing {joinCode}</button>}
+                          {(joinOwnerToken || joinServerOwner) && <button type="button" className={`${shellStyles.outlineButton} ${shellStyles.dangerButton}`} onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }}>Stop sharing {joinCode}</button>}
                         </div>
                       )}
                       {LIVE_FEATURES_ENABLED && (
@@ -25633,7 +25636,7 @@ function Board2Editor({
                         <button type="button" onClick={() => { setBoardSettingsOpen(false); projectFileInputRef.current?.click(); }} disabled={isLoadingProject} style={{ ...sketchButton, flex: 1, padding: "6px 8px", fontSize: 11, opacity: isLoadingProject ? 0.5 : 1 }} title="Load board from .nbp file">📂 Load</button>
                       </div>
                     </div>}
-                    {joinCode && joinOwnerToken && (
+                    {joinCode && (joinOwnerToken || joinServerOwner) && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Sharing</div>
                         <button type="button" onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }} style={{ ...miniButton, width: "100%", padding: "6px 8px", color: "#a32916", borderColor: "#a32916" }}>Stop sharing {joinCode}</button>

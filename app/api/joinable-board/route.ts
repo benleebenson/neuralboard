@@ -74,14 +74,23 @@ export async function PATCH(request: Request) {
   } catch (error) { return joinableBoardError(error); }
 }
 
+// Stop sharing: the same owner check as PATCH — the owner token from creation, or the signed-in
+// account that owns the board (e.g. after claiming it, on a device without the token).
 export async function DELETE(request: Request) {
   try {
     const body = await request.json() as { code?: string; token?: string };
     const code = normalizeJoinCode(body.code);
-    if (code.length !== 6 || !body.token) return NextResponse.json({ error: "Invalid sharing session." }, { status: 400 });
-    const { data, error } = await getSupabase().from("joinable_boards").update({ active: false, updated_at: active() }).eq("code", code).eq("owner_token_hash", joinTokenHash(body.token)).select("code").maybeSingle();
+    if (code.length !== 6) return NextResponse.json({ error: "Invalid sharing session." }, { status: 400 });
+    const supabase = getSupabase();
+    const { data: board, error: readError } = await supabase.from("joinable_boards").select("id,owner_email,owner_token_hash").eq("code", code).maybeSingle();
+    if (readError) throw readError;
+    const forbidden = () => NextResponse.json({ error: "Only the board owner can stop sharing." }, { status: 403 });
+    if (!board) return forbidden();
+    const ownerByToken = typeof body.token === "string" && body.token.length > 0 && joinTokenHash(body.token) === board.owner_token_hash;
+    const ownerByAccount = !ownerByToken && board.owner_email !== null && (await getServerSession(authOptions))?.user?.email === board.owner_email;
+    if (!ownerByToken && !ownerByAccount) return forbidden();
+    const { error } = await supabase.from("joinable_boards").update({ active: false, updated_at: active() }).eq("id", board.id);
     if (error) throw error;
-    if (!data) return NextResponse.json({ error: "Only the board owner can stop sharing." }, { status: 403 });
     return NextResponse.json({ ok: true });
   } catch (error) { return joinableBoardError(error); }
 }
