@@ -38,7 +38,7 @@ import {
 } from "@/lib/board2/animated-image";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { EDITOR_BOARD_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
-import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
+import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, listBoards, loadStarredBoardStyleSummaries, safeBoardFilename, supportsBoardDirectory, writeBoardFile, type BoardLibraryEntry } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
 import { layoutUploadedImageBatch } from "@/lib/board2/batch-media-layout";
@@ -229,6 +229,7 @@ import {
   stableOrganicLayoutSeed,
   titleCenterpieceRect,
 } from "@/lib/board2/organic-topic-layout";
+import { findImportPlacement, importContentBounds } from "@/lib/board2/import-board-placement";
 import { canonicalSourceKey, imageContentFingerprint, planMediaReferences } from "@/lib/board2/auto-build-media";
 import {
   AUTO_CAMERA_HOLD_FRACTION,
@@ -2520,6 +2521,16 @@ const IMPORT_BOARD_GAP = 80;
 const IMPORT_BOARD_MIN_CLIP_W = 20;
 // Keeps a board of thumbnails or of wall-sized images from arriving absurdly scaled.
 const IMPORT_BOARD_SCALE_RANGE = [0.25, 4] as const;
+// Fields an imported item leaves behind: who added it on the source board, per-device caches, and
+// ties to the source's narration, camera and auto-build topics, none of which exist here.
+const IMPORT_DROPPED_ANNOTATION_KEYS = ["addedBy", "autoRole", "autoTopicId", "autoLayoutSeed", "cameraBeat", "narrationTime", "rationale"] as const;
+const IMPORT_DROPPED_CLIP_KEYS = [...IMPORT_DROPPED_ANNOTATION_KEYS, "thumbnailDataUri", "thumbnailBlobUrl", "mediaCacheKey", "narrationVideoMask"] as const;
+
+function omitImportedKeys<T extends object>(item: T, keys: readonly string[]): T {
+  const copy = { ...item } as Record<string, unknown>;
+  for (const key of keys) delete copy[key];
+  return copy as T;
+}
 
 // Median board width of image/video clips, ignoring slivers; the "typical clip size" of a board.
 function medianBoardMediaWidth(clips: readonly Clip[]): number | null {
@@ -2530,6 +2541,31 @@ function medianBoardMediaWidth(clips: readonly Clip[]): number | null {
   if (!widths.length) return null;
   const middle = Math.floor(widths.length / 2);
   return widths.length % 2 ? widths[middle] : (widths[middle - 1] + widths[middle]) / 2;
+}
+
+type BoardRect = { x: number; y: number; width: number; height: number };
+
+// The board area a clip covers: none when it isn't on the board.
+function boardItemRect(clip: Clip): BoardRect[] {
+  if (clip.boardX === undefined || clip.boardY === undefined || clip.boardW === undefined || clip.boardH === undefined) return [];
+  return [{ x: clip.boardX, y: clip.boardY, width: clip.boardW, height: clip.boardH }];
+}
+
+// The board area an annotation covers, including arrow ends and pen points that reach past its box.
+function annotationBoardRect(annotation: Annotation): BoardRect {
+  const xs = [annotation.boardX, annotation.boardX + annotation.boardW];
+  const ys = [annotation.boardY, annotation.boardY + annotation.boardH];
+  if (annotation.arrowStartX !== undefined) xs.push(annotation.arrowStartX);
+  if (annotation.arrowEndX !== undefined) xs.push(annotation.arrowEndX);
+  if (annotation.arrowStartY !== undefined) ys.push(annotation.arrowStartY);
+  if (annotation.arrowEndY !== undefined) ys.push(annotation.arrowEndY);
+  for (const point of annotation.points ?? []) {
+    xs.push(point.x);
+    ys.push(point.y);
+  }
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
 }
 
 function generateId(): string {
@@ -6339,6 +6375,15 @@ function Board2Editor({
   const [clipsUpgradeOpen, setClipsUpgradeOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [isImportingBoard, setIsImportingBoard] = useState(false);
+  // Import board picker (left sidebar): the boards-folder boards, and which were imported this session.
+  const [importPicker, setImportPicker] = useState<
+    | { status: "loading" }
+    | { status: "needsFolder" }
+    | { status: "ready"; boards: BoardLibraryEntry[] }
+    | { status: "error"; message: string }
+    | null
+  >(null);
+  const [importedBoardFiles, setImportedBoardFiles] = useState<ReadonlySet<string>>(() => new Set());
   const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
@@ -22527,6 +22572,67 @@ function Board2Editor({
     });
     return (
       <>
+        {importPicker && (
+          <div
+            role="dialog"
+            aria-label="Import board"
+            onClick={(event) => { if (event.target === event.currentTarget && !isImportingBoard) setImportPicker(null); }}
+            style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+          >
+            <div style={{ width: "min(560px, 100%)", maxHeight: "min(640px, 100%)", background: "#fffdf5", border: "2px solid #2a2a2a", borderRadius: 8, boxShadow: "4px 4px 0 #2a2a2a", display: "flex", flexDirection: "column", fontFamily: "monospace" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderBottom: "1.5px solid #2a2a2a", flexShrink: 0 }}>
+                <span style={{ fontWeight: 700, fontSize: 13 }}>⤓ IMPORT BOARD</span>
+                <button onClick={() => setImportPicker(null)} disabled={isImportingBoard} aria-label="Close" style={{ ...miniButton, padding: "3px 8px", fontSize: 15, marginLeft: "auto" }}>×</button>
+              </div>
+              <div style={{ padding: "8px 14px", fontSize: 11, lineHeight: 1.45, color: "#555", borderBottom: "1.5px solid rgba(42,42,42,0.2)", flexShrink: 0 }}>
+                Brings that board&apos;s images, videos, GIFs, text, sticky notes and drawings onto this one, laid out as they were, in free space. Its narration, timeline and camera stay behind. The board file isn&apos;t changed.
+              </div>
+              <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "8px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+                {importPicker.status === "loading" && <div style={{ fontSize: 12, padding: "12px 0" }}>Reading your boards…</div>}
+                {importPicker.status === "needsFolder" && (
+                  <div style={{ fontSize: 12, padding: "12px 0", display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" }}>
+                    Choose the folder your boards are saved in to list them here.
+                    <button onClick={() => void openImportBoardPicker(true)} style={{ ...sketchButton, fontSize: 11, padding: "6px 10px" }}>Choose boards folder</button>
+                  </div>
+                )}
+                {importPicker.status === "error" && <div style={{ fontSize: 12, padding: "12px 0", color: "#a33" }}>{importPicker.message}</div>}
+                {importPicker.status === "ready" && !importPicker.boards.length && <div style={{ fontSize: 12, padding: "12px 0" }}>No saved boards in your boards folder yet.</div>}
+                {importPicker.status === "ready" && importPicker.boards.map((entry) => {
+                  const isOpenBoard = entry.fileName === recipeLibraryFilenameRef.current;
+                  const imported = importedBoardFiles.has(entry.fileName);
+                  return (
+                    <button
+                      key={entry.fileName}
+                      onClick={() => void importBoard(entry.file, entry.fileName)}
+                      disabled={isImportingBoard}
+                      style={{ ...sketchButton, display: "flex", alignItems: "center", gap: 10, padding: 6, textAlign: "left", fontSize: 12, opacity: isImportingBoard ? 0.5 : 1 }}
+                    >
+                      {entry.thumbnailDataUri
+                        // eslint-disable-next-line @next/next/no-img-element -- data URI thumbnail from the board file
+                        ? <img src={entry.thumbnailDataUri} alt="" style={{ width: 72, height: 48, objectFit: "cover", borderRadius: 3, border: "1px solid rgba(42,42,42,0.3)", flexShrink: 0 }} />
+                        : <div style={{ width: 72, height: 48, borderRadius: 3, background: BOARD_SURFACE_COLOR, border: "1px solid rgba(42,42,42,0.3)", flexShrink: 0 }} />}
+                      <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                        <span style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.meta.title || entry.fileName.replace(/\.nbp$/i, "")}</span>
+                        <span style={{ fontSize: 10, color: "#666" }}>
+                          {new Date(entry.meta.modifiedAt).toLocaleDateString()}
+                          {isOpenBoard ? " · open now" : ""}
+                          {imported ? " · imported — importing again adds another copy" : ""}
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <div style={{ padding: "10px 14px", borderTop: "1.5px solid rgba(42,42,42,0.2)", flexShrink: 0, display: "flex", alignItems: "center", gap: 8 }}>
+                <label style={{ ...uploadControlStyle, fontSize: 11, opacity: isImportingBoard ? 0.5 : 1, pointerEvents: isImportingBoard ? "none" : undefined }}>
+                  {isImportingBoard ? "Importing board…" : "From a .nbp file…"}
+                  <input type="file" accept=".nbp,.zip" aria-label="Import board from file" disabled={isImportingBoard} style={nativeFilePickerStyle} onChange={(event) => { const f = event.target.files?.[0]; event.target.value = ""; if (f) void importBoard(f); }} />
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
+
         {libraryOpen && (
           <div
             role="dialog"
@@ -22554,13 +22660,6 @@ function Board2Editor({
                   </button>
                 )}
                 <button onClick={() => setLibraryOpen(false)} style={{ ...miniButton, padding: "3px 8px", fontSize: 15, marginLeft: isSignedIn ? 0 : "auto" }}>×</button>
-              </div>
-
-              <div style={{ padding: "10px 14px", borderBottom: "1.5px solid rgba(42,42,42,0.2)", flexShrink: 0 }}>
-                <label title="Merge another board's visuals to the right of this one" style={{ ...uploadControlStyle, fontSize: 11, opacity: isImportingBoard ? 0.5 : 1, pointerEvents: isImportingBoard ? "none" : undefined }}>
-                  {isImportingBoard ? "Importing board…" : "⤓ Import Board (.nbp)"}
-                  <input type="file" accept=".nbp,.zip" aria-label="Import board" disabled={isImportingBoard} style={nativeFilePickerStyle} onChange={(event) => { const f = event.target.files?.[0]; event.target.value = ""; if (f) void importBoard(f); }} />
-                </label>
               </div>
 
               {isSignedIn && (
@@ -24770,39 +24869,51 @@ function Board2Editor({
     }
   }
 
-  // Import Board (📚 panel): merges another .nbp's visual elements into this board without touching
-  // what's here. Narration and character-driven blocks (characterFocus, pan camera moves tied to
-  // the source layout) stay behind. The imported set keeps its internal layout: it's scaled so its
-  // median media width matches this board's, then placed IMPORT_BOARD_GAP right of the existing
-  // content. Its timeline blocks are queued after the current timeline instead of overlapping it.
-  async function importBoard(file: File) {
-    if (isLoadingProject || isImportingBoard) return;
+  // Import board (left sidebar): merges another .nbp's visuals into this board; the source file is
+  // only read. Images, videos (GIFs stay animated) and annotations come across as board-only items
+  // with fresh ids. The source's video stays behind: narration, timeline blocks, zoom boxes,
+  // pan/character blocks, camera keyframes, characters and board settings. The imported set keeps
+  // its arrangement exactly (annotations drawn over images included), scaled so its median media
+  // width matches this board's, and goes as one block into the free space that keeps the board
+  // most compact (lib/board2/import-board-placement). The owner's board grows to fit; a joiner
+  // can't resize the board, so theirs must fit inside it. On a shared board the media is uploaded
+  // like any other add, and the items become the importer's own.
+  async function importBoard(file: File, sourceFileName = file.name) {
+    if (isLoadingProject || isImportingBoard || viewOnly) return;
     setIsImportingBoard(true);
-    setToast(`Importing ${file.name}…`);
+    const label = sourceFileName.replace(/\.(nbp|zip)$/i, "");
+    setToast(`Importing ${label}…`);
+    const createdUrls: string[] = [];
+    const started = performance.now();
     try {
       const files = unzipSync(new Uint8Array(await file.arrayBuffer()));
       if (!files["manifest.json"]) throw new Error("Not a valid .nbp file");
       const rawManifest = JSON.parse(strFromU8(files["manifest.json"]));
 
-      // Fresh ids so nothing collides with this board; mediaId links between appearances survive.
-      const idMap = new Map<string, string>();
-      const remapId = (id: unknown) => {
-        const key = String(id ?? "");
-        let next = idMap.get(key);
-        if (!next) {
-          next = generateId();
-          idMap.set(key, next);
-        }
-        return next;
-      };
-
-      const importedClips: Clip[] = [];
+      // One record per board item: v2 manifests repeat a media item once per timeline appearance,
+      // and only its board copy (id === mediaId) is wanted. Items with no board position, and the
+      // video that plays a narration, are part of the source's video rather than its board.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- manifest records are untyped JSON
+      const recordsByItem = new Map<string, any[]>();
       for (const record of manifestClipRecords(rawManifest)) {
         const type = String(record?.type ?? "");
-        if (type !== "image" && type !== "video" && type !== "customZoom") continue;
-        const { thumbnailDataUri, thumbnailBlobUrl: _staleThumbnailBlobUrl, mediaCacheKey: _mediaCacheKey, ...mc } = record;
-        const id = remapId(mc.id);
-        const base = { ...mc, id, ...(mc.mediaId ? { mediaId: remapId(mc.mediaId) } : {}) };
+        if (type !== "image" && type !== "video") continue;
+        if (record.narrationVideoFor) continue;
+        if (![record.boardX, record.boardY, record.boardW, record.boardH].every((value) => Number.isFinite(Number(value)))) continue;
+        const key = String(record.mediaId ?? record.id ?? "");
+        recordsByItem.set(key, [...(recordsByItem.get(key) ?? []), record]);
+      }
+
+      const importedClips: Clip[] = [];
+      // Shared boards: media is uploaded once its clip exists, so a failure leaves a local copy.
+      const sharedUploads: Array<{ index: number; asset: File; type: "image" | "video" }> = [];
+      for (const [key, group] of recordsByItem) {
+        const record = group.find((candidate) => String(candidate.id ?? "") === key) ?? group[0];
+        const type = String(record.type) as "image" | "video";
+        const thumbnailDataUri = record.thumbnailDataUri;
+        const mc = omitImportedKeys(record, IMPORT_DROPPED_CLIP_KEYS);
+        const id = generateId();
+        const base = { ...mc, id, mediaId: id, featured: false as const, startTime: 0 };
         const thumbnailUrl = type === "video" && typeof thumbnailDataUri === "string" && thumbnailDataUri.startsWith("data:image/")
           ? thumbnailDataUri
           : type === "video" && typeof mc.youtubeId === "string" && /^[A-Za-z0-9_-]{11}$/.test(mc.youtubeId)
@@ -24811,9 +24922,7 @@ function Board2Editor({
         if (thumbnailUrl?.startsWith("data:")) registerVideoThumbnail(id, thumbnailUrl);
         const thumbnail = thumbnailUrl ? { thumbnailBlobUrl: thumbnailUrl } : {};
         let rawClip: Record<string, unknown>;
-        if (type === "customZoom") {
-          rawClip = { ...base, sourceUrl: "" };
-        } else if (mc.needsRedownload) {
+        if (mc.needsRedownload) {
           rawClip = { ...base, ...thumbnail, sourceUrl: "", needsRedownload: true };
         } else if (mc.assetFile && files[mc.assetFile]) {
           const data = files[mc.assetFile];
@@ -24821,7 +24930,7 @@ function Board2Editor({
           assetBytes.set(data);
           // A File named after its source board gives the autosave a stable cache key; one File
           // per clip keeps video instances off a shared decoder, as in loadBoard.
-          const asset = new File([assetBytes.buffer], `${file.name}/${mc.assetFile}`, {
+          const asset = new File([assetBytes.buffer], `${sourceFileName}/${mc.assetFile}`, {
             type: mc.assetMime || "application/octet-stream",
             lastModified: file.lastModified,
           });
@@ -24832,57 +24941,82 @@ function Board2Editor({
             void saveCachedMedia(cacheKey, asset).catch(() => {});
           }
           const blobUrl = URL.createObjectURL(asset);
+          createdUrls.push(blobUrl);
           if (type === "image") {
             const previewBlob = await createImagePreviewBlob(asset);
             const previewUrl = previewBlob === asset ? blobUrl : URL.createObjectURL(previewBlob);
+            if (previewUrl !== blobUrl) createdUrls.push(previewUrl);
             rawClip = { ...base, sourceUrl: blobUrl, sourceBlob: asset, previewUrl };
           } else {
-            createVideoElement(id, blobUrl);
             rawClip = { ...base, ...thumbnail, sourceUrl: blobUrl, sourceBlob: asset };
           }
+          if (joinCode) sharedUploads.push({ index: importedClips.length, asset, type });
         } else {
           rawClip = { ...base, ...thumbnail, sourceUrl: mc.sourceUrl ?? "" };
         }
-        const clip = normalizeLoadedTimelineRecord(rawClip, `imported_clip_${importedClips.length}`, N_LAYERS - 1) as unknown as Clip;
-        importedClips.push(isBoardMediaClip(clip) && clip.featured === false
-          ? { ...clip, mediaId: clip.mediaId ?? clip.id, featured: false as const }
-          : clip);
+        importedClips.push(normalizeLoadedTimelineRecord(rawClip, `imported_clip_${importedClips.length}`, N_LAYERS - 1) as unknown as Clip);
       }
       const importedAnnotations: Annotation[] = (Array.isArray(rawManifest.annotations) ? rawManifest.annotations : [])
-        .map((annotation: Annotation) => ({ ...annotation, id: generateId() }));
+        .filter((annotation: Annotation) => [annotation?.boardX, annotation?.boardY, annotation?.boardW, annotation?.boardH].every(Number.isFinite))
+        .map((annotation: Annotation) => ({ ...omitImportedKeys(annotation, IMPORT_DROPPED_ANNOTATION_KEYS), id: generateId() }));
       if (!importedClips.length && !importedAnnotations.length) {
-        setToast(`${file.name} has no visual elements to import`);
+        setToast(`${label} has nothing on its board to import`);
         return;
       }
 
-      const hasGeometry = (clip: Clip) => clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined;
-      const existingClips = clipsRef.current;
-      const existingAnnotations = annotationsRef.current;
-      const existingRights = [
-        ...existingClips.filter(hasGeometry).map((clip) => clip.boardX! + clip.boardW!),
-        ...existingAnnotations.map((annotation) => annotation.boardX + annotation.boardW),
+      const existingRects = [
+        ...clipsRef.current.flatMap(boardItemRect),
+        ...annotationsRef.current.map(annotationBoardRect),
       ];
-      const importedBoxes = [
-        ...importedClips.filter(hasGeometry).map((clip) => ({ x: clip.boardX!, y: clip.boardY! })),
-        ...importedAnnotations.map((annotation) => ({ x: annotation.boardX, y: annotation.boardY })),
-      ];
-      const currentMedian = medianBoardMediaWidth(existingClips);
+      const currentMedian = medianBoardMediaWidth(clipsRef.current);
       const importedMedian = medianBoardMediaWidth(importedClips);
       const scale = currentMedian && importedMedian
         ? clamp(currentMedian / importedMedian, IMPORT_BOARD_SCALE_RANGE[0], IMPORT_BOARD_SCALE_RANGE[1])
         : 1;
-      const sourceLeft = importedBoxes.length ? Math.min(...importedBoxes.map((box) => box.x)) : 0;
-      const sourceTop = importedBoxes.length ? Math.min(...importedBoxes.map((box) => box.y)) : 0;
-      // An empty board keeps the imported layout where it was.
-      const targetLeft = existingRights.length ? Math.max(...existingRights) + IMPORT_BOARD_GAP : sourceLeft;
-      const mapX = (x: number) => targetLeft + (x - sourceLeft) * scale;
-      const mapY = (y: number) => sourceTop + (y - sourceTop) * scale;
+      const source = importContentBounds([...importedClips.flatMap(boardItemRect), ...importedAnnotations.map(annotationBoardRect)])!;
+      const board = boardDimensionsRef.current;
+      const spot = findImportPlacement({
+        group: { width: source.width * scale, height: source.height * scale },
+        occupied: existingRects,
+        gap: IMPORT_BOARD_GAP,
+        board,
+        canGrow: isBoardOwner,
+      });
+      if (!spot) {
+        setToast(`${label} doesn't fit in the free space on this board — only the owner can make the board bigger`);
+        return;
+      }
+      const mapX = (x: number) => spot.x + (x - source.x) * scale;
+      const mapY = (y: number) => spot.y + (y - source.y) * scale;
 
-      const timelineOffset = currentPlaybackDuration(existingClips);
+      // Shared boards get the media on the server before the items appear, so joiners never see
+      // an item whose media is only on this device unless the upload failed.
+      let notShared = 0;
+      if (sharedUploads.length) {
+        setToast(`Sharing ${sharedUploads.length} media file${sharedUploads.length === 1 ? "" : "s"} from ${label}…`);
+        let next = 0;
+        const worker = async () => {
+          while (next < sharedUploads.length) {
+            const upload = sharedUploads[next++];
+            try {
+              const url = upload.type === "image"
+                ? await uploadJoinableImage(upload.asset, upload.asset.name.split("/").pop() || "image")
+                : await uploadJoinableAv(upload.asset);
+              importedClips[upload.index] = { ...importedClips[upload.index], sourceUrl: url };
+            } catch {
+              notShared++;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, sharedUploads.length) }, worker));
+      }
+      for (const clip of importedClips) {
+        if (clip.type === "video" && clip.sourceUrl) createVideoElement(clip.id, clip.sourceUrl);
+      }
+
       const placedClips = importedClips.map((clip) => ({
         ...clip,
-        ...(hasGeometry(clip) ? { boardX: mapX(clip.boardX!), boardY: mapY(clip.boardY!), boardW: clip.boardW! * scale, boardH: clip.boardH! * scale } : {}),
-        ...(isFeaturedTimelineClip(clip) ? { startTime: clip.startTime + timelineOffset } : {}),
+        boardX: mapX(clip.boardX!), boardY: mapY(clip.boardY!), boardW: clip.boardW! * scale, boardH: clip.boardH! * scale,
       }));
       const placedAnnotations = importedAnnotations.map((annotation) => ({
         ...annotation,
@@ -24899,25 +25033,58 @@ function Board2Editor({
         ...(annotation.strokeWidth !== undefined ? { strokeWidth: annotation.strokeWidth * scale } : {}),
       }));
 
-      const placedRight = Math.max(0, ...placedClips.filter(hasGeometry).map((clip) => clip.boardX! + clip.boardW!), ...placedAnnotations.map((annotation) => annotation.boardX + annotation.boardW));
-      const placedBottom = Math.max(0, ...placedClips.filter(hasGeometry).map((clip) => clip.boardY! + clip.boardH!), ...placedAnnotations.map((annotation) => annotation.boardY + annotation.boardH));
-      const nextDimensions = {
-        width: Math.max(boardDimensionsRef.current.width, Math.ceil((placedRight + IMPORT_BOARD_GAP) / 500) * 500),
-        height: Math.max(boardDimensionsRef.current.height, Math.ceil((placedBottom + IMPORT_BOARD_GAP) / 500) * 500),
-      };
-      boardDimensionsRef.current = nextDimensions;
-      setBoardDimensions(nextDimensions);
-      clipsRef.current = [...existingClips, ...placedClips];
+      if (isBoardOwner) {
+        const placedRight = spot.x + source.width * scale;
+        const placedBottom = spot.y + source.height * scale;
+        const nextDimensions = {
+          width: Math.max(board.width, Math.ceil((placedRight + IMPORT_BOARD_GAP) / 500) * 500),
+          height: Math.max(board.height, Math.ceil((placedBottom + IMPORT_BOARD_GAP) / 500) * 500),
+        };
+        if (nextDimensions.width !== board.width || nextDimensions.height !== board.height) {
+          boardDimensionsRef.current = nextDimensions;
+          setBoardDimensions(nextDimensions);
+        }
+      }
+      clipsRef.current = [...clipsRef.current, ...placedClips];
       setClips(clipsRef.current);
-      annotationsRef.current = [...existingAnnotations, ...placedAnnotations];
+      annotationsRef.current = [...annotationsRef.current, ...placedAnnotations];
       setAnnotations(annotationsRef.current);
-      setClipSelection(placedClips.filter(hasGeometry).map((clip) => clip.id));
+      setClipSelection(placedClips.map((clip) => clip.id));
+      createdUrls.length = 0; // now owned by the clips
+      const again = importedBoardFiles.has(sourceFileName);
+      setImportedBoardFiles((prev) => new Set(prev).add(sourceFileName));
       setLibraryOpen(false);
-      setToast(`Imported ${placedClips.length + placedAnnotations.length} clips from ${file.name}`);
+      setImportPicker(null);
+      const count = placedClips.length + placedAnnotations.length;
+      setToast([
+        `Imported ${count} item${count === 1 ? "" : "s"} from ${label}${again ? " (a second copy)" : ""}`,
+        notShared ? `${notShared} media file${notShared === 1 ? " is" : "s are"} only on this device — others on this board won't see ${notShared === 1 ? "it" : "them"}` : "",
+      ].filter(Boolean).join(" · "));
+      console.info(`[import-board] ${label}: ${count} items in ${Math.round(performance.now() - started)}ms`);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Import failed");
     } finally {
+      for (const url of createdUrls) URL.revokeObjectURL(url);
       setIsImportingBoard(false);
+    }
+  }
+
+  async function openImportBoardPicker(promptForFolder = false) {
+    if (!supportsBoardDirectory()) {
+      setImportPicker({ status: "error", message: "This browser can't read your boards folder — choose a .nbp file instead." });
+      return;
+    }
+    setImportPicker({ status: "loading" });
+    try {
+      const directory = await getBoardsDirectory({ prompt: promptForFolder, write: false });
+      if (!directory) {
+        setImportPicker({ status: "needsFolder" });
+        return;
+      }
+      setImportPicker({ status: "ready", boards: await listBoards(directory) });
+    } catch (error) {
+      if ((error as DOMException)?.name === "AbortError") setImportPicker({ status: "needsFolder" });
+      else setImportPicker({ status: "error", message: error instanceof Error ? error.message : "Could not read the boards folder." });
     }
   }
 
@@ -25522,6 +25689,7 @@ function Board2Editor({
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: SAVE_BUTTON_COLOR, fontWeight: 700 }}>💾 Save</button>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
+          {!viewOnly && <button onClick={() => { void openImportBoardPicker(); setMobileEditorMenuOpen(false); }} disabled={isImportingBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isImportingBoard ? .45 : 1 }}>⤓ Import board</button>}
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
           <button onClick={() => { undoBoard(); setMobileEditorMenuOpen(false); }} disabled={!canUndoBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canUndoBoard ? 1 : .45 }}>↶ Undo</button>
@@ -25565,6 +25733,16 @@ function Board2Editor({
               ↑ Upload narration video
               <input type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" aria-label="Upload narration video" style={nativeFilePickerStyle} onChange={handleNarrationVideoUpload} />
             </label>
+            {!viewOnly && (
+              <button
+                onClick={() => void openImportBoardPicker()}
+                disabled={isImportingBoard}
+                style={{ ...uploadControlStyle, flexShrink: 0, opacity: isImportingBoard ? 0.5 : 1 }}
+                title="Bring another board's images, videos, GIFs, text and drawings onto this one"
+              >
+                {isImportingBoard ? "Importing board…" : "⤓ Import board"}
+              </button>
+            )}
             <button
               onClick={() => addPanClip()}
               style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
