@@ -26,7 +26,16 @@ import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinable
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
-import { convertAnimatedGifToMp4, isGifFile } from "@/lib/gif-to-video";
+import {
+  animatedImageFrameIndex,
+  animatedImageSourceUrl,
+  decodeAnimatedImage,
+  animatedImageSupported,
+  isAnimatableImageType,
+  isGifFile,
+  releaseAnimatedImage,
+  type AnimatedImage,
+} from "@/lib/board2/animated-image";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { EDITOR_BOARD_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, loadStarredBoardStyleSummaries, safeBoardFilename, writeBoardFile } from "@/lib/board-library";
@@ -178,7 +187,9 @@ import {
   centeredBoardDropPosition,
   droppedImageUrl,
   extensionForImageType,
+  firstUriListEntry,
   imageBlobFromTransferItem,
+  imageSourceFromHtml,
   isBoardMediaFile,
   stringFromTransferItem,
   type DroppedBlob,
@@ -562,6 +573,8 @@ type Clip = {
   // playback position is that narration's, it is always silent itself, and the mask frames it.
   narrationVideoFor?: string;
   narrationVideoMask?: NarrationVideoMask;
+  // Image clips only: the source is an animated GIF/WebP whose frames loop (lib/board2/animated-image).
+  animatedImage?: boolean;
 
   rationale?: string;
 };
@@ -2094,6 +2107,7 @@ type MediaItem = {
   ytStart?: number;
   ytEnd?: number;
   source?: ClipSource; // provenance passthrough for the resulting Clip; defaults to "manual"
+  animatedImage?: boolean;
 };
 
 type PendingMediaPlacement = {
@@ -6788,7 +6802,7 @@ function Board2Editor({
   const mobileBoardCharacterCanvasRef = useRef<HTMLCanvasElement>(null);
   const boardImageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const mobileBoardImageCanvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
-  const drawBoardImageOverlaysRef = useRef<(time: number) => void>(() => {});
+  const drawBoardImageOverlaysRef = useRef<(time: number, animatedOnly?: boolean) => void>(() => {});
   const playCanvasRef = useRef<HTMLCanvasElement>(null);
   const playContainerRef = useRef<HTMLDivElement>(null);
   const boardContainerRef = useRef<HTMLDivElement>(null);
@@ -6822,6 +6836,11 @@ function Board2Editor({
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportVideoFramesRef = useRef<Map<string, ImageBitmap>>(new Map());
+  // Decoded frames of animated GIF/WebP image clips, by source URL; null marks a source that
+  // turned out to be a still. Shared by the board overlay, preview and both export paths.
+  const animatedImagesRef = useRef<Map<string, AnimatedImage | null>>(new Map());
+  const animatedImageLoadRef = useRef<Map<string, Promise<AnimatedImage | null>>>(new Map());
+  const boardAnimatedFrameRef = useRef<Map<string, ImageBitmap>>(new Map());
   const mediaEditScratchRef = useRef<HTMLCanvasElement | null>(null);
   const mediaEditorPreviewRef = useRef<HTMLVideoElement | null>(null);
   const exportCancelRef = useRef(false);
@@ -9499,11 +9518,16 @@ function Board2Editor({
       ctx.globalAlpha = 1;
       if (clip.type === "image") {
         const renderUrl = clip.previewUrl ?? clip.sourceUrl;
+        // An animated GIF draws the frame for this timeline instant; until its frames are decoded
+        // it falls back to the still below.
+        const animatedFrame = animatedImageFrame(clip, time);
         const img = preparedImageRendering
           ? exportImgCacheRef.current.get(clip.sourceUrl)
           : cachedPreviewImage(renderUrl);
         if (!img && quality === "preview") loadMedia(renderUrl, "image");
-        if (img?.complete && img.naturalWidth > 0) {
+        if (animatedFrame) {
+          drawEditedCrateredMedia(ctx, animatedFrame, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
+        } else if (img?.complete && img.naturalWidth > 0) {
           drawEditedCrateredMedia(ctx, img, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
         }
       } else if (clip.type === "customZoom") {
@@ -9901,8 +9925,11 @@ function Board2Editor({
     return clip.boardX + clip.boardW >= left && clip.boardX <= right && clip.boardY + clip.boardH >= top && clip.boardY <= bottom;
   }
 
-  const drawBoardImageOverlays = useCallback((time: number) => {
+  // `animatedOnly` is the animated-GIF ticker's redraw: it skips stills and unchanged frames.
+  const drawBoardImageOverlays = useCallback((time: number, animatedOnly = false) => {
     const currentClips = clipsRef.current;
+    // Board GIFs loop on the wall clock, so they keep moving while the timeline is paused.
+    const wallSec = performance.now() / 1000;
     const authoredBazooka = authoredBazookaTimeline(
       time,
       [resolvedCharActionsRef.current, resolvedCharActions2Ref.current],
@@ -9917,9 +9944,33 @@ function Board2Editor({
     };
     for (const clip of currentClips) {
       if (clip.type !== "image" || clip.boardX === undefined || clip.boardW === undefined || clip.boardH === undefined) continue;
+      if (animatedOnly && !clip.animatedImage) continue;
       const renderUrl = clip.previewUrl ?? clip.sourceUrl;
       const canvases = [boardImageCanvasRefs.current.get(clip.id), mobileBoardImageCanvasRefs.current.get(clip.id)].filter(Boolean) as HTMLCanvasElement[];
       if (!canvases.length) continue;
+      if (clip.animatedImage) {
+        const frame = animatedImageFrame(clip, wallSec);
+        if (animatedOnly && frame && boardAnimatedFrameRef.current.get(clip.id) === frame) continue;
+        // Until frames decode (or where ImageDecoder is missing) the canvas stays empty and the CSS
+        // background shows through — for a freshly added GIF that is the GIF, animating natively.
+        if (!frame) continue;
+        boardAnimatedFrameRef.current.set(clip.id, frame);
+        for (const canvas of canvases) {
+          const ctx = canvas.getContext("2d");
+          if (!ctx) continue;
+          canvas.style.transform = `translate(${shake.x}px, ${shake.y}px)`;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          canvas.style.backgroundImage = "none";
+          const mediaEditScratch = mediaEditScratchRef.current ?? document.createElement("canvas");
+          mediaEditScratchRef.current = mediaEditScratch;
+          drawEditedCrateredMedia(
+            ctx, frame, 0, 0, canvas.width, canvas.height, clip,
+            authoredBazooka.craters.filter((crater) => crater.clipId === clip.id),
+            mediaEditScratch,
+          );
+        }
+        continue;
+      }
       const image = cachedPreviewImage(renderUrl);
       if (!image) loadMedia(renderUrl, "image", boardClipInImmediateViewport(clip) ? "visible" : "preload");
       for (const canvas of canvases) {
@@ -9945,6 +9996,34 @@ function Board2Editor({
   }, []);
 
   useEffect(() => { drawBoardImageOverlaysRef.current = drawBoardImageOverlays; }, [drawBoardImageOverlays]);
+
+  // Animated GIFs on the board: redraw just their canvases at up to 30 fps while any exist, and
+  // free decoded frames once no clip uses them.
+  const hasAnimatedImages = clips.some((clip) => clip.type === "image" && clip.animatedImage);
+  useEffect(() => {
+    const inUse = new Set(clips.filter((clip) => clip.type === "image" && clip.animatedImage).map((clip) => clip.sourceUrl));
+    for (const [url, decoded] of animatedImagesRef.current) {
+      if (inUse.has(url)) continue;
+      if (decoded) releaseAnimatedImage(decoded);
+      animatedImagesRef.current.delete(url);
+    }
+    const liveIds = new Set(clips.map((clip) => clip.id));
+    for (const id of boardAnimatedFrameRef.current.keys()) if (!liveIds.has(id)) boardAnimatedFrameRef.current.delete(id);
+  }, [clips]);
+  useEffect(() => {
+    if (!hasAnimatedImages) return;
+    let rafId = 0;
+    let lastDrawAt = 0;
+    const tick = (now: number) => {
+      if (now - lastDrawAt >= 1000 / 30 - 4) {
+        lastDrawAt = now;
+        drawBoardImageOverlaysRef.current(playheadRef.current, true);
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [hasAnimatedImages]);
 
   useEffect(() => {
     for (const canvas of [boardCharacterCanvasRef.current, mobileBoardCharacterCanvasRef.current]) {
@@ -10742,7 +10821,55 @@ function Board2Editor({
     return promise;
   }
 
+  // Decodes an animated image clip's frames once per source URL.
+  function ensureAnimatedImage(clip: Clip): Promise<AnimatedImage | null> {
+    if (clip.type !== "image" || !clip.animatedImage || !clip.sourceUrl) return Promise.resolve(null);
+    const key = clip.sourceUrl;
+    if (animatedImagesRef.current.has(key)) return Promise.resolve(animatedImagesRef.current.get(key) ?? null);
+    const pending = animatedImageLoadRef.current.get(key);
+    if (pending) return pending;
+    const promise = (async () => {
+      try {
+        const blob: Blob = clip.sourceBlob ?? await fetch(key).then((response) => {
+          if (!response.ok) throw new Error(`Animated image failed (${response.status})`);
+          return response.blob();
+        });
+        return await decodeAnimatedImage(blob);
+      } catch (error) {
+        console.warn("[animated-image] could not load", clip.name, error);
+        return null;
+      }
+    })().then((decoded) => {
+      animatedImagesRef.current.set(key, decoded);
+      if (decoded) {
+        drawFrameRef.current(playheadRef.current);
+        drawBoardImageOverlaysRef.current(playheadRef.current);
+      }
+      return decoded;
+    }).finally(() => animatedImageLoadRef.current.delete(key));
+    animatedImageLoadRef.current.set(key, promise);
+    return promise;
+  }
+
+  // The frame of an animated image clip showing at timeline `time`; undefined for a still or while
+  // its frames decode (a decode is started on first use).
+  function animatedImageFrame(clip: Clip, time: number): ImageBitmap | undefined {
+    if (clip.type !== "image" || !clip.animatedImage) return undefined;
+    const decoded = animatedImagesRef.current.get(clip.sourceUrl);
+    if (decoded === undefined) {
+      void ensureAnimatedImage(clip);
+      return undefined;
+    }
+    return decoded ? decoded.frames[animatedImageFrameIndex(decoded.frameStartsMs, decoded.loopMs, time)] : undefined;
+  }
+
+  // Export paths prepare every image through here, so an animated clip's frames are decoded
+  // before its first exported frame.
   function ensureExportImage(clip: Clip): Promise<void> {
+    return Promise.all([ensureExportStillImage(clip), ensureAnimatedImage(clip)]).then(() => undefined);
+  }
+
+  function ensureExportStillImage(clip: Clip): Promise<void> {
     if (clip.type !== "image" || !clip.sourceUrl) return Promise.resolve();
     const cached = exportImgCacheRef.current.get(clip.sourceUrl);
     if (cached?.complete && cached.naturalWidth > 0) {
@@ -10943,6 +11070,7 @@ function Board2Editor({
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
           sourceBlob: item.blob,
+          ...(item.type === "image" && item.animatedImage ? { animatedImage: true } : {}),
           youtubeId: item.youtubeId,
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
@@ -14108,13 +14236,10 @@ function Board2Editor({
 
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
   // in the media library, and places it on the board via addClipAndPlaceOnBoard.
-  async function ingestMediaFile(input: File | Blob, name: string, center?: { x: number; y: number }) {
-    let file = input;
-    if (isGifFile(file, name)) {
-      setToast(`Converting ${name} to a looping video…`);
-      const video = await convertAnimatedGifToMp4(file, boardColorRef.current);
-      if (video) file = video;
-    }
+  async function ingestMediaFile(input: File | Blob, name: string, center?: { x: number; y: number }): Promise<MediaItem> {
+    const file = input;
+    // Animated GIF/WebP stays an image clip whose decoded frames loop (lib/board2/animated-image).
+    const animated = isGifFile(file, name) || isAnimatableImageType(file.type) ? await decodeAnimatedImage(file) : null;
     const type: "image" | "video" = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(name)) ? "video" : "image";
     let url: string;
     let notShared = "";
@@ -14138,12 +14263,39 @@ function Board2Editor({
     }
     if (type === "image") {
       await decodeImageForPlacement(url);
+      if (animated) animatedImagesRef.current.set(url, animated);
     }
-    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file };
+    const item: MediaItem = { id: generateId(), name, type, url, duration, blob: file, ...(type === "image" && animated ? { animatedImage: true } : {}) };
     setMediaLibrary((prev) => [...prev, item]);
     if (playModeRef.current && !center) queueMediaPlacement(item);
     else await addClipAndPlaceOnBoard(item, center);
     if (notShared) setToast(notShared);
+    return item;
+  }
+
+  // Fetches the real GIF behind a pasted/dropped image URL and places it. When the fetch fails and
+  // the browser also supplied a flattened still, that still is placed and the toast says why, so a
+  // GIF never silently turns into one frame. The fetch runs in this browser first; only the
+  // fallback, /api/proxy-image, fetches server-side (Pro-only).
+  async function ingestAnimatedImageUrl(url: string, still: Blob | null, stillName: string, center?: { x: number; y: number }) {
+    setToast("Fetching the animated GIF…");
+    let blob: Blob;
+    try {
+      blob = await fetchDroppedImage(url);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "it could not be fetched";
+      if (!still) {
+        setToast(`Couldn't fetch that GIF: ${reason}`);
+        return;
+      }
+      await ingestMediaFile(still, stillName, center);
+      setToast(`Couldn't fetch the animated GIF (${reason}) — placed a still frame instead`);
+      return;
+    }
+    const item = await ingestMediaFile(blob, droppedUrlName(url, blob), center);
+    setToast(item.animatedImage
+      ? "GIF added — it loops on the board and in exports"
+      : animatedImageSupported() ? "That GIF has a single frame, so it was added as a still" : "This browser can't decode GIF frames, so it was added as a still");
   }
 
   async function ingestRevealImageFile(file: File | Blob, name: string, actionId: string) {
@@ -14289,6 +14441,8 @@ function Board2Editor({
         if (blob.size > MAX_PASTED_IMAGE_BYTES) throw new Error("Dropped image is too large (max 15MB)");
         return blob;
       }
+      const proxyError = await response.json().then((body: { error?: string }) => body.error).catch(() => undefined);
+      directError = `${directError}; server fetch: ${proxyError ?? `failed (${response.status})`}`;
     }
     throw new Error(directError);
   }
@@ -14345,6 +14499,21 @@ function Board2Editor({
       droppedBlobs.push(candidate);
     }
 
+    // An image dragged out of a web page can arrive as a flattened still next to its URL; when the
+    // URL is a GIF, place the real file instead (falling back to the still if it can't be fetched).
+    if (droppedBlobs.length === 1 && !isGifFile(droppedBlobs[0].blob, droppedBlobs[0].blob instanceof File ? droppedBlobs[0].blob.name : "")) {
+      const animatedUrl = animatedImageSourceUrl(imageSourceFromHtml(immediateStrings["text/html"] ?? ""))
+        ?? animatedImageSourceUrl(firstUriListEntry(immediateStrings["text/uri-list"] ?? ""));
+      if (animatedUrl) {
+        try {
+          await ingestAnimatedImageUrl(animatedUrl, droppedBlobs[0].blob, droppedBlobName(droppedBlobs[0].blob, droppedBlobs[0].declaredType, 0), point);
+        } catch (error) {
+          setToast(error instanceof Error ? error.message : "Could not add the dropped GIF");
+        }
+        return;
+      }
+    }
+
     if (droppedBlobs.length > 0) {
       for (const [index, candidate] of droppedBlobs.entries()) {
         try {
@@ -14363,15 +14532,25 @@ function Board2Editor({
     for (const { type, value } of itemStrings) {
       if (value && !immediateStrings[type]) immediateStrings[type] = value;
     }
-    const imageUrl = droppedImageUrl({
+    const droppedUrl = droppedImageUrl({
       uriList: immediateStrings["text/uri-list"],
       html: immediateStrings["text/html"],
       plainText: immediateStrings["text/plain"],
     }, window.location.href);
-    if (!imageUrl) {
+    if (!droppedUrl) {
       setToast("That drop did not contain a usable image");
       return;
     }
+    const animatedUrl = animatedImageSourceUrl(droppedUrl);
+    if (animatedUrl) {
+      try {
+        await ingestAnimatedImageUrl(animatedUrl, null, "", point);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Could not add the dropped GIF");
+      }
+      return;
+    }
+    const imageUrl = droppedUrl;
     try {
       const blob = await fetchDroppedImage(imageUrl);
       await ingestMediaFile(blob, droppedUrlName(imageUrl, blob), point);
@@ -17127,6 +17306,7 @@ function Board2Editor({
           boardX: pos.boardX, boardY: pos.boardY, boardW: w, boardH: h,
           sourceDurationSec: item.type === "video" ? item.duration : undefined,
           sourceBlob: item.blob,
+          ...(item.type === "image" && item.animatedImage ? { animatedImage: true } : {}),
         },
       ];
     });
@@ -20779,6 +20959,27 @@ function Board2Editor({
       const imageFiles = itemImages.length > 0
         ? itemImages
         : Array.from(e.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+
+      // "Copy image" on a GIF puts a flattened single frame on the clipboard, plus the image's URL
+      // in text/html (and sometimes text/uri-list); that URL is the real, animated file. A bare GIF
+      // URL copied as text counts too, unless a board clip is waiting to be pasted.
+      const clipboardText = (type: string) => { try { return e.clipboardData?.getData(type) ?? ""; } catch { return ""; } };
+      const revealActionSelected = [...characterActionsRef.current, ...characterActions2Ref.current]
+        .some((action) => action.id === selectedCharActionIdRef.current && action.sequenceId === trenchCoatRevealSequence.id);
+      const animatedUrl = revealActionSelected || imageFiles.some((file) => isGifFile(file, file.name))
+        ? null
+        : animatedImageSourceUrl(imageSourceFromHtml(clipboardText("text/html")))
+          ?? animatedImageSourceUrl(firstUriListEntry(clipboardText("text/uri-list")))
+          ?? (imageFiles.length > 0 || !clipboardRef.current ? animatedImageSourceUrl(clipboardText("text/plain")) : null);
+      if (animatedUrl) {
+        e.preventDefault();
+        const still = imageFiles[0] && imageFiles[0].size <= MAX_PASTED_IMAGE_BYTES ? imageFiles[0] : null;
+        const stillName = `Pasted image ${Date.now()}.${still?.type.split("/")[1] || "png"}`;
+        void ingestAnimatedImageUrl(animatedUrl, still, stillName).catch((error) => {
+          setToast(error instanceof Error ? `Could not add the GIF: ${error.message}` : "Could not add the GIF");
+        });
+        return;
+      }
 
       if (imageFiles.length > 0) {
         e.preventDefault();

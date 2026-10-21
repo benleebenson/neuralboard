@@ -18,7 +18,10 @@ export async function POST(request: Request) {
     if (!board) return NextResponse.json({ error: "That board is no longer joinable." }, { status: 404 });
     const id = crypto.randomUUID();
     const path = `${board.id}/${id}.webp`;
-    const bytes = await sharp(Buffer.from(await file.arrayBuffer()), { limitInputPixels: 50_000_000 }).rotate().resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true }).webp({ quality: 88 }).toBuffer();
+    // GIF/WebP keep every frame (as animated WebP) so animated board GIFs animate for everyone; the
+    // pixel limit then covers all frames stacked, hence the larger allowance.
+    const animated = file.type === "image/gif" || file.type === "image/webp";
+    const bytes = await sharp(Buffer.from(await file.arrayBuffer()), { limitInputPixels: animated ? 150_000_000 : 50_000_000, animated }).rotate().resize({ width: 2400, height: 2400, fit: "inside", withoutEnlargement: true }).webp({ quality: 88 }).toBuffer();
     const upload = await supabase.storage.from("joinable-board-media").upload(path, bytes, { contentType: "image/webp", upsert: false });
     if (upload.error) throw upload.error;
     return NextResponse.json({ url: `/api/joinable-board/media/${code}/${id}`, mime: "image/webp" }, { status: 201 });
