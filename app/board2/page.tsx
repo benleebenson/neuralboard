@@ -155,6 +155,16 @@ import {
   shouldResumeNarrationPlayback,
 } from "@/lib/board2/narration-playback";
 import {
+  fitNarrationVideoShape,
+  narrationVideoMaskCss,
+  narrationVideoSourceTime,
+  simplifyFreeformPoints,
+  traceNarrationVideoMask,
+  type NarrationVideoMask,
+  type NarrationVideoShape,
+  type NormalizedRect,
+} from "@/lib/board2/narration-video";
+import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
   TRANSCRIPTION_SAMPLE_RATE,
@@ -548,9 +558,31 @@ type Clip = {
   narrationTypewriter?: boolean; // customZoom-only: type out the narration spoken during this zoom
   flashImageUrl?: string; // flash-only: /flash/images/... drawn full-screen while the block is active
   flashSoundUrl?: string; // flash-only: /flash/sounds/... played from the block's start
+  // Narration video (video clips only): the narration clip whose audio this video supplies. Its
+  // playback position is that narration's, it is always silent itself, and the mask frames it.
+  narrationVideoFor?: string;
+  narrationVideoMask?: NarrationVideoMask;
 
   rationale?: string;
 };
+
+// How the person framed a narration video before placing it; sizes are the source frame's.
+type NarrationVideoPlacement = {
+  shape: NarrationVideoShape;
+  rect?: NormalizedRect;
+  points?: number[];
+  sourceWidth: number;
+  sourceHeight: number;
+};
+
+type NarrationVideoDraft = NarrationVideoPlacement & {
+  file: File;
+  previewUrl: string;
+  drawing: boolean;   // freeform: still adding points
+};
+
+// Long edge of a narration video when it lands on the board (board px).
+const NARRATION_VIDEO_BOARD_LONG_EDGE = 480;
 
 type MediaEditDraft = {
   clipId: string;
@@ -6402,6 +6434,10 @@ function Board2Editor({
   const [clipboardReady, setClipboardReady] = useState(false);
   const [isBoardDropActive, setIsBoardDropActive] = useState(false);
   const [mediaEditDraft, setMediaEditDraft] = useState<MediaEditDraft | null>(null);
+  const [narrationVideoDraft, setNarrationVideoDraft] = useState<NarrationVideoDraft | null>(null);
+  const narrationVideoPlayPendingRef = useRef<Set<string>>(new Set());
+  const narrationVideoStrokeRef = useRef(false); // freeform: this press is drawing freehand
+  const narrationVideoPressRef = useRef(false);
   const [zoomEditClipId, setZoomEditClipId] = useState<string | null>(null);
   const [mediaEditorPlaying, setMediaEditorPlaying] = useState(false);
 
@@ -9473,6 +9509,31 @@ function Board2Editor({
       } else if (clip.type === "customZoom") {
         // No pixels of its own — it's purely a camera target, so whatever else is on the board
         // at this position (or the bare board surface) shows through untouched.
+      } else if (clip.narrationVideoFor) {
+        // Narration video: deterministic export draws the frame decoded for this instant
+        // (prepareOfflineVideoFrames); preview and real-time export draw the element, which
+        // syncNarrationVideos keeps at the narration's position, paused or playing. The same mask
+        // clips every path.
+        const vid = videoElsRef.current.get(clip.id);
+        const offlineFrame = offlineVideoRendering ? exportVideoFramesRef.current.get(clip.id) : undefined;
+        const media: EditableMediaSource | undefined = offlineFrame
+          ?? (!offlineVideoRendering && vid && vid.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA ? vid : undefined)
+          ?? thumbnailImagesRef.current.get(clip.id)
+          ?? undefined;
+        ctx.save();
+        if (traceNarrationVideoMask(ctx, clip.narrationVideoMask, sx - sw / 2, sy - sh / 2, sw, sh)) ctx.clip();
+        if (media) {
+          try {
+            drawEditedCrateredMedia(ctx, media, sx - sw / 2, sy - sh / 2, sw, sh, clip, renderCraters.filter((crater) => crater.clipId === clip.id), mediaEditScratch);
+          } catch {
+            ctx.fillStyle = "#111";
+            ctx.fillRect(sx - sw / 2, sy - sh / 2, sw, sh);
+          }
+        } else {
+          ctx.fillStyle = "#111";
+          ctx.fillRect(sx - sw / 2, sy - sh / 2, sw, sh);
+        }
+        ctx.restore();
       } else {
         const vid = videoElsRef.current.get(clip.id);
         const thumbEl = thumbnailImagesRef.current.get(clip.id);
@@ -9968,7 +10029,8 @@ function Board2Editor({
   // gain node if one exists, otherwise the video element's native volume/muted as a fallback
   // (e.g. createMediaElementSource threw).
   function effectiveClipVolume(clip: Clip): number {
-    if (clip.muted) return 0;
+    // A narration video's sound is its narration clip; its own audio track never plays.
+    if (clip.muted || clip.narrationVideoFor) return 0;
     if (clip.type === "video" && mutedLayersRef.current[clip.layer ?? 1]) return 0;
     return clip.volume ?? 1;
   }
@@ -10149,7 +10211,8 @@ function Board2Editor({
   ) {
     // eslint-disable-next-line react-hooks/purity
     const now = performance.now();
-    const videoClips = currentClips.filter((clip) => clip.type === "video");
+    // Narration videos follow their narration clip instead (syncNarrationVideos).
+    const videoClips = currentClips.filter((clip) => clip.type === "video" && !clip.narrationVideoFor);
     const activeWindows = new Map<string, { start: number; end: number }>(
       options.audioMode === "focused"
         ? []
@@ -10304,6 +10367,59 @@ function Board2Editor({
     evaluateVideoPlaybackStatesRef.current = evaluateVideoPlaybackStates;
   });
 
+  // Narration videos play continuously wherever the camera is: each element's position is its
+  // narration's (narrationVideoSourceTime), whether or not the item is on screen. While playing,
+  // small drift is absorbed with a playback-rate nudge and larger drift with a seek; while paused,
+  // the element is seeked to the playhead so scrubbing the timeline scrubs the video. Silent:
+  // the narration clip's own audio element carries the sound.
+  function syncNarrationVideos(time: number, currentClips: readonly Clip[], playing: boolean) {
+    for (const clip of currentClips) {
+      if (clip.type !== "video" || !clip.narrationVideoFor) continue;
+      const narration = currentClips.find((candidate) => candidate.id === clip.narrationVideoFor && candidate.type === "narration");
+      const vid = videoElsRef.current.get(clip.id) ?? (clip.sourceUrl ? createVideoElement(clip.id, clip.sourceUrl) : null);
+      if (!vid) continue;
+      vid.muted = true;
+      vid.loop = false;
+      setClipAudioOff(clip.id, vid);
+      if (!vid.dataset.narrationVideo) {
+        vid.dataset.narrationVideo = "1";
+        // A paused scrub lands after the seek finishes; redraw so the preview shows that frame.
+        vid.addEventListener("seeked", () => { if (!isPlayingRef.current && !isExportingRef.current) drawFrameRef.current(playheadRef.current); });
+      }
+      if (!narration) {
+        if (!vid.paused) vid.pause();
+        continue;
+      }
+      const { sourceTime, inRange } = narrationVideoSourceTime(narration, time, Number.isFinite(vid.duration) ? vid.duration : undefined);
+      const shouldPlay = playing && inRange && vid.readyState >= HTMLMediaElement.HAVE_METADATA && sourceTime < (Number.isFinite(vid.duration) ? vid.duration - 0.05 : Infinity);
+      // Keeps prewarmVideoElement from resetting an element that is already in use.
+      videoRangeStateRef.current.set(clip.id, true);
+      if (shouldPlay) {
+        const drift = vid.currentTime - sourceTime;
+        if (vid.paused || vid.ended) {
+          // While play() is pending the element still reports paused; seeking and calling play()
+          // again every frame would restart that seek forever. Start once, catch up afterwards.
+          if (narrationVideoPlayPendingRef.current.has(clip.id)) continue;
+          if (Math.abs(drift) > 0.05) { try { vid.currentTime = sourceTime; } catch {} }
+          vid.playbackRate = 1;
+          narrationVideoPlayPendingRef.current.add(clip.id);
+          vid.play().catch(() => {}).finally(() => narrationVideoPlayPendingRef.current.delete(clip.id));
+        } else if (Math.abs(drift) > 0.25) {
+          if (!vid.seeking) { try { vid.currentTime = sourceTime; } catch {} }
+          vid.playbackRate = 1;
+        } else {
+          vid.playbackRate = Math.abs(drift) > 0.03 ? (drift > 0 ? 0.95 : 1.05) : 1;
+        }
+      } else {
+        if (!vid.paused) vid.pause();
+        vid.playbackRate = 1;
+        if (!vid.seeking && vid.readyState >= HTMLMediaElement.HAVE_METADATA && Math.abs(vid.currentTime - sourceTime) > 0.02) {
+          try { vid.currentTime = sourceTime; } catch {}
+        }
+      }
+    }
+  }
+
   // Warms up a freshly created video element's decoder with a silent play()→pause() cycle so
   // its first "real" entry (restart-on-entry, Step 16.10) already has a decoded frame ready to
   // draw — otherwise the first playthrough plays audio while the canvas still shows the frozen
@@ -10314,6 +10430,8 @@ function Board2Editor({
       // directly onto the currently-playing position), don't interfere — pausing/silencing it
       // here would kill playback that's already legitimately underway.
       if (videoRangeStateRef.current.get(clipId)) return;
+      // A narration video's position belongs to its narration (syncNarrationVideos).
+      if (clipsRef.current.some((clip) => clip.id === clipId && clip.narrationVideoFor)) return;
       ensureVideoAudioNodes(clipId, vid);
       setClipAudioOff(clipId, vid); // keep the warm-up silent
       vid.play().then(() => {
@@ -10372,6 +10490,8 @@ function Board2Editor({
           if (clip.type !== "video") continue;
           const vid = videoElsRef.current.get(clip.id);
           if (!vid) continue;
+          // A narration video holds its frame; the paused sync below keeps it at the playhead.
+          if (clip.narrationVideoFor) { vid.pause(); continue; }
           switchVideoOff(clip, vid);
           videoRangeStateRef.current.set(clip.id, false);
           const runtime = videoRuntimeFor(clip.id);
@@ -10398,6 +10518,7 @@ function Board2Editor({
     lastRafTimeRef.current = now;
     const t = playheadRef.current;
     evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { cameraAudioFocus: true });
+    syncNarrationVideos(t, clipsRef.current, true);
     // Narration has one owner at every timeline instant, including when duplicate clips overlap.
     // This shared ownership rule also drives the export schedule below. The second sync handles a
     // media-clock sample that crossed a clip boundary during this animation frame.
@@ -10440,6 +10561,7 @@ function Board2Editor({
         if (clip.type !== "video") continue;
         const vid = videoElsRef.current.get(clip.id);
         if (!vid) continue;
+        if (clip.narrationVideoFor) { vid.pause(); continue; }
         switchVideoOff(clip, vid);
         const runtime = videoRuntimeFor(clip.id);
         runtime.state = "dormant";
@@ -10455,7 +10577,13 @@ function Board2Editor({
     return () => { if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current); };
   }, [isPlaying, rafLoop]);
 
-  useEffect(() => { if (!isPlaying) drawFrame(playhead); }, [
+  useEffect(() => {
+    if (isPlaying) return;
+    if (!isExportingRef.current) syncNarrationVideos(playhead, clipsRef.current, false);
+    drawFrame(playhead);
+  // syncNarrationVideos reads refs only.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
     playhead,
     clips,
     annotations,
@@ -10914,6 +11042,9 @@ function Board2Editor({
     }
     thumbnailImagesRef.current.delete(clipId);
     if (clip?.type === "narration") {
+      // Its narration video has nothing left to play; it goes with it.
+      const linkedVideo = clipsRef.current.find((linked) => linked.type === "video" && linked.narrationVideoFor === clipId);
+      if (linkedVideo) removeBoardEntity(linkedVideo);
       removeNarrationAudioElement(clipId);
       URL.revokeObjectURL(clip.sourceUrl);
       setCharacterActions((prev) => prev.filter((action) => action.narrationGestureClipId !== clipId));
@@ -10930,7 +11061,11 @@ function Board2Editor({
     if (!clip || !isBoardBackedClip(clip)) return;
     const noun = clip.type === "customZoom" ? "drawn focus area" : clip.type === "image" ? "image" : "video";
     if (!window.confirm(`Delete this ${noun} from the board? This removes it and any timeline blocks that reference it.`)) return;
+    removeBoardEntity(clip);
+  }
 
+  // Removes a board item and every timeline block that references it (no confirmation).
+  function removeBoardEntity(clip: Clip) {
     const mediaId = boardEntityId(clip);
     // Remove all appearances referencing this entity, including future duplicate blocks.
     const entityClips = clipsRef.current.filter((candidate) => referencesBoardEntity(candidate, mediaId));
@@ -11807,10 +11942,117 @@ function Board2Editor({
     setIsRecording(false);
   }
 
+  // ─ Narration video ───────────────────────────────────────────────────────
+
+  async function handleNarrationVideoUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!isBoardOwner) {
+      setToast("Only the board's owner can add narration — it changes the timeline");
+      return;
+    }
+    if (!file.type.startsWith("video/") && !/\.(mp4|mov|webm|mkv)$/i.test(file.name)) {
+      setToast("Choose a video file for a narration video");
+      return;
+    }
+    const previewUrl = URL.createObjectURL(file);
+    try {
+      const meta = await getVideoMeta(previewUrl);
+      if (!(meta.w > 0 && meta.h > 0)) throw new Error("No picture found in this video");
+      setNarrationVideoDraft({ file, previewUrl, shape: "original", sourceWidth: meta.w, sourceHeight: meta.h, drawing: false });
+    } catch (error) {
+      URL.revokeObjectURL(previewUrl);
+      setToast(error instanceof Error ? error.message : "Could not read that video");
+    }
+  }
+
+  function closeNarrationVideoDraft() {
+    setNarrationVideoDraft((draft) => {
+      if (draft) URL.revokeObjectURL(draft.previewUrl);
+      return null;
+    });
+  }
+
+  async function confirmNarrationVideoDraft() {
+    const draft = narrationVideoDraft;
+    if (!draft) return;
+    if (draft.shape === "rect" && !draft.rect) { setToast("Drag a rectangle over the video first"); return; }
+    if (draft.shape === "freeform" && (draft.points?.length ?? 0) < 6) { setToast("Draw a shape with at least three points first"); return; }
+    const { file, previewUrl, drawing: _drawing, ...placement } = draft;
+    setNarrationVideoDraft(null);
+    URL.revokeObjectURL(previewUrl);
+    await addNarrationFromFile(file, placement);
+  }
+
+  // Puts a narration video on the board with its narration clip. One per board: an existing
+  // narration video is replaced, together with the narration clip it supplied.
+  async function placeNarrationVideo(file: File, narrationClip: Clip, placement: NarrationVideoPlacement): Promise<{ notShared: string }> {
+    const fit = fitNarrationVideoShape(placement.shape, placement.sourceWidth, placement.sourceHeight, { rect: placement.rect, points: placement.points });
+    const boardW = Math.round(fit.aspect >= 1 ? NARRATION_VIDEO_BOARD_LONG_EDGE : NARRATION_VIDEO_BOARD_LONG_EDGE * fit.aspect);
+    const boardH = Math.round(fit.aspect >= 1 ? NARRATION_VIDEO_BOARD_LONG_EDGE / fit.aspect : NARRATION_VIDEO_BOARD_LONG_EDGE);
+    const previous = clipsRef.current.find((clip) => clip.type === "video" && clip.narrationVideoFor);
+    let sourceUrl = "";
+    let notShared = "";
+    if (joinCode) {
+      if (narrationClip.audioBlob === file && !narrationClip.sourceUrl.startsWith("blob:")) {
+        sourceUrl = narrationClip.sourceUrl; // large videos narrate from the file itself: share it once
+      } else {
+        setToast("Sharing narration video…");
+        try { sourceUrl = await uploadJoinableAv(file); } catch (error) {
+          notShared = `The narration video is only on this device — ${error instanceof Error ? error.message : "it couldn't be shared"}. Others on this board won't see it.`;
+        }
+      }
+    }
+    if (!sourceUrl) sourceUrl = URL.createObjectURL(file);
+    const position = previous?.boardX !== undefined && previous.boardY !== undefined
+      ? { boardX: previous.boardX, boardY: previous.boardY }
+      : findBoardPosForNewMedia(clipsRef.current, boardW, boardH);
+    const videoClip: Clip = {
+      id: generateId(),
+      type: "video",
+      name: `🎥 ${narrationClip.name}`.slice(0, 40),
+      sourceUrl,
+      sourceBlob: file,
+      startTime: narrationClip.startTime,
+      duration: Math.min(4, narrationClip.duration),
+      layer: 1,
+      featured: false,
+      boardX: position.boardX,
+      boardY: position.boardY,
+      boardW,
+      boardH,
+      sourceDurationSec: narrationClip.duration,
+      cropLeft: fit.crop.left || undefined,
+      cropRight: fit.crop.right || undefined,
+      cropTop: fit.crop.top || undefined,
+      cropBottom: fit.crop.bottom || undefined,
+      narrationVideoFor: narrationClip.id,
+      narrationVideoMask: fit.mask,
+      source: "manual",
+    };
+    if (previous) {
+      const previousNarration = clipsRef.current.find((clip) => clip.id === previous.narrationVideoFor);
+      removeBoardEntity(previous);
+      if (previousNarration) deleteClip(previousNarration.id);
+    }
+    setClips((prev) => [...prev, narrationClip, videoClip]);
+    createVideoElement(videoClip.id, videoClip.sourceUrl);
+    selectionSurfaceRef.current = "board";
+    setSelectedClipId(videoClip.id);
+    return { notShared };
+  }
+
   async function handleNarrationUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    await addNarrationFromFile(file);
+  }
+
+  // Adds a narration clip from an audio or video file. With `video`, the same file is also placed
+  // on the board as that narration's video (see placeNarrationVideo). Returns the narration id.
+  async function addNarrationFromFile(file: File, video?: NarrationVideoPlacement): Promise<string | null> {
     const isVideoFile = file.type.startsWith("video/") || (!file.type.startsWith("audio/") && /\.(mp4|mov|mkv)$/i.test(file.name));
     setToast("Processing audio…");
     let blobUrl: string | null = null;
@@ -11864,7 +12106,7 @@ function Board2Editor({
         }
       }
       const clipId = generateId();
-      setClips((prev) => [...prev, {
+      const narrationClip: Clip = {
         id: clipId,
         type: "narration" as const,
         name: file.name.replace(/\.[^.]+$/, "").slice(0, 40),
@@ -11872,7 +12114,13 @@ function Board2Editor({
         audioBlob,
         startTime: playheadRef.current,
         duration: dur,
-      }]);
+      };
+      if (video) {
+        const placed = await placeNarrationVideo(file, narrationClip, video);
+        if (placed.notShared && !notShared) notShared = placed.notShared;
+      } else {
+        setClips((prev) => [...prev, narrationClip]);
+      }
       // The waveform is optional. Large recordings should appear on the board without waiting
       // for another full decode of the file.
       if (audioBlob.size <= 32 * 1024 * 1024 && !(isVideoFile && audioBlob === file)) {
@@ -11880,10 +12128,12 @@ function Board2Editor({
           setClips((current) => current.map((clip) => clip.id === clipId ? { ...clip, waveform } : clip));
         }).catch(() => {});
       }
-      setToast(notShared || (isVideoFile ? "Video narration added" : "Narration added"));
+      setToast(notShared || (video ? "Narration video added" : isVideoFile ? "Video narration added" : "Narration added"));
+      return clipId;
     } catch (err) {
       if (blobUrl) URL.revokeObjectURL(blobUrl);
       setToast(err instanceof Error ? err.message : "Failed to process file");
+      return null;
     }
   }
 
@@ -16918,7 +17168,8 @@ function Board2Editor({
       const vid = videoElsRef.current.get(clip.id);
       if (!vid) continue;
       const isInRange = !!activeVideoWindow(clip, startPh);
-      if (firstPlay && !isInRange) {
+      // Narration videos are started by syncNarrationVideos; this unlock would pause them again.
+      if (firstPlay && !isInRange && !clip.narrationVideoFor) {
         setClipAudioOff(clip.id, vid);
         vid.play().then(() => {
           const state = videoPlaybackStateRef.current.get(clip.id)?.state ?? "dormant";
@@ -17782,6 +18033,15 @@ function Board2Editor({
       const sourceDuration = Number.isFinite(video.duration) && video.duration > 0
         ? video.duration
         : Math.max(0.001, clip.sourceDurationSec ?? clip.duration);
+      const narration = clip.narrationVideoFor
+        ? currentClips.find((candidate) => candidate.id === clip.narrationVideoFor && candidate.type === "narration")
+        : undefined;
+      if (clip.narrationVideoFor) {
+        // The same position syncNarrationVideos holds the preview element at.
+        const sourceTime = narration ? narrationVideoSourceTime(narration, time, sourceDuration).sourceTime : 0;
+        exportVideoFramesRef.current.set(clip.id, await seekAndDecodeVideoFrame(video, sourceTime));
+        continue;
+      }
       const active = !!activeVideoWindow(clip, time);
       const sourceTime = deterministicVideoSourceTime({
         timelineTime: time,
@@ -18216,6 +18476,7 @@ function Board2Editor({
               force: renderedFrames === 0,
               audioMode: "silent",
             });
+            syncNarrationVideos(timelineTime, currentClips, true);
             renderToCtx(exportCtx, timelineTime, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "realtime-export");
             renderedFrames++;
             nextFrameTime += 1 / exportFps;
@@ -21121,6 +21382,175 @@ function Board2Editor({
     );
   }
 
+  function narrationVideoDraftPoint(event: React.PointerEvent<SVGSVGElement>): [number, number] {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return [
+      clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1),
+      clamp((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1),
+    ];
+  }
+
+  // Rectangle: drag out the crop. Freeform: click to place corners and/or drag to draw freehand;
+  // clicking the first point (or "Close shape") finishes. A new press after closing starts over.
+  function handleNarrationVideoDraftPointerDown(event: React.PointerEvent<SVGSVGElement>) {
+    const draft = narrationVideoDraft;
+    if (!draft || (draft.shape !== "rect" && draft.shape !== "freeform")) return;
+    event.preventDefault();
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch {}
+    narrationVideoPressRef.current = true;
+    const [x, y] = narrationVideoDraftPoint(event);
+    if (draft.shape === "rect") {
+      setNarrationVideoDraft({ ...draft, rect: { x0: x, y0: y, x1: x, y1: y }, drawing: true });
+      return;
+    }
+    const points = draft.drawing ? draft.points ?? [] : [];
+    if (draft.drawing && points.length >= 6 && Math.hypot(x - points[0], y - points[1]) < 0.035) {
+      setNarrationVideoDraft({ ...draft, points: simplifyFreeformPoints(points, 0.004), drawing: false });
+      return;
+    }
+    setNarrationVideoDraft({ ...draft, points: [...points, x, y], drawing: true });
+    narrationVideoStrokeRef.current = true;
+  }
+
+  function handleNarrationVideoDraftPointerMove(event: React.PointerEvent<SVGSVGElement>) {
+    const draft = narrationVideoDraft;
+    if (!draft || !draft.drawing || !narrationVideoPressRef.current) return;
+    const [x, y] = narrationVideoDraftPoint(event);
+    if (draft.shape === "rect" && draft.rect) {
+      setNarrationVideoDraft({ ...draft, rect: { ...draft.rect, x1: x, y1: y } });
+    } else if (draft.shape === "freeform" && narrationVideoStrokeRef.current) {
+      const points = draft.points ?? [];
+      const n = points.length;
+      if (n >= 2 && Math.hypot(x - points[n - 2], y - points[n - 1]) < 0.008) return;
+      setNarrationVideoDraft({ ...draft, points: [...points, x, y] });
+    }
+  }
+
+  function handleNarrationVideoDraftPointerUp(event: React.PointerEvent<SVGSVGElement>) {
+    const draft = narrationVideoDraft;
+    narrationVideoStrokeRef.current = false;
+    narrationVideoPressRef.current = false;
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch {}
+    if (draft?.shape === "rect" && draft.rect) {
+      const { x0, y0, x1, y1 } = draft.rect;
+      const tooSmall = Math.abs(x1 - x0) < 0.05 || Math.abs(y1 - y0) < 0.05;
+      setNarrationVideoDraft({ ...draft, rect: tooSmall ? undefined : draft.rect, drawing: false });
+    }
+  }
+
+  // The board's DOM tile for a narration video: its frame, cropped like the canvas draw (the
+  // mask is a clip-path on the tile's container).
+  function renderNarrationVideoTile(clip: Clip) {
+    const crop = normalizedMediaCrop(clip);
+    const keptX = Math.max(0.05, 1 - (crop.left + crop.right) / 100);
+    const keptY = Math.max(0.05, 1 - (crop.top + crop.bottom) / 100);
+    return (
+      <div data-narration-video-tile style={{ position: "relative", width: "100%", height: "100%", backgroundColor: "#1a1a2e", overflow: "hidden" }}>
+        {clip.thumbnailBlobUrl && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={clip.thumbnailBlobUrl} alt={clip.name} draggable={false} style={{ position: "absolute", left: `${-crop.left / keptX}%`, top: `${-crop.top / keptY}%`, width: `${100 / keptX}%`, height: `${100 / keptY}%`, objectFit: "fill", pointerEvents: "none", userSelect: "none" }} />
+        )}
+        <span style={{ position: "absolute", left: "50%", top: 6, transform: "translateX(-50%)", padding: "1px 5px", background: "rgba(20,20,30,.62)", color: "#fff", fontSize: 10, fontFamily: "monospace", whiteSpace: "nowrap", pointerEvents: "none" }}>🎥 narration</span>
+      </div>
+    );
+  }
+
+  function renderNarrationVideoModal() {
+    const draft = narrationVideoDraft;
+    if (!draft) return null;
+    const aspect = draft.sourceWidth / Math.max(1, draft.sourceHeight);
+    const replacing = clips.some((clip) => clip.type === "video" && clip.narrationVideoFor);
+    const points = draft.points ?? [];
+    const pointList = (values: number[]) => values.reduce<string[]>((pairs, value, index) => {
+      if (index % 2 === 0) pairs.push(`${value},${values[index + 1] ?? 0}`);
+      return pairs;
+    }, []).join(" ");
+    let shapePath = "";
+    if (draft.shape === "circle") {
+      const side = Math.min(draft.sourceWidth, draft.sourceHeight);
+      const rx = side / draft.sourceWidth / 2, ry = side / draft.sourceHeight / 2;
+      shapePath = `M ${0.5 - rx} 0.5 A ${rx} ${ry} 0 1 0 ${0.5 + rx} 0.5 A ${rx} ${ry} 0 1 0 ${0.5 - rx} 0.5 Z`;
+    } else if (draft.shape === "rect" && draft.rect) {
+      const x0 = Math.min(draft.rect.x0, draft.rect.x1), x1 = Math.max(draft.rect.x0, draft.rect.x1);
+      const y0 = Math.min(draft.rect.y0, draft.rect.y1), y1 = Math.max(draft.rect.y0, draft.rect.y1);
+      shapePath = `M ${x0} ${y0} H ${x1} V ${y1} H ${x0} Z`;
+    } else if (draft.shape === "freeform" && points.length >= 6 && !draft.drawing) {
+      shapePath = `M ${pointList(points).split(" ").join(" L ")} Z`;
+    }
+    const canPlace = draft.shape === "original" || draft.shape === "circle" || (draft.shape === "rect" && !!draft.rect) || (draft.shape === "freeform" && points.length >= 6 && !draft.drawing);
+    const shapeOptions: Array<[NarrationVideoShape, string]> = [["original", "▭ Original"], ["circle", "◯ Circle"], ["rect", "⬚ Rectangle"], ["freeform", "✎ Freeform"]];
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Frame narration video"
+        data-narration-video-modal
+        onClick={(event) => { if (event.target === event.currentTarget) closeNarrationVideoDraft(); }}
+        style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(0,0,0,.68)" }}
+      >
+        <div style={{ width: 720, maxWidth: "96vw", maxHeight: "94vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, padding: 16, background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "5px 5px 0 #2a2a2a", fontFamily: "monospace" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <strong style={{ fontSize: 13 }}>🎥 NARRATION VIDEO — {draft.file.name.slice(0, 40)}</strong>
+            <button type="button" aria-label="Cancel narration video" onClick={closeNarrationVideoDraft} style={{ ...miniButton, marginLeft: "auto", padding: "1px 7px", fontSize: 15 }}>×</button>
+          </div>
+          <div style={{ fontSize: 10, lineHeight: 1.5, color: "#4a4a4a" }}>
+            Its sound becomes the narration track and the video goes on the board, playing the whole way through. Pick how it&apos;s framed — the shape is fixed once placed.
+            {replacing && <><br /><b style={{ color: "#a32916" }}>This replaces the board&apos;s current narration video and the narration it supplied.</b></>}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+            {shapeOptions.map(([shape, label]) => (
+              <button
+                key={shape}
+                type="button"
+                aria-pressed={draft.shape === shape}
+                onClick={() => setNarrationVideoDraft({ ...draft, shape, drawing: false, ...(shape === "freeform" ? { points: [] } : {}) })}
+                style={{ ...miniButton, padding: "7px 4px", fontWeight: 700, background: draft.shape === shape ? "#2a2a2a" : "#fffdf5", color: draft.shape === shape ? "#fff" : "#2a2a2a" }}
+              >{label}</button>
+            ))}
+          </div>
+          <div style={{ position: "relative", width: `min(100%, ${(52 * aspect).toFixed(2)}vh)`, aspectRatio: `${draft.sourceWidth} / ${draft.sourceHeight}`, margin: "0 auto", background: "#111", border: "1.5px solid #2a2a2a" }}>
+            <video src={draft.previewUrl} muted autoPlay loop playsInline style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", pointerEvents: "none" }} />
+            <svg
+              data-narration-video-draw
+              viewBox="0 0 1 1"
+              preserveAspectRatio="none"
+              onPointerDown={handleNarrationVideoDraftPointerDown}
+              onPointerMove={handleNarrationVideoDraftPointerMove}
+              onPointerUp={handleNarrationVideoDraftPointerUp}
+              onPointerCancel={handleNarrationVideoDraftPointerUp}
+              style={{ position: "absolute", inset: 0, width: "100%", height: "100%", touchAction: "none", cursor: draft.shape === "rect" || draft.shape === "freeform" ? "crosshair" : "default" }}
+            >
+              {shapePath && <path d={`M 0 0 H 1 V 1 H 0 Z ${shapePath}`} fillRule="evenodd" fill="rgba(0,0,0,.6)" />}
+              {shapePath && <path d={shapePath} fill="none" stroke="#c8f135" strokeWidth={2} vectorEffect="non-scaling-stroke" />}
+              {draft.shape === "freeform" && draft.drawing && points.length >= 2 && (
+                <>
+                  <polyline points={pointList(points)} fill="none" stroke="#c8f135" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+                  <circle cx={points[0]} cy={points[1]} r={0.012} fill="#ff5e3a" />
+                </>
+              )}
+            </svg>
+          </div>
+          <div style={{ fontSize: 10, color: "#5a5a5a", minHeight: 14 }}>
+            {draft.shape === "original" && "The whole frame, at its own aspect ratio."}
+            {draft.shape === "circle" && "A circle from the middle of the frame."}
+            {draft.shape === "rect" && (draft.rect ? "Drag again to redraw the rectangle." : "Drag a rectangle over the video.")}
+            {draft.shape === "freeform" && (draft.drawing
+              ? "Click to add corners or drag to draw; click the red first point to close the shape."
+              : points.length >= 6 ? "Shape closed. Press on the video to start over." : "Click to add corners (e.g. three for a triangle) or drag to draw freehand.")}
+            {" "}Each edge can trim at most 45% of the frame.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {draft.shape === "freeform" && draft.drawing && points.length >= 6 && (
+              <button type="button" onClick={() => setNarrationVideoDraft({ ...draft, points: simplifyFreeformPoints(points, 0.004), drawing: false })} style={{ ...sketchButton, padding: "8px 10px", fontSize: 11 }}>Close shape</button>
+            )}
+            <button type="button" onClick={closeNarrationVideoDraft} style={{ ...sketchButton, marginLeft: "auto", padding: "8px 10px", fontSize: 11, background: "#fffdf5" }}>Cancel</button>
+            <button type="button" disabled={!canPlace} onClick={() => void confirmNarrationVideoDraft()} style={{ ...sketchButton, padding: "8px 14px", fontSize: 11, fontWeight: 700, background: "#c8f135", opacity: canPlace ? 1 : 0.5 }}>Place on board</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderMediaEditorModal() {
     if (!mediaEditDraft) return null;
     const clip = clips.find((candidate) => candidate.id === mediaEditDraft.clipId);
@@ -22538,14 +22968,14 @@ function Board2Editor({
                     top: clip.boardY! * boardZoom,
                     width: clip.boardW! * boardZoom,
                     height: clip.boardH! * boardZoom,
-                    border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : "1.5px solid rgba(42,42,42,0.4)",
-                    boxShadow: isSel ? "0 0 0 2px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : "1px 1px 4px rgba(42,42,42,0.2)",
+                    border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : clip.narrationVideoFor ? "none" : "1.5px solid rgba(42,42,42,0.4)",
+                    boxShadow: isSel ? "0 0 0 2px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)" : clip.narrationVideoFor ? "none" : "1px 1px 4px rgba(42,42,42,0.2)",
                     touchAction: "none",
                     pointerEvents: clip.type === "customZoom" ? "none" : undefined,
                     zIndex: clip.type === "customZoom" ? 0 : 1,
                   }}
                 >
-                  <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: clip.needsRedownload ? "auto" : "none" }}>
+                  <div style={{ position: "absolute", inset: 0, overflow: "hidden", pointerEvents: clip.needsRedownload ? "auto" : "none", clipPath: narrationVideoMaskCss(clip.narrationVideoMask) }}>
                     {clip.needsRedownload ? (
                       <button
                         type="button"
@@ -22569,7 +22999,7 @@ function Board2Editor({
                         aria-label={clip.name}
                         style={{ width: "100%", height: "100%", display: "block", transformOrigin: "center", backgroundImage: `url(${clip.previewUrl ?? clip.sourceUrl})`, backgroundSize: "100% 100%", backgroundRepeat: "no-repeat" }}
                       />
-                    ) : clip.type === "customZoom" ? (
+                    ) : clip.narrationVideoFor ? renderNarrationVideoTile(clip) : clip.type === "customZoom" ? (
                       <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                         <span style={{ color: "rgba(28,111,201,0.45)", fontSize: Math.max(10, 16 * boardZoom), pointerEvents: "none" }}>🔍</span>
                       </div>
@@ -22578,7 +23008,7 @@ function Board2Editor({
                         <span style={{ color: "#7df5b0", background: clip.thumbnailBlobUrl ? "rgba(20,20,30,.62)" : "transparent", borderRadius: clip.thumbnailBlobUrl ? "50%" : 0, width: clip.thumbnailBlobUrl ? Math.max(22, 34 * boardZoom) : undefined, height: clip.thumbnailBlobUrl ? Math.max(22, 34 * boardZoom) : undefined, display: "flex", alignItems: "center", justifyContent: "center", fontSize: Math.max(7, 10 * boardZoom), fontFamily: "monospace", pointerEvents: "none" }}>▶{clip.thumbnailBlobUrl ? "" : ` ${clip.name}`}</span>
                       </div>
                     )}
-                    <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none" }}>
+                    <div style={{ display: clip.narrationVideoFor ? "none" : undefined, position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 3px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: Math.max(6, 8 * boardZoom), fontFamily: "monospace", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", pointerEvents: "none" }}>
                       {clip.name}
                     </div>
                   </div>
@@ -23385,6 +23815,8 @@ function Board2Editor({
         )}
         {renderDownloadToasts()}
         {renderMediaEditorModal()}
+      {renderNarrationVideoModal()}
+        {renderNarrationVideoModal()}
         {renderZoomEditorModal()}
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
@@ -24927,6 +25359,11 @@ function Board2Editor({
             </button>
             <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
             <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
+            <label title="A video of you talking: its sound becomes the narration and the video goes on the board" style={{ ...uploadControlStyle, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
+              <svg aria-hidden="true" width="13" height="10" viewBox="0 0 13 10" style={{ flexShrink: 0 }}><rect x="0.75" y="1.25" width="8" height="7.5" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" /><path d="M9.5 4 L12.25 2.25 V7.75 L9.5 6 Z" fill="currentColor" /></svg>
+              ↑ Upload narration video
+              <input type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.webm" aria-label="Upload narration video" style={nativeFilePickerStyle} onChange={handleNarrationVideoUpload} />
+            </label>
             <button
               onClick={() => addPanClip()}
               style={{ ...sketchButton, background: PAN_CLIP_COLOR, fontSize: 11, padding: "6px 10px", fontWeight: 700 }}
@@ -25006,74 +25443,6 @@ function Board2Editor({
                     Show
                   </label>
                 </div>
-              </div>
-              <div style={{ width: "100%", border: "1.5px dashed #7a5b00", background: "#fff7d6", padding: 8, boxSizing: "border-box" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
-                  <span style={{ fontSize: 9, fontWeight: 700, color: "#6a4b00", textTransform: "uppercase", letterSpacing: 0.6 }}>Image draft pace</span>
-                  <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, color: "#6a4b00" }}>
-                    every
-                    <input
-                      type="number"
-                      min={3}
-                      max={12}
-                      step={1}
-                      value={autoImageSeconds}
-                      disabled={!!autoBuildPhase}
-                      onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 3, 12))}
-                      style={{ width: 38, padding: "2px 3px", border: "1px solid #7a5b00", background: "#fff", fontFamily: "monospace", fontSize: 10 }}
-                    />
-                    sec
-                  </label>
-                </div>
-                <label style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, fontSize: 9, color: "#6a4b00", cursor: "pointer" }}>
-                  <input type="checkbox" checked={autoStyleConditioning} disabled={!!autoBuildPhase} onChange={(event) => setAutoStyleConditioning(event.target.checked)} />
-                  Use my starred-board style
-                </label>
-                <div style={{ marginBottom: 6, fontSize: 8, lineHeight: 1.35, color: autoStyleConditioning && selectedStyleExemplarCount ? "#496700" : "#6a6a6a" }}>
-                  {!autoStyleConditioning
-                    ? "Style conditioning off — using default planning."
-                    : !styleExemplarsLoaded
-                      ? "Checking the Board Library for training examples…"
-                      : selectedStyleExemplarCount
-                        ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
-                        : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
-                </div>
-                {renderOutroAutoBuildOptions(true)}
-                <button
-                  onClick={() => void autoBuildFromNarration()}
-                  disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
-                  title="Transcribe the compiled narration, find real images, place timed featured clips, and generate an editable camera path"
-                  style={{
-                    ...sketchButton,
-                    width: "100%",
-                    padding: "7px 8px",
-                    fontSize: 10,
-                    fontWeight: 700,
-                    background: "#ffd45c",
-                    opacity: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1,
-                    cursor: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? "not-allowed" : "pointer",
-                  }}
-                >
-                  {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
-                </button>
-                {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", marginTop: 5, color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
-                {autoBuildError && !autoBuildPhase && (
-                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
-                )}
-                {autoBuildCancelled && !autoBuildPhase && (
-                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#8a6200" }}>⚠ Auto-build cancelled</div>
-                )}
-                {autoBuildSummary && !autoBuildPhase && (
-                  <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>
-                )}
-                {autoBuildPlanDetails && !autoBuildPhase && (
-                  <details style={{ marginTop: 5, fontSize: 8, lineHeight: 1.4 }}>
-                    <summary style={{ cursor: "pointer", fontWeight: 700 }}>Narration scope & camera audit</summary>
-                    {autoBuildPlanDetails.styleNote && <div style={{ marginTop: 4, color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
-                    {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 7, paddingTop: 5, borderTop: "1px solid rgba(42,42,42,.14)" }}><b>{index + 1}. {item.startTime.toFixed(2)}s · {item.scope.toUpperCase()} · {item.framing}</b>{item.actualArrival !== undefined && <span> · arrived {item.actualArrival.toFixed(2)}s (Δ {item.driftSeconds?.toFixed(3)}s)</span>}<br />“{item.narrationText}”<br /><span style={{ color: "#6a6a6a" }}>{item.query} — {item.reason}</span></div>)}
-                  </details>
-                )}
-                {!autoBuildPhase && <div style={{ marginTop: 5, fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
               </div>
             </ProGated>
             {isRecording && (
@@ -25320,10 +25689,10 @@ function Board2Editor({
                         top: clip.boardY! * boardZoom,
                         width: clip.boardW! * boardZoom,
                         height: clip.boardH! * boardZoom,
-                        border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : "1.5px solid rgba(42,42,42,0.4)",
+                        border: isSel ? "2px solid #ff5e3a" : clip.type === "customZoom" ? "1.5px dashed #2e8fff" : clip.narrationVideoFor ? "none" : "1.5px solid rgba(42,42,42,0.4)",
                         boxShadow: isSel
                           ? "0 0 0 1px #ff5e3a, 1px 1px 6px rgba(42,42,42,0.25)"
-                          : "1px 1px 4px rgba(42,42,42,0.2)",
+                          : clip.narrationVideoFor ? "none" : "1px 1px 4px rgba(42,42,42,0.2)",
                         cursor: "grab",
                         overflow: "visible",
                         pointerEvents: clip.type === "customZoom" ? "none" : undefined,
@@ -25331,7 +25700,7 @@ function Board2Editor({
                       }}
                       onPointerDown={(e) => { if (isMobile && e.pointerType !== "mouse") handleMobileBoardPointerDown(e as React.PointerEvent<HTMLDivElement>); else if (!isSpaceDown) handleBoardClipPointerDown(e, clip); }}
                     >
-                      <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+                      <div style={{ position: "absolute", inset: 0, overflow: "hidden", clipPath: narrationVideoMaskCss(clip.narrationVideoMask) }}>
                         {clip.needsRedownload ? (
                           <button
                             type="button"
@@ -25356,7 +25725,7 @@ function Board2Editor({
                             aria-label={clip.name}
                             style={{ width: "100%", height: "100%", display: "block", userSelect: "none", pointerEvents: "none", transformOrigin: "center", backgroundImage: `url(${clip.previewUrl ?? clip.sourceUrl})`, backgroundSize: "100% 100%", backgroundRepeat: "no-repeat" }}
                           />
-                        ) : clip.type === "customZoom" ? (
+                        ) : clip.narrationVideoFor ? renderNarrationVideoTile(clip) : clip.type === "customZoom" ? (
                           <div style={{ width: "100%", height: "100%", background: "rgba(184,226,255,0.09)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                             <span style={{ color: "rgba(28,111,201,0.45)", fontSize: 20, pointerEvents: "none" }}>🔍</span>
                           </div>
@@ -25365,7 +25734,7 @@ function Board2Editor({
                             <span style={{ color: "#7df5b0", background: clip.thumbnailBlobUrl ? "rgba(20,20,30,.62)" : "transparent", borderRadius: clip.thumbnailBlobUrl ? "50%" : 0, width: clip.thumbnailBlobUrl ? 38 : undefined, height: clip.thumbnailBlobUrl ? 38 : undefined, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontFamily: "monospace", pointerEvents: "none" }}>▶{clip.thumbnailBlobUrl ? "" : ` ${clip.name}`}</span>
                           </div>
                         )}
-                        <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 4px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: 9, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none" }}>
+                        <div style={{ display: clip.narrationVideoFor ? "none" : undefined, position: "absolute", bottom: 0, left: 0, right: 0, padding: "1px 4px", background: "rgba(42,42,42,0.7)", color: "#fff", fontSize: 9, fontFamily: "monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", pointerEvents: "none" }}>
                           {clip.name}
                         </div>
                       </div>
@@ -25404,7 +25773,7 @@ function Board2Editor({
                         />
                         );
                       })}
-                      {isSel && (isBoardMediaClip(clip) || clip.type === "customZoom") && (
+                      {isSel && !clip.narrationVideoFor && (isBoardMediaClip(clip) || clip.type === "customZoom") && (
                         <button
                           type="button"
                           aria-label={`Edit ${clip.name}`}
@@ -26608,6 +26977,78 @@ function Board2Editor({
 
             {toolsPanelOpen && (
               <div data-tools-panel style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div style={panelLabelStyle}>AI images</div>
+                <ProGated featureName="Auto-build from narration">
+                <div style={{ width: "100%", border: "1.5px dashed #7a5b00", background: "#fff7d6", padding: 8, boxSizing: "border-box" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: "#6a4b00", textTransform: "uppercase", letterSpacing: 0.6 }}>Image draft pace</span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9, color: "#6a4b00" }}>
+                      every
+                      <input
+                        type="number"
+                        min={3}
+                        max={12}
+                        step={1}
+                        value={autoImageSeconds}
+                        disabled={!!autoBuildPhase}
+                        onChange={(event) => setAutoImageSeconds(clamp(Number(event.target.value) || 4, 3, 12))}
+                        style={{ width: 38, padding: "2px 3px", border: "1px solid #7a5b00", background: "#fff", fontFamily: "monospace", fontSize: 10 }}
+                      />
+                      sec
+                    </label>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5, fontSize: 9, color: "#6a4b00", cursor: "pointer" }}>
+                    <input type="checkbox" checked={autoStyleConditioning} disabled={!!autoBuildPhase} onChange={(event) => setAutoStyleConditioning(event.target.checked)} />
+                    Use my starred-board style
+                  </label>
+                  <div style={{ marginBottom: 6, fontSize: 8, lineHeight: 1.35, color: autoStyleConditioning && selectedStyleExemplarCount ? "#496700" : "#6a6a6a" }}>
+                    {!autoStyleConditioning
+                      ? "Style conditioning off — using default planning."
+                      : !styleExemplarsLoaded
+                        ? "Checking the Board Library for training examples…"
+                        : selectedStyleExemplarCount
+                          ? `Planning in your style from ${selectedStyleExemplarCount} starred board${selectedStyleExemplarCount === 1 ? "" : "s"}${selectedStyleExemplarCount < styleExemplars.length ? ` (${styleExemplars.length} available; newest fit the style budget)` : ""}.`
+                          : "No training examples starred — using default planning. Star boards in the Library to teach your style."}
+                  </div>
+                  {renderOutroAutoBuildOptions(true)}
+                  <button
+                    onClick={() => void autoBuildFromNarration()}
+                    disabled={!!autoBuildPhase || !clips.some((clip) => clip.type === "narration")}
+                    title="Transcribe the compiled narration, find real images, place timed featured clips, and generate an editable camera path"
+                    style={{
+                      ...sketchButton,
+                      width: "100%",
+                      padding: "7px 8px",
+                      fontSize: 10,
+                      fontWeight: 700,
+                      background: "#ffd45c",
+                      opacity: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? 0.5 : 1,
+                      cursor: autoBuildPhase || !clips.some((clip) => clip.type === "narration") ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    {autoBuildPhase ? `⟳ ${autoBuildPhase}` : "🖼 Auto-build from narration"}
+                  </button>
+                  {autoBuildPhase && <button type="button" onClick={cancelAutoBuild} style={{ ...miniButton, width: "100%", marginTop: 5, color: "#a32916", borderColor: "#a32916" }}>Cancel auto-build</button>}
+                  {autoBuildError && !autoBuildPhase && (
+                    <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#a32916" }}>✗ {autoBuildError}</div>
+                  )}
+                  {autoBuildCancelled && !autoBuildPhase && (
+                    <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#8a6200" }}>⚠ Auto-build cancelled</div>
+                  )}
+                  {autoBuildSummary && !autoBuildPhase && (
+                    <div style={{ marginTop: 5, fontSize: 9, lineHeight: 1.35, color: "#496700" }}>✓ {autoBuildSummary}</div>
+                  )}
+                  {autoBuildPlanDetails && !autoBuildPhase && (
+                    <details style={{ marginTop: 5, fontSize: 8, lineHeight: 1.4 }}>
+                      <summary style={{ cursor: "pointer", fontWeight: 700 }}>Narration scope & camera audit</summary>
+                      {autoBuildPlanDetails.styleNote && <div style={{ marginTop: 4, color: "#496700" }}>{autoBuildPlanDetails.styleNote}</div>}
+                      {autoBuildPlanDetails.images.map((item, index) => <div key={`${item.startTime}:${item.query}`} style={{ marginTop: 7, paddingTop: 5, borderTop: "1px solid rgba(42,42,42,.14)" }}><b>{index + 1}. {item.startTime.toFixed(2)}s · {item.scope.toUpperCase()} · {item.framing}</b>{item.actualArrival !== undefined && <span> · arrived {item.actualArrival.toFixed(2)}s (Δ {item.driftSeconds?.toFixed(3)}s)</span>}<br />“{item.narrationText}”<br /><span style={{ color: "#6a6a6a" }}>{item.query} — {item.reason}</span></div>)}
+                    </details>
+                  )}
+                  {!autoBuildPhase && <div style={{ marginTop: 5, fontSize: 9, color: clips.some((clip) => clip.source === "auto") ? keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "#a14d00" : "#496700" : "#6a6a6a" }}>Auto-build: {clips.some((clip) => clip.source === "auto") ? `${keyframesOutOfDate || !!autoBuildSource && autoBuildSource !== currentGeneratedBoardSource ? "⚠ stale (inputs changed)" : "✓"} ${clips.filter((clip) => clip.source === "auto" && clip.type === "image").length} images · ${cameraKeyframes.length} keyframes` : "none"}</div>}
+                </div>
+                </ProGated>
+                <div style={{ height: 1, background: "rgba(42,42,42,.15)" }} />
                 <div style={panelLabelStyle}>Camera & services</div>
                 <span role="status" aria-live="polite" title={cameraGenerationMessage?.text} style={{ fontSize: 9, fontFamily: "monospace", color: keyframesOutOfDate ? "#a14d00" : cameraKeyframes.length ? "#496700" : "#6a6a6a", border: "1px solid currentColor", padding: "5px 7px" }}>
                   Camera: {cameraGenerationPhase ? "updating…" : keyframesOutOfDate ? "update queued…" : cameraKeyframes.length ? `✓ ${cameraKeyframes.length} keyframes` : "none"}
@@ -29068,6 +29509,7 @@ function Board2Editor({
       )}
       {renderDownloadToasts()}
       {renderMediaEditorModal()}
+      {renderNarrationVideoModal()}
       {renderZoomEditorModal()}
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
