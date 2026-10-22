@@ -499,7 +499,7 @@ function recipeProvenance(source?: ClipSource): RecipeProvenance {
 
 type Clip = {
   id: string;
-  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration" | "flash" | "bleep";
+  type: "image" | "video" | "pan" | "characterFocus" | "customZoom" | "narration" | "flash" | "bleep" | "cutto";
   name: string;
   sourceUrl: string;
   startTime: number;
@@ -569,6 +569,14 @@ type Clip = {
   narrationTime?: number;
   narrationTypewriter?: boolean; // customZoom-only: type out the narration spoken during this zoom
   flashImageUrl?: string; // flash-only: /flash/images/... drawn full-screen while the block is active
+  // cutto-only: an overlay on the output frame showing uploaded media (sourceUrl/sourceBlob, cached
+  // for autosave like other uploads) or the board's narration video (cutToSourceClipId).
+  cutToMedia?: "image" | "video";
+  cutToSourceClipId?: string;
+  cutToSourceW?: number; // natural size of the source, for aspect ratios
+  cutToSourceH?: number;
+  cropX?: number; cropY?: number; cropW?: number; cropH?: number; // 0–1 of the source; default the full frame
+  displayX?: number; displayY?: number; displayW?: number; displayH?: number; // 0–1 of the output frame
   flashSoundUrl?: string; // flash-only: /flash/sounds/... played from the block's start
   // Narration video (video clips only): the narration clip whose audio this video supplies. Its
   // playback position is that narration's, it is always silent itself, and the mask frames it.
@@ -1400,6 +1408,70 @@ function drawZoomNarrationTypewriter(
 }
 
 // ─── Flash cut ─────────────────────────────────────────────────────────────────
+// ─ Cut To ────────────────────────────────────────────────────────────────────
+// A "cutto" clip lays a cropped piece of media over the output frame for its span: the part of
+// the source inside crop (0–1 of the source) is scaled into display (0–1 of the frame). Drawn by
+// renderToCtx above the board and annotations, below speech bubbles, captions and flash cuts.
+const CUT_TO_CLIP_COLOR = "#b197fc";
+const CUT_TO_DEFAULT_DURATION = 3;
+const CUT_TO_INITIAL_FILL = 0.7; // first placement: centered, fitting 70% of the frame
+const CUT_TO_MIN_SIZE = 0.03;
+
+type CutToRect = { x: number; y: number; w: number; h: number };
+const cutToImagesAwaitingRedraw = new WeakSet<HTMLImageElement>();
+type CutToSource = { image: CanvasImageSource; width: number; height: number };
+
+function cutToCrop(clip: Clip): CutToRect {
+  return { x: clip.cropX ?? 0, y: clip.cropY ?? 0, w: clip.cropW ?? 1, h: clip.cropH ?? 1 };
+}
+
+function cutToDisplay(clip: Clip): CutToRect {
+  return { x: clip.displayX ?? 0.15, y: clip.displayY ?? 0.15, w: clip.displayW ?? 0.7, h: clip.displayH ?? 0.7 };
+}
+
+// A display rect centered in the frame at `pixelAspect` (width/height of what's shown). Frame
+// coordinates are normalized, so its width/height ratio is pixelAspect / frameAspect.
+function fitCutToDisplay(pixelAspect: number, frameAspect: number, fill = CUT_TO_INITIAL_FILL): CutToRect {
+  let w = fill;
+  let h = (w * frameAspect) / pixelAspect;
+  if (h > fill) { h = fill; w = (h * pixelAspect) / frameAspect; }
+  return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+}
+
+function isCutToActive(clip: Clip, time: number): boolean {
+  return clip.type === "cutto" && time >= clip.startTime && time < clip.startTime + clip.duration;
+}
+
+// `alwaysDrawId` shows one Cut To regardless of time (the selected clip while editing, in preview only).
+function drawCutToOverlays(
+  ctx: CanvasRenderingContext2D,
+  time: number,
+  clips: readonly Clip[],
+  width: number,
+  height: number,
+  sourceFor: (clip: Clip) => CutToSource | null,
+  alwaysDrawId: string | null,
+) {
+  const visible = clips
+    .filter((clip) => clip.type === "cutto" && (clip.id === alwaysDrawId || isCutToActive(clip, time)))
+    .sort((a, b) => a.startTime - b.startTime);
+  for (const clip of visible) {
+    const source = sourceFor(clip);
+    if (!source || source.width <= 0 || source.height <= 0) continue;
+    const crop = cutToCrop(clip);
+    const display = cutToDisplay(clip);
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.drawImage(
+      source.image,
+      crop.x * source.width, crop.y * source.height, crop.w * source.width, crop.h * source.height,
+      display.x * width, display.y * height, display.w * width, display.h * height,
+    );
+    ctx.restore();
+  }
+}
+
 // A "flash" clip slams a full-screen meme image over everything (board, camera, captions) for its
 // whole duration and plays a sound effect from its start. It hits on a white frame, drops through
 // a couple of blown-out frames to the clean image, and leaves on one overexposed frame — stepped,
@@ -1427,7 +1499,9 @@ function flashCutImage(url: string): HTMLImageElement {
 
 // Export renders must never draw a frame before the flash image has decoded.
 async function preloadFlashCutImages(clips: readonly Clip[]): Promise<void> {
-  const urls = new Set(clips.flatMap((clip) => clip.type === "flash" && clip.flashImageUrl ? [clip.flashImageUrl] : []));
+  const urls = new Set(clips.flatMap((clip) =>
+    clip.type === "flash" && clip.flashImageUrl ? [clip.flashImageUrl]
+      : clip.type === "cutto" && clip.cutToMedia === "image" && clip.sourceUrl ? [clip.sourceUrl] : []));
   await Promise.all([...urls].map((url) => flashCutImage(url).decode().catch(() => {
     console.warn("[flash-cut] image failed to load", url);
   })));
@@ -6362,6 +6436,12 @@ function Board2Editor({
   const [snapshotIncludeCharacter, setSnapshotIncludeCharacter] = useState(true);
   const [clipsPanelOpen, setClipsPanelOpen] = useState(false);
   const [flashPickerOpen, setFlashPickerOpen] = useState(false);
+  const [cutToPickerOpen, setCutToPickerOpen] = useState(false);
+  // Selected Cut To on the preview: "position" moves/resizes where it sits on the frame, "crop"
+  // picks which part of the source it shows.
+  const [cutToEditMode, setCutToEditMode] = useState<"position" | "crop">("position");
+  const previewCutToClipIdRef = useRef<string | null>(null);
+  const cutToCropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [flashAssets, setFlashAssets] = useState<{ images: FlashAsset[]; sounds: FlashAsset[] } | null>(null);
   const [flashPickImageUrl, setFlashPickImageUrl] = useState<string | null>(null);
   const [flashPickSoundUrl, setFlashPickSoundUrl] = useState<string | null>(null);
@@ -7879,6 +7959,39 @@ function Board2Editor({
     if (flashSoundNodesRef.current.some((node) => !flashIds.has(node.clipId))) stopFlashCutSounds(flashIds);
   }, [clips]);
   const selectedFlashClipId = selectedClip?.type === "flash" ? selectedClip.id : null;
+  // While paused, the preview shows the selected Cut To even outside its block so it can be
+  // positioned and cropped; each new selection starts in position mode.
+  const selectedCutToId = selectedClip?.type === "cutto" ? selectedClip.id : null;
+  useEffect(() => {
+    previewCutToClipIdRef.current = isPlaying ? null : selectedCutToId;
+    if (!isPlaying) requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
+  }, [isPlaying, selectedCutToId]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the mode per selection
+    setCutToEditMode("position");
+  }, [selectedCutToId]);
+  // Crop mode: the whole source, fitted, under the crop box. Redrawn per animation frame while
+  // open so a video source shows its current frame.
+  useEffect(() => {
+    if (cutToEditMode !== "crop" || !selectedCutToId || isPlaying) return;
+    let raf = 0;
+    const draw = () => {
+      raf = requestAnimationFrame(draw);
+      const canvas = cutToCropCanvasRef.current;
+      const clip = clipsRef.current.find((candidate) => candidate.id === selectedCutToId);
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !clip || !ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const source = cutToSourceFor(clip, false);
+      if (!source) return;
+      const aspect = source.width / source.height;
+      const fw = Math.min(canvas.width, canvas.height * aspect);
+      const fh = fw / aspect;
+      ctx.drawImage(source.image, (canvas.width - fw) / 2, (canvas.height - fh) / 2, fw, fh);
+    };
+    draw();
+    return () => cancelAnimationFrame(raf);
+  }, [cutToEditMode, isPlaying, selectedCutToId]);
   useEffect(() => {
     if (selectedFlashClipId && !flashAssets) void loadFlashAssets();
   // Lists the asset folders the first time a flash block is selected.
@@ -9780,6 +9893,7 @@ function Board2Editor({
       drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
     }
     ctx.restore();
+    drawCutToOverlays(ctx, time, currentClips, W, H, (clip) => cutToSourceFor(clip, offlineVideoRendering), quality === "preview" ? previewCutToClipIdRef.current : null);
     const mediaBubbleTarget = narrationMediaBubbleTarget(time, currentClips, cam, sf, W, H);
     drawNarrationSpeechBubble(ctx, time, currentClips, W, H, speechBubbleAnchor, mediaBubbleTarget);
     drawZoomNarrationTypewriter(ctx, time, currentClips, W, H);
@@ -10643,6 +10757,7 @@ function Board2Editor({
     const t = playheadRef.current;
     evaluateVideoPlaybackStates(t, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current, { cameraAudioFocus: true });
     syncNarrationVideos(t, clipsRef.current, true);
+    syncCutToVideos(t, clipsRef.current, true);
     // Narration has one owner at every timeline instant, including when duplicate clips overlap.
     // This shared ownership rule also drives the export schedule below. The second sync handles a
     // media-clock sample that crossed a clip boundary during this animation frame.
@@ -10703,7 +10818,10 @@ function Board2Editor({
 
   useEffect(() => {
     if (isPlaying) return;
-    if (!isExportingRef.current) syncNarrationVideos(playhead, clipsRef.current, false);
+    if (!isExportingRef.current) {
+      syncNarrationVideos(playhead, clipsRef.current, false);
+      syncCutToVideos(playhead, clipsRef.current, false);
+    }
     drawFrame(playhead);
   // syncNarrationVideos reads refs only.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -11426,6 +11544,289 @@ function Board2Editor({
     selectionSurfaceRef.current = "timeline";
     setClipSelection([id]);
     setToast(`⚡ Flash added at ${formatTime(startTime)}`);
+  }
+
+  // ─ Cut To blocks ──────────────────────────────────────────────────────────
+
+  // What a Cut To draws from: its own image or video, or the narration video it points at. Export
+  // frames are decoded ahead of each frame (prepareOfflineVideoFrames); preview and real-time
+  // export read the live, synced video elements.
+  function cutToSourceFor(clip: Clip, offlineFrames: boolean): CutToSource | null {
+    if (clip.cutToMedia === "image") {
+      if (!clip.sourceUrl) return null;
+      const image = flashCutImage(clip.sourceUrl);
+      if (image.complete && image.naturalWidth > 0) return { image, width: image.naturalWidth, height: image.naturalHeight };
+      // Still loading (e.g. restored from autosave): redraw the paused preview once it arrives.
+      if (!cutToImagesAwaitingRedraw.has(image)) {
+        cutToImagesAwaitingRedraw.add(image);
+        image.addEventListener("load", () => { if (!isPlayingRef.current && !isExportingRef.current) drawFrameRef.current(playheadRef.current); }, { once: true });
+      }
+      return null;
+    }
+    const videoClipId = clip.cutToSourceClipId ?? clip.id;
+    if (offlineFrames) {
+      const frame = exportVideoFramesRef.current.get(videoClipId);
+      return frame ? { image: frame, width: frame.width, height: frame.height } : null;
+    }
+    const vid = videoElsRef.current.get(videoClipId);
+    return vid && vid.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && vid.videoWidth > 0
+      ? { image: vid, width: vid.videoWidth, height: vid.videoHeight }
+      : null;
+  }
+
+  function cutToVideoSourceTime(clip: Clip, time: number, sourceDuration?: number): number {
+    const raw = Math.max(0, time - clip.startTime + (clip.sourceOffsetSec ?? 0));
+    return sourceDuration && Number.isFinite(sourceDuration) ? Math.min(raw, Math.max(0, sourceDuration - 0.05)) : raw;
+  }
+
+  // Uploaded Cut To videos play muted in step with the playhead while their block is active and
+  // hold the right frame while paused (narration-video Cut Tos use the narration video, which
+  // syncNarrationVideos already keeps in step).
+  function syncCutToVideos(time: number, currentClips: readonly Clip[], playing: boolean) {
+    for (const clip of currentClips) {
+      if (clip.type !== "cutto" || clip.cutToMedia !== "video" || clip.cutToSourceClipId || !clip.sourceUrl) continue;
+      const vid = videoElsRef.current.get(clip.id) ?? createVideoElement(clip.id, clip.sourceUrl);
+      vid.muted = true;
+      vid.loop = false;
+      setClipAudioOff(clip.id, vid);
+      if (!vid.dataset.cutTo) {
+        vid.dataset.cutTo = "1";
+        vid.addEventListener("seeked", () => { if (!isPlayingRef.current && !isExportingRef.current) drawFrameRef.current(playheadRef.current); });
+      }
+      videoRangeStateRef.current.set(clip.id, true);
+      const sourceTime = cutToVideoSourceTime(clip, time, vid.duration);
+      if (playing && isCutToActive(clip, time) && vid.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        if (vid.paused || vid.ended) {
+          if (Math.abs(vid.currentTime - sourceTime) > 0.05) { try { vid.currentTime = sourceTime; } catch {} }
+          vid.play().catch(() => {});
+        } else if (Math.abs(vid.currentTime - sourceTime) > 0.25 && !vid.seeking) {
+          try { vid.currentTime = sourceTime; } catch {}
+        }
+      } else {
+        if (!vid.paused) vid.pause();
+        if (!playing && !vid.seeking && vid.readyState >= HTMLMediaElement.HAVE_METADATA && Math.abs(vid.currentTime - sourceTime) > 0.02) {
+          try { vid.currentTime = sourceTime; } catch {}
+        }
+      }
+    }
+  }
+
+  function narrationVideoClip(currentClips: readonly Clip[]): Clip | undefined {
+    return currentClips.find((clip) => clip.type === "video" && !!clip.narrationVideoFor && !!clip.sourceUrl);
+  }
+
+  function addCutToClip(fields: Partial<Clip> & { name: string; cutToMedia: "image" | "video"; cutToSourceW: number; cutToSourceH: number }) {
+    const id = generateId();
+    const startTime = Math.max(0, playheadRef.current);
+    const duration = CUT_TO_DEFAULT_DURATION;
+    const display = fitCutToDisplay(fields.cutToSourceW / fields.cutToSourceH, canvasWRef.current / canvasHRef.current);
+    const clip: Clip = {
+      sourceUrl: "",
+      ...fields,
+      id, type: "cutto", startTime, duration, layer: freeVisualLayerAt(startTime, duration),
+      cropX: 0, cropY: 0, cropW: 1, cropH: 1,
+      displayX: display.x, displayY: display.y, displayW: display.w, displayH: display.h,
+    };
+    clipsRef.current = [...clipsRef.current, clip];
+    setClips((prev) => [...prev, clip]);
+    selectionSurfaceRef.current = "timeline";
+    setClipSelection([id]);
+    setCutToEditMode("position");
+    setToast(`✂ Cut To added at ${formatTime(startTime)}`);
+    return clip;
+  }
+
+  async function insertCutToNarration() {
+    setCutToPickerOpen(false);
+    const narrationVideo = narrationVideoClip(clipsRef.current);
+    if (!narrationVideo) { setToast("Upload a narration video first"); return; }
+    const vid = videoElsRef.current.get(narrationVideo.id);
+    let { w, h } = vid && vid.videoWidth > 0 ? { w: vid.videoWidth, h: vid.videoHeight } : { w: 0, h: 0 };
+    if (!w || !h) ({ w, h } = await getVideoMeta(narrationVideo.sourceUrl).catch(() => ({ duration: 0, w: 16, h: 9 })));
+    addCutToClip({ name: "Cut To · Narration", cutToMedia: "video", cutToSourceClipId: narrationVideo.id, cutToSourceW: w || 16, cutToSourceH: h || 9 });
+  }
+
+  async function insertCutToFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    setCutToPickerOpen(false);
+    if (!file) return;
+    const isVideo = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(file.name));
+    if (!isVideo && !file.type.startsWith("image/")) { setToast("Choose an image or a video"); return; }
+    try {
+      setToast(`Adding ${file.name}…`);
+      // On a shared board the media goes to shared storage so everyone sees the Cut To.
+      const url = joinCode
+        ? (isVideo ? await uploadJoinableAv(file) : await uploadJoinableImage(file, file.name))
+        : URL.createObjectURL(file);
+      let w = 16, h = 9;
+      if (isVideo) {
+        const meta = await getVideoMeta(url);
+        if (meta.w > 0 && meta.h > 0) { w = meta.w; h = meta.h; }
+      } else {
+        const image = flashCutImage(url);
+        await image.decode().catch(() => {});
+        if (image.naturalWidth > 0) { w = image.naturalWidth; h = image.naturalHeight; }
+      }
+      const clip = addCutToClip({ name: `Cut To · ${file.name}`, cutToMedia: isVideo ? "video" : "image", sourceUrl: url, sourceBlob: file, cutToSourceW: w, cutToSourceH: h });
+      if (isVideo) createVideoElement(clip.id, url);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not add that file");
+    }
+  }
+
+  function updateCutTo(clipId: string, patch: Partial<Clip>) {
+    setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "cutto" ? { ...clip, ...patch } : clip));
+  }
+
+  // Keeps the shown picture undistorted after a crop change: same width and center, height from
+  // the crop's pixel aspect.
+  function displayForCrop(clip: Clip, crop: CutToRect): CutToRect {
+    const display = cutToDisplay(clip);
+    const pixelAspect = (crop.w * (clip.cutToSourceW ?? 16)) / (crop.h * (clip.cutToSourceH ?? 9));
+    const h = (display.w * (canvasWRef.current / canvasHRef.current)) / pixelAspect;
+    return { x: display.x, y: display.y + (display.h - h) / 2, w: display.w, h };
+  }
+
+  // Drag on the preview overlay. `area` is the on-screen size of one normalized unit: the preview
+  // frame in position mode, the fitted source image in crop mode. Corners keep the aspect ratio
+  // unless Shift is held; crop stays inside the source.
+  function startCutToDrag(event: React.PointerEvent, clip: Clip, handle: "move" | "nw" | "ne" | "sw" | "se", mode: "position" | "crop", area: { w: number; h: number }) {
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const start = mode === "crop" ? cutToCrop(clip) : cutToDisplay(clip);
+    const startX = event.clientX, startY = event.clientY;
+    const ratio = start.w / start.h;
+    const onMove = (ev: PointerEvent) => {
+      const dx = (ev.clientX - startX) / area.w;
+      const dy = (ev.clientY - startY) / area.h;
+      let next: CutToRect;
+      if (handle === "move") {
+        next = mode === "crop"
+          ? { ...start, x: clamp(start.x + dx, 0, 1 - start.w), y: clamp(start.y + dy, 0, 1 - start.h) }
+          : { ...start, x: clamp(start.x + dx, CUT_TO_MIN_SIZE - start.w, 1 - CUT_TO_MIN_SIZE), y: clamp(start.y + dy, CUT_TO_MIN_SIZE - start.h, 1 - CUT_TO_MIN_SIZE) };
+      } else {
+        const west = handle === "nw" || handle === "sw";
+        const north = handle === "nw" || handle === "ne";
+        const anchorX = west ? start.x + start.w : start.x;
+        const anchorY = north ? start.y + start.h : start.y;
+        const pointerX = (west ? start.x : start.x + start.w) + dx;
+        const pointerY = (north ? start.y : start.y + start.h) + dy;
+        let w = Math.max(CUT_TO_MIN_SIZE, west ? anchorX - pointerX : pointerX - anchorX);
+        let h = Math.max(CUT_TO_MIN_SIZE, north ? anchorY - pointerY : pointerY - anchorY);
+        const maxW = mode === "crop" ? (west ? anchorX : 1 - anchorX) : Infinity;
+        const maxH = mode === "crop" ? (north ? anchorY : 1 - anchorY) : Infinity;
+        if (!ev.shiftKey) {
+          if (w / ratio >= h) h = w / ratio; else w = h * ratio;
+          if (w > maxW) { w = maxW; h = w / ratio; }
+          if (h > maxH) { h = maxH; w = h * ratio; }
+        } else {
+          w = Math.min(w, maxW);
+          h = Math.min(h, maxH);
+        }
+        next = { x: west ? anchorX - w : anchorX, y: north ? anchorY - h : anchorY, w, h };
+      }
+      if (mode === "crop") {
+        const display = displayForCrop(clip, next);
+        updateCutTo(clip.id, { cropX: next.x, cropY: next.y, cropW: next.w, cropH: next.h, displayX: display.x, displayY: display.y, displayW: display.w, displayH: display.h });
+      } else {
+        updateCutTo(clip.id, { displayX: next.x, displayY: next.y, displayW: next.w, displayH: next.h });
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  function renderCutToProperties(clip: Clip) {
+    const missingNarration = !!clip.cutToSourceClipId && !clipsRef.current.some((candidate) => candidate.id === clip.cutToSourceClipId);
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ fontSize: 9, fontFamily: "monospace", color: "#3b2470", background: CUT_TO_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
+          Shown over the video for this block. Edit it on the preview: drag to move, corners to resize (Shift: free aspect).
+        </div>
+        {missingNarration && <div style={{ fontSize: 9, fontFamily: "monospace", color: "#a32916" }}>The narration video it shows was removed.</div>}
+        <div style={{ display: "flex", gap: 4 }}>
+          {(["position", "crop"] as const).map((mode) => (
+            <button key={mode} type="button" aria-pressed={cutToEditMode === mode} onClick={() => setCutToEditMode(mode)}
+              style={{ ...miniButton, flex: 1, padding: "5px 6px", background: cutToEditMode === mode ? "#2a2a2a" : "transparent", color: cutToEditMode === mode ? "#fff" : "#2a2a2a" }}
+            >
+              {mode === "position" ? "✥ Position" : "⬚ Crop"}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button type="button" style={{ ...miniButton, flex: 1 }} onClick={() => {
+            const d = cutToDisplay(clip);
+            updateCutTo(clip.id, { displayX: (1 - d.w) / 2, displayY: (1 - d.h) / 2 });
+          }}>Center</button>
+          <button type="button" style={{ ...miniButton, flex: 1 }} onClick={() => {
+            const full = { x: 0, y: 0, w: 1, h: 1 };
+            const display = fitCutToDisplay((clip.cutToSourceW ?? 16) / (clip.cutToSourceH ?? 9), canvasWRef.current / canvasHRef.current);
+            updateCutTo(clip.id, { cropX: full.x, cropY: full.y, cropW: full.w, cropH: full.h, displayX: display.x, displayY: display.y, displayW: display.w, displayH: display.h });
+          }}>Reset</button>
+        </div>
+        {!previewVisible && <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a6a6a" }}>Show the preview to position and crop it.</div>}
+      </div>
+    );
+  }
+
+  // The interactive layer over the desktop preview for the selected Cut To (absolutely positioned
+  // divs; crop mode adds a canvas showing the whole source under the crop box).
+  function renderCutToEditOverlay(ow: number, oh: number) {
+    const clip = selectedClip?.type === "cutto" ? selectedClip : null;
+    if (!clip || isPlaying) return null;
+    const handleSize = 12;
+    const corner = (rect: { left: number; top: number; width: number; height: number }, mode: "position" | "crop", area: { w: number; h: number }) =>
+      (["nw", "ne", "sw", "se"] as const).map((handle) => (
+        <div key={handle} onPointerDown={(event) => startCutToDrag(event, clip, handle, mode, area)}
+          style={{
+            position: "absolute", width: handleSize, height: handleSize, borderRadius: 2, background: "#fff", border: `2px solid ${CUT_TO_CLIP_COLOR}`, boxSizing: "border-box",
+            left: (handle === "nw" || handle === "sw" ? rect.left : rect.left + rect.width) - handleSize / 2,
+            top: (handle === "nw" || handle === "ne" ? rect.top : rect.top + rect.height) - handleSize / 2,
+            cursor: handle === "nw" || handle === "se" ? "nwse-resize" : "nesw-resize", pointerEvents: "auto", touchAction: "none",
+          }}
+        />
+      ));
+    const centerHandle = (rect: { left: number; top: number; width: number; height: number }, mode: "position" | "crop", area: { w: number; h: number }) => (
+      <div title="Drag to move" onPointerDown={(event) => startCutToDrag(event, clip, "move", mode, area)}
+        style={{ position: "absolute", left: rect.left + rect.width / 2 - 11, top: rect.top + rect.height / 2 - 11, width: 22, height: 22, borderRadius: "50%", background: CUT_TO_CLIP_COLOR, border: "2px solid #fff", boxShadow: "0 1px 4px rgba(0,0,0,.4)", display: "grid", placeItems: "center", color: "#2a2a2a", fontSize: 12, cursor: "move", pointerEvents: "auto", touchAction: "none" }}
+      >✥</div>
+    );
+    if (cutToEditMode === "crop") {
+      const sourceAspect = (clip.cutToSourceW ?? 16) / (clip.cutToSourceH ?? 9);
+      const fw = Math.min(ow, oh * sourceAspect);
+      const fh = fw / sourceAspect;
+      const fx = (ow - fw) / 2, fy = (oh - fh) / 2;
+      const crop = cutToCrop(clip);
+      const rect = { left: fx + crop.x * fw, top: fy + crop.y * fh, width: crop.w * fw, height: crop.h * fh };
+      return (
+        <div style={{ position: "absolute", left: 1.5, top: 1.5, width: ow, height: oh, background: "#111", overflow: "hidden", zIndex: 5 }}>
+          <canvas ref={cutToCropCanvasRef} width={Math.round(ow * editorCanvasDpr)} height={Math.round(oh * editorCanvasDpr)} style={{ position: "absolute", inset: 0, width: ow, height: oh }} />
+          <div onPointerDown={(event) => startCutToDrag(event, clip, "move", "crop", { w: fw, h: fh })}
+            style={{ position: "absolute", ...rect, boxShadow: "0 0 0 9999px rgba(0,0,0,0.55)", outline: `2px solid ${CUT_TO_CLIP_COLOR}`, cursor: "move", touchAction: "none" }} />
+          {centerHandle(rect, "crop", { w: fw, h: fh })}
+          {corner(rect, "crop", { w: fw, h: fh })}
+          <span style={{ position: "absolute", left: 6, top: 6, fontFamily: "monospace", fontSize: 9, color: "#fff", background: "rgba(0,0,0,.55)", padding: "2px 5px", pointerEvents: "none" }}>Crop · the box is what shows</span>
+        </div>
+      );
+    }
+    const display = cutToDisplay(clip);
+    const rect = { left: display.x * ow, top: display.y * oh, width: display.w * ow, height: display.h * oh };
+    return (
+      <div style={{ position: "absolute", left: 1.5, top: 1.5, width: ow, height: oh, overflow: "hidden", pointerEvents: "none", zIndex: 5 }}>
+        <div onPointerDown={(event) => startCutToDrag(event, clip, "move", "position", { w: ow, h: oh })}
+          style={{ position: "absolute", ...rect, outline: `2px solid ${CUT_TO_CLIP_COLOR}`, cursor: "move", pointerEvents: "auto", touchAction: "none" }} />
+        {centerHandle(rect, "position", { w: ow, h: oh })}
+        {corner(rect, "position", { w: ow, h: oh })}
+      </div>
+    );
   }
 
   // ─ Bleep blocks ───────────────────────────────────────────────────────────
@@ -18279,6 +18680,26 @@ function Board2Editor({
       });
       exportVideoFramesRef.current.set(clip.id, await seekAndDecodeVideoFrame(video, sourceTime));
     }
+
+    // Cut To videos draw whether or not their source is on camera: decode their frame too.
+    for (const cut of currentClips) {
+      if (!isCutToActive(cut, time) || cut.cutToMedia !== "video") continue;
+      if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+      const source = cut.cutToSourceClipId ? currentClips.find((candidate) => candidate.id === cut.cutToSourceClipId) : cut;
+      if (!source?.sourceUrl || exportVideoFramesRef.current.has(source.id)) continue;
+      const video = videoElsRef.current.get(source.id) ?? createVideoElement(source.id, source.sourceUrl);
+      video.pause();
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) (await seekAndDecodeVideoFrame(video, 0)).close();
+      const sourceDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+      let sourceTime: number;
+      if (cut.cutToSourceClipId) {
+        const narration = currentClips.find((candidate) => candidate.id === source.narrationVideoFor && candidate.type === "narration");
+        sourceTime = narration ? narrationVideoSourceTime(narration, time, sourceDuration).sourceTime : 0;
+      } else {
+        sourceTime = cutToVideoSourceTime(cut, time, sourceDuration);
+      }
+      exportVideoFramesRef.current.set(source.id, await seekAndDecodeVideoFrame(video, sourceTime));
+    }
   }
 
   async function decodeOfflineAudioSources(
@@ -18702,6 +19123,7 @@ function Board2Editor({
               audioMode: "silent",
             });
             syncNarrationVideos(timelineTime, currentClips, true);
+            syncCutToVideos(timelineTime, currentClips, true);
             renderToCtx(exportCtx, timelineTime, currentClips, currentCameraKeyframes, W, H, currentAnnotations, undefined, undefined, "realtime-export");
             renderedFrames++;
             nextFrameTime += 1 / exportFps;
@@ -23527,7 +23949,7 @@ function Board2Editor({
               <div style={{ position: "absolute", left: 0, right: 0, top: MOBILE_TRACK_H + 4, height: MOBILE_NARRATION_H, background: "rgba(255,150,200,0.07)", borderTop: "1px dashed rgba(42,42,42,0.18)" }} />
 
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : clip.type === "cutto" ? CUT_TO_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const isSel = clip.id === selectedClipId;
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const layer = clip.layer ?? 1;
@@ -23552,7 +23974,7 @@ function Board2Editor({
                     <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-left")} />
                     <span style={{ position: "absolute", left: HANDLE_W + 3, right: HANDLE_W + 3, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 8, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none" }}>
-                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "cutto" ? "✂ Cut To" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Character Focus" : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : clip.name}
                     </span>
                     <div style={{ position: "absolute", right: 0, top: 0, bottom: 0, width: HANDLE_W, background: "rgba(42,42,42,0.22)", touchAction: "none" }}
                       onPointerDown={(e) => handleClipPointerDown(e, clip, "resize-right")} />
@@ -23744,7 +24166,7 @@ function Board2Editor({
               {mobileDrawer === "props" && selectedClip && (
                 <>
                   <div style={{ fontFamily: "monospace", fontSize: 9, fontWeight: 700, letterSpacing: 1.5, color: "#6a6a6a", textTransform: "uppercase", marginBottom: 12 }}>
-                    {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
+                    {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "cutto" ? "✂ Cut To" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name.slice(0, 28)}
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                     {isBoardMediaClip(selectedClip) && (
@@ -23758,6 +24180,7 @@ function Board2Editor({
                       </button>
                     )}
                     {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, true)}
+                    {selectedClip.type === "cutto" && renderCutToProperties(selectedClip)}
                     {selectedClip.type === "bleep" && renderBleepProperties()}
                     <div>
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Duration (s)</div>
@@ -23768,7 +24191,7 @@ function Board2Editor({
                         style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" } as React.CSSProperties}
                       />
                     </div>
-                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && (
+                    {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && selectedClip.type !== "cutto" && (
                       <div>
                         <div style={{ ...panelLabelStyle, marginBottom: 6 }}>
                           Hold {Math.round((selectedClip.holdFraction ?? HOLD_FRACTION) * 100)}% · Trans {Math.round((1 - (selectedClip.holdFraction ?? HOLD_FRACTION)) * 100)}%
@@ -24679,6 +25102,9 @@ function Board2Editor({
           } else if (mc.type === "video") {
             createVideoElement(mc.id, blobUrl);
             loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: blobUrl, sourceBlob: blob });
+          } else if (mc.type === "cutto") {
+            if (mc.cutToMedia === "video") createVideoElement(mc.id, blobUrl);
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           }
         } else {
           loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: mc.sourceUrl ?? "" });
@@ -25340,8 +25766,8 @@ function Board2Editor({
       const sharedClips: Clip[] = [];
       const notShared: string[] = [];
       for (const clip of clipsRef.current) {
-        const avBlob = clip.type === "video" ? clip.sourceBlob : clip.type === "narration" ? clip.audioBlob : undefined;
-        if (clip.type === "image" && clip.sourceBlob?.size) {
+        const avBlob = clip.type === "video" || (clip.type === "cutto" && clip.cutToMedia === "video") ? clip.sourceBlob : clip.type === "narration" ? clip.audioBlob : undefined;
+        if ((clip.type === "image" || (clip.type === "cutto" && clip.cutToMedia === "image")) && clip.sourceBlob?.size) {
           const sourceUrl = await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code);
           sharedClips.push({ ...clip, sourceUrl });
         } else if (avBlob?.size && clip.sourceUrl.startsWith("blob:")) {
@@ -27301,6 +27727,7 @@ function Board2Editor({
               </div>
               {previewVisible && (
                 <div style={{ position: "relative", width: previewW, height: previewHeight }}>
+                  {renderCutToEditOverlay(previewW, previewHeight)}
                   <canvas
                     ref={canvasRef}
                     width={Math.round(previewRenderW * editorCanvasDpr)}
@@ -28276,7 +28703,7 @@ function Board2Editor({
             ) : (
               <>
                 <div style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
+                  {selectedClip.type === "flash" ? "⚡ Flash cut" : selectedClip.type === "bleep" ? "🔇 Bleep" : selectedClip.type === "cutto" ? "✂ Cut To" : selectedClip.type === "pan" ? "⟷ Pan clip" : selectedClip.type === "characterFocus" ? "◎ Character focus" : selectedClip.type === "customZoom" ? "🔍 Custom zoom" : selectedClip.type === "narration" ? "🎙 Narration" : selectedClip.name}
                 </div>
                 {isBoardMediaClip(selectedClip) && (
                   <button type="button" onClick={() => openMediaEditor(selectedClip)} style={{ ...sketchButton, width: "100%", padding: "7px 10px", fontSize: 11, background: "#ffd45c" }}>
@@ -28299,6 +28726,7 @@ function Board2Editor({
                   </div>
                 )}
                 {selectedClip.type === "flash" && renderFlashCutProperties(selectedClip, false)}
+                {selectedClip.type === "cutto" && renderCutToProperties(selectedClip)}
                 {selectedClip.type === "bleep" && renderBleepProperties()}
                 {selectedClip.type === "customZoom" && (
                   <div style={{ fontSize: 9, fontFamily: "monospace", color: "#1c6fc9", background: CUSTOM_ZOOM_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
@@ -28390,7 +28818,7 @@ function Board2Editor({
                   </div>
                 )}
 
-                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && (
+                {selectedClip.type !== "narration" && selectedClip.type !== "characterFocus" && selectedClip.type !== "flash" && selectedClip.type !== "bleep" && selectedClip.type !== "cutto" && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Hold / Transition</div>
                     <input
@@ -28620,6 +29048,44 @@ function Board2Editor({
               </>
             )}
             <button
+              onClick={() => setCutToPickerOpen((open) => !open)}
+              aria-expanded={cutToPickerOpen}
+              title="Cut To: overlay the narration video or an uploaded image/video at the playhead"
+              style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11, background: cutToPickerOpen ? "#2a2a2a" : CUT_TO_CLIP_COLOR, color: cutToPickerOpen ? "#fff" : "#2a2a2a", flexShrink: 0 }}
+            >
+              ✂ Cut To
+            </button>
+            {cutToPickerOpen && (
+              <>
+                <div onClick={() => setCutToPickerOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
+                <div
+                  role="dialog"
+                  aria-label="Cut To"
+                  style={{
+                    position: "fixed", left: isMobile ? 8 : 200, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
+                    width: isMobile ? undefined : 300, zIndex: 901, boxSizing: "border-box",
+                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
+                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 8,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <strong style={{ fontSize: 12 }}>✂ Cut To · at {formatTime(playhead)}</strong>
+                    <button type="button" onClick={() => setCutToPickerOpen(false)} style={miniButton}>✕</button>
+                  </div>
+                  {narrationVideoClip(clips) && (
+                    <button type="button" onClick={() => { void insertCutToNarration(); }} style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, textAlign: "left" }}>
+                      🎙 Narration video
+                    </button>
+                  )}
+                  <label style={{ ...uploadControlStyle, fontSize: 11 }}>
+                    ⬆ Upload image or video
+                    <input type="file" accept="image/*,video/*" aria-label="Upload a Cut To image or video" style={nativeFilePickerStyle} onChange={(event) => { void insertCutToFile(event); }} />
+                  </label>
+                  <span style={{ fontSize: 9, color: "#6a6a6a" }}>Adds a {CUT_TO_DEFAULT_DURATION}s block; drag its edges on the timeline to change how long it shows.</span>
+                </div>
+              </>
+            )}
+            <button
               onClick={insertBleep}
               title="Insert a bleep at the playhead: silences the narration under it and plays a censor tone"
               style={{ ...sketchButton, height: 30, padding: "0 10px", fontSize: 11, background: BLEEP_CLIP_COLOR, flexShrink: 0 }}
@@ -28828,11 +29294,11 @@ function Board2Editor({
 
               {/* Visual clips (image / video / pan) */}
               {clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration").map((clip, ci) => {
-                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
+                const color = clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : clip.type === "cutto" ? CUT_TO_CLIP_COLOR : CLIP_COLORS[ci % CLIP_COLORS.length];
                 const selected = clip.id === selectedClipId || selectedClipIds.includes(clip.id);
                 const clipPx = Math.max(HANDLE_W * 2 + 4, clip.duration * pxPerSec);
                 const isCharacterFocus = clip.type === "characterFocus";
-                const isFlash = clip.type === "flash" || clip.type === "bleep";
+                const isFlash = clip.type === "flash" || clip.type === "bleep" || clip.type === "cutto";
                 const hf = isCharacterFocus || isFlash ? 1 : clip.holdFraction ?? HOLD_FRACTION;
                 const innerW = clipPx - HANDLE_W * 2;
                 const holdW = Math.max(0, innerW * hf);
@@ -28889,7 +29355,7 @@ function Board2Editor({
                     />
                     {/* Clip name */}
                     <span style={{ position: "absolute", left: HANDLE_W + 4, right: HANDLE_W + 4, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 9, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", color: "#2a2a2a", pointerEvents: "none", zIndex: 4 }}>
-                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
+                      {clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "cutto" ? "✂ Cut To" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? `◎ Character ${clip.focusCharacterId === "c2" ? "2" : "1"} Focus` : clip.type === "customZoom" ? (clip.narrationTypewriter ? "🔍 Zoom · ⌨ Narration" : "🔍 Custom Zoom") : `${clip.name}${clip.boardX !== undefined ? " [B]" : ""}`}
                     </span>
                     {/* Right resize handle */}
                     <div
