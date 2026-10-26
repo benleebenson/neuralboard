@@ -1409,13 +1409,15 @@ function drawZoomNarrationTypewriter(
 
 // ─── Flash cut ─────────────────────────────────────────────────────────────────
 // ─ Mobile video editor ──────────────────────────────────────────────────────
-// Phones with the editor open get a CapCut-style layout: preview on top, a horizontally scrolling
+// Phones with the editor open get a CapCut-style layout (in the app's light palette): preview on top, a horizontally scrolling
 // timeline that moves under a fixed center playhead, primary actions, then a scrolling tool row.
 // Panels open as bottom sheets.
-const MOBILE_EDITOR_BG = "#1a1a1a";
-const MOBILE_EDITOR_PANEL = "#242424";
-const MOBILE_EDITOR_INK = "#f2f2f2";
-const MOBILE_EDITOR_MUTED = "rgba(242,242,242,0.6)";
+// Same cream/parchment palette as the desktop editor.
+const MOBILE_EDITOR_BG = "#f5f1e8";
+const MOBILE_EDITOR_PANEL = "#fffdf5";
+const MOBILE_EDITOR_INK = "#2a2a2a";
+const MOBILE_EDITOR_MUTED = "rgba(42,42,42,0.6)";
+const MOBILE_EDITOR_LINE = "rgba(42,42,42,0.12)";
 const MOBILE_TIMELINE_DEFAULT_PPS = 40;
 const MOBILE_TIMELINE_MIN_PPS = 8;
 const MOBILE_TIMELINE_MAX_PPS = 400;
@@ -12077,8 +12079,8 @@ function Board2Editor({
       <>
         {(["resize-left", "resize-right"] as const).map((kind) => (
           <div key={kind} aria-label={kind === "resize-left" ? "Trim start" : "Trim end"} onPointerDown={(event) => startMobileTrim(event, clip, kind)}
-            style={{ position: "absolute", top: 0, [kind === "resize-left" ? "left" : "right"]: -2, width: 18, height, background: "#fff", borderRadius: kind === "resize-left" ? "6px 0 0 6px" : "0 6px 6px 0", display: "grid", placeItems: "center", touchAction: "none", zIndex: 3 }}
-          ><span style={{ width: 3, height: Math.min(20, height - 12), borderRadius: 2, background: "#1a1a1a" }} /></div>
+            style={{ position: "absolute", top: 0, [kind === "resize-left" ? "left" : "right"]: -2, width: 18, height, background: MOBILE_EDITOR_INK, borderRadius: kind === "resize-left" ? "6px 0 0 6px" : "0 6px 6px 0", display: "grid", placeItems: "center", touchAction: "none", zIndex: 3 }}
+          ><span style={{ width: 3, height: Math.min(20, height - 12), borderRadius: 2, background: MOBILE_EDITOR_PANEL }} /></div>
         ))}
       </>
     ) : null;
@@ -12088,7 +12090,7 @@ function Board2Editor({
         style={{
           position: "absolute", left: clip.startTime * pps, top, width: Math.max(6, clip.duration * pps), height, boxSizing: "border-box",
           borderRadius: 6, overflow: "visible", cursor: "pointer",
-          outline: selected?.id === clip.id ? "2px solid #fff" : "none", outlineOffset: 0,
+          outline: selected?.id === clip.id ? `2px solid ${MOBILE_EDITOR_INK}` : "none", outlineOffset: 0,
           ...extra,
         }}
       >
@@ -12100,17 +12102,17 @@ function Board2Editor({
       const content = (
         <>
           <span aria-hidden="true" style={{ fontSize: 20, lineHeight: 1 }}>{icon}</span>
-          <span style={{ fontSize: 10, color: disabled ? "rgba(242,242,242,0.35)" : MOBILE_EDITOR_MUTED, whiteSpace: "nowrap" }}>{label}</span>
+          <span style={{ fontSize: 10, color: disabled ? "rgba(42,42,42,0.3)" : MOBILE_EDITOR_MUTED, whiteSpace: "nowrap" }}>{label}</span>
         </>
       );
-      const style: React.CSSProperties = { position: "relative", flex: "0 0 auto", minWidth: 64, minHeight: 56, padding: "6px 4px", border: 0, background: "transparent", color: disabled ? "rgba(242,242,242,0.35)" : MOBILE_EDITOR_INK, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, cursor: disabled ? "default" : "pointer", fontFamily: "inherit" };
+      const style: React.CSSProperties = { position: "relative", flex: "0 0 auto", minWidth: 64, minHeight: 56, padding: "6px 4px", border: 0, background: "transparent", color: disabled ? "rgba(42,42,42,0.3)" : MOBILE_EDITOR_INK, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, cursor: disabled ? "default" : "pointer", fontFamily: "inherit" };
       return input
         ? <label key={key} style={style}>{content}{input}</label>
         : <button key={key} type="button" disabled={disabled} onClick={onClick} style={style}>{content}</button>;
     };
     const primary = (key: string, icon: React.ReactNode, label: string, onClick: () => void, accent: string, active = false) => (
       <button key={key} type="button" onClick={onClick} aria-pressed={active}
-        style={{ flex: 1, minHeight: 52, border: 0, borderRadius: 12, background: active ? accent : MOBILE_EDITOR_PANEL, color: active ? "#1a1a1a" : MOBILE_EDITOR_INK, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, fontFamily: "inherit", fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: `inset 0 -3px 0 ${accent}` }}
+        style={{ flex: 1, minHeight: 52, borderRadius: 12, background: active ? accent : MOBILE_EDITOR_PANEL, color: MOBILE_EDITOR_INK, border: `1px solid ${MOBILE_EDITOR_LINE}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, fontFamily: "inherit", fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: `inset 0 -3px 0 ${accent}` }}
       >
         <span aria-hidden="true" style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
         {label}
@@ -12118,7 +12120,7 @@ function Board2Editor({
     );
     const round = (label: string, icon: React.ReactNode, onClick: () => void, size: number, disabled = false, filled = false) => (
       <button type="button" aria-label={label} title={label} onClick={onClick} disabled={disabled}
-        style={{ width: size, height: size, borderRadius: "50%", border: filled ? 0 : "1px solid rgba(255,255,255,0.18)", background: filled ? "#f2f2f2" : "transparent", color: filled ? "#1a1a1a" : MOBILE_EDITOR_INK, opacity: disabled ? 0.35 : 1, display: "grid", placeItems: "center", fontSize: size > 50 ? 22 : 18, cursor: disabled ? "default" : "pointer" }}
+        style={{ width: size, height: size, borderRadius: "50%", border: filled ? 0 : "1px solid rgba(42,42,42,0.25)", background: filled ? MOBILE_EDITOR_INK : MOBILE_EDITOR_PANEL, color: filled ? MOBILE_EDITOR_PANEL : MOBILE_EDITOR_INK, opacity: disabled ? 0.35 : 1, display: "grid", placeItems: "center", fontSize: size > 50 ? 22 : 18, cursor: disabled ? "default" : "pointer" }}
       >{icon}</button>
     );
     const sheetHeader = (title: string) => (
@@ -12132,7 +12134,7 @@ function Board2Editor({
     return (
       <div data-mobile-editor style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: MOBILE_EDITOR_BG, color: MOBILE_EDITOR_INK, fontFamily: "monospace", overflow: "hidden" }}>
         {/* 1. Preview + transport */}
-        <div style={{ flex: `0 0 ${draft ? 48 : 40}dvh`, minHeight: 0, display: "flex", flexDirection: "column", transition: "flex-basis 180ms ease" }}>
+        <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}>
           <div ref={observeMobilePreview} style={{ flex: 1, minHeight: 0, position: "relative", margin: "8px 12px 0" }}>
             {frameW > 0 && (
               <div style={{ position: "absolute", left: (box.w - frameW) / 2, top: (box.h - frameH) / 2, width: frameW, height: frameH }}>
@@ -12140,7 +12142,7 @@ function Board2Editor({
                   ref={canvasRef}
                   width={Math.round(previewRenderW * editorCanvasDpr)}
                   height={Math.round(previewRenderH * editorCanvasDpr)}
-                  style={{ display: "block", width: frameW, height: frameH, background: "#000", borderRadius: 4 }}
+                  style={{ display: "block", width: frameW, height: frameH, background: "#000", borderRadius: 4, boxShadow: "0 0 0 1px rgba(42,42,42,0.3), 0 4px 14px rgba(42,42,42,0.18)" }}
                 />
                 {draft && (
                   <div style={{ position: "absolute", inset: 0, touchAction: "none" }}>
@@ -12169,7 +12171,7 @@ function Board2Editor({
           <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 18, padding: "2px 0 8px" }}>
             {draft ? (
               <>
-                <button type="button" onClick={() => setMobileZoomDraft(null)} style={{ minWidth: 96, minHeight: 44, borderRadius: 22, border: "1px solid rgba(255,255,255,0.25)", background: "transparent", color: MOBILE_EDITOR_INK, fontFamily: "inherit", fontSize: 13, fontWeight: 700 }}>Cancel</button>
+                <button type="button" onClick={() => setMobileZoomDraft(null)} style={{ minWidth: 96, minHeight: 44, borderRadius: 22, border: "1px solid rgba(42,42,42,0.3)", background: MOBILE_EDITOR_PANEL, color: MOBILE_EDITOR_INK, fontFamily: "inherit", fontSize: 13, fontWeight: 700 }}>Cancel</button>
                 <button type="button" onClick={confirmMobileZoomDraft} style={{ minWidth: 96, minHeight: 44, borderRadius: 22, border: 0, background: CUSTOM_ZOOM_CLIP_COLOR, color: "#1a1a1a", fontFamily: "inherit", fontSize: 13, fontWeight: 700 }}>Add at {formatTime(playhead)}</button>
               </>
             ) : (
@@ -12183,7 +12185,7 @@ function Board2Editor({
         </div>
 
         {/* 2. Timeline: scrolls under a fixed center playhead; pinch to change scale */}
-        <div style={{ flex: "1 1 auto", minHeight: 150, position: "relative", borderTop: "1px solid rgba(255,255,255,0.08)", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+        <div style={{ flex: "0 0 150px", position: "relative", borderTop: `1px solid ${MOBILE_EDITOR_LINE}`, borderBottom: `1px solid ${MOBILE_EDITOR_LINE}`, background: "rgba(255,253,245,0.7)" }}>
           <div
             ref={mobileTimelineRef}
             aria-label="Timeline"
@@ -12222,13 +12224,13 @@ function Board2Editor({
                 ))}
               </div>
               {/* Main strip: media as filmstrip thumbnails; camera moves as a bar on top of it */}
-              <div style={{ position: "absolute", left: 0, right: 0, top: 26, height: 56, borderRadius: 6, background: "rgba(255,255,255,0.05)" }}>
+              <div style={{ position: "absolute", left: 0, right: 0, top: 26, height: 56, borderRadius: 6, background: "rgba(42,42,42,0.05)" }}>
                 {mediaBlocks.map((clip) => {
                   const thumb = clip.type === "video" ? clip.thumbnailBlobUrl : clip.previewUrl ?? clip.sourceUrl;
                   return block(clip, 0, 56, {
-                    background: "#3b3b3b",
+                    background: "#d8d1c2",
                     ...(thumb ? { backgroundImage: `url(${thumb})`, backgroundSize: "auto 100%", backgroundRepeat: "repeat-x" } : {}),
-                    border: "1px solid rgba(0,0,0,0.6)",
+                    border: "1px solid rgba(42,42,42,0.35)",
                   });
                 })}
                 {cameraBlocks.map((clip) => block(clip, 0, 16, { background: blockColor(clip), opacity: 0.92, zIndex: 2 }))}
@@ -12243,7 +12245,7 @@ function Board2Editor({
             </div>
           </div>
           {/* Fixed center playhead */}
-          <div aria-hidden="true" style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 2, marginLeft: -1, background: "#fff", boxShadow: "0 0 4px rgba(0,0,0,0.6)", pointerEvents: "none" }} />
+          <div aria-hidden="true" style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 2, marginLeft: -1, background: "#ff5e3a", pointerEvents: "none" }} />
         </div>
 
         {/* 3. Primary actions */}
@@ -12255,7 +12257,7 @@ function Board2Editor({
         </div>
 
         {/* 4. Tools (scroll horizontally) */}
-        <div style={{ flexShrink: 0, display: "flex", overflowX: "auto", gap: 2, padding: "2px 8px calc(6px + env(safe-area-inset-bottom))", borderTop: "1px solid rgba(255,255,255,0.08)", scrollbarWidth: "none", touchAction: "pan-x" }}>
+        <div style={{ flexShrink: 0, display: "flex", overflowX: "auto", gap: 2, padding: "2px 8px calc(6px + env(safe-area-inset-bottom))", borderTop: `1px solid ${MOBILE_EDITOR_LINE}`, background: MOBILE_EDITOR_PANEL, scrollbarWidth: "none", touchAction: "pan-x" }}>
           {selected && tool("delete", "🗑", "Delete clip", () => { deleteClip(selected.id); setClipSelection([]); })}
           {tool("media", "＋", "Add Media", undefined, <input type="file" accept="image/*,video/*" multiple aria-label="Add media" style={nativeFilePickerStyle} onChange={(event) => { void handleMobileAddMedia(event); }} />)}
           {tool("narration", "🎙", "Narration", () => setMobileSheet("narration"))}
@@ -26600,8 +26602,8 @@ function Board2Editor({
             </button>
           </div>
 
-          {/* Center: the board's share code and who's on the board */}
-          <div style={{ flexShrink: 0, position: "relative", display: "flex", alignItems: "center", gap: 6 }}>
+          {/* Center: the board's share code and who's on the board (not in the cramped mobile editor bar) */}
+          <div style={{ flexShrink: 0, position: "relative", display: mobileEditorMode ? "none" : "flex", alignItems: "center", gap: 6 }}>
             {joinCode ? (
               <button type="button" onClick={() => { void copyBoardCode(); }} title="Copy board code" aria-label={`Board code ${joinCode}, copy to clipboard`}
                 style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: topBar.pillBg, color: topBar.muted, fontFamily: "monospace", fontSize: 11, fontWeight: 700, letterSpacing: 2, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
@@ -26624,7 +26626,7 @@ function Board2Editor({
 
           {/* Right: save to account, settings, fullscreen, close the video editor */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
-            {canSaveBoardToAccount && (
+            {canSaveBoardToAccount && !mobileEditorMode && (
               <button type="button" onClick={saveBoardToAccount} title={`${boardExpiryLabel}. Save it to your account to keep it.`}
                 style={{ height: topBar.button - 2, padding: "0 10px", borderRadius: 999, border: `1px solid ${topBar.pillBorder}`, background: "transparent", color: topBar.muted, fontFamily: "monospace", fontSize: 10, cursor: "pointer", whiteSpace: "nowrap" }}
               >
@@ -31107,12 +31109,12 @@ const EDITOR_TOP_BAR: TopBarTheme = {
   pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
 };
 
-// The mobile video editor is dark end to end (see MOBILE_EDITOR_BG).
+// The mobile video editor's bar: the editor bar's light look, sized for touch.
 const MOBILE_EDITOR_TOP_BAR: TopBarTheme = {
   height: 44, button: 44, icon: 17,
-  background: MOBILE_EDITOR_BG, borderBottom: "1px solid rgba(255,255,255,0.08)", ink: MOBILE_EDITOR_INK, muted: MOBILE_EDITOR_MUTED,
-  activeBg: "rgba(255,255,255,0.12)", activeBorder: "rgba(255,255,255,0.3)",
-  pillBorder: "rgba(255,255,255,0.25)", pillBg: "transparent", dotRing: MOBILE_EDITOR_BG,
+  background: MOBILE_EDITOR_PANEL, borderBottom: `1px solid ${MOBILE_EDITOR_LINE}`, ink: MOBILE_EDITOR_INK, muted: MOBILE_EDITOR_MUTED,
+  activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
+  pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: MOBILE_EDITOR_PANEL,
 };
 
 // On touch screens every top-bar control is at least 44×44 (buttons 46, so the code pill at
