@@ -31,8 +31,8 @@ export async function GET() {
       .order("published_at", { ascending: false })
       .limit(200);
     if (error) throw error;
-    // Boards published without an account show their join code (so anyone can open and edit them,
-    // including their creator on another device) only while that board is still being shared.
+    // Boards published without an account are listed only while their board is still being shared.
+    // Their join code is never sent: only the creating device knows it (nb_anon_boards).
     const codes = (data ?? []).flatMap((row) => row.join_code ? [row.join_code as string] : []);
     let liveCodes = new Set<string>();
     if (codes.length) {
@@ -42,7 +42,7 @@ export async function GET() {
     }
     const boards: PublishedBoardCard[] = (data ?? [])
       .filter((row) => !row.join_code || liveCodes.has(row.join_code))
-      .map((row) => ({ id: row.id, title: row.title, publishedAt: row.published_at, ...(row.join_code ? { joinCode: row.join_code } : {}) }));
+      .map((row) => ({ id: row.id, title: row.title, publishedAt: row.published_at, ...(row.join_code ? { anonymous: true } : {}) }));
     return NextResponse.json({ boards }, { headers: noStore });
   } catch (error) { return publishedBoardsError(error); }
 }

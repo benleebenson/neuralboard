@@ -251,8 +251,12 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
                 </span>
                 <span className={styles.cardTitle}>{board.title}</span>
               </a>
-              {/* Published without an account: its join code opens it for editing on any device. */}
-              {board.joinCode && <BoardCodeRow code={board.joinCode} copied={copiedCode === board.joinCode} onCopy={copyCode} />}
+              {/* Published without an account: view only here; its code stays on the creating device. */}
+              {board.anonymous && (
+                <div className={styles.cardJoin}>
+                  <a className={styles.joinLink} href={viewUrl(board.id)} aria-label={`View ${board.title} (read-only)`}>View</a>
+                </div>
+              )}
             </li>
           ))}
         </ul>

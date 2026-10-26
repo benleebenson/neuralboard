@@ -10,9 +10,9 @@ export const PUBLISHED_STORAGE_BUDGET_BYTES = 950 * 1024 * 1024;
 export const PUBLISHED_TITLE_MAX = 120;
 export const PUBLISHED_KEY_MAX = 255;
 
-/** One Home feed card. The owner's email is never sent to other users. `joinCode` is set for boards
- *  published without an account: anyone with it can open and edit the board. */
-export type PublishedBoardCard = { id: string; title: string; publishedAt: string; joinCode?: string };
+/** One Home feed card. Neither the owner's email nor an anonymous board's join code is ever sent
+ *  to other users; `anonymous` marks boards published without an account (view-only here). */
+export type PublishedBoardCard = { id: string; title: string; publishedAt: string; anonymous?: boolean };
 
 /** The signed-in user's own publications, keyed by board file name, for the Profile toggles. */
 export type MyPublishedBoard = { id: string; boardKey: string; title: string; sizeBytes: number; publishedAt: string };
