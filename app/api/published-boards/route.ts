@@ -16,31 +16,38 @@ import { publishedBoardsError, sessionEmail } from "@/lib/published-boards-serve
 import { unexpiredBoardFilter } from "@/lib/joinable-board-server";
 
 const PER_USER_MAX = 25;
+const UNDEFINED_COLUMN = "42703"; // Postgres: column does not exist
 const noStore = { "Cache-Control": "no-store" };
 
 /** Home feed: every published board, newest first. Open to everyone, signed in or not. */
 export async function GET() {
   try {
     const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from("published_boards")
-      .select("id,title,published_at,join_code")
-      .not("published_at", "is", null)
-      .not("package_path", "is", null)
-      .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
-      .order("published_at", { ascending: false })
-      .limit(200);
+    const listed = (columns: string, unexpiredOnly: boolean) => {
+      let query = supabase.from("published_boards").select(columns)
+        .not("published_at", "is", null)
+        .not("package_path", "is", null);
+      if (unexpiredOnly) query = query.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+      return query.order("published_at", { ascending: false }).limit(200);
+    };
+    let { data, error } = await listed("id,title,published_at,join_code", true);
+    if (error?.code === UNDEFINED_COLUMN) {
+      // 20261026_anonymous_published_boards.sql not applied yet: no anonymous publications can
+      // exist, so the original listing is complete.
+      ({ data, error } = await listed("id,title,published_at", false));
+    }
     if (error) throw error;
     // Boards published without an account are listed only while their board is still being shared.
     // Their join code is never sent: only the creating device knows it (nb_anon_boards).
-    const codes = (data ?? []).flatMap((row) => row.join_code ? [row.join_code as string] : []);
+    const rows = (data ?? []) as unknown as Array<{ id: string; title: string; published_at: string; join_code?: string | null }>;
+    const codes = rows.flatMap((row) => row.join_code ? [row.join_code] : []);
     let liveCodes = new Set<string>();
     if (codes.length) {
       const { data: live, error: liveError } = await supabase.from("joinable_boards").select("code").in("code", codes).eq("active", true).or(unexpiredBoardFilter());
       if (liveError) throw liveError;
       liveCodes = new Set((live ?? []).map((board) => board.code as string));
     }
-    const boards: PublishedBoardCard[] = (data ?? [])
+    const boards: PublishedBoardCard[] = rows
       .filter((row) => !row.join_code || liveCodes.has(row.join_code))
       .map((row) => ({ id: row.id, title: row.title, publishedAt: row.published_at, ...(row.join_code ? { anonymous: true } : {}) }));
     return NextResponse.json({ boards }, { headers: noStore });

@@ -92,6 +92,8 @@ export async function completePublishedUpload(id: string, version: string, title
 export async function unpublishJoinCodes(codes: string[]): Promise<void> {
   if (codes.length === 0) return;
   const { data, error } = await getSupabase().from("published_boards").delete().in("join_code", codes).select("id");
+  // Before 20261026_anonymous_published_boards.sql there is no join_code column and nothing to remove.
+  if (error?.code === "42703") return;
   if (error) throw error;
   for (const row of data ?? []) await removePublishedObjects(await publishedBoardObjects(row.id));
 }
