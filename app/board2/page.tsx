@@ -1408,6 +1408,35 @@ function drawZoomNarrationTypewriter(
 }
 
 // ─── Flash cut ─────────────────────────────────────────────────────────────────
+// ─ Mobile video editor ──────────────────────────────────────────────────────
+// Phones with the editor open get a CapCut-style layout: preview on top, a horizontally scrolling
+// timeline that moves under a fixed center playhead, primary actions, then a scrolling tool row.
+// Panels open as bottom sheets.
+const MOBILE_EDITOR_BG = "#1a1a1a";
+const MOBILE_EDITOR_PANEL = "#242424";
+const MOBILE_EDITOR_INK = "#f2f2f2";
+const MOBILE_EDITOR_MUTED = "rgba(242,242,242,0.6)";
+const MOBILE_TIMELINE_DEFAULT_PPS = 40;
+const MOBILE_TIMELINE_MIN_PPS = 8;
+const MOBILE_TIMELINE_MAX_PPS = 400;
+const MOBILE_ZOOM_DEFAULT_WIDTH = 0.6; // fraction of the frame
+
+const MOBILE_SHEET_STYLE: React.CSSProperties = {
+  position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 901, boxSizing: "border-box",
+  maxHeight: "75dvh", overflowY: "auto",
+  background: "#fffdf5", color: "#2a2a2a", borderRadius: "16px 16px 0 0",
+  padding: "14px 16px calc(16px + env(safe-area-inset-bottom))",
+  boxShadow: "0 -8px 30px rgba(0,0,0,.35)", fontFamily: "monospace",
+  display: "flex", flexDirection: "column", gap: 10, animation: "nbSheetUp 180ms ease-out",
+};
+
+// Whether a zoom box drawn on the frame (normalized w/h) is locked to one of the custom-zoom snap
+// ratios; frameAspect converts normalized units to the board's real proportions.
+function mobileZoomBoxSnapped(box: { w: number; h: number }, frameAspect: number): boolean {
+  const ratio = (box.w / box.h) * frameAspect;
+  return CUSTOM_ZOOM_SNAP_RATIOS.some((target) => Math.abs(ratio - target) / target <= 0.005);
+}
+
 // ─ Cut To ────────────────────────────────────────────────────────────────────
 // A "cutto" clip lays a cropped piece of media over the output frame for its span: the part of
 // the source inside crop (0–1 of the source) is scaled into display (0–1 of the frame). Drawn by
@@ -6437,6 +6466,24 @@ function Board2Editor({
   const [clipsPanelOpen, setClipsPanelOpen] = useState(false);
   const [flashPickerOpen, setFlashPickerOpen] = useState(false);
   const [cutToPickerOpen, setCutToPickerOpen] = useState(false);
+  // Mobile video editor (see MOBILE_EDITOR_BG): timeline scale, the custom-zoom box being drawn on
+  // the preview (normalized to the frame), the open bottom sheet and the preview's measured size.
+  const [mobilePps, setMobilePps] = useState(MOBILE_TIMELINE_DEFAULT_PPS);
+  const [mobileZoomDraft, setMobileZoomDraft] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [mobileSheet, setMobileSheet] = useState<"narration" | "captions" | null>(null);
+  const [mobilePreviewSize, setMobilePreviewSize] = useState({ w: 0, h: 0 });
+  const mobileTimelineRef = useRef<HTMLDivElement | null>(null);
+  const mobileTimelineProgrammaticLeftRef = useRef(-1);
+  const mobileTimelinePinchRef = useRef<{ distance: number; pps: number } | null>(null);
+  const mobilePreviewObserverRef = useRef<ResizeObserver | null>(null);
+  const observeMobilePreview = useCallback((element: HTMLDivElement | null) => {
+    mobilePreviewObserverRef.current?.disconnect();
+    mobilePreviewObserverRef.current = null;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => setMobilePreviewSize({ w: entry.contentRect.width, h: entry.contentRect.height }));
+    observer.observe(element);
+    mobilePreviewObserverRef.current = observer;
+  }, []);
   // Selected Cut To on the preview: "position" moves/resizes where it sits on the frame, "crop"
   // picks which part of the source it shows.
   const [cutToEditMode, setCutToEditMode] = useState<"position" | "crop">("position");
@@ -6653,6 +6700,9 @@ function Board2Editor({
   const boardUndoHistoryRef = useRef<Array<{ signature: string; snapshot: BoardUndoSnapshot }>>([]);
   const boardUndoTimerRef = useRef<number | null>(null);
   const boardUndoApplyingSignatureRef = useRef<string | null>(null);
+  // States undone away from, newest last; any new board change clears it.
+  const boardRedoStackRef = useRef<Array<{ signature: string; snapshot: BoardUndoSnapshot }>>([]);
+  const [canRedoBoard, setCanRedoBoard] = useState(false);
   const [canUndoBoard, setCanUndoBoard] = useState(false);
 
   // ── Character ──
@@ -7970,6 +8020,40 @@ function Board2Editor({
     // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the mode per selection
     setCutToEditMode("position");
   }, [selectedCutToId]);
+
+  // Phone + editor open: the CapCut-style mobile editor replaces the desktop panels and timeline
+  // (which stay mounted, hidden, so everything they own keeps working).
+  const mobileEditorMode = isMobile && !chromeHidden && !viewOnly;
+  useEffect(() => {
+    if (!mobileEditorMode) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- leaving the mobile editor drops its draft
+      setMobileZoomDraft(null);
+      setMobileSheet(null);
+      return;
+    }
+    // The mobile preview is a new canvas: make sure it's enabled and painted.
+    previewVisibleRef.current = true;
+    setPreviewVisible(true);
+    requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
+  }, [mobileEditorMode]);
+  // The preview canvas mounts once its box has been measured: paint it then.
+  const mobilePreviewReady = mobileEditorMode && mobilePreviewSize.w > 0 && mobilePreviewSize.h > 0;
+  useEffect(() => {
+    if (mobilePreviewReady) requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
+  }, [mobilePreviewReady]);
+  // The timeline scrolls under the fixed center playhead: keep its scroll at playhead × scale
+  // (during playback, after seeks, after pinch-zooming). User scrolls move the playhead instead
+  // (see the timeline's onScroll), so this only writes when the two disagree.
+  useEffect(() => {
+    if (!mobileEditorMode) return;
+    const el = mobileTimelineRef.current;
+    if (!el) return;
+    const target = playhead * mobilePps;
+    if (Math.abs(el.scrollLeft - target) > 0.5) {
+      mobileTimelineProgrammaticLeftRef.current = target;
+      el.scrollLeft = target;
+    }
+  }, [mobileEditorMode, mobilePps, playhead]);
   // Crop mode: the whole source, fitted, under the crop box. Redrawn per animation frame while
   // open so a video source shows its current frame.
   useEffect(() => {
@@ -8448,6 +8532,11 @@ function Board2Editor({
       boardUndoApplyingSignatureRef.current = null;
       return;
     }
+    // A new change (not an undo/redo landing) makes the redo history obsolete.
+    if (boardRedoStackRef.current.length && boardUndoHistoryRef.current.at(-1)?.signature !== boardUndoSignature) {
+      boardRedoStackRef.current = [];
+      setCanRedoBoard(false);
+    }
     if (boardUndoTimerRef.current !== null) window.clearTimeout(boardUndoTimerRef.current);
     if (boardUndoHistoryRef.current.length === 0) {
       boardUndoHistoryRef.current = [{ signature: boardUndoSignature, snapshot: boardUndoSnapshot }];
@@ -8476,10 +8565,39 @@ function Board2Editor({
     if (history.length === 0) return;
     if (history.at(-1)?.signature === boardUndoSignature) {
       if (history.length < 2) return;
-      history.pop();
+      boardRedoStackRef.current.push(history.pop()!);
+    } else {
+      // A change still waiting to be recorded: keep it so redo can bring it back.
+      boardRedoStackRef.current.push({ signature: boardUndoSignature, snapshot: boardUndoSnapshot });
     }
     const target = history.at(-1);
     if (!target) return;
+    applyBoardUndoEntry(target);
+    setCanUndoBoard(history.length > 1);
+    setCanRedoBoard(boardRedoStackRef.current.length > 0);
+    setToast("Undid last board change");
+    // applyBoardUndoEntry only reads refs and setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boardUndoSignature, boardUndoSnapshot]);
+
+  const redoBoard = useCallback(() => {
+    const entry = boardRedoStackRef.current.pop();
+    if (!entry) return;
+    if (boardUndoTimerRef.current !== null) {
+      window.clearTimeout(boardUndoTimerRef.current);
+      boardUndoTimerRef.current = null;
+    }
+    boardUndoHistoryRef.current.push(entry);
+    applyBoardUndoEntry(entry);
+    setCanUndoBoard(boardUndoHistoryRef.current.length > 1);
+    setCanRedoBoard(boardRedoStackRef.current.length > 0);
+    setToast("Redid board change");
+    // applyBoardUndoEntry only reads refs and setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Puts the board back to a recorded snapshot (shared by undo and redo).
+  function applyBoardUndoEntry(target: { signature: string; snapshot: BoardUndoSnapshot }) {
     boardUndoApplyingSignatureRef.current = target.signature;
     const restoredClips = restoreDerivedClipFields(target.snapshot.clips, clipsRef.current);
     target.snapshot.clips = restoredClips;
@@ -8521,9 +8639,7 @@ function Board2Editor({
     setCaptionPosition(s.captionPosition);
     setClipSelection([]);
     setAnnotationSelection([]);
-    setCanUndoBoard(history.length > 1);
-    setToast("Undid last board change");
-  }, [boardUndoSignature]);
+  }
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -11826,6 +11942,482 @@ function Board2Editor({
         {centerHandle(rect, "position", { w: ow, h: oh })}
         {corner(rect, "position", { w: ow, h: oh })}
       </div>
+    );
+  }
+
+  // ─ Mobile video editor ────────────────────────────────────────────────────
+
+  // Where the camera is looking at the playhead, as a board rect: the preview frame in board units.
+  function mobileFrameViewport() {
+    const cam = editorCameraAtTime(playheadRef.current, clipsRef.current, cameraKeyframesRef.current, canvasWRef.current, canvasHRef.current);
+    return cameraViewport(cam, canvasWRef.current, canvasHRef.current, boardDimensionsRef.current.width);
+  }
+
+  async function handleMobileAddMedia(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!files.length) return;
+    // New media lands where the preview is looking, fanned out a little when there are several.
+    const vp = mobileFrameViewport();
+    const cx = (vp.left + vp.right) / 2, cy = (vp.top + vp.bottom) / 2;
+    for (const [index, file] of files.entries()) {
+      try {
+        await ingestMediaFile(file, file.name, { x: cx + index * 40, y: cy + index * 40 });
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : `Could not add ${file.name}`);
+      }
+    }
+  }
+
+  function startMobileZoomDraft() {
+    if (isPlayingRef.current) seekEditorPlayback(playheadRef.current);
+    // Same aspect as the frame, so it starts locked to the export ratio.
+    const w = MOBILE_ZOOM_DEFAULT_WIDTH, h = MOBILE_ZOOM_DEFAULT_WIDTH;
+    setMobileZoomDraft({ x: (1 - w) / 2, y: (1 - h) / 2, w, h });
+  }
+
+  function confirmMobileZoomDraft() {
+    const draft = mobileZoomDraft;
+    if (!draft) return;
+    const vp = mobileFrameViewport();
+    const vw = vp.right - vp.left, vh = vp.bottom - vp.top;
+    addCustomZoomClip(vp.left + draft.x * vw, vp.top + draft.y * vh, draft.w * vw, draft.h * vh, playheadRef.current);
+    setMobileZoomDraft(null);
+  }
+
+  // Dragging the zoom box (move) or a corner (resize, with the same ratio magnet as desktop drawing:
+  // within 15% of 9:16, 16:9 or 1:1 it locks to it). Normalized frame units; the magnet works in
+  // board proportions, so x is scaled by the frame aspect (and both by 1000 to clear its minimum size).
+  function startMobileZoomDrag(event: React.PointerEvent, handle: "move" | "nw" | "ne" | "sw" | "se", frame: { w: number; h: number }) {
+    const start = mobileZoomDraft;
+    if (!start) return;
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const startX = event.clientX, startY = event.clientY;
+    const frameAspect = canvasWRef.current / canvasHRef.current;
+    const preferred = canvasAspect === "9:16" ? 9 / 16 : 16 / 9;
+    const onMove = (ev: PointerEvent) => {
+      const dx = (ev.clientX - startX) / frame.w;
+      const dy = (ev.clientY - startY) / frame.h;
+      if (handle === "move") {
+        setMobileZoomDraft({ ...start, x: clamp(start.x + dx, 0, 1 - start.w), y: clamp(start.y + dy, 0, 1 - start.h) });
+        return;
+      }
+      const west = handle === "nw" || handle === "sw";
+      const north = handle === "nw" || handle === "ne";
+      const anchorX = west ? start.x + start.w : start.x;
+      const anchorY = north ? start.y + start.h : start.y;
+      let px = clamp((west ? start.x : start.x + start.w) + dx, 0, 1);
+      let py = clamp((north ? start.y : start.y + start.h) + dy, 0, 1);
+      const S = 1000;
+      const snap = snapCustomZoomDraw(anchorX * frameAspect * S, anchorY * S, px * frameAspect * S, py * S, preferred);
+      px = clamp(snap.currentX / (frameAspect * S), 0, 1);
+      py = clamp(snap.currentY / S, 0, 1);
+      const w = Math.max(0.05, Math.abs(px - anchorX)), h = Math.max(0.05, Math.abs(py - anchorY));
+      setMobileZoomDraft({ x: west ? anchorX - w : anchorX, y: north ? anchorY - h : anchorY, w, h });
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  // Trim a selected block on the mobile timeline by dragging its edge handle (the desktop drag rules).
+  function startMobileTrim(event: React.PointerEvent, clip: Clip, kind: "resize-left" | "resize-right") {
+    event.preventDefault();
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const pps = mobilePps;
+    const origin = { kind, blockId: clip.id, originalStartTime: clip.startTime, originalDuration: clip.duration, originalLayer: clip.layer ?? 1, originalSourceOffsetSec: clip.sourceOffsetSec };
+    const onMove = (ev: PointerEvent) => {
+      setClips((prev) => applyTimelineBlockDrag(prev, origin, {
+        deltaSeconds: (ev.clientX - startX) / pps,
+        targetLayer: clip.layer ?? 1,
+        playhead: playheadRef.current,
+        snapThresholdSeconds: MAGNETIC_SNAP_PX / pps,
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  function renderMobileEditor() {
+    const frameAspect = canvasW / canvasH;
+    const box = mobilePreviewSize;
+    const frameW = box.w > 0 && box.h > 0 ? Math.min(box.w, box.h * frameAspect) : 0;
+    const frameH = frameW / frameAspect;
+    const draft = mobileZoomDraft;
+    const zoomSnapped = !!draft && mobileZoomBoxSnapped(draft, frameAspect);
+    const pps = mobilePps;
+    const trackWidth = timelineDuration * pps;
+    const markerStep = pps >= 80 ? 1 : pps >= 40 ? 2 : pps >= 16 ? 5 : 10;
+    const featured = clips.filter((clip) => isFeaturedTimelineClip(clip));
+    const mediaBlocks = featured.filter((clip) => clip.type === "image" || clip.type === "video").sort((a, b) => (a.layer ?? 1) - (b.layer ?? 1));
+    const cameraBlocks = featured.filter((clip) => clip.type === "customZoom" || clip.type === "pan" || clip.type === "characterFocus");
+    const effectBlocks = featured.filter((clip) => clip.type === "cutto" || clip.type === "flash" || clip.type === "bleep");
+    const narrationBlocks = featured.filter((clip) => clip.type === "narration");
+    const hasNarration = narrationBlocks.length > 0;
+    const selected = selectedClip && featured.some((clip) => clip.id === selectedClip.id) ? selectedClip : null;
+    const blockColor = (clip: Clip) => clip.type === "customZoom" ? CUSTOM_ZOOM_CLIP_COLOR : clip.type === "pan" ? PAN_CLIP_COLOR : clip.type === "characterFocus" ? CHARACTER_FOCUS_CLIP_COLOR : clip.type === "cutto" ? CUT_TO_CLIP_COLOR : clip.type === "flash" ? FLASH_CLIP_COLOR : clip.type === "bleep" ? BLEEP_CLIP_COLOR : "#5c7cfa";
+    const blockLabel = (clip: Clip) => clip.type === "customZoom" ? "🔍 Zoom" : clip.type === "pan" ? "⟷ Pan" : clip.type === "characterFocus" ? "◎ Focus" : clip.type === "cutto" ? "✂ Cut To" : clip.type === "flash" ? "⚡ Flash" : clip.type === "bleep" ? "🔇 Bleep" : clip.type === "narration" ? "🎙 Narration" : clip.name;
+    const selectBlock = (clip: Clip) => { selectionSurfaceRef.current = "timeline"; setClipSelection([clip.id]); };
+    const trimHandles = (clip: Clip, height: number) => selected?.id === clip.id && clip.type !== "narration" ? (
+      <>
+        {(["resize-left", "resize-right"] as const).map((kind) => (
+          <div key={kind} aria-label={kind === "resize-left" ? "Trim start" : "Trim end"} onPointerDown={(event) => startMobileTrim(event, clip, kind)}
+            style={{ position: "absolute", top: 0, [kind === "resize-left" ? "left" : "right"]: -2, width: 18, height, background: "#fff", borderRadius: kind === "resize-left" ? "6px 0 0 6px" : "0 6px 6px 0", display: "grid", placeItems: "center", touchAction: "none", zIndex: 3 }}
+          ><span style={{ width: 3, height: Math.min(20, height - 12), borderRadius: 2, background: "#1a1a1a" }} /></div>
+        ))}
+      </>
+    ) : null;
+    const block = (clip: Clip, top: number, height: number, extra: React.CSSProperties = {}) => (
+      <div key={clip.id} role="button" aria-label={`${blockLabel(clip)} at ${formatTime(clip.startTime)}`} aria-pressed={selected?.id === clip.id}
+        onClick={(event) => { event.stopPropagation(); selectBlock(clip); }}
+        style={{
+          position: "absolute", left: clip.startTime * pps, top, width: Math.max(6, clip.duration * pps), height, boxSizing: "border-box",
+          borderRadius: 6, overflow: "visible", cursor: "pointer",
+          outline: selected?.id === clip.id ? "2px solid #fff" : "none", outlineOffset: 0,
+          ...extra,
+        }}
+      >
+        <div style={{ position: "absolute", inset: 0, borderRadius: 6, overflow: "hidden", display: "flex", alignItems: "center", padding: "0 6px", fontSize: 10, fontWeight: 700, color: "#1a1a1a", whiteSpace: "nowrap" }}>{extra.backgroundImage ? null : blockLabel(clip)}</div>
+        {trimHandles(clip, height)}
+      </div>
+    );
+    const tool = (key: string, icon: React.ReactNode, label: string, onClick?: () => void, input?: React.ReactNode, disabled = false) => {
+      const content = (
+        <>
+          <span aria-hidden="true" style={{ fontSize: 20, lineHeight: 1 }}>{icon}</span>
+          <span style={{ fontSize: 10, color: disabled ? "rgba(242,242,242,0.35)" : MOBILE_EDITOR_MUTED, whiteSpace: "nowrap" }}>{label}</span>
+        </>
+      );
+      const style: React.CSSProperties = { position: "relative", flex: "0 0 auto", minWidth: 64, minHeight: 56, padding: "6px 4px", border: 0, background: "transparent", color: disabled ? "rgba(242,242,242,0.35)" : MOBILE_EDITOR_INK, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, cursor: disabled ? "default" : "pointer", fontFamily: "inherit" };
+      return input
+        ? <label key={key} style={style}>{content}{input}</label>
+        : <button key={key} type="button" disabled={disabled} onClick={onClick} style={style}>{content}</button>;
+    };
+    const primary = (key: string, icon: React.ReactNode, label: string, onClick: () => void, accent: string, active = false) => (
+      <button key={key} type="button" onClick={onClick} aria-pressed={active}
+        style={{ flex: 1, minHeight: 52, border: 0, borderRadius: 12, background: active ? accent : MOBILE_EDITOR_PANEL, color: active ? "#1a1a1a" : MOBILE_EDITOR_INK, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2, fontFamily: "inherit", fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: `inset 0 -3px 0 ${accent}` }}
+      >
+        <span aria-hidden="true" style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
+        {label}
+      </button>
+    );
+    const round = (label: string, icon: React.ReactNode, onClick: () => void, size: number, disabled = false, filled = false) => (
+      <button type="button" aria-label={label} title={label} onClick={onClick} disabled={disabled}
+        style={{ width: size, height: size, borderRadius: "50%", border: filled ? 0 : "1px solid rgba(255,255,255,0.18)", background: filled ? "#f2f2f2" : "transparent", color: filled ? "#1a1a1a" : MOBILE_EDITOR_INK, opacity: disabled ? 0.35 : 1, display: "grid", placeItems: "center", fontSize: size > 50 ? 22 : 18, cursor: disabled ? "default" : "pointer" }}
+      >{icon}</button>
+    );
+    const sheetHeader = (title: string) => (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <strong style={{ fontSize: 13 }}>{title}</strong>
+        <button type="button" onClick={() => setMobileSheet(null)} style={{ ...miniButton, minWidth: 44, minHeight: 44 }}>✕</button>
+      </div>
+    );
+    const sheetButton: React.CSSProperties = { ...sketchButton, minHeight: 48, padding: "10px 12px", fontSize: 12, textAlign: "left" };
+
+    return (
+      <div data-mobile-editor style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", background: MOBILE_EDITOR_BG, color: MOBILE_EDITOR_INK, fontFamily: "monospace", overflow: "hidden" }}>
+        {/* 1. Preview + transport */}
+        <div style={{ flex: `0 0 ${draft ? 48 : 40}dvh`, minHeight: 0, display: "flex", flexDirection: "column", transition: "flex-basis 180ms ease" }}>
+          <div ref={observeMobilePreview} style={{ flex: 1, minHeight: 0, position: "relative", margin: "8px 12px 0" }}>
+            {frameW > 0 && (
+              <div style={{ position: "absolute", left: (box.w - frameW) / 2, top: (box.h - frameH) / 2, width: frameW, height: frameH }}>
+                <canvas
+                  ref={canvasRef}
+                  width={Math.round(previewRenderW * editorCanvasDpr)}
+                  height={Math.round(previewRenderH * editorCanvasDpr)}
+                  style={{ display: "block", width: frameW, height: frameH, background: "#000", borderRadius: 4 }}
+                />
+                {draft && (
+                  <div style={{ position: "absolute", inset: 0, touchAction: "none" }}>
+                    <div onPointerDown={(event) => startMobileZoomDrag(event, "move", { w: frameW, h: frameH })}
+                      style={{ position: "absolute", left: draft.x * frameW, top: draft.y * frameH, width: draft.w * frameW, height: draft.h * frameH, border: `2px dashed ${zoomSnapped ? CUSTOM_ZOOM_SNAPPED_COLOR : "#2e8fff"}`, background: "rgba(184,226,255,0.12)", boxShadow: "0 0 0 9999px rgba(0,0,0,0.35)", touchAction: "none", boxSizing: "border-box" }}
+                    />
+                    {(["nw", "ne", "sw", "se"] as const).map((corner) => (
+                      <div key={corner} aria-label={`Resize zoom box ${corner}`} onPointerDown={(event) => startMobileZoomDrag(event, corner, { w: frameW, h: frameH })}
+                        style={{
+                          position: "absolute", width: 44, height: 44, touchAction: "none",
+                          left: (corner === "nw" || corner === "sw" ? draft.x : draft.x + draft.w) * frameW - 22,
+                          top: (corner === "nw" || corner === "ne" ? draft.y : draft.y + draft.h) * frameH - 22,
+                          background: `radial-gradient(circle, ${zoomSnapped ? CUSTOM_ZOOM_SNAPPED_COLOR : "#2e8fff"} 0 7px, #fff 7px 9px, transparent 9px)`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div style={{ flexShrink: 0, textAlign: "center", fontSize: 11, color: MOBILE_EDITOR_MUTED, fontVariantNumeric: "tabular-nums", padding: "6px 0 2px" }}>
+            {formatClipMMSS(playhead)} / {formatClipMMSS(currentPlaybackDuration(clips))}
+            {draft && <span style={{ marginLeft: 8, color: zoomSnapped ? CUSTOM_ZOOM_SNAPPED_COLOR : MOBILE_EDITOR_MUTED }}>{zoomSnapped ? "· locked to ratio" : "· free"}</span>}
+          </div>
+          <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 18, padding: "2px 0 8px" }}>
+            {draft ? (
+              <>
+                <button type="button" onClick={() => setMobileZoomDraft(null)} style={{ minWidth: 96, minHeight: 44, borderRadius: 22, border: "1px solid rgba(255,255,255,0.25)", background: "transparent", color: MOBILE_EDITOR_INK, fontFamily: "inherit", fontSize: 13, fontWeight: 700 }}>Cancel</button>
+                <button type="button" onClick={confirmMobileZoomDraft} style={{ minWidth: 96, minHeight: 44, borderRadius: 22, border: 0, background: CUSTOM_ZOOM_CLIP_COLOR, color: "#1a1a1a", fontFamily: "inherit", fontSize: 13, fontWeight: 700 }}>Add at {formatTime(playhead)}</button>
+              </>
+            ) : (
+              <>
+                {round("Undo", "↶", undoBoard, 44, !canUndoBoard)}
+                {round(isPlaying ? "Pause" : "Play", isPlaying ? "❚❚" : "▶", togglePlay, 56, false, true)}
+                {round("Redo", "↷", redoBoard, 44, !canRedoBoard)}
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* 2. Timeline: scrolls under a fixed center playhead; pinch to change scale */}
+        <div style={{ flex: "1 1 auto", minHeight: 150, position: "relative", borderTop: "1px solid rgba(255,255,255,0.08)", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+          <div
+            ref={mobileTimelineRef}
+            aria-label="Timeline"
+            onScroll={(event) => {
+              const el = event.currentTarget;
+              // Our own sync writes are ignored; a user scroll moves (and pauses) the playhead.
+              if (Math.abs(el.scrollLeft - mobileTimelineProgrammaticLeftRef.current) < 1) return;
+              mobileTimelineProgrammaticLeftRef.current = -1;
+              seekEditorPlayback(clamp(el.scrollLeft / pps, 0, timelineDuration));
+            }}
+            onPointerDown={() => { if (isPlayingRef.current) seekEditorPlayback(playheadRef.current); }}
+            onTouchStart={(event) => {
+              if (event.touches.length !== 2) return;
+              const [a, b] = [event.touches[0], event.touches[1]];
+              mobileTimelinePinchRef.current = { distance: Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)), pps };
+            }}
+            onTouchMove={(event) => {
+              const pinch = mobileTimelinePinchRef.current;
+              if (!pinch || event.touches.length !== 2) return;
+              const [a, b] = [event.touches[0], event.touches[1]];
+              const distance = Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY));
+              setMobilePps(clamp(pinch.pps * distance / pinch.distance, MOBILE_TIMELINE_MIN_PPS, MOBILE_TIMELINE_MAX_PPS));
+            }}
+            onTouchEnd={(event) => { if (event.touches.length < 2) mobileTimelinePinchRef.current = null; }}
+            onClick={() => setClipSelection([])}
+            style={{ position: "absolute", inset: 0, overflowX: "auto", overflowY: "hidden", touchAction: "pan-x", scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}
+          >
+            {/* Half-width padding on each side lets 0s and the end reach the center line. */}
+            <div style={{ position: "relative", width: trackWidth, height: "100%", margin: "0 50%" }}>
+              {/* Time markers */}
+              <div style={{ position: "absolute", left: 0, right: 0, top: 0, height: 20 }}>
+                {Array.from({ length: Math.floor(timelineDuration / markerStep) + 1 }, (_, index) => index * markerStep).map((seconds) => (
+                  <span key={seconds} style={{ position: "absolute", left: seconds * pps, top: 4, transform: "translateX(-50%)", fontSize: 9, color: MOBILE_EDITOR_MUTED, whiteSpace: "nowrap" }}>
+                    {formatClipMMSS(seconds)}
+                  </span>
+                ))}
+              </div>
+              {/* Main strip: media as filmstrip thumbnails; camera moves as a bar on top of it */}
+              <div style={{ position: "absolute", left: 0, right: 0, top: 26, height: 56, borderRadius: 6, background: "rgba(255,255,255,0.05)" }}>
+                {mediaBlocks.map((clip) => {
+                  const thumb = clip.type === "video" ? clip.thumbnailBlobUrl : clip.previewUrl ?? clip.sourceUrl;
+                  return block(clip, 0, 56, {
+                    background: "#3b3b3b",
+                    ...(thumb ? { backgroundImage: `url(${thumb})`, backgroundSize: "auto 100%", backgroundRepeat: "repeat-x" } : {}),
+                    border: "1px solid rgba(0,0,0,0.6)",
+                  });
+                })}
+                {cameraBlocks.map((clip) => block(clip, 0, 16, { background: blockColor(clip), opacity: 0.92, zIndex: 2 }))}
+              </div>
+              {/* Overlays (Cut To, flash, bleep) below the strip, then narration */}
+              <div style={{ position: "absolute", left: 0, right: 0, top: 88, height: 24 }}>
+                {effectBlocks.map((clip) => block(clip, 0, 24, { background: blockColor(clip) }))}
+              </div>
+              <div style={{ position: "absolute", left: 0, right: 0, top: 118, height: 24 }}>
+                {narrationBlocks.map((clip) => block(clip, 0, 24, { background: "#ffa8d0" }))}
+              </div>
+            </div>
+          </div>
+          {/* Fixed center playhead */}
+          <div aria-hidden="true" style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 2, marginLeft: -1, background: "#fff", boxShadow: "0 0 4px rgba(0,0,0,0.6)", pointerEvents: "none" }} />
+        </div>
+
+        {/* 3. Primary actions */}
+        <div style={{ flexShrink: 0, display: "flex", gap: 8, padding: "8px 12px" }}>
+          {primary("zoom", "🔍", "Custom Zoom", () => draft ? setMobileZoomDraft(null) : startMobileZoomDraft(), CUSTOM_ZOOM_CLIP_COLOR, !!draft)}
+          {primary("play", isPlaying ? "❚❚" : "▶", isPlaying ? "Pause" : "Play", togglePlay, "#c8f135", isPlaying)}
+          {primary("cutto", "✂", "Cut To", () => setCutToPickerOpen(true), CUT_TO_CLIP_COLOR, cutToPickerOpen)}
+          {primary("flash", "⚡", "Flash", () => { void openFlashPicker(); }, FLASH_CLIP_COLOR, flashPickerOpen)}
+        </div>
+
+        {/* 4. Tools (scroll horizontally) */}
+        <div style={{ flexShrink: 0, display: "flex", overflowX: "auto", gap: 2, padding: "2px 8px calc(6px + env(safe-area-inset-bottom))", borderTop: "1px solid rgba(255,255,255,0.08)", scrollbarWidth: "none", touchAction: "pan-x" }}>
+          {selected && tool("delete", "🗑", "Delete clip", () => { deleteClip(selected.id); setClipSelection([]); })}
+          {tool("media", "＋", "Add Media", undefined, <input type="file" accept="image/*,video/*" multiple aria-label="Add media" style={nativeFilePickerStyle} onChange={(event) => { void handleMobileAddMedia(event); }} />)}
+          {tool("narration", "🎙", "Narration", () => setMobileSheet("narration"))}
+          {tool("annotations", "✎", "Annotations", () => setToast("Drawing annotations is desktop-only for now"))}
+          {tool("captions", "CC", "Captions", () => setMobileSheet("captions"))}
+          {tool("export", isExporting ? "✕" : "⬇", isExporting ? "Cancel export" : "Export", () => { if (isExporting) cancelExport(); else void startExport(); })}
+          {tool("settings", "⚙", "Settings", () => setBoardSettingsOpen(true))}
+          {tool("bleep", "🔇", "Bleep", insertBleep, undefined, !hasNarration)}
+          {AI_FEATURES_ENABLED && tool("autobuild", "✦", "Auto-build", () => { void autoBuildFromNarration(); }, undefined, !hasNarration || !!autoBuildPhase)}
+          {tool("save", "💾", "Save", () => setSaveModalOpen(true))}
+        </div>
+
+        {renderFlashPicker()}
+        {renderCutToPicker()}
+        {mobileSheet && <div onClick={() => setMobileSheet(null)} style={{ position: "fixed", inset: 0, zIndex: 900, background: "rgba(0,0,0,0.35)" }} />}
+        {mobileSheet === "narration" && (
+          <div role="dialog" aria-label="Narration" style={MOBILE_SHEET_STYLE}>
+            {sheetHeader("🎙 Narration")}
+            <label style={{ ...uploadControlStyle, minHeight: 48, fontSize: 12 }}>↑ Upload narration audio<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration audio" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileSheet(null); }} /></label>
+            <label style={{ ...uploadControlStyle, minHeight: 48, fontSize: 12 }}>↑ Upload narration video<input type="file" accept="video/*" aria-label="Upload narration video" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationVideoUpload(event); setMobileSheet(null); }} /></label>
+            <button type="button" onClick={() => { if (isRecording) stopNarrationRecording(); else void startNarrationRecording(); setMobileSheet(null); }} style={{ ...sheetButton, background: isRecording ? "#ff5e3a" : sheetButton.background }}>
+              {isRecording ? "■ Stop recording" : "● Record narration"}
+            </button>
+          </div>
+        )}
+        {mobileSheet === "captions" && (
+          <div role="dialog" aria-label="Captions" style={MOBILE_SHEET_STYLE}>
+            {sheetHeader("CC Captions")}
+            <button type="button" disabled={!hasNarration || !!captionGenerationPhase} onClick={() => { void generateNarrationCaptions(); }} style={{ ...sheetButton, opacity: hasNarration ? 1 : 0.45 }}>
+              {captionGenerationPhase ? `⟳ ${captionGenerationPhase}` : captionTrack.length ? "↻ Regenerate captions" : "✦ Generate captions from narration"}
+            </button>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 44, fontSize: 12 }}>
+              <input type="checkbox" checked={captionsEnabled} disabled={!captionTrack.length} onChange={(event) => setCaptionsEnabled(event.target.checked)} style={{ width: 22, height: 22 }} />
+              Show captions
+            </label>
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["small", "medium", "large"] as const).map((size) => (
+                <button key={size} type="button" onClick={() => setCaptionFontSize(size)} style={{ ...miniButton, flex: 1, minHeight: 44, background: captionFontSize === size ? "#2a2a2a" : "transparent", color: captionFontSize === size ? "#fff" : "#2a2a2a" }}>{size}</button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["upper", "lower"] as const).map((position) => (
+                <button key={position} type="button" onClick={() => setCaptionPosition(position)} style={{ ...miniButton, flex: 1, minHeight: 44, background: captionPosition === position ? "#2a2a2a" : "transparent", color: captionPosition === position ? "#fff" : "#2a2a2a" }}>{position === "upper" ? "Top" : "Bottom"}</button>
+              ))}
+            </div>
+            {!hasNarration && <span style={{ fontSize: 10, color: "#6a6a6a" }}>Add narration first: captions come from its transcript.</span>}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Flash and Cut To pickers: popovers above the desktop timeline, bottom sheets in the mobile editor.
+  function renderFlashPicker() {
+    if (!flashPickerOpen) return null;
+    return (
+              <>
+                <div onClick={closeFlashPicker} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
+                <div
+                  role="dialog"
+                  aria-label="Flash cut picker"
+                  style={mobileEditorMode ? MOBILE_SHEET_STYLE : {
+                    position: "fixed", left: isMobile ? 8 : 120, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
+                    // Grows upward from the timeline; cap it to the room under the top bar so a large
+                    // library scrolls inside the picker instead of pushing its header off-screen.
+                    width: isMobile ? undefined : 380, maxHeight: `min(60vh, calc(100dvh - ${(isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8 + topBar.height + 8}px - env(safe-area-inset-top)))`, overflowY: "auto", zIndex: 901, boxSizing: "border-box",
+                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
+                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 10,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <strong style={{ fontSize: 12 }}>⚡ Flash cut</strong>
+                    <button type="button" onClick={closeFlashPicker} style={miniButton}>✕</button>
+                  </div>
+                  {!flashAssets ? (
+                    <div style={{ fontSize: 10, color: "#6a6a6a" }}>Loading…</div>
+                  ) : (
+                    <>
+                      <div style={panelLabelStyle}>Image ({flashAssets.images.length})</div>
+                      {flashAssets.images.length === 0 ? (
+                        <div style={{ fontSize: 10, color: "#a32916" }}>No images in public/flash/images</div>
+                      ) : (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {flashAssets.images.map((asset) => (
+                            <button
+                              key={asset.url}
+                              type="button"
+                              data-flash-image={asset.url}
+                              title={asset.name}
+                              onClick={() => setFlashPickImageUrl(asset.url)}
+                              style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      <div style={panelLabelStyle}>Sound ({flashAssets.sounds.length})</div>
+                      {flashAssets.sounds.length === 0 && (
+                        <div style={{ fontSize: 10, color: "#a32916" }}>No sounds in public/flash/sounds</div>
+                      )}
+                      {flashAssets.sounds.map((asset) => (
+                        <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <button type="button" title="Preview sound" aria-label={`Preview ${asset.name}`} onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 28, padding: 0 }}>▶</button>
+                          <button
+                            type="button"
+                            data-flash-sound={asset.url}
+                            onClick={() => setFlashPickSoundUrl(asset.url)}
+                            style={{ ...miniButton, flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: asset.url === flashPickSoundUrl ? "#2a2a2a" : "transparent", color: asset.url === flashPickSoundUrl ? "#fff" : "#2a2a2a" }}
+                          >
+                            {asset.name}
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        disabled={!flashPickImageUrl || !flashPickSoundUrl}
+                        onClick={() => {
+                          if (!flashPickImageUrl || !flashPickSoundUrl) return;
+                          insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
+                          closeFlashPicker();
+                        }}
+                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl && flashPickSoundUrl ? 1 : 0.4 }}
+                      >
+                        Insert at {formatTime(playhead)} · {FLASH_CUT_DEFAULT_DURATION}s
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+    );
+  }
+
+  function renderCutToPicker() {
+    if (!cutToPickerOpen) return null;
+    return (
+              <>
+                <div onClick={() => setCutToPickerOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
+                <div
+                  role="dialog"
+                  aria-label="Cut To"
+                  style={mobileEditorMode ? MOBILE_SHEET_STYLE : {
+                    position: "fixed", left: isMobile ? 8 : 200, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
+                    width: isMobile ? undefined : 300, zIndex: 901, boxSizing: "border-box",
+                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
+                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 8,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <strong style={{ fontSize: 12 }}>✂ Cut To · at {formatTime(playhead)}</strong>
+                    <button type="button" onClick={() => setCutToPickerOpen(false)} style={miniButton}>✕</button>
+                  </div>
+                  {narrationVideoClip(clips) && (
+                    <button type="button" onClick={() => { void insertCutToNarration(); }} style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, textAlign: "left" }}>
+                      🎙 Narration video
+                    </button>
+                  )}
+                  <label style={{ ...uploadControlStyle, fontSize: 11 }}>
+                    ⬆ Upload image or video
+                    <input type="file" accept="image/*,video/*" aria-label="Upload a Cut To image or video" style={nativeFilePickerStyle} onChange={(event) => { void insertCutToFile(event); }} />
+                  </label>
+                  <span style={{ fontSize: 9, color: "#6a6a6a" }}>Adds a {CUT_TO_DEFAULT_DURATION}s block; drag its edges on the timeline to change how long it shows.</span>
+                </div>
+              </>
     );
   }
 
@@ -25842,7 +26434,7 @@ function Board2Editor({
     );
   })();
 
-  const topBar = touchSizedTopBar(EDITOR_TOP_BAR, isMobile);
+  const topBar = mobileEditorMode ? MOBILE_EDITOR_TOP_BAR : touchSizedTopBar(EDITOR_TOP_BAR, isMobile);
   // An anonymous board expires unless its creator saves it to an account (a quiet top-bar button).
   const canSaveBoardToAccount = !viewOnly && !!joinCode && joinAnonymous && !!joinOwnerToken;
   const boardExpiryLabel = (() => {
@@ -25862,6 +26454,8 @@ function Board2Editor({
       <div ref={videoHiddenContainerRef} style={{ display: "none" }} aria-hidden="true" />
       <style>{`
         @keyframes nbpulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes nbSheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        [data-mobile-editor] ::-webkit-scrollbar { display: none; }
         /* CSS fullscreen (no Fullscreen API, e.g. iPhone Safari): the page is exactly the viewport and never scrolls. */
         html.nb-fullscreen-mode, html.nb-fullscreen-mode body { height: 100dvh; overflow: hidden; overscroll-behavior: none; }
         [data-board2-exporting] > :not(style):not([aria-hidden="true"]):not([data-export-progress]) { visibility: hidden !important; }
@@ -26001,12 +26595,9 @@ function Board2Editor({
               style={{ display: "flex", alignItems: "center", gap: 2, height: topBar.button, padding: "0 6px 0 2px", border: 0, borderRadius: 7, background: "transparent", color: topBar.muted, cursor: "pointer", whiteSpace: "nowrap" }}
             >
               <BackIcon />
-              <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>
+              {/* Phones need the room for the code pill and the action buttons. */}
+              {!mobileEditorMode && <span style={{ fontFamily: "'Caveat', cursive", fontSize: 19, fontWeight: 700, lineHeight: 1 }}>Neural Board</span>}
             </button>
-            {isMobile && (
-              <button type="button" aria-label="Open editor menu" aria-expanded={mobileEditorMenuOpen} onClick={() => setMobileEditorMenuOpen((open) => !open)} className={shellStyles.glassButton} style={{ fontSize: 15 }}><span>☰</span></button>
-            )}
-            {isMobile && <button onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"} style={{ ...miniButton, width: topBar.button, height: topBar.button, padding: 0, borderRadius: 7, borderColor: topBar.activeBorder, background: isPlaying ? "#ff5e3a" : "#c8f135", fontSize: 12 }}>{isPlaying ? "⏸" : "▶"}</button>}
           </div>
 
           {/* Center: the board's share code and who's on the board */}
@@ -26142,7 +26733,7 @@ function Board2Editor({
       <div style={{ display: "flex", flex: 1, minHeight: 0, flexDirection: "column", overflow: "hidden" }}>
 
         {/* Top row: media | board+preview | properties */}
-        <div style={{ display: "flex", flex: 1, minHeight: 0, borderBottom: chromeHidden ? 0 : "1.5px solid rgba(42,42,42,0.15)" }}>
+        <div style={{ display: mobileEditorMode ? "none" : "flex", flex: 1, minHeight: 0, borderBottom: chromeHidden ? 0 : "1.5px solid rgba(42,42,42,0.15)" }}>
 
           {/* ── Left: media library ── */}
           <div style={{ width: 210, flexShrink: 0, borderRight: "1.5px solid rgba(42,42,42,0.15)", padding: "14px 12px", display: chromeHidden || isMobile ? "none" : "flex", flexDirection: "column", gap: 8, overflowY: "auto", background: "rgba(255,253,245,0.65)" }}>
@@ -27725,7 +28316,7 @@ function Board2Editor({
                   </button>
                 </div>
               </div>
-              {previewVisible && (
+              {previewVisible && !mobileEditorMode && (
                 <div style={{ position: "relative", width: previewW, height: previewHeight }}>
                   {renderCutToEditOverlay(previewW, previewHeight)}
                   <canvas
@@ -28951,7 +29542,8 @@ function Board2Editor({
         </div>
 
         {/* ── Bottom: timeline ── */}
-        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: chromeHidden ? "none" : "flex", flexDirection: "column" }}>
+        {mobileEditorMode && renderMobileEditor()}
+        <div style={{ height: isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H, paddingBottom: isMobile ? "env(safe-area-inset-bottom)" : undefined, boxSizing: "border-box", flexShrink: 0, background: "rgba(255,253,245,0.85)", display: chromeHidden || mobileEditorMode ? "none" : "flex", flexDirection: "column" }}>
 
           {/* Timeline controls bar */}
           <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 5 : 8, padding: isMobile ? "3px max(6px, env(safe-area-inset-left))" : "6px 12px", borderBottom: "1px solid rgba(42,42,42,0.12)", background: "rgba(245,236,216,0.85)", flexShrink: 0, flexWrap: "nowrap", overflowX: isMobile ? "auto" : "visible" }}>
@@ -28973,80 +29565,7 @@ function Board2Editor({
             >
               ⚡ Flash
             </button>
-            {flashPickerOpen && (
-              <>
-                <div onClick={closeFlashPicker} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
-                <div
-                  role="dialog"
-                  aria-label="Flash cut picker"
-                  style={{
-                    position: "fixed", left: isMobile ? 8 : 120, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
-                    // Grows upward from the timeline; cap it to the room under the top bar so a large
-                    // library scrolls inside the picker instead of pushing its header off-screen.
-                    width: isMobile ? undefined : 380, maxHeight: `min(60vh, calc(100dvh - ${(isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8 + topBar.height + 8}px - env(safe-area-inset-top)))`, overflowY: "auto", zIndex: 901, boxSizing: "border-box",
-                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
-                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 10,
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <strong style={{ fontSize: 12 }}>⚡ Flash cut</strong>
-                    <button type="button" onClick={closeFlashPicker} style={miniButton}>✕</button>
-                  </div>
-                  {!flashAssets ? (
-                    <div style={{ fontSize: 10, color: "#6a6a6a" }}>Loading…</div>
-                  ) : (
-                    <>
-                      <div style={panelLabelStyle}>Image ({flashAssets.images.length})</div>
-                      {flashAssets.images.length === 0 ? (
-                        <div style={{ fontSize: 10, color: "#a32916" }}>No images in public/flash/images</div>
-                      ) : (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {flashAssets.images.map((asset) => (
-                            <button
-                              key={asset.url}
-                              type="button"
-                              data-flash-image={asset.url}
-                              title={asset.name}
-                              onClick={() => setFlashPickImageUrl(asset.url)}
-                              style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
-                            />
-                          ))}
-                        </div>
-                      )}
-                      <div style={panelLabelStyle}>Sound ({flashAssets.sounds.length})</div>
-                      {flashAssets.sounds.length === 0 && (
-                        <div style={{ fontSize: 10, color: "#a32916" }}>No sounds in public/flash/sounds</div>
-                      )}
-                      {flashAssets.sounds.map((asset) => (
-                        <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <button type="button" title="Preview sound" aria-label={`Preview ${asset.name}`} onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 28, padding: 0 }}>▶</button>
-                          <button
-                            type="button"
-                            data-flash-sound={asset.url}
-                            onClick={() => setFlashPickSoundUrl(asset.url)}
-                            style={{ ...miniButton, flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", background: asset.url === flashPickSoundUrl ? "#2a2a2a" : "transparent", color: asset.url === flashPickSoundUrl ? "#fff" : "#2a2a2a" }}
-                          >
-                            {asset.name}
-                          </button>
-                        </div>
-                      ))}
-                      <button
-                        type="button"
-                        disabled={!flashPickImageUrl || !flashPickSoundUrl}
-                        onClick={() => {
-                          if (!flashPickImageUrl || !flashPickSoundUrl) return;
-                          insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
-                          closeFlashPicker();
-                        }}
-                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl && flashPickSoundUrl ? 1 : 0.4 }}
-                      >
-                        Insert at {formatTime(playhead)} · {FLASH_CUT_DEFAULT_DURATION}s
-                      </button>
-                    </>
-                  )}
-                </div>
-              </>
-            )}
+            {!mobileEditorMode && renderFlashPicker()}
             <button
               onClick={() => setCutToPickerOpen((open) => !open)}
               aria-expanded={cutToPickerOpen}
@@ -29055,36 +29574,7 @@ function Board2Editor({
             >
               ✂ Cut To
             </button>
-            {cutToPickerOpen && (
-              <>
-                <div onClick={() => setCutToPickerOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 900 }} />
-                <div
-                  role="dialog"
-                  aria-label="Cut To"
-                  style={{
-                    position: "fixed", left: isMobile ? 8 : 200, right: isMobile ? 8 : undefined, bottom: (isMobile ? (isPortrait ? 156 : 104) : TIMELINE_H) + 8,
-                    width: isMobile ? undefined : 300, zIndex: 901, boxSizing: "border-box",
-                    background: "#fffdf5", border: "2px solid #2a2a2a", boxShadow: "4px 4px 0 #2a2a2a", padding: 12,
-                    fontFamily: "monospace", display: "flex", flexDirection: "column", gap: 8,
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <strong style={{ fontSize: 12 }}>✂ Cut To · at {formatTime(playhead)}</strong>
-                    <button type="button" onClick={() => setCutToPickerOpen(false)} style={miniButton}>✕</button>
-                  </div>
-                  {narrationVideoClip(clips) && (
-                    <button type="button" onClick={() => { void insertCutToNarration(); }} style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, textAlign: "left" }}>
-                      🎙 Narration video
-                    </button>
-                  )}
-                  <label style={{ ...uploadControlStyle, fontSize: 11 }}>
-                    ⬆ Upload image or video
-                    <input type="file" accept="image/*,video/*" aria-label="Upload a Cut To image or video" style={nativeFilePickerStyle} onChange={(event) => { void insertCutToFile(event); }} />
-                  </label>
-                  <span style={{ fontSize: 9, color: "#6a6a6a" }}>Adds a {CUT_TO_DEFAULT_DURATION}s block; drag its edges on the timeline to change how long it shows.</span>
-                </div>
-              </>
-            )}
+            {!mobileEditorMode && renderCutToPicker()}
             <button
               onClick={insertBleep}
               title="Insert a bleep at the playhead: silences the narration under it and plays a censor tone"
@@ -30615,6 +31105,14 @@ const EDITOR_TOP_BAR: TopBarTheme = {
   background: "rgba(255,253,245,0.65)", borderBottom: "1.5px solid rgba(42,42,42,0.15)", ink: "#2a2a2a", muted: "rgba(42,42,42,0.55)",
   activeBg: "rgba(42,42,42,0.07)", activeBorder: "rgba(42,42,42,0.2)",
   pillBorder: "rgba(42,42,42,0.2)", pillBg: "transparent", dotRing: "#fffdf5",
+};
+
+// The mobile video editor is dark end to end (see MOBILE_EDITOR_BG).
+const MOBILE_EDITOR_TOP_BAR: TopBarTheme = {
+  height: 44, button: 44, icon: 17,
+  background: MOBILE_EDITOR_BG, borderBottom: "1px solid rgba(255,255,255,0.08)", ink: MOBILE_EDITOR_INK, muted: MOBILE_EDITOR_MUTED,
+  activeBg: "rgba(255,255,255,0.12)", activeBorder: "rgba(255,255,255,0.3)",
+  pillBorder: "rgba(255,255,255,0.25)", pillBg: "transparent", dotRing: MOBILE_EDITOR_BG,
 };
 
 // On touch screens every top-bar control is at least 44×44 (buttons 46, so the code pill at
