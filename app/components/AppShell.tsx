@@ -225,17 +225,25 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
 
   const needle = query.trim().toLowerCase();
   const boards = feed.kind === "ready" ? feed.boards.filter((board) => !needle || board.title.toLowerCase().includes(needle)) : [];
+  const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const copyCode = (code: string) => {
+    void navigator.clipboard.writeText(code).then(() => {
+      setCopiedCode(code);
+      window.setTimeout(() => setCopiedCode((current) => current === code ? null : current), 1400);
+    }, () => {});
+  };
 
   return (
     <>
       <h1 className={styles.srOnly}>Public boards</h1>
+      <PublishedFromThisDevice copiedCode={copiedCode} onCopy={copyCode} />
       {feed.kind === "loading" ? (
         <section className={styles.empty}>Loading boards…</section>
       ) : boards.length > 0 ? (
         // Every board is equal: one grid, newest first, nothing featured.
         <ul className={styles.feedGrid}>
           {boards.map((board) => (
-            <li key={board.id}>
+            <li key={board.id} className={styles.feedItem}>
               <a className={styles.card} href={viewUrl(board.id)} aria-label={`View ${board.title}`}>
                 <span className={styles.thumb}>
                   {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
@@ -243,6 +251,8 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
                 </span>
                 <span className={styles.cardTitle}>{board.title}</span>
               </a>
+              {/* Published without an account: its join code opens it for editing on any device. */}
+              {board.joinCode && <BoardCodeRow code={board.joinCode} copied={copiedCode === board.joinCode} onCopy={copyCode} />}
             </li>
           ))}
         </ul>
@@ -259,6 +269,52 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
         </section>
       )}
     </>
+  );
+}
+
+function BoardCodeRow({ code, copied, onCopy, openLabel = "Join to edit" }: { code: string; copied: boolean; onCopy: (code: string) => void; openLabel?: string }) {
+  return (
+    <div className={styles.cardJoin}>
+      <button type="button" className={styles.codeChip} onClick={() => onCopy(code)} title="Copy join code" aria-label={`Join code ${code}, copy`}>
+        {copied ? "Copied!" : code}
+      </button>
+      <a className={styles.joinLink} href={`/board2?join=${code}`}>{openLabel}</a>
+    </div>
+  );
+}
+
+// Boards this device published by saving without an account (nb_anon_boards), with their codes, so
+// they can be reopened here or entered on another device. Shown signed in or not.
+function PublishedFromThisDevice({ copiedCode, onCopy }: { copiedCode: string | null; onCopy: (code: string) => void }) {
+  const [boards, setBoards] = useState<Array<{ code: string; publishedId: string; expiresAt: string | null }>>([]);
+  useEffect(() => {
+    const now = Date.now();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is read after hydration
+    setBoards(Object.entries(readCreatedBoards())
+      .filter(([, board]) => !!board.publishedId && (!board.expiresAt || Date.parse(board.expiresAt) > now))
+      .sort(([, a], [, b]) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
+      .map(([code, board]) => ({ code, publishedId: board.publishedId!, expiresAt: board.expiresAt })));
+  }, []);
+  if (!boards.length) return null;
+  return (
+    <section className={styles.myPublished} aria-labelledby="my-published-title">
+      <h2 id="my-published-title" className={styles.sectionTitle}>Published from this device</h2>
+      <p className={styles.caption}>Enter a board’s code on another device to keep editing it there.</p>
+      <ul className={styles.feedGrid}>
+        {boards.map((board) => (
+          <li key={board.code} className={styles.feedItem}>
+            <a className={styles.card} href={`/board2?join=${board.code}`} aria-label={`Open board ${board.code}`}>
+              <span className={styles.thumb}>
+                {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
+                <img src={`/api/published-boards/${board.publishedId}/preview`} alt="" loading="lazy" />
+              </span>
+              <span className={styles.cardTitle}>{board.expiresAt ? `Expires ${new Date(board.expiresAt).toLocaleDateString()}` : "Saved to an account"}</span>
+            </a>
+            <BoardCodeRow code={board.code} copied={copiedCode === board.code} onCopy={onCopy} openLabel="Open" />
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

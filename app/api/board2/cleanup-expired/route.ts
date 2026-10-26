@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { getSupabase } from "@/lib/supabase";
+import { unpublishJoinCodes } from "@/lib/published-boards-server";
 
 const MEDIA_BUCKET = "joinable-board-media";
 const BOARDS_PER_RUN = 200;
@@ -30,7 +31,7 @@ async function cleanupExpired(request: Request) {
   try {
     const supabase = getSupabase();
     const { data: boards, error } = await supabase.from("joinable_boards")
-      .select("id").is("owner_email", null).lt("expires_at", new Date().toISOString())
+      .select("id,code").is("owner_email", null).lt("expires_at", new Date().toISOString())
       .limit(BOARDS_PER_RUN);
     if (error) throw error;
     let deletedFiles = 0;
@@ -52,6 +53,9 @@ async function cleanupExpired(request: Request) {
         console.error("CLEANUP_EXPIRED_MEDIA_FAIL", board.id, mediaError);
       }
     }
+    // Their publications (published from Save without an account) expire with them.
+    const expiredCodes = (boards ?? []).filter((board) => deletedBoardIds.includes(board.id)).map((board) => board.code as string);
+    await unpublishJoinCodes(expiredCodes);
     if (deletedBoardIds.length) {
       const { error: deleteError } = await supabase.from("joinable_boards").delete().in("id", deletedBoardIds).is("owner_email", null);
       if (deleteError) throw deleteError;

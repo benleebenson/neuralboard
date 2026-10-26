@@ -6,6 +6,7 @@ import { getSupabase } from "@/lib/supabase";
 import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
 import { joinableBoardError, joinTokenHash, participantIdFromToken, unexpiredBoardFilter } from "@/lib/joinable-board-server";
 import { checkJoinerUpdate } from "@/lib/joinable-board-permissions";
+import { unpublishJoinCodes } from "@/lib/published-boards-server";
 
 const active = () => new Date().toISOString();
 
@@ -91,6 +92,8 @@ export async function DELETE(request: Request) {
     if (!ownerByToken && !ownerByAccount) return forbidden();
     const { error } = await supabase.from("joinable_boards").update({ active: false, updated_at: active() }).eq("id", board.id);
     if (error) throw error;
+    // Its code is no longer usable, so a feed card showing it would only mislead.
+    await unpublishJoinCodes([code]).catch((unpublishError) => console.error("UNPUBLISH_JOIN_CODE_FAIL", unpublishError));
     return NextResponse.json({ ok: true });
   } catch (error) { return joinableBoardError(error); }
 }

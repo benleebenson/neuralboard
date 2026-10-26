@@ -132,7 +132,8 @@ export async function participantIdFor(token: string): Promise<string> {
 // The creator's owner token for each board made on this device, so they can come back to it,
 // stop sharing it, and claim it after signing in. Keyed by join code.
 export const CREATED_BOARDS_STORAGE_KEY = "nb_anon_boards";
-export type CreatedBoardRecord = { token: string; expiresAt: string | null; createdAt: string };
+// `publishedId`: the board's Home-feed publication, made by Save while signed out.
+export type CreatedBoardRecord = { token: string; expiresAt: string | null; createdAt: string; publishedId?: string };
 
 export function readCreatedBoards(): Record<string, CreatedBoardRecord> {
   try {

@@ -47,13 +47,13 @@ export type PublishPackage = { packageBlob: Blob; previewBlob: Blob };
  * 1920px, narration and video are kept as they are, and the result is still a valid .nbp the
  * editor loads unchanged. The owner's local file is never modified.
  */
-export async function buildPublishPackage(
-  directory: FileSystemDirectoryHandle,
-  fileName: string,
-  file: File,
-  onProgress: (fraction: number) => void,
-): Promise<PublishPackage> {
-  const { manifest, files } = readNbpManifest(new Uint8Array(await file.arrayBuffer()));
+/**
+ * A smaller copy of a .nbp for publishing: every still image is re-encoded to WebP and capped at
+ * 1920px, narration and video are kept as they are, and the result is still a valid .nbp the
+ * editor loads unchanged.
+ */
+export async function compressBoardPackage(nbpBytes: Uint8Array, onProgress: (fraction: number) => void = () => {}): Promise<Blob> {
+  const { manifest, files } = readNbpManifest(nbpBytes);
   const refs: AssetRef[] = [];
   collectAssetRefs(manifest, refs);
   const mimeByFile = new Map<string, string>();
@@ -84,10 +84,24 @@ export async function buildPublishPackage(
   for (const ref of refs) if (recompressed.has(ref.assetFile as string)) ref.assetMime = "image/webp";
   output["manifest.json"] = [new TextEncoder().encode(JSON.stringify(manifest)), { level: 6 }];
   const zipped = zipSync(output);
-  const packageBlob = new Blob([zipped.slice().buffer], { type: "application/zip" });
+  return new Blob([zipped.slice().buffer], { type: "application/zip" });
+}
 
+/** A feed-card preview (small WebP) from any image. */
+export function publishPreviewWebp(source: Blob): Promise<Blob> {
+  return encodeWebp(source, PREVIEW_LONG_SIDE, PREVIEW_QUALITY);
+}
+
+/** A boards-folder board's publish package; the owner's local file is never modified. */
+export async function buildPublishPackage(
+  directory: FileSystemDirectoryHandle,
+  fileName: string,
+  file: File,
+  onProgress: (fraction: number) => void,
+): Promise<PublishPackage> {
+  const packageBlob = await compressBoardPackage(new Uint8Array(await file.arrayBuffer()), onProgress);
   const composite = await boardCompositePreview(directory, fileName, file);
-  const previewBlob = await encodeWebp(composite, PREVIEW_LONG_SIDE, PREVIEW_QUALITY);
+  const previewBlob = await publishPreviewWebp(composite);
   onProgress(1);
   return { packageBlob, previewBlob };
 }
@@ -161,6 +175,36 @@ export async function publishBoard(input: {
     if ((error as DOMException)?.name === "AbortError") void unpublishBoard(start.id).catch(() => {});
     throw error;
   }
+}
+
+/**
+ * Publishes a board without an account: its creator proves ownership with the joinable board's
+ * owner token, and the publication is keyed by the join code (one per board, replaced on re-save).
+ */
+export async function publishAnonymousBoard(input: {
+  joinCode: string;
+  ownerToken: string;
+  title: string;
+  packageBlob: Blob;
+  previewBlob: Blob;
+  signal: AbortSignal;
+}): Promise<{ id: string }> {
+  const { joinCode, ownerToken, title, packageBlob, previewBlob, signal } = input;
+  const start = await json<PublishStart>(await fetch("/api/published-boards/anonymous", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ joinCode, ownerToken, title, packageBytes: packageBlob.size, previewBytes: previewBlob.size }),
+    signal,
+  }));
+  await uploadToSignedUrl(start.uploads.preview, previewBlob, () => {}, signal);
+  await uploadToSignedUrl(start.uploads.package, packageBlob, () => {}, signal);
+  await json<{ ok: true }>(await fetch("/api/published-boards/anonymous", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: start.id, version: start.version, title, joinCode, ownerToken }),
+    signal,
+  }));
+  return { id: start.id };
 }
 
 export async function unpublishBoard(id: string): Promise<void> {

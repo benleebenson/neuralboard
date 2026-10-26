@@ -24,7 +24,11 @@ export async function POST(request: Request) {
       .is("owner_email", null).gt("expires_at", new Date().toISOString())
       .select("code").maybeSingle();
     if (error) throw error;
-    if (data) return NextResponse.json({ ok: true });
+    if (data) {
+      // A publication made before claiming no longer expires either.
+      await supabase.from("published_boards").update({ expires_at: null }).eq("join_code", code);
+      return NextResponse.json({ ok: true });
+    }
     // Repeat claims (another tab, a retry) by the same account are fine.
     const { data: existing, error: lookupError } = await supabase.from("joinable_boards")
       .select("owner_email").eq("code", code).eq("owner_token_hash", tokenHash).maybeSingle();

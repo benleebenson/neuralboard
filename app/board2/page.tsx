@@ -22,7 +22,8 @@ import {
   Muxer as WebMMuxer,
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
-import { forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
+import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
+import { ANONYMOUS_BOARD_TTL_DAYS, forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
@@ -25153,6 +25154,11 @@ function Board2Editor({
                 onKeyDown={(e) => { if (e.key === "Enter") saveBoard(); if (e.key === "Escape") setSaveModalOpen(false); }}
                 style={{ width: "100%", fontFamily: "monospace", fontSize: 16, padding: "12px 10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" as const, marginBottom: 14, outline: "none" }}
               />
+              {!session?.user?.email && (
+                <p style={{ margin: "0 0 12px", fontFamily: "monospace", fontSize: 10, lineHeight: 1.5, color: "#6a4b00", background: "#fff4cf", border: "1px solid #e8cf86", padding: "6px 8px" }}>
+                  Not signed in: saving also publishes this board to the public boards feed with its join code, so you can open it on another device. Anyone with the code can view and edit it. It expires in {ANONYMOUS_BOARD_TTL_DAYS} days unless you sign in.
+                </p>
+              )}
               <div style={{ display: "flex", gap: 8 }}>
                 <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700, padding: "10px 0" }}>
                   {isSaving ? "Saving…" : "💾 Save .nbp"}
@@ -25522,11 +25528,60 @@ function Board2Editor({
       setIsDirty(false);
       setSaveModalOpen(false);
       setToast(savedToFolder ? "Board saved to library!" : "Board downloaded!");
+      if (!session?.user?.email) void publishAnonymousSave(zippedBytes, manifest.meta.title || saveName);
     } catch (err) {
       setToast(err instanceof Error ? err.message : "Save failed");
     } finally {
       setIsSaving(false);
     }
+  }
+
+  // Saving without an account also publishes the board to the Home feed with its join code, so its
+  // creator can find and reopen it from another device (making the board joinable first if it
+  // isn't). Runs in the background after the save itself; only the board's creator can publish.
+  async function publishAnonymousSave(nbpBytes: Uint8Array, title: string) {
+    let code = joinCode;
+    let token = joinOwnerToken || (joinCode ? readCreatedBoards()[joinCode]?.token ?? "" : "");
+    if (!code) {
+      const created = await makeBoardJoinable();
+      if (!created) return;
+      ({ code, token } = created);
+    }
+    if (!token) return;
+    try {
+      const packageBlob = await compressBoardPackage(nbpBytes);
+      const previewBlob = await publishPreviewWebp(await boardPreviewSnapshot(title));
+      const { id } = await publishAnonymousBoard({ joinCode: code, ownerToken: token, title: title || "Untitled board", packageBlob, previewBlob, signal: new AbortController().signal });
+      const record = readCreatedBoards()[code];
+      rememberCreatedBoard(code, { token, expiresAt: record?.expiresAt ?? null, createdAt: record?.createdAt ?? new Date().toISOString(), publishedId: id });
+      setToast(`Published to public boards · code ${code}`);
+    } catch (error) {
+      setToast(`Saved, but publishing failed: ${error instanceof Error ? error.message : "please try again"}`);
+    }
+  }
+
+  // The preview's current frame for a feed card, or a plain title card when it can't be read
+  // (hidden preview, or cross-origin media tainting the canvas).
+  async function boardPreviewSnapshot(title: string): Promise<Blob> {
+    const toBlob = (canvas: HTMLCanvasElement) => new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    const preview = canvasRef.current;
+    if (preview) {
+      try {
+        const blob = await toBlob(preview);
+        if (blob) return blob;
+      } catch {}
+    }
+    const fallback = document.createElement("canvas");
+    fallback.width = 640;
+    fallback.height = 360;
+    const ctx = fallback.getContext("2d")!;
+    ctx.fillStyle = boardColorRef.current;
+    ctx.fillRect(0, 0, fallback.width, fallback.height);
+    ctx.fillStyle = "#2a2a2a";
+    ctx.font = "bold 34px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText((title || "Untitled board").slice(0, 26), fallback.width / 2, fallback.height / 2 + 12);
+    return (await toBlob(fallback)) ?? new Blob([], { type: "image/png" });
   }
 
   // "Export board data": the same complete recipe as Save Board, but as a single self-contained
@@ -26348,7 +26403,8 @@ function Board2Editor({
   }
 
   // No account needed: signed out, this creates an anonymous board that expires unless saved.
-  async function makeBoardJoinable() {
+  // Resolves to the new code and owner token, or null if it failed.
+  async function makeBoardJoinable(): Promise<{ code: string; token: string } | null> {
     setJoinStatus("connecting");
     try {
       const response = await fetch("/api/joinable-board", { method: "POST" });
@@ -26395,9 +26451,11 @@ function Board2Editor({
       setToast(notShared.length
         ? `Board join code: ${result.code}. Only on this device, not shared: ${notShared.join(", ")}`
         : `Board join code: ${result.code}`);
-    } catch (error) {
+
+      return { code: result.code, token: result.token };    } catch (error) {
       setJoinStatus("error");
       setToast(error instanceof Error ? error.message : "Could not make this board joinable.");
+      return null;
     }
   }
 
@@ -30869,6 +30927,11 @@ function Board2Editor({
               onKeyDown={(e) => { if (e.key === "Enter") saveBoard(); if (e.key === "Escape") setSaveModalOpen(false); }}
               style={{ width: "100%", fontFamily: "monospace", fontSize: 14, padding: "9px 10px", border: "1.5px solid #2a2a2a", background: "#fff", boxSizing: "border-box" as const, marginBottom: 14, outline: "none" }}
             />
+            {!session?.user?.email && (
+              <p style={{ margin: "0 0 12px", fontFamily: "monospace", fontSize: 10, lineHeight: 1.5, color: "#6a4b00", background: "#fff4cf", border: "1px solid #e8cf86", padding: "6px 8px" }}>
+                Not signed in: saving also publishes this board to the public boards feed with its join code, so you can open it on another device. Anyone with the code can view and edit it. It expires in {ANONYMOUS_BOARD_TTL_DAYS} days unless you sign in.
+              </p>
+            )}
             <div style={{ display: "flex", gap: 8 }}>
               <button onClick={saveBoard} disabled={isSaving} style={{ ...sketchButton, flex: 1, background: "#c8f135", fontWeight: 700 }}>
                 {isSaving ? "Saving…" : "💾 Save .nbp"}

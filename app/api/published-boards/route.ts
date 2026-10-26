@@ -13,6 +13,7 @@ import {
   type PublishStart,
 } from "@/lib/published-boards";
 import { publishedBoardsError, sessionEmail } from "@/lib/published-boards-server";
+import { unexpiredBoardFilter } from "@/lib/joinable-board-server";
 
 const PER_USER_MAX = 25;
 const noStore = { "Cache-Control": "no-store" };
@@ -20,15 +21,28 @@ const noStore = { "Cache-Control": "no-store" };
 /** Home feed: every published board, newest first. Open to everyone, signed in or not. */
 export async function GET() {
   try {
-    const { data, error } = await getSupabase()
+    const supabase = getSupabase();
+    const { data, error } = await supabase
       .from("published_boards")
-      .select("id,title,published_at")
+      .select("id,title,published_at,join_code")
       .not("published_at", "is", null)
       .not("package_path", "is", null)
+      .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
       .order("published_at", { ascending: false })
       .limit(200);
     if (error) throw error;
-    const boards: PublishedBoardCard[] = (data ?? []).map((row) => ({ id: row.id, title: row.title, publishedAt: row.published_at }));
+    // Boards published without an account show their join code (so anyone can open and edit them,
+    // including their creator on another device) only while that board is still being shared.
+    const codes = (data ?? []).flatMap((row) => row.join_code ? [row.join_code as string] : []);
+    let liveCodes = new Set<string>();
+    if (codes.length) {
+      const { data: live, error: liveError } = await supabase.from("joinable_boards").select("code").in("code", codes).eq("active", true).or(unexpiredBoardFilter());
+      if (liveError) throw liveError;
+      liveCodes = new Set((live ?? []).map((board) => board.code as string));
+    }
+    const boards: PublishedBoardCard[] = (data ?? [])
+      .filter((row) => !row.join_code || liveCodes.has(row.join_code))
+      .map((row) => ({ id: row.id, title: row.title, publishedAt: row.published_at, ...(row.join_code ? { joinCode: row.join_code } : {}) }));
     return NextResponse.json({ boards }, { headers: noStore });
   } catch (error) { return publishedBoardsError(error); }
 }
