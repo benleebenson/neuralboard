@@ -174,6 +174,7 @@ import {
   type NarrationVideoShape,
   type NormalizedRect,
 } from "@/lib/board2/narration-video";
+import { NARRATION_FILE_ACCEPT, dragCarriesFiles, isNarrationFile, narrationDragVerdict } from "@/lib/board2/narration-drop";
 import {
   TRANSCRIPTION_CHUNK_CONTEXT_SECONDS,
   TRANSCRIPTION_CHUNK_SECONDS,
@@ -6622,6 +6623,7 @@ function Board2Editor({
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; timeSec: number; clipId?: string } | null>(null);
   const [clipboardReady, setClipboardReady] = useState(false);
   const [isBoardDropActive, setIsBoardDropActive] = useState(false);
+  const [narrationDropVerdict, setNarrationDropVerdict] = useState<"accept" | "reject" | null>(null);
   const [mediaEditDraft, setMediaEditDraft] = useState<MediaEditDraft | null>(null);
   const [narrationVideoDraft, setNarrationVideoDraft] = useState<NarrationVideoDraft | null>(null);
   const narrationVideoPlayPendingRef = useRef<Set<string>>(new Set());
@@ -12277,7 +12279,7 @@ function Board2Editor({
         {mobileSheet === "narration" && (
           <div role="dialog" aria-label="Narration" style={MOBILE_SHEET_STYLE}>
             {sheetHeader("🎙 Narration")}
-            <label style={{ ...uploadControlStyle, minHeight: 48, fontSize: 12 }}>↑ Upload narration audio<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload narration audio" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileSheet(null); }} /></label>
+            <label style={{ ...uploadControlStyle, minHeight: 48, fontSize: 12 }}>↑ Upload narration audio<input type="file" accept={NARRATION_FILE_ACCEPT} aria-label="Upload narration audio" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileSheet(null); }} /></label>
             <label style={{ ...uploadControlStyle, minHeight: 48, fontSize: 12 }}>↑ Upload narration video<input type="file" accept="video/*" aria-label="Upload narration video" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationVideoUpload(event); setMobileSheet(null); }} /></label>
             <button type="button" onClick={() => { if (isRecording) stopNarrationRecording(); else void startNarrationRecording(); setMobileSheet(null); }} style={{ ...sheetButton, background: isRecording ? "#ff5e3a" : sheetButton.background }}>
               {isRecording ? "■ Stop recording" : "● Record narration"}
@@ -13216,6 +13218,42 @@ function Board2Editor({
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    await addNarrationFromFile(file);
+  }
+
+  // OS file drags onto the timeline's narration row load narration exactly as the Upload narration
+  // input does (added at the playhead, alongside any existing narration). Other rows keep their
+  // media-library drop.
+  function isOverNarrationRow(e: React.DragEvent<HTMLDivElement>): boolean {
+    const y = e.clientY - e.currentTarget.getBoundingClientRect().top;
+    return y >= TRACK_H && y <= TRACK_H + 4 + NARRATION_TRACK_H + 4;
+  }
+
+  function handleTimelineDragOver(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const verdict = dragCarriesFiles(e.dataTransfer) && isOverNarrationRow(e) ? narrationDragVerdict(e.dataTransfer) : null;
+    if (verdict) e.dataTransfer.dropEffect = verdict === "accept" ? "copy" : "none";
+    setNarrationDropVerdict(verdict);
+  }
+
+  function handleTimelineDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setNarrationDropVerdict(null);
+  }
+
+  async function handleTimelineFileDrop(e: React.DragEvent<HTMLDivElement>) {
+    setNarrationDropVerdict(null);
+    if (!dragCarriesFiles(e.dataTransfer)) { void handleTimelineDrop(e); return; }
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files ?? []);
+    if (!isOverNarrationRow(e)) {
+      setToast("Drop audio on the narration row, or drop images and video on the board");
+      return;
+    }
+    const file = files.find(isNarrationFile);
+    if (!file) {
+      setToast(`${files[0]?.name || "That file"} isn't audio — drop an mp3, wav, m4a, aac, ogg, flac, mp4, mov or webm`);
+      return;
+    }
     await addNarrationFromFile(file);
   }
 
@@ -24671,7 +24709,7 @@ function Board2Editor({
                     </ProGated>}
                     <label style={{ ...uploadControlStyle, width: "100%", padding: "10px 14px", fontSize: 13 }}>
                       ↑ Upload narration
-                      <input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileDrawer(null); }} />
+                      <input type="file" accept={NARRATION_FILE_ACCEPT} aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileDrawer(null); }} />
                     </label>
                     <ProGated featureName="Narration Recording">
                       <button
@@ -26768,7 +26806,7 @@ function Board2Editor({
           )}
           <button onClick={() => { setSaveModalOpen(true); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, background: SAVE_BUTTON_COLOR, fontWeight: 700 }}>💾 Save</button>
           <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={(event) => { void handleMediaUpload(event); setMobileEditorMenuOpen(false); }} /></label>
-          <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
+          <label style={{ ...uploadControlStyle, padding: "10px 5px", fontSize: 10 }}>↑ Upload narration<input type="file" accept={NARRATION_FILE_ACCEPT} aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={(event) => { void handleNarrationUpload(event); setMobileEditorMenuOpen(false); }} /></label>
           {!viewOnly && <button onClick={() => { void openImportBoardPicker(); setMobileEditorMenuOpen(false); }} disabled={isImportingBoard} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: isImportingBoard ? .45 : 1 }}>⤓ Import board</button>}
           <button onClick={() => { projectFileInputRef.current?.click(); setMobileEditorMenuOpen(false); }} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10 }}>📂 Load</button>
           <button onClick={() => { void generateCameraKeyframes(); setMobileEditorMenuOpen(false); }} disabled={!canGenerateCamera || !!cameraGenerationPhase} style={{ ...sketchButton, padding: "10px 5px", fontSize: 10, opacity: canGenerateCamera && !cameraGenerationPhase ? 1 : .45 }}>{cameraGenerationPhase ? "⟳ Camera…" : `⬡ Camera ${keyframesOutOfDate ? "⚠" : cameraKeyframes.length ? `✓${cameraKeyframes.length}` : ""}`}</button>
@@ -26807,7 +26845,7 @@ function Board2Editor({
               {isSaving ? "Saving…" : "💾 Save board"}
             </button>
             <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload media<input type="file" accept="image/*,video/*" multiple aria-label="Upload media" style={nativeFilePickerStyle} onChange={handleMediaUpload} /></label>
-            <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload narration<input type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mov,.webm" aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
+            <label style={{ ...uploadControlStyle, flexShrink: 0 }}>↑ Upload narration<input type="file" accept={NARRATION_FILE_ACCEPT} aria-label="Upload audio or MP4 narration" style={nativeFilePickerStyle} onChange={handleNarrationUpload} /></label>
             <label title="A video of you talking: its sound becomes the narration and the video goes on the board" style={{ ...uploadControlStyle, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
               <svg aria-hidden="true" width="13" height="10" viewBox="0 0 13 10" style={{ flexShrink: 0 }}><rect x="0.75" y="1.25" width="8" height="7.5" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.5" /><path d="M9.5 4 L12.25 2.25 V7.75 L9.5 6 Z" fill="currentColor" /></svg>
               ↑ Upload narration video
@@ -29784,8 +29822,9 @@ function Board2Editor({
               setTimelineScroll(sl);
             }}
             onPointerDown={handleTimelinePointerDown}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={handleTimelineDrop}
+            onDragOver={handleTimelineDragOver}
+            onDragLeave={handleTimelineDragLeave}
+            onDrop={(e) => { void handleTimelineFileDrop(e); }}
             onContextMenu={(e) => {
               e.preventDefault();
               const rect = scrollerRef.current!.getBoundingClientRect();
@@ -29832,6 +29871,20 @@ function Board2Editor({
               <div style={{ position: "absolute", left: timelineScroll + 2, top: TRACK_H + 6, pointerEvents: "none", zIndex: 15 }}>
                 <span style={{ fontSize: 7, fontFamily: "monospace", color: "rgba(180,80,130,0.5)", letterSpacing: 0.5, textTransform: "uppercase" }}>audio</span>
               </div>
+              {narrationDropVerdict && (
+                <div
+                  data-narration-drop-target={narrationDropVerdict}
+                  style={{
+                    position: "absolute", left: 0, right: 0, top: TRACK_H + 4, height: NARRATION_TRACK_H, zIndex: 25, pointerEvents: "none",
+                    background: narrationDropVerdict === "accept" ? "rgba(255,110,170,0.22)" : "rgba(255,94,58,0.14)",
+                    outline: `2px dashed ${narrationDropVerdict === "accept" ? "#c2185b" : "#ff5e3a"}`, outlineOffset: -2,
+                  }}
+                >
+                  <span style={{ position: "absolute", left: timelineScroll + 40, top: "50%", transform: "translateY(-50%)", fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: narrationDropVerdict === "accept" ? "#8a1040" : "#c0391b", whiteSpace: "nowrap", background: "#fffdf5", border: "1.5px solid currentColor", padding: "3px 8px" }}>
+                    {narrationDropVerdict === "accept" ? "🎙 Drop to add as narration" : "✕ Not an audio file"}
+                  </span>
+                </div>
+              )}
               {timelineMarquee && (() => {
                 const left = Math.min(timelineMarquee.startX, timelineMarquee.currentX);
                 const top = Math.min(timelineMarquee.startY, timelineMarquee.currentY);
