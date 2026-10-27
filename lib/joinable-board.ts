@@ -50,6 +50,8 @@ export type JoinableBoardState = {
   showCharacter2?: boolean;
   canvasAspect?: "16:9" | "9:16";
   boardColor?: string;
+  // Item id -> participant ids that like it. Server-owned: see lib/joinable-board-likes.
+  likes?: Record<string, string[]>;
 };
 
 /**

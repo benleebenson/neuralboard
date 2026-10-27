@@ -1,0 +1,18 @@
+/* Likes under a shared-board item's bottom-right corner. Lives inside .theme (AppShell.module.css)
+   for its tokens. The button is the hit area (44px on touch screens); .pill is what shows. */
+.likes{display:inline-flex;align-items:center;justify-content:flex-end;min-width:28px;min-height:28px;padding:0;border:0;background:transparent;line-height:1;cursor:pointer;pointer-events:auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
+span.likes{cursor:default}
+.touch{min-width:44px;min-height:44px}
+.pill{display:inline-flex;align-items:center;gap:1px;height:24px;padding:0 8px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);box-shadow:0 1px 4px rgba(47,53,51,.16);color:var(--link);font-size:12px;font-weight:700;white-space:nowrap;transition:background .12s ease,box-shadow .12s ease}
+.touch .pill{height:30px;padding:0 10px;font-size:13px}
+.likes svg{display:block;width:14px;height:14px}
+.touch svg{width:16px;height:16px}
+.heartFilled{fill:var(--section)}
+.heartEmpty{fill:none;stroke:var(--icon-muted);stroke-width:2;stroke-linejoin:round}
+.extra{margin-left:3px}
+/* Yours: the brand gradient, so a liked item reads differently at a glance. */
+.likes[aria-pressed="true"] .pill{border-color:transparent;background:var(--brand-gradient);color:var(--on-gradient)}
+.likes[aria-pressed="true"] .heartFilled{fill:var(--on-gradient)}
+button.likes:hover .pill{box-shadow:0 0 0 1px var(--new-border),0 1px 4px rgba(47,53,51,.16)}
+button.likes:focus-visible{outline:none}
+button.likes:focus-visible .pill{box-shadow:0 0 0 2px var(--section)}

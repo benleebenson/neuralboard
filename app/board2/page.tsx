@@ -12,6 +12,7 @@ import { listSimpleWorldBoards, openSimpleWorldBoardFile, openSimpleWorldPreview
 import { AccountControl, CheckoutReturnNotice } from "@/app/components/AccountControl";
 import { LogoMark } from "@/app/components/AppShell";
 import { EmojiPicker } from "@/app/components/EmojiPicker";
+import { BoardItemLikes } from "@/app/components/BoardItemLikes";
 import shellStyles from "@/app/components/AppShell.module.css";
 import { shellFont } from "@/app/components/shell-font";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
@@ -25,6 +26,7 @@ import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
 import { ANONYMOUS_BOARD_TTL_DAYS, forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
 import { validPublishedBoardId } from "@/lib/published-boards";
+import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
 import {
@@ -6435,6 +6437,10 @@ function Board2Editor({
     void participantIdFor(participantTokenRef.current).then((id) => { if (!cancelled) setParticipantId(id); });
     return () => { cancelled = true; };
   }, []);
+  // Likes on the shared board's items, as the server last sent them (only the server changes them),
+  // and the items with a like request on its way.
+  const [boardLikes, setBoardLikes] = useState<BoardLikes>({});
+  const likeInFlightRef = useRef(new Set<string>());
   // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
   const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
   const boardAddImageInputRef = useRef<HTMLInputElement | null>(null);
@@ -8141,10 +8147,13 @@ function Board2Editor({
         ? { ...clip, sourceBlob: local.sourceBlob, audioBlob: local.audioBlob, previewUrl: local.previewUrl, thumbnailBlobUrl: local.thumbnailBlobUrl }
         : clip;
     });
+    // Likes aren't part of what this tab saves, so they stay out of the base it compares edits to.
+    const { likes: _likes, ...sharedState } = serverState;
     joinVersionRef.current = version;
-    joinBaseRef.current = serverState;
-    joinLastSignatureRef.current = stableStringify(serverState);
-    setJoinBaseAuthors(boardItemAuthors(serverState));
+    joinBaseRef.current = sharedState;
+    joinLastSignatureRef.current = stableStringify(sharedState);
+    setJoinBaseAuthors(boardItemAuthors(sharedState));
+    setBoardLikes(readLikes(serverState));
     clipsRef.current = incomingClips;
     setClips(incomingClips);
     setMediaLibrary(incomingClips.filter((clip) => (clip.type === "image" || clip.type === "video") && !!clip.sourceUrl).map((clip) => ({ id: clip.mediaId ?? clip.id, name: clip.name, type: clip.type as "image" | "video", url: clip.sourceUrl, duration: clip.duration })));
@@ -8315,6 +8324,31 @@ function Board2Editor({
       }
     }, JOIN_WRITE_BATCH_MS);
   }, [applyJoinableState, joinCode, joinOwnerToken, joinStatus, joinableSignature, joinWriteTick, participantId]);
+  // Likes go straight to the server (never through the board save), which works out who is liking
+  // from this browser's participant token. Shown at once here; the pull that follows brings the
+  // stored likes, and the broadcast makes everyone else pull too.
+  async function toggleBoardLike(itemId: string) {
+    if (!joinCode || viewOnly || !participantId || likeInFlightRef.current.has(itemId)) return;
+    const before = boardLikes[itemId] ?? [];
+    const liked = !before.includes(participantId);
+    likeInFlightRef.current.add(itemId);
+    setBoardLikes((current) => {
+      const others = (current[itemId] ?? []).filter((id) => id !== participantId);
+      return { ...current, [itemId]: liked ? [...others, participantId] : others };
+    });
+    try {
+      const response = await fetch("/api/joinable-board/like", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: joinCode, itemId, liked, participantToken: participantTokenRef.current }) });
+      const result = await response.json().catch(() => ({})) as { version?: number; error?: string };
+      if (!response.ok) throw new Error(result.error || "Your like wasn't saved.");
+      if (typeof result.version === "number") void joinChannelRef.current?.send({ type: "broadcast", event: "board-saved", payload: { version: result.version } });
+    } catch (error) {
+      setBoardLikes((current) => ({ ...current, [itemId]: before }));
+      setToast(error instanceof Error ? error.message : "Your like wasn't saved.");
+    } finally {
+      likeInFlightRef.current.delete(itemId);
+      joinPullRef.current?.();
+    }
+  }
   // A pending save belongs to the board it was made on.
   useEffect(() => () => {
     if (joinWriteTimerRef.current) window.clearTimeout(joinWriteTimerRef.current);
@@ -27723,6 +27757,31 @@ function Board2Editor({
                         >✕</button>
                       )}
                     </div>
+                  );
+                })}
+
+                {/* Likes, hanging just below each shared item's bottom-right corner so they never cover
+                    it. Only items the server has (synced) can be liked; a selected item's resize
+                    handle sits on that corner, so its likes drop below the handle. Items too small on
+                    screen to tell whose likes are whose show none until zoomed in; small ones get the
+                    one-heart-and-count form. */}
+                {joinCode && [
+                  ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
+                  ...annotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
+                  const likers = boardLikes[item.id] ?? [];
+                  const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;
+                  return (
+                    <BoardItemLikes
+                      key={`likes-${item.id}`}
+                      count={likers.length}
+                      mine={!!participantId && likers.includes(participantId)}
+                      compact={item.w * boardZoom < 110}
+                      touch={isMobile}
+                      itemName={item.name}
+                      onToggle={viewOnly ? undefined : () => { void toggleBoardLike(item.id); }}
+                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + 2, transform: "translateX(-100%)", zIndex: 7 }}
+                    />
                   );
                 })}
 

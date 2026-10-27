@@ -6,6 +6,7 @@ import { getSupabase } from "@/lib/supabase";
 import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
 import { joinableBoardError, joinTokenHash, participantIdFromToken, unexpiredBoardFilter } from "@/lib/joinable-board-server";
 import { checkJoinerUpdate } from "@/lib/joinable-board-permissions";
+import { withStoredLikes } from "@/lib/joinable-board-likes";
 import { unpublishJoinCodes } from "@/lib/published-boards-server";
 
 const active = () => new Date().toISOString();
@@ -67,6 +68,8 @@ export async function PATCH(request: Request) {
       if (!check.ok) return NextResponse.json({ error: check.error, forbidden: true }, { status: 403 });
       state = check.state;
     }
+    // Likes change only through /api/joinable-board/like; a save, even the owner's, keeps the stored ones.
+    state = withStoredLikes(board.state, state);
     // Only applies if nobody saved since this board was read.
     const { data, error } = await supabase.from("joinable_boards").update({ state, version: board.version + 1, updated_at: active() }).eq("id", board.id).eq("version", board.version).select("version").maybeSingle();
     if (error) throw error;
