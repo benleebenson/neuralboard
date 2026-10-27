@@ -1506,11 +1506,19 @@ function drawCutToOverlays(
 }
 
 // A "flash" clip slams a full-screen meme image over everything (board, camera, captions) for its
-// whole duration and plays a sound effect from its start. It hits on a white frame, drops through
-// a couple of blown-out frames to the clean image, and leaves on one overexposed frame — stepped,
-// never eased (see lib/board2/flash-cut.ts) — so preview and export land on the same frames.
+// whole duration and plays a sound effect from its start. It blooms in through white to the
+// clean image and eases back out under a soft glow (see lib/board2/flash-cut.ts); the envelope is
+// a pure function of time, so preview and export land on the same frames. A flash with no image
+// is sound-only.
 // Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets.
-const FLASH_CUT_DEFAULT_DURATION = 0.6;
+const FLASH_CUT_DEFAULT_DURATION = 1;
+// Stock flash sounds are mastered hot: at full gain the vine boom's hit is ≈ -8 LUFS (400 ms
+// momentary) and the flashbang ≈ -1 LUFS with +2 dBFS true peak, while narration runs ≈ -26 LUFS
+// at its loud moments. 0.25 (-12 dB) lands the vine boom ≈ 6 dB over narration. Flash blocks
+// without a stored volume use this; new blocks take the last volume set on a flash instead.
+const FLASH_SOUND_DEFAULT_VOLUME = 0.25;
+const FLASH_VOLUME_STORAGE_KEY = "nb_board2_flash_volume";
+const FLASH_NO_IMAGE = ""; // picker selection for a sound-only flash
 const FLASH_CLIP_COLOR = "#ffe14d";
 const BLEEP_CLIP_COLOR = "#ff6b6b";
 type FlashAsset = { name: string; url: string };
@@ -1584,6 +1592,19 @@ function trimLeadingSilence(context: BaseAudioContext, buffer: AudioBuffer): Aud
   return trimmed;
 }
 
+// The volume a clip is set to, before mute/layer muting (see effectiveClipVolume).
+function clipVolumeSetting(clip: Clip): number {
+  return clip.volume ?? (clip.type === "flash" ? FLASH_SOUND_DEFAULT_VOLUME : 1);
+}
+
+function rememberedFlashVolume(): number {
+  try {
+    const stored = Number.parseFloat(window.localStorage.getItem(FLASH_VOLUME_STORAGE_KEY) ?? "");
+    if (Number.isFinite(stored) && stored >= 0 && stored <= 1) return stored;
+  } catch {}
+  return FLASH_SOUND_DEFAULT_VOLUME;
+}
+
 function flashCutSoundClips(clips: readonly Clip[]): Array<Clip & { flashSoundUrl: string }> {
   return clips.filter((clip): clip is Clip & { flashSoundUrl: string } =>
     clip.type === "flash" && !!clip.flashSoundUrl && clip.duration > 0 && !clip.muted);
@@ -1596,21 +1617,21 @@ function drawFlashCutOverlay(
   width: number,
   height: number,
 ) {
-  // The most recently started flash wins when blocks overlap.
+  // The most recently started flash wins when blocks overlap; sound-only flashes draw nothing.
   let flash: Clip | null = null;
   for (const clip of clips) {
-    if (clip.type !== "flash" || time < clip.startTime || time >= clip.startTime + clip.duration) continue;
+    if (clip.type !== "flash" || !clip.flashImageUrl || time < clip.startTime || time >= clip.startTime + clip.duration) continue;
     if (!flash || clip.startTime >= flash.startTime) flash = clip;
   }
   if (!flash?.flashImageUrl) return;
   const image = flashCutImage(flash.flashImageUrl);
   const exposure = flashCutExposure(time - flash.startTime, flash.duration);
   ctx.save();
-  ctx.globalAlpha = 1;
+  ctx.globalAlpha = exposure.opacity;
   ctx.globalCompositeOperation = "source-over";
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, width, height);
-  if (exposure.showImage && image.complete && image.naturalWidth > 0) {
+  if (exposure.opacity > 0 && image.complete && image.naturalWidth > 0) {
     // Cover: scale to fill the frame and crop the overflow, centered.
     const scale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
     const sw = width / scale;
@@ -1621,7 +1642,7 @@ function drawFlashCutOverlay(
     if (exposure.boost > 0) {
       // Additive self-overlay blows out highlights like an exposure punch.
       ctx.globalCompositeOperation = "lighter";
-      ctx.globalAlpha = exposure.boost;
+      ctx.globalAlpha = exposure.boost * exposure.opacity;
       ctx.drawImage(image, sx, sy, sw, sh, 0, 0, width, height);
       ctx.globalCompositeOperation = "source-over";
     }
@@ -10391,7 +10412,7 @@ function Board2Editor({
     // A narration video's sound is its narration clip; its own audio track never plays.
     if (clip.muted || clip.narrationVideoFor) return 0;
     if (clip.type === "video" && mutedLayersRef.current[clip.layer ?? 1]) return 0;
-    return clip.volume ?? 1;
+    return clipVolumeSetting(clip);
   }
 
   function currentPlaybackDuration(currentClips: Clip[]): number {
@@ -11614,7 +11635,7 @@ function Board2Editor({
     setFlashPickerOpen(true);
     const assets = await loadFlashAssets();
     if (!assets) return;
-    setFlashPickImageUrl((current) => current && assets.images.some((asset) => asset.url === current) ? current : assets.images[0]?.url ?? null);
+    setFlashPickImageUrl((current) => current === FLASH_NO_IMAGE || (current && assets.images.some((asset) => asset.url === current)) ? current : assets.images[0]?.url ?? FLASH_NO_IMAGE);
     setFlashPickSoundUrl((current) => current && assets.sounds.some((asset) => asset.url === current) ? current : assets.sounds[0]?.url ?? null);
   }
 
@@ -11623,9 +11644,10 @@ function Board2Editor({
     stopFlashSoundPreview();
   }
 
-  function previewFlashSound(url: string) {
+  function previewFlashSound(url: string, volume: number) {
     stopFlashSoundPreview();
     const audio = new Audio(url);
+    audio.volume = Math.max(0, Math.min(1, volume));
     flashPreviewAudioRef.current = audio;
     audio.play().catch((error) => console.warn("[flash-cut] sound preview failed", error));
   }
@@ -11648,6 +11670,7 @@ function Board2Editor({
     return Array.from({ length: N_LAYERS }, (_, index) => index).find((candidate) => !overlaps(candidate)) ?? 0;
   }
 
+  // An empty imageUrl inserts a sound-only flash.
   function insertFlashCut(imageUrl: string, soundUrl: string) {
     const id = generateId();
     const startTime = Math.max(0, playheadRef.current);
@@ -11657,9 +11680,10 @@ function Board2Editor({
     const clip: Clip = {
       id, type: "flash", name: "Flash", sourceUrl: "",
       startTime, duration, layer,
-      flashImageUrl: imageUrl, flashSoundUrl: soundUrl,
+      flashImageUrl: imageUrl || undefined, flashSoundUrl: soundUrl,
+      volume: rememberedFlashVolume(),
     };
-    flashCutImage(imageUrl);
+    if (imageUrl) flashCutImage(imageUrl);
     clipsRef.current = [...existingClips, clip];
     setClips((prev) => [...prev, clip]);
     selectionSurfaceRef.current = "timeline";
@@ -12340,29 +12364,35 @@ function Board2Editor({
                   ) : (
                     <>
                       <div style={panelLabelStyle}>Image ({flashAssets.images.length})</div>
-                      {flashAssets.images.length === 0 ? (
+                      {flashAssets.images.length === 0 && (
                         <div style={{ fontSize: 10, color: "#a32916" }}>No images in public/flash/images</div>
-                      ) : (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {flashAssets.images.map((asset) => (
-                            <button
-                              key={asset.url}
-                              type="button"
-                              data-flash-image={asset.url}
-                              title={asset.name}
-                              onClick={() => setFlashPickImageUrl(asset.url)}
-                              style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
-                            />
-                          ))}
-                        </div>
                       )}
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        <button
+                          type="button"
+                          data-flash-image="none"
+                          title="No image — sound only"
+                          onClick={() => setFlashPickImageUrl(FLASH_NO_IMAGE)}
+                          style={{ width: 72, height: 72, padding: 0, border: flashPickImageUrl === FLASH_NO_IMAGE ? "3px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 10 }}
+                        >🔊<br />No image</button>
+                        {flashAssets.images.map((asset) => (
+                          <button
+                            key={asset.url}
+                            type="button"
+                            data-flash-image={asset.url}
+                            title={asset.name}
+                            onClick={() => setFlashPickImageUrl(asset.url)}
+                            style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+                          />
+                        ))}
+                      </div>
                       <div style={panelLabelStyle}>Sound ({flashAssets.sounds.length})</div>
                       {flashAssets.sounds.length === 0 && (
                         <div style={{ fontSize: 10, color: "#a32916" }}>No sounds in public/flash/sounds</div>
                       )}
                       {flashAssets.sounds.map((asset) => (
                         <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <button type="button" title="Preview sound" aria-label={`Preview ${asset.name}`} onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 28, padding: 0 }}>▶</button>
+                          <button type="button" title="Preview sound" aria-label={`Preview ${asset.name}`} onClick={() => previewFlashSound(asset.url, rememberedFlashVolume())} style={{ ...miniButton, width: 28, padding: 0 }}>▶</button>
                           <button
                             type="button"
                             data-flash-sound={asset.url}
@@ -12375,13 +12405,13 @@ function Board2Editor({
                       ))}
                       <button
                         type="button"
-                        disabled={!flashPickImageUrl || !flashPickSoundUrl}
+                        disabled={flashPickImageUrl === null || !flashPickSoundUrl}
                         onClick={() => {
-                          if (!flashPickImageUrl || !flashPickSoundUrl) return;
+                          if (flashPickImageUrl === null || !flashPickSoundUrl) return;
                           insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
                           closeFlashPicker();
                         }}
-                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl && flashPickSoundUrl ? 1 : 0.4 }}
+                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl !== null && flashPickSoundUrl ? 1 : 0.4 }}
                       >
                         Insert at {formatTime(playhead)} · {FLASH_CUT_DEFAULT_DURATION}s
                       </button>
@@ -12443,6 +12473,14 @@ function Board2Editor({
     setToast(`🔇 Bleep added at ${formatTime(startTime)}`);
   }
 
+  // A flash's volume is also remembered as the starting volume for the next flash inserted.
+  function setSelectedClipVolume(clip: Clip, volume: number) {
+    if (clip.type === "flash") {
+      try { window.localStorage.setItem(FLASH_VOLUME_STORAGE_KEY, String(volume)); } catch {}
+    }
+    setClips((prev) => prev.map((c) => c.id === clip.id ? { ...c, volume, muted: false } : c));
+  }
+
   function updateFlashCut(clipId: string, patch: { flashImageUrl?: string; flashSoundUrl?: string }) {
     if (patch.flashImageUrl) flashCutImage(patch.flashImageUrl);
     setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...patch } : clip));
@@ -12464,7 +12502,7 @@ function Board2Editor({
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a5200", background: FLASH_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
-          Full-screen image slams in on the sound — drag the block edge to hold it longer
+          {clip.flashImageUrl ? "Full-screen image flashes in on the sound — drag the block edge to hold it longer" : "Sound only — pick an image to flash one on screen"}
         </div>
         {clip.flashImageUrl && (
           // eslint-disable-next-line @next/next/no-img-element
@@ -12473,6 +12511,12 @@ function Board2Editor({
         <div style={panelLabelStyle}>Image · {flashAssetName(clip.flashImageUrl, images)}</div>
         {images ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            <button
+              type="button"
+              title="No image — sound only"
+              onClick={() => updateFlashCut(clip.id, { flashImageUrl: undefined })}
+              style={{ width: thumb, height: thumb, padding: 0, border: !clip.flashImageUrl ? "2.5px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 9 }}
+            >🔊<br />None</button>
             {images.map((asset) => (
               <button
                 key={asset.url}
@@ -12489,7 +12533,7 @@ function Board2Editor({
         <div style={panelLabelStyle}>Sound · {flashAssetName(clip.flashSoundUrl, sounds)}</div>
         {sounds && sounds.map((asset) => (
           <div key={asset.url} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <button type="button" title="Preview sound" onClick={() => previewFlashSound(asset.url)} style={{ ...miniButton, width: 24, padding: 0 }}>▶</button>
+            <button type="button" title="Preview sound" onClick={() => previewFlashSound(asset.url, clipVolumeSetting(clip))} style={{ ...miniButton, width: 24, padding: 0 }}>▶</button>
             <button
               type="button"
               onClick={() => updateFlashCut(clip.id, { flashSoundUrl: asset.url })}
@@ -24920,13 +24964,14 @@ function Board2Editor({
                         )}
                       </div>
                     )}
-                    {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep") && (
+                    {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep" || selectedClip.type === "flash") && (
                       <div>
-                        <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Volume {Math.round((selectedClip.muted ? 0 : (selectedClip.volume ?? 1)) * 100)}%</div>
+                        <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Volume {Math.round((selectedClip.muted ? 0 : clipVolumeSetting(selectedClip)) * 100)}%</div>
                         <input
                           type="range" min={0} max={1} step={0.01}
-                          value={selectedClip.muted ? 0 : (selectedClip.volume ?? 1)}
-                          onChange={(e) => { const v = parseFloat(e.target.value); setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, volume: v, muted: false } : c)); }}
+                          aria-label="Clip volume"
+                          value={selectedClip.muted ? 0 : clipVolumeSetting(selectedClip)}
+                          onChange={(e) => setSelectedClipVolume(selectedClip, parseFloat(e.target.value))}
                           style={{ width: "100%", accentColor: "#c8f135" }}
                         />
                       </div>
@@ -29589,18 +29634,16 @@ function Board2Editor({
                   </div>
                 )}
 
-                {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep") && (
+                {(selectedClip.type === "video" || selectedClip.type === "narration" || selectedClip.type === "bleep" || selectedClip.type === "flash") && (
                   <div>
                     <div style={{ ...panelLabelStyle, marginBottom: 5 }}>Volume</div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <input
                         type="range"
                         min={0} max={1} step={0.01}
-                        value={selectedClip.muted ? 0 : (selectedClip.volume ?? 1)}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          setClips((prev) => prev.map((c) => c.id === selectedClipId ? { ...c, volume: v, muted: false } : c));
-                        }}
+                        aria-label="Clip volume"
+                        value={selectedClip.muted ? 0 : clipVolumeSetting(selectedClip)}
+                        onChange={(e) => setSelectedClipVolume(selectedClip, parseFloat(e.target.value))}
                         style={{ flex: 1, accentColor: "#c8f135" }}
                       />
                       <button
@@ -29611,7 +29654,7 @@ function Board2Editor({
                       </button>
                     </div>
                     <div style={{ fontFamily: "monospace", fontSize: 9, color: "#6a6a6a", marginTop: 2 }}>
-                      {selectedClip.muted ? "Muted" : `${Math.round((selectedClip.volume ?? 1) * 100)}%`}
+                      {selectedClip.muted ? "Muted" : `${Math.round(clipVolumeSetting(selectedClip) * 100)}%`}
                     </div>
                   </div>
                 )}
