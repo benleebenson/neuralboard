@@ -6497,6 +6497,18 @@ function Board2Editor({
   const [clipsPanelOpen, setClipsPanelOpen] = useState(false);
   const [flashPickerOpen, setFlashPickerOpen] = useState(false);
   const [cutToPickerOpen, setCutToPickerOpen] = useState(false);
+  // Board-color eyedropper fallback (no native EyeDropper): a snapshot of the visible board to sample,
+  // and the loupe, which is drawn straight to the DOM per animation frame (no React re-render).
+  const [eyedropperActive, setEyedropperActive] = useState(false);
+  const [pickedColorChip, setPickedColorChip] = useState<string | null>(null);
+  const eyedropperSnapshotRef = useRef<{ ctx: CanvasRenderingContext2D; scale: number } | null>(null);
+  const eyedropperLoupeRef = useRef<HTMLDivElement | null>(null);
+  const eyedropperLoupeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const eyedropperHexRef = useRef<HTMLSpanElement | null>(null);
+  const eyedropperPatchCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const eyedropperPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const eyedropperFrameRef = useRef<number | null>(null);
+  const eyedropperColorRef = useRef<string | null>(null);
   // Mobile video editor (see MOBILE_EDITOR_BG): timeline scale, the custom-zoom box being drawn on
   // the preview (normalized to the frame), the open bottom sheet and the preview's measured size.
   const [mobilePps, setMobilePps] = useState(MOBILE_TIMELINE_DEFAULT_PPS);
@@ -8092,6 +8104,19 @@ function Board2Editor({
       board.removeEventListener("gesturechange", onGesture);
     };
   }, [isMobile]);
+  useEffect(() => {
+    if (!eyedropperActive) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") { event.preventDefault(); stopBoardEyedropper(); } };
+    const onPointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Node) || !boardContainerRef.current?.contains(event.target)) stopBoardEyedropper();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+    };
+  }, [eyedropperActive]);
   // The preview canvas mounts once its box has been measured: paint it then.
   const mobilePreviewReady = mobileEditorMode && mobilePreviewSize.w > 0 && mobilePreviewSize.h > 0;
   useEffect(() => {
@@ -12028,6 +12053,167 @@ function Board2Editor({
           style={{ position: "absolute", ...rect, outline: `2px solid ${CUT_TO_CLIP_COLOR}`, cursor: "move", pointerEvents: "auto", touchAction: "none" }} />
         {centerHandle(rect, "position", { w: ow, h: oh })}
         {corner(rect, "position", { w: ow, h: oh })}
+      </div>
+    );
+  }
+
+  // ─ Board color eyedropper ─────────────────────────────────────────────────
+
+  function applyPickedBoardColor(hex: string) {
+    const color = hex.toLowerCase();
+    setBoardColor(color);
+    setPickedColorChip(color);
+    window.setTimeout(() => setPickedColorChip((current) => current === color ? null : current), 1800);
+  }
+
+  // The browser's own eyedropper (Chrome/Edge) when there is one; otherwise our board loupe.
+  async function startBoardEyedropper() {
+    setBoardSettingsOpen(false);
+    const NativeEyeDropper = (window as EyeDropperWindow).EyeDropper;
+    if (NativeEyeDropper) {
+      try {
+        const { sRGBHex } = await new NativeEyeDropper().open();
+        applyPickedBoardColor(sRGBHex);
+      } catch {
+        // Esc or a click away: nothing picked.
+      }
+      return;
+    }
+    const container = boardContainerRef.current;
+    const rect = container?.getBoundingClientRect();
+    if (!container || !rect || rect.width < 1 || rect.height < 1) {
+      setToast("Show the board to pick a color from it");
+      return;
+    }
+    try {
+      eyedropperSnapshotRef.current = await renderVisibleBoardForEyedropper(rect);
+      setEyedropperActive(true);
+      setToast("Click anywhere on the board to use that color · Esc to cancel");
+    } catch {
+      setToast("Couldn't read the board's colors here");
+    }
+  }
+
+  // The visible part of the board, drawn with the export renderer at the screen's pan and zoom.
+  // Rendered at time -1 so timeline overlays (captions, flash, Cut To) stay out of it.
+  async function renderVisibleBoardForEyedropper(rect: DOMRect): Promise<{ ctx: CanvasRenderingContext2D; scale: number }> {
+    const scale = Math.min(2, window.devicePixelRatio || 1);
+    const width = Math.max(1, Math.round(rect.width * scale));
+    const height = Math.max(1, Math.round(rect.height * scale));
+    const currentClips = clipsRef.current;
+    const currentAnnotations = annotationsRef.current;
+    await Promise.all([
+      ensureAnnotationFontsLoaded(currentAnnotations),
+      ...currentClips.filter((clip) => clip.type === "image").map((clip) => ensureExportImage(clip)),
+    ]);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+    if (!ctx) throw new Error("Could not create the eyedropper canvas");
+    const zoom = boardZoomRef.current;
+    const pan = boardPanRef.current;
+    const visibleW = rect.width / zoom;
+    const visibleH = rect.height / zoom;
+    const camera = { cameraX: -pan.x / zoom + visibleW / 2, cameraY: -pan.y / zoom + visibleH / 2, boardZoom: 1 };
+    // As in exportBoardImage: the renderer scales by boardDimensionsRef's width, so point it at
+    // the visible area for this render.
+    const originalDimensions = boardDimensionsRef.current;
+    boardDimensionsRef.current = { width: visibleW, height: visibleH };
+    try {
+      await prepareOfflineVideoFrames(-1, currentClips, camera, width, height);
+      renderToCtx(ctx, -1, currentClips, cameraKeyframesRef.current, width, height, currentAnnotations, camera, undefined, "snapshot");
+    } finally {
+      boardDimensionsRef.current = originalDimensions;
+    }
+    ctx.getImageData(0, 0, 1, 1); // throws now (cross-origin media) rather than on the first hover
+    return { ctx, scale };
+  }
+
+  function stopBoardEyedropper() {
+    setEyedropperActive(false);
+    eyedropperSnapshotRef.current = null;
+    eyedropperPointerRef.current = null;
+    eyedropperColorRef.current = null;
+    if (eyedropperFrameRef.current !== null) cancelAnimationFrame(eyedropperFrameRef.current);
+    eyedropperFrameRef.current = null;
+  }
+
+  // One loupe update per animation frame, straight to the DOM: position, magnified patch, hex.
+  function drawEyedropperLoupe() {
+    eyedropperFrameRef.current = null;
+    const pointer = eyedropperPointerRef.current;
+    const snapshot = eyedropperSnapshotRef.current;
+    const loupe = eyedropperLoupeRef.current;
+    const loupeCanvas = eyedropperLoupeCanvasRef.current;
+    const container = boardContainerRef.current;
+    if (!pointer || !snapshot || !loupe || !loupeCanvas || !container) return;
+    const sx = Math.round(pointer.x * snapshot.scale), sy = Math.round(pointer.y * snapshot.scale);
+    const half = Math.floor(EYEDROPPER_PATCH / 2);
+    const patch = snapshot.ctx.getImageData(sx - half, sy - half, EYEDROPPER_PATCH, EYEDROPPER_PATCH);
+    const center = (half * EYEDROPPER_PATCH + half) * 4;
+    const hex = rgbHex(patch.data[center], patch.data[center + 1], patch.data[center + 2]);
+    eyedropperColorRef.current = hex;
+    const patchCanvas = eyedropperPatchCanvasRef.current ?? (eyedropperPatchCanvasRef.current = document.createElement("canvas"));
+    patchCanvas.width = EYEDROPPER_PATCH;
+    patchCanvas.height = EYEDROPPER_PATCH;
+    patchCanvas.getContext("2d")?.putImageData(patch, 0, 0);
+    const lctx = loupeCanvas.getContext("2d");
+    if (lctx) {
+      lctx.imageSmoothingEnabled = false;
+      lctx.clearRect(0, 0, loupeCanvas.width, loupeCanvas.height);
+      lctx.drawImage(patchCanvas, 0, 0, loupeCanvas.width, loupeCanvas.height);
+      // Crosshair: outline the center pixel.
+      const cell = loupeCanvas.width / EYEDROPPER_PATCH;
+      lctx.lineWidth = Math.max(1, cell / 6);
+      lctx.strokeStyle = "#ffffff";
+      lctx.strokeRect(half * cell, half * cell, cell, cell);
+      lctx.strokeStyle = "#2a2a2a";
+      lctx.strokeRect(half * cell - lctx.lineWidth, half * cell - lctx.lineWidth, cell + lctx.lineWidth * 2, cell + lctx.lineWidth * 2);
+    }
+    if (eyedropperHexRef.current) eyedropperHexRef.current.textContent = hex.toUpperCase();
+    loupe.style.setProperty("--eyedropper-color", hex);
+    // Below-right of the cursor, flipped to stay inside the board.
+    const size = loupe.offsetWidth, tall = loupe.offsetHeight, gap = 18;
+    const x = pointer.x + gap + size > container.clientWidth ? pointer.x - gap - size : pointer.x + gap;
+    const y = pointer.y + gap + tall > container.clientHeight ? pointer.y - gap - tall : pointer.y + gap;
+    loupe.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    loupe.style.visibility = "visible";
+  }
+
+  function renderEyedropperOverlay() {
+    if (!eyedropperActive) return null;
+    const pointAt = (event: React.PointerEvent<HTMLDivElement>) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+    const loupeSize = EYEDROPPER_PATCH * EYEDROPPER_ZOOM;
+    return (
+      <div
+        role="application"
+        aria-label="Pick a color from the board"
+        onPointerMove={(event) => {
+          eyedropperPointerRef.current = pointAt(event);
+          if (eyedropperFrameRef.current === null) eyedropperFrameRef.current = requestAnimationFrame(drawEyedropperLoupe);
+        }}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          eyedropperPointerRef.current = pointAt(event);
+          drawEyedropperLoupe();
+          const hex = eyedropperColorRef.current;
+          stopBoardEyedropper();
+          if (hex) applyPickedBoardColor(hex);
+        }}
+        style={{ position: "absolute", inset: 0, zIndex: 400, cursor: "crosshair", touchAction: "none" }}
+      >
+        <div ref={eyedropperLoupeRef} style={{ position: "absolute", left: 0, top: 0, visibility: "hidden", pointerEvents: "none", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: 4, background: "#fffdf5", border: "1.5px solid #2a2a2a", borderRadius: 8, boxShadow: "0 4px 14px rgba(0,0,0,0.25)", willChange: "transform" }}>
+          <canvas ref={eyedropperLoupeCanvasRef} width={loupeSize * 2} height={loupeSize * 2} style={{ width: loupeSize, height: loupeSize, display: "block", borderRadius: 4, imageRendering: "pixelated" }} />
+          <span style={{ display: "flex", alignItems: "center", gap: 5, fontFamily: "monospace", fontSize: 11, fontWeight: 700, color: "#2a2a2a" }}>
+            <span aria-hidden="true" style={{ width: 10, height: 10, borderRadius: 2, border: "1px solid rgba(42,42,42,0.4)", background: "var(--eyedropper-color, transparent)" }} />
+            <span ref={eyedropperHexRef} />
+          </span>
+        </div>
       </div>
     );
   }
@@ -26808,6 +26994,7 @@ function Board2Editor({
                           <span className={shellStyles.caption}>Board color</span>
                           <div className={shellStyles.popoverRow}>
                             <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={32} />
+                            <button type="button" className={shellStyles.glassButton} onClick={() => { void startBoardEyedropper(); }} aria-label="Pick the board color from the screen" title="Eyedropper: pick a color from the board"><EyedropperIcon /></button>
                             <span style={{ flex: 1, color: "var(--ink)", fontWeight: 600, textTransform: "uppercase" }}>{boardColor}</span>
                             {boardColor !== BOARD_SURFACE_COLOR && <button type="button" className={shellStyles.outlineButton} onClick={() => setBoardColor(BOARD_SURFACE_COLOR)} style={{ width: "auto" }}>Reset</button>}
                           </div>
@@ -26923,6 +27110,7 @@ function Board2Editor({
                       <div style={{ ...panelLabelStyle, marginBottom: 6 }}>Board color</div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                         <BoardColorSwatch color={boardColor} onChange={setBoardColor} size={28} />
+                        <button type="button" onClick={() => { void startBoardEyedropper(); }} aria-label="Pick the board color from the screen" title="Eyedropper: pick a color from the board" style={{ ...miniButton, width: 30, height: 28, padding: 0, display: "grid", placeItems: "center" }}><EyedropperIcon size={15} /></button>
                         <span style={{ flex: 1, textTransform: "uppercase" }}>{boardColor}</span>
                         {boardColor !== BOARD_SURFACE_COLOR && <button type="button" onClick={() => setBoardColor(BOARD_SURFACE_COLOR)} style={miniButton}>Reset</button>}
                       </div>
@@ -26974,6 +27162,12 @@ function Board2Editor({
         </div>
       )}
       {renderExportReadySheet()}
+      {pickedColorChip && (
+        <div role="status" style={{ position: "fixed", left: "50%", bottom: "calc(88px + env(safe-area-inset-bottom))", transform: "translateX(-50%)", zIndex: 10050, display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: 999, background: "#2a2a2a", color: "#fffdf5", fontFamily: "monospace", fontSize: 12, boxShadow: "0 4px 14px rgba(0,0,0,0.25)", pointerEvents: "none" }}>
+          <span aria-hidden="true" style={{ width: 16, height: 16, borderRadius: 4, background: pickedColorChip, border: "1.5px solid #fffdf5" }} />
+          Board color {pickedColorChip.toUpperCase()}
+        </div>
+      )}
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (
@@ -27267,6 +27461,7 @@ function Board2Editor({
                   style={{ position: "absolute", inset: 0, zIndex: 200, cursor: "grab", touchAction: "none" }}
                 />
               )}
+              {renderEyedropperOverlay()}
               {boardViewEditable && (
                 <input ref={boardAddImageInputRef} type="file" accept="image/*" multiple aria-hidden="true" tabIndex={-1} style={{ display: "none" }} onChange={(event) => { void handleBoardPromptImages(event); }} />
               )}
@@ -31367,6 +31562,24 @@ const uploadControlStyle: React.CSSProperties = {
 };
 
 // Circular swatch over a native color input: the OS picker (the color wheel on macOS) is the popover.
+// Eyedropper (board color): the loupe shows an 11×11-pixel patch magnified 6× around the cursor.
+const EYEDROPPER_PATCH = 11;
+const EYEDROPPER_ZOOM = 6;
+type NativeEyeDropper = { open: () => Promise<{ sRGBHex: string }> };
+type EyeDropperWindow = Window & { EyeDropper?: new () => NativeEyeDropper };
+
+function EyedropperIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="m2 22 1-1h3l9-9" /><path d="M3 21v-3l9-9" /><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z" />
+    </svg>
+  );
+}
+
+function rgbHex(r: number, g: number, b: number): string {
+  return `#${[r, g, b].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function BoardColorSwatch({ color, onChange, size = 22 }: { color: string; onChange: (color: string) => void; size?: number }) {
   return (
     <span title="Board color" style={{ position: "relative", display: "inline-block", width: size, height: size, flexShrink: 0, borderRadius: "50%", background: color, border: "1.5px solid #2a2a2a", boxShadow: "1.5px 1.5px 0 #2a2a2a", cursor: "pointer" }}>
