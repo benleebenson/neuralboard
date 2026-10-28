@@ -573,6 +573,10 @@ type Clip = {
   narrationTime?: number;
   narrationTypewriter?: boolean; // customZoom-only: type out the narration spoken during this zoom
   flashImageUrl?: string; // flash-only: /flash/images/... drawn full-screen while the block is active
+  // flash-only: the user's own image instead, kept in sourceUrl/sourceBlob like a Cut To upload.
+  // Flashes reusing one image share its id (and Blob), so it is stored and shared once.
+  flashCustomImageId?: string;
+  flashCustomImageName?: string;
   // cutto-only: an overlay on the output frame showing uploaded media (sourceUrl/sourceBlob, cached
   // for autosave like other uploads) or the board's narration video (cutToSourceClipId).
   cutToMedia?: "image" | "video";
@@ -1512,7 +1516,8 @@ function drawCutToOverlays(
 // clean image and eases back out under a soft glow (see lib/board2/flash-cut.ts); the envelope is
 // a pure function of time, so preview and export land on the same frames. A flash with no image
 // is sound-only.
-// Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets.
+// Assets come from public/flash/{images,sounds}, listed by /api/board2/flash-assets; a flash can
+// instead use an uploaded or pasted image (flashCustomImageId), stored with the board.
 const FLASH_CUT_DEFAULT_DURATION = 1;
 // Stock flash sounds are mastered hot: at full gain the vine boom's hit is ≈ -8 LUFS (400 ms
 // momentary) and the flashbang ≈ -1 LUFS with +2 dBFS true peak, while narration runs ≈ -26 LUFS
@@ -1524,6 +1529,8 @@ const FLASH_NO_IMAGE = ""; // picker selection for a sound-only flash
 const FLASH_CLIP_COLOR = "#ffe14d";
 const BLEEP_CLIP_COLOR = "#ff6b6b";
 type FlashAsset = { name: string; url: string };
+// An uploaded or pasted flash image. `blob` is absent for one that arrived from a shared board.
+type FlashCustomImage = { id: string; name: string; url: string; blob?: Blob };
 
 const flashCutImageCache = new Map<string, HTMLImageElement>();
 const flashCutSoundBytes = new Map<string, Promise<ArrayBuffer>>();
@@ -1540,10 +1547,16 @@ function flashCutImage(url: string): HTMLImageElement {
   return image;
 }
 
+// The image a flash block draws: a custom image's own source, else a built-in one.
+function flashImageSource(clip: Clip): string | undefined {
+  if (clip.type !== "flash") return undefined;
+  return clip.flashCustomImageId ? clip.sourceUrl || undefined : clip.flashImageUrl;
+}
+
 // Export renders must never draw a frame before the flash image has decoded.
 async function preloadFlashCutImages(clips: readonly Clip[]): Promise<void> {
   const urls = new Set(clips.flatMap((clip) =>
-    clip.type === "flash" && clip.flashImageUrl ? [clip.flashImageUrl]
+    flashImageSource(clip) ? [flashImageSource(clip)!]
       : clip.type === "cutto" && clip.cutToMedia === "image" && clip.sourceUrl ? [clip.sourceUrl] : []));
   await Promise.all([...urls].map((url) => flashCutImage(url).decode().catch(() => {
     console.warn("[flash-cut] image failed to load", url);
@@ -1622,11 +1635,14 @@ function drawFlashCutOverlay(
   // The most recently started flash wins when blocks overlap; sound-only flashes draw nothing.
   let flash: Clip | null = null;
   for (const clip of clips) {
-    if (clip.type !== "flash" || !clip.flashImageUrl || time < clip.startTime || time >= clip.startTime + clip.duration) continue;
+    if (!flashImageSource(clip) || time < clip.startTime || time >= clip.startTime + clip.duration) continue;
     if (!flash || clip.startTime >= flash.startTime) flash = clip;
   }
-  if (!flash?.flashImageUrl) return;
-  const image = flashCutImage(flash.flashImageUrl);
+  const source = flash && flashImageSource(flash);
+  if (!flash || !source) return;
+  const image = flashCutImage(source);
+  // An image that failed to load leaves the flash sound-only rather than a black frame.
+  if (image.complete && image.naturalWidth === 0) return;
   const exposure = flashCutExposure(time - flash.startTime, flash.duration);
   ctx.save();
   ctx.globalAlpha = exposure.opacity;
@@ -6523,6 +6539,10 @@ function Board2Editor({
   const [flashAssets, setFlashAssets] = useState<{ images: FlashAsset[]; sounds: FlashAsset[] } | null>(null);
   const [flashPickImageUrl, setFlashPickImageUrl] = useState<string | null>(null);
   const [flashPickSoundUrl, setFlashPickSoundUrl] = useState<string | null>(null);
+  // A custom image picked for the next flash (overrides flashPickImageUrl), and custom images added
+  // in the picker this session that no flash uses yet.
+  const [flashPickCustom, setFlashPickCustom] = useState<FlashCustomImage | null>(null);
+  const [flashPendingImages, setFlashPendingImages] = useState<FlashCustomImage[]>([]);
   const flashPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
   const [identifiedClips, setIdentifiedClips] = useState<IdentifiedClip[]>([]);
   const [clipsLoading, setClipsLoading] = useState(false);
@@ -8036,11 +8056,22 @@ function Board2Editor({
       if (clip.type === "bleep") flashIds.add(clip.id);
       if (clip.type !== "flash") continue;
       flashIds.add(clip.id);
-      if (clip.flashImageUrl) flashCutImage(clip.flashImageUrl);
+      const source = flashImageSource(clip);
+      if (source) flashCutImage(source);
     }
     if (flashSoundNodesRef.current.some((node) => !flashIds.has(node.clipId))) stopFlashCutSounds(flashIds);
   }, [clips]);
   const selectedFlashClipId = selectedClip?.type === "flash" ? selectedClip.id : null;
+  // This board's custom flash images, one per id, for reuse by any flash.
+  const flashCustomImages = useMemo(() => {
+    const byId = new Map<string, FlashCustomImage>();
+    for (const clip of clips) {
+      if (clip.type !== "flash" || !clip.flashCustomImageId || !clip.sourceUrl || byId.has(clip.flashCustomImageId)) continue;
+      byId.set(clip.flashCustomImageId, { id: clip.flashCustomImageId, name: clip.flashCustomImageName ?? "Custom image", url: clip.sourceUrl, blob: clip.sourceBlob });
+    }
+    for (const image of flashPendingImages) if (!byId.has(image.id)) byId.set(image.id, image);
+    return [...byId.values()];
+  }, [clips, flashPendingImages]);
   // While paused, the preview shows the selected Cut To even outside its block so it can be
   // positioned and cropped; each new selection starts in position mode.
   const selectedCutToId = selectedClip?.type === "cutto" ? selectedClip.id : null;
@@ -11704,8 +11735,96 @@ function Board2Editor({
     return Array.from({ length: N_LAYERS }, (_, index) => index).find((candidate) => !overlaps(candidate)) ?? 0;
   }
 
-  // An empty imageUrl inserts a sound-only flash.
-  function insertFlashCut(imageUrl: string, soundUrl: string) {
+  // The clip fields that point a flash at a custom image, or clear one.
+  function flashCustomImageFields(image: FlashCustomImage | null): Partial<Clip> {
+    return image
+      ? { flashImageUrl: undefined, flashCustomImageId: image.id, flashCustomImageName: image.name, sourceUrl: image.url, sourceBlob: image.blob }
+      : { flashCustomImageId: undefined, flashCustomImageName: undefined, sourceUrl: "", sourceBlob: undefined };
+  }
+
+  // An uploaded or pasted file as a custom flash image. It stays a local blob until a flash on a
+  // shared board uses it (shareFlashCustomImage).
+  async function flashCustomImageFromFile(file: Blob, name: string): Promise<FlashCustomImage> {
+    if (!file.type.startsWith("image/")) throw new Error("Choose an image file");
+    if (file.size > MAX_PASTED_IMAGE_BYTES) throw new Error("Image too large (max 15MB)");
+    const url = URL.createObjectURL(file);
+    try {
+      await flashCutImage(url).decode();
+    } catch {
+      URL.revokeObjectURL(url);
+      throw new Error("That image could not be read");
+    }
+    return { id: generateId(), name: name.replace(/\.[^.]+$/, "") || "Custom image", url, blob: file };
+  }
+
+  // On a shared board the image goes to shared storage, once per image, so joiners see it.
+  async function shareFlashCustomImage(image: FlashCustomImage): Promise<FlashCustomImage> {
+    if (!joinCode || !image.url.startsWith("blob:") || !image.blob) return image;
+    setToast("Sharing the flash image…");
+    const shared = { ...image, url: await uploadJoinableImage(image.blob, image.name) };
+    setFlashPendingImages((prev) => prev.map((pending) => pending.id === image.id ? shared : pending));
+    setFlashPickCustom((current) => current?.id === image.id ? shared : current);
+    return shared;
+  }
+
+  // A new custom image: selected in the open picker, or applied to the selected flash block.
+  async function addFlashCustomImage(file: Blob, name: string, target: "picker" | { clipId: string }) {
+    try {
+      const image = await flashCustomImageFromFile(file, name);
+      if (target === "picker") {
+        setFlashPendingImages((prev) => [...prev, image]);
+        setFlashPickCustom(image);
+        setToast("Image ready — insert the flash to use it");
+      } else {
+        await setFlashCutCustomImage(target.clipId, image);
+        setToast("Flash image replaced");
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not use that image");
+    }
+  }
+
+  async function handleFlashImageUpload(event: React.ChangeEvent<HTMLInputElement>, target: "picker" | { clipId: string }) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (file) await addFlashCustomImage(file, file.name, target);
+  }
+
+  // Pasted image for the flash picker or a selected flash; a GIF's URL fetches the real file,
+  // falling back to the flattened still the browser also put on the clipboard.
+  async function pasteFlashCustomImage(animatedUrl: string | null, still: File | null, target: "picker" | { clipId: string }) {
+    let file: Blob | null = still;
+    let name = still?.name || `Pasted image ${Date.now()}`;
+    if (animatedUrl) {
+      try {
+        file = await fetchDroppedImage(animatedUrl);
+        name = droppedUrlName(animatedUrl, file);
+      } catch (error) {
+        if (!still) { setToast(`Couldn't fetch that GIF: ${error instanceof Error ? error.message : "it could not be fetched"}`); return; }
+      }
+    }
+    if (file) await addFlashCustomImage(file, name, target);
+  }
+
+  async function insertPickedFlashCut() {
+    if (!flashPickSoundUrl) return;
+    if (!flashPickCustom) {
+      if (flashPickImageUrl === null) return;
+      insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
+      closeFlashPicker();
+      return;
+    }
+    const soundUrl = flashPickSoundUrl;
+    closeFlashPicker();
+    try {
+      insertFlashCut("", soundUrl, await shareFlashCustomImage(flashPickCustom));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not share the flash image");
+    }
+  }
+
+  // An empty imageUrl without a custom image inserts a sound-only flash.
+  function insertFlashCut(imageUrl: string, soundUrl: string, customImage?: FlashCustomImage) {
     const id = generateId();
     const startTime = Math.max(0, playheadRef.current);
     const duration = FLASH_CUT_DEFAULT_DURATION;
@@ -11716,8 +11835,10 @@ function Board2Editor({
       startTime, duration, layer,
       flashImageUrl: imageUrl || undefined, flashSoundUrl: soundUrl,
       volume: rememberedFlashVolume(),
+      ...(customImage ? flashCustomImageFields(customImage) : {}),
     };
-    if (imageUrl) flashCutImage(imageUrl);
+    const source = flashImageSource(clip);
+    if (source) flashCutImage(source);
     clipsRef.current = [...existingClips, clip];
     setClips((prev) => [...prev, clip]);
     selectionSurfaceRef.current = "timeline";
@@ -12397,7 +12518,7 @@ function Board2Editor({
                     <div style={{ fontSize: 10, color: "#6a6a6a" }}>Loading…</div>
                   ) : (
                     <>
-                      <div style={panelLabelStyle}>Image ({flashAssets.images.length})</div>
+                      <div style={panelLabelStyle}>Image ({flashAssets.images.length + flashCustomImages.length}) · or paste one (⌘V)</div>
                       {flashAssets.images.length === 0 && (
                         <div style={{ fontSize: 10, color: "#a32916" }}>No images in public/flash/images</div>
                       )}
@@ -12406,17 +12527,35 @@ function Board2Editor({
                           type="button"
                           data-flash-image="none"
                           title="No image — sound only"
-                          onClick={() => setFlashPickImageUrl(FLASH_NO_IMAGE)}
-                          style={{ width: 72, height: 72, padding: 0, border: flashPickImageUrl === FLASH_NO_IMAGE ? "3px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 10 }}
+                          onClick={() => { setFlashPickCustom(null); setFlashPickImageUrl(FLASH_NO_IMAGE); }}
+                          style={{ width: 72, height: 72, padding: 0, border: !flashPickCustom && flashPickImageUrl === FLASH_NO_IMAGE ? "3px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 10 }}
                         >🔊<br />No image</button>
+                        <label
+                          data-flash-image="upload"
+                          title="Use your own image (or paste one with ⌘V)"
+                          style={{ width: 72, height: 72, boxSizing: "border-box", border: "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 10, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}
+                        >
+                          ⬆<br />Upload image
+                          <input type="file" accept="image/*" hidden onChange={(event) => void handleFlashImageUpload(event, "picker")} />
+                        </label>
+                        {flashCustomImages.map((image) => (
+                          <button
+                            key={image.id}
+                            type="button"
+                            data-flash-image={`custom:${image.id}`}
+                            title={image.name}
+                            onClick={() => setFlashPickCustom(image)}
+                            style={{ width: 72, height: 72, padding: 0, border: flashPickCustom?.id === image.id ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${image.url}")`, cursor: "pointer" }}
+                          />
+                        ))}
                         {flashAssets.images.map((asset) => (
                           <button
                             key={asset.url}
                             type="button"
                             data-flash-image={asset.url}
                             title={asset.name}
-                            onClick={() => setFlashPickImageUrl(asset.url)}
-                            style={{ width: 72, height: 72, padding: 0, border: asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+                            onClick={() => { setFlashPickCustom(null); setFlashPickImageUrl(asset.url); }}
+                            style={{ width: 72, height: 72, padding: 0, border: !flashPickCustom && asset.url === flashPickImageUrl ? "3px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
                           />
                         ))}
                       </div>
@@ -12439,13 +12578,9 @@ function Board2Editor({
                       ))}
                       <button
                         type="button"
-                        disabled={flashPickImageUrl === null || !flashPickSoundUrl}
-                        onClick={() => {
-                          if (flashPickImageUrl === null || !flashPickSoundUrl) return;
-                          insertFlashCut(flashPickImageUrl, flashPickSoundUrl);
-                          closeFlashPicker();
-                        }}
-                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: flashPickImageUrl !== null && flashPickSoundUrl ? 1 : 0.4 }}
+                        disabled={(!flashPickCustom && flashPickImageUrl === null) || !flashPickSoundUrl}
+                        onClick={() => void insertPickedFlashCut()}
+                        style={{ ...sketchButton, padding: "8px 10px", fontSize: 11, background: "#c8f135", opacity: (flashPickCustom || flashPickImageUrl !== null) && flashPickSoundUrl ? 1 : 0.4 }}
                       >
                         Insert at {formatTime(playhead)} · {FLASH_CUT_DEFAULT_DURATION}s
                       </button>
@@ -12515,9 +12650,17 @@ function Board2Editor({
     setClips((prev) => prev.map((c) => c.id === clip.id ? { ...c, volume, muted: false } : c));
   }
 
+  // Picking a built-in image (or none) drops any custom image the flash had.
   function updateFlashCut(clipId: string, patch: { flashImageUrl?: string; flashSoundUrl?: string }) {
     if (patch.flashImageUrl) flashCutImage(patch.flashImageUrl);
-    setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...patch } : clip));
+    const imageFields = "flashImageUrl" in patch ? flashCustomImageFields(null) : {};
+    setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...imageFields, ...patch } : clip));
+  }
+
+  async function setFlashCutCustomImage(clipId: string, image: FlashCustomImage) {
+    const shared = await shareFlashCustomImage(image);
+    flashCutImage(shared.url);
+    setClips((prev) => prev.map((clip) => clip.id === clipId && clip.type === "flash" ? { ...clip, ...flashCustomImageFields(shared) } : clip));
   }
 
   function renderBleepProperties() {
@@ -12533,31 +12676,48 @@ function Board2Editor({
     const images = flashAssets?.images;
     const sounds = flashAssets?.sounds;
     const thumb = compact ? 46 : 58;
+    const imageSource = flashImageSource(clip);
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         <div style={{ fontSize: 9, fontFamily: "monospace", color: "#6a5200", background: FLASH_CLIP_COLOR, padding: "3px 6px", border: "1px solid rgba(42,42,42,0.2)" }}>
-          {clip.flashImageUrl ? "Full-screen image flashes in on the sound — drag the block edge to hold it longer" : "Sound only — pick an image to flash one on screen"}
+          {imageSource ? "Full-screen image flashes in on the sound — drag the block edge to hold it longer" : "Sound only — pick an image to flash one on screen"}
         </div>
-        {clip.flashImageUrl && (
+        {imageSource && (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={clip.flashImageUrl} alt="" style={{ width: "100%", aspectRatio: canvasAspect === "9:16" ? "9 / 16" : "16 / 9", maxHeight: 160, objectFit: "cover", border: "1.5px solid #2a2a2a", background: "#000" }} />
+          <img src={imageSource} alt="" style={{ width: "100%", aspectRatio: canvasAspect === "9:16" ? "9 / 16" : "16 / 9", maxHeight: 160, objectFit: "cover", border: "1.5px solid #2a2a2a", background: "#000" }} />
         )}
-        <div style={panelLabelStyle}>Image · {flashAssetName(clip.flashImageUrl, images)}</div>
+        <div style={panelLabelStyle}>Image · {clip.flashCustomImageId ? clip.flashCustomImageName ?? "Custom image" : flashAssetName(clip.flashImageUrl, images)}</div>
         {images ? (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
             <button
               type="button"
               title="No image — sound only"
               onClick={() => updateFlashCut(clip.id, { flashImageUrl: undefined })}
-              style={{ width: thumb, height: thumb, padding: 0, border: !clip.flashImageUrl ? "2.5px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 9 }}
+              style={{ width: thumb, height: thumb, padding: 0, border: !imageSource ? "2.5px solid #ff5e3a" : "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 9 }}
             >🔊<br />None</button>
+            <label
+              title="Use your own image (or paste one with ⌘V)"
+              style={{ width: thumb, height: thumb, boxSizing: "border-box", border: "1.5px dashed rgba(42,42,42,0.5)", background: "#fffdf5", cursor: "pointer", fontFamily: "monospace", fontSize: 9, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}
+            >
+              ⬆<br />Upload
+              <input type="file" accept="image/*" hidden onChange={(event) => void handleFlashImageUpload(event, { clipId: clip.id })} />
+            </label>
+            {flashCustomImages.map((image) => (
+              <button
+                key={image.id}
+                type="button"
+                title={image.name}
+                onClick={() => void setFlashCutCustomImage(clip.id, image).catch((error) => setToast(error instanceof Error ? error.message : "Could not share the flash image"))}
+                style={{ width: thumb, height: thumb, padding: 0, border: image.id === clip.flashCustomImageId ? "2.5px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${image.url}")`, cursor: "pointer" }}
+              />
+            ))}
             {images.map((asset) => (
               <button
                 key={asset.url}
                 type="button"
                 title={asset.name}
                 onClick={() => updateFlashCut(clip.id, { flashImageUrl: asset.url })}
-                style={{ width: thumb, height: thumb, padding: 0, border: asset.url === clip.flashImageUrl ? "2.5px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
+                style={{ width: thumb, height: thumb, padding: 0, border: !clip.flashCustomImageId && asset.url === clip.flashImageUrl ? "2.5px solid #ff5e3a" : "1.5px solid rgba(42,42,42,0.35)", background: `#000 center / cover no-repeat url("${asset.url}")`, cursor: "pointer" }}
               />
             ))}
           </div>
@@ -22149,6 +22309,14 @@ function Board2Editor({
         : animatedImageSourceUrl(imageSourceFromHtml(clipboardText("text/html")))
           ?? animatedImageSourceUrl(firstUriListEntry(clipboardText("text/uri-list")))
           ?? (imageFiles.length > 0 || !clipboardRef.current ? animatedImageSourceUrl(clipboardText("text/plain")) : null);
+      // With the flash picker open or one flash block selected, the image is for that flash.
+      const flashTarget = flashPickerOpen ? "picker" as const
+        : selectedClip?.type === "flash" && selectedClipIdsRef.current.length <= 1 ? { clipId: selectedClip.id } : null;
+      if (flashTarget && (animatedUrl || imageFiles.length > 0)) {
+        e.preventDefault();
+        void pasteFlashCustomImage(animatedUrl, imageFiles[0] ?? null, flashTarget);
+        return;
+      }
       if (animatedUrl) {
         e.preventDefault();
         const still = imageFiles[0] && imageFiles[0].size <= MAX_PASTED_IMAGE_BYTES ? imageFiles[0] : null;
@@ -25396,7 +25564,8 @@ function Board2Editor({
         } else {
           const blob = await readClipAsset(clip);
           const ext = mimeToExt(blob.type, clip.name);
-          const assetFile = `assets/${isBoardBackedClipType(clip.type) ? boardEntityId(clip) : clip.id}.${ext}`;
+          const assetId = isBoardBackedClipType(clip.type) ? boardEntityId(clip) : clip.flashCustomImageId ? `flash-${clip.flashCustomImageId}` : clip.id;
+          const assetFile = `assets/${assetId}.${ext}`;
           const buf = await blob.arrayBuffer();
           if (!zipFiles[assetFile]) zipFiles[assetFile] = [new Uint8Array(buf), { level: 0 }];
           manifestClips.push({ ...withSource, assetFile, assetMime: blob.type });
@@ -25870,6 +26039,8 @@ function Board2Editor({
             loadedClips.push({ ...mc, ...restoredThumbnail, sourceUrl: blobUrl, sourceBlob: blob });
           } else if (mc.type === "cutto") {
             if (mc.cutToMedia === "video") createVideoElement(mc.id, blobUrl);
+            loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
+          } else if (mc.type === "flash") {
             loadedClips.push({ ...mc, sourceUrl: blobUrl, sourceBlob: blob });
           }
         } else {
@@ -26532,11 +26703,23 @@ function Board2Editor({
       rememberCreatedBoard(result.code, { token: result.token, expiresAt: result.expiresAt ?? null, createdAt: new Date().toISOString() });
       const sharedClips: Clip[] = [];
       const notShared: string[] = [];
+      // Flashes reusing one custom image share a single upload.
+      const sharedFlashImages = new Map<string, Promise<string>>();
       for (const clip of clipsRef.current) {
         const avBlob = clip.type === "video" || (clip.type === "cutto" && clip.cutToMedia === "video") ? clip.sourceBlob : clip.type === "narration" ? clip.audioBlob : undefined;
         if ((clip.type === "image" || (clip.type === "cutto" && clip.cutToMedia === "image")) && clip.sourceBlob?.size) {
           const sourceUrl = await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code);
           sharedClips.push({ ...clip, sourceUrl });
+        } else if (clip.type === "flash" && clip.flashCustomImageId && clip.sourceBlob?.size && clip.sourceUrl.startsWith("blob:")) {
+          const imageId = clip.flashCustomImageId;
+          if (!sharedFlashImages.has(imageId)) sharedFlashImages.set(imageId, uploadJoinableImage(clip.sourceBlob, clip.flashCustomImageName || "flash image", result.code));
+          try {
+            sharedClips.push({ ...clip, sourceUrl: await sharedFlashImages.get(imageId)! });
+          } catch (error) {
+            const reason = `Flash image “${clip.flashCustomImageName || "custom"}” (${error instanceof Error ? error.message : "upload failed"})`;
+            if (!notShared.includes(reason)) notShared.push(reason);
+            sharedClips.push(clip);
+          }
         } else if (avBlob?.size && clip.sourceUrl.startsWith("blob:")) {
           try {
             sharedClips.push({ ...clip, sourceUrl: await uploadJoinableAv(avBlob, result.code) });
