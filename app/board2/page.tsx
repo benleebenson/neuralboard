@@ -6502,6 +6502,8 @@ function Board2Editor({
   const [mobilePps, setMobilePps] = useState(MOBILE_TIMELINE_DEFAULT_PPS);
   const [mobileZoomDraft, setMobileZoomDraft] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [mobileSheet, setMobileSheet] = useState<"narration" | "captions" | null>(null);
+  // A finished export waiting for the user to save it (touch devices; see deliverExportedVideo).
+  const [exportReady, setExportReady] = useState<{ file: File; url: string } | null>(null);
   const [mobilePreviewSize, setMobilePreviewSize] = useState({ w: 0, h: 0 });
   const mobileTimelineRef = useRef<HTMLDivElement | null>(null);
   const mobileTimelineProgrammaticLeftRef = useRef(-1);
@@ -8068,6 +8070,28 @@ function Board2Editor({
     setPreviewVisible(true);
     requestAnimationFrame(() => drawFrameRef.current(playheadRef.current));
   }, [mobileEditorMode]);
+  // Phones: one finger pans and two pinch the board (handleMobileBoardPointerDown/Move/Up); stop the
+  // browser from scrolling or pinch-zooming the page over it. touch-action alone isn't enough on
+  // iOS Safari, so cancel touchmove, multi-finger touchstart and Safari's gesture events. Taps
+  // still work (single-finger touchstart isn't cancelled), and text fields keep native behavior.
+  useEffect(() => {
+    const board = boardContainerRef.current;
+    if (!isMobile || !board) return;
+    const inTextField = (target: EventTarget | null) => target instanceof Element && !!target.closest("input, textarea, select, [contenteditable='true']");
+    const onTouchStart = (event: TouchEvent) => { if (event.touches.length > 1 && !inTextField(event.target)) event.preventDefault(); };
+    const onTouchMove = (event: TouchEvent) => { if (!inTextField(event.target)) event.preventDefault(); };
+    const onGesture = (event: Event) => event.preventDefault();
+    board.addEventListener("touchstart", onTouchStart, { passive: false });
+    board.addEventListener("touchmove", onTouchMove, { passive: false });
+    board.addEventListener("gesturestart", onGesture);
+    board.addEventListener("gesturechange", onGesture);
+    return () => {
+      board.removeEventListener("touchstart", onTouchStart);
+      board.removeEventListener("touchmove", onTouchMove);
+      board.removeEventListener("gesturestart", onGesture);
+      board.removeEventListener("gesturechange", onGesture);
+    };
+  }, [isMobile]);
   // The preview canvas mounts once its box has been measured: paint it then.
   const mobilePreviewReady = mobileEditorMode && mobilePreviewSize.w > 0 && mobilePreviewSize.h > 0;
   useEffect(() => {
@@ -12005,6 +12029,98 @@ function Board2Editor({
         {centerHandle(rect, "position", { w: ow, h: oh })}
         {corner(rect, "position", { w: ow, h: oh })}
       </div>
+    );
+  }
+
+  // ─ Export delivery ────────────────────────────────────────────────────────
+
+  // Desktop downloads the finished video. Mobile browsers file downloads somewhere obscure, so on
+  // touch devices it waits in a sheet whose Save Video button opens the native share sheet (iOS:
+  // "Save Video" puts it in Photos; Android: save to device or an app). share() must run inside a
+  // fresh tap: the export itself takes far longer than the user activation from the Export tap lasts.
+  function deliverExportedVideo(blob: Blob, fileName: string) {
+    const touch = isMobile || (typeof window !== "undefined" && "ontouchstart" in window);
+    if (!touch) {
+      downloadBlobFile(blob, fileName);
+      return;
+    }
+    const file = new File([blob], fileName, { type: blob.type || "video/mp4" });
+    setExportReady((previous) => {
+      if (previous) URL.revokeObjectURL(previous.url);
+      return { file, url: URL.createObjectURL(file) };
+    });
+  }
+
+  function downloadBlobFile(blob: Blob, fileName: string) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  }
+
+  // File sharing needs both share() and a canShare() that accepts this particular file.
+  function canShareFile(file: File): boolean {
+    try {
+      return typeof navigator.share === "function" && typeof navigator.canShare === "function" && navigator.canShare({ files: [file] });
+    } catch {
+      return false;
+    }
+  }
+
+  function closeExportReady() {
+    setExportReady((previous) => {
+      if (previous) URL.revokeObjectURL(previous.url);
+      return null;
+    });
+  }
+
+  async function saveExportedVideo() {
+    const ready = exportReady;
+    if (!ready) return;
+    if (canShareFile(ready.file)) {
+      try {
+        await navigator.share({ files: [ready.file], title: "NeuralBoard Export" });
+        closeExportReady();
+        return;
+      } catch (error) {
+        if ((error as DOMException)?.name === "AbortError") return; // closed the share sheet
+        // Anything else (e.g. share refused): fall back to downloading it.
+      }
+    }
+    downloadBlobFile(ready.file, ready.file.name);
+  }
+
+  function renderExportReadySheet() {
+    if (!exportReady) return null;
+    const shareable = canShareFile(exportReady.file);
+    const hint = !shareable
+      ? "This browser can't share files, so Download saves the video to your downloads."
+      : isIOSDevice()
+        ? "Tap Save Video, then choose “Save Video” in the share sheet to put it in your camera roll."
+        : "Tap Save Video, then choose where to save it in the share sheet.";
+    return (
+      <>
+        <div onClick={closeExportReady} style={{ position: "fixed", inset: 0, zIndex: 10040, background: "rgba(0,0,0,0.4)" }} />
+        <div role="dialog" aria-label="Your video is ready" style={{ ...MOBILE_SHEET_STYLE, zIndex: 10041 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <strong style={{ fontSize: 14 }}>🎬 Your video is ready</strong>
+            <button type="button" onClick={closeExportReady} aria-label="Close" style={{ ...miniButton, minWidth: 44, minHeight: 44 }}>✕</button>
+          </div>
+          <p style={{ margin: 0, fontSize: 12, lineHeight: 1.5 }}>{hint}</p>
+          <button type="button" onClick={() => { void saveExportedVideo(); }} style={{ ...sketchButton, minHeight: 52, fontSize: 14, fontWeight: 700, background: "#c8f135" }}>
+            {shareable ? "⬇ Save Video" : "⬇ Download"}
+          </button>
+          {shareable && (
+            <button type="button" onClick={() => downloadBlobFile(exportReady.file, exportReady.file.name)} style={{ ...sketchButton, minHeight: 44, fontSize: 12 }}>
+              Download file instead
+            </button>
+          )}
+        </div>
+      </>
     );
   }
 
@@ -19864,15 +19980,8 @@ function Board2Editor({
       const blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
       if (!exportCancelRef.current) {
         if (blob.size === 0) throw new Error("MediaRecorder produced an empty export");
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement("a");
-        anchor.href = url;
         const ext = blob.type.includes("mp4") ? "mp4" : "webm";
-        anchor.download = opts.filenameBase ? `${opts.filenameBase}.${ext}` : `board2-export.${ext}`;
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        deliverExportedVideo(blob, opts.filenameBase ? `${opts.filenameBase}.${ext}` : `board2-export.${ext}`);
         console.info("[board2:realtime-export] complete", {
           expectedFrames: totalFrames,
           renderedFrames,
@@ -20236,15 +20345,7 @@ function Board2Editor({
         await writable.close();
         writable = null;
       } else if (outputBuffer) {
-        const blob = new Blob([outputBuffer()], { type: mimeType });
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = `board2-export.${extension}`;
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        deliverExportedVideo(new Blob([outputBuffer()], { type: mimeType }), `board2-export.${extension}`);
       }
       setExportProgress(1);
       setToast(fallbackNotice
@@ -22360,8 +22461,11 @@ function Board2Editor({
       const dy = e.clientY - g.startY;
       if (Math.hypot(dx, dy) >= BOARD_TOUCH_DRAG_THRESHOLD_PX) {
         if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
-        g.type = g.hitClipIsSelected || g.hitAnnotationIsSelected ? "move" : "pan";
+        // Dragging an item you can edit moves it (and selects it); anywhere else pans the board.
+        g.type = g.hitClipId || g.hitAnnotationId ? "move" : "pan";
         if (g.type === "pan") setBoardAddPrompt(null);
+        else if (g.hitClipId && !g.hitClipIsSelected) setClipSelection([g.hitClipId]);
+        else if (g.hitAnnotationId && !g.hitAnnotationIsSelected) setAnnotationSelection([g.hitAnnotationId]);
       }
     }
 
@@ -26869,6 +26973,7 @@ function Board2Editor({
           </div>
         </div>
       )}
+      {renderExportReadySheet()}
       {!chromeHidden && <CheckoutReturnNotice isPro={isProUser} />}
 
       {!chromeHidden && isMobile && mobileEditorMenuOpen && (
