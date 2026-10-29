@@ -4,7 +4,7 @@ import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { BOARD_LIBRARY_PENDING_FILE, type BoardLibraryEntry, getBoardsDirectory, listBoards, readNbpManifest, supportsBoardDirectory, updateTrainingFlag } from "@/lib/board-library";
 import { MainSectionNav } from "@/app/components/MainSectionNav";
-import { addSimpleWorldBoard, listSimpleWorldBoards } from "@/lib/simple-world";
+import { addSimpleWorldBoard, listSimpleWorldBoards, removeSimpleWorldBoard } from "@/lib/simple-world";
 
 function formatDuration(seconds: number): string {
   const rounded = Math.max(0, Math.round(seconds));
@@ -19,6 +19,7 @@ export default function BoardLibraryPage() {
   const [message, setMessage] = useState("");
   const [spaceBoardFiles, setSpaceBoardFiles] = useState<Set<string>>(() => new Set());
   const [addingToSpace, setAddingToSpace] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   const refreshBoards = useCallback(async (handle: FileSystemDirectoryHandle) => {
     setBusy(true);
@@ -87,6 +88,29 @@ export default function BoardLibraryPage() {
       setAddingToSpace(null);
     }
   }, [addingToSpace, directory]);
+
+  // Deleting a board also drops it from the space, which would otherwise keep a dead composite.
+  const deleteBoard = useCallback(async (entry: BoardLibraryEntry) => {
+    if (!directory || deleting) return;
+    if (!confirm(`Delete “${entry.meta.title}” permanently? This removes ${entry.fileName} from your boards folder.`)) return;
+    setDeleting(entry.fileName);
+    setMessage("");
+    try {
+      await directory.removeEntry(entry.fileName);
+      await removeSimpleWorldBoard(entry.fileName, directory);
+      setSpaceBoardFiles((current) => {
+        const next = new Set(current);
+        next.delete(entry.fileName);
+        return next;
+      });
+      setBoards((current) => current.filter((board) => board.fileName !== entry.fileName));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not delete that board.");
+      await refreshBoards(directory);
+    } finally {
+      setDeleting(null);
+    }
+  }, [deleting, directory, refreshBoards]);
 
   const addFilesToSpace = useCallback(async (files: File[]) => {
     if (!files.length || addingToSpace) return;
@@ -181,7 +205,15 @@ export default function BoardLibraryPage() {
                   >
                     {addingToSpace === entry.fileName ? "Building composite…" : spaceBoardFiles.has(entry.fileName) ? "✓ In Space" : "Add to Space"}
                   </button>
-                  <button onClick={async () => { if (confirm(`Delete “${entry.meta.title}”?`)) { await directory.removeEntry(entry.fileName); await refreshBoards(directory); } }} style={{ ...deleteStyle, padding: 0 }}>Delete</button>
+                  <button
+                    type="button"
+                    aria-label={`Delete ${entry.meta.title}`}
+                    disabled={deleting !== null}
+                    onClick={() => void deleteBoard(entry)}
+                    style={{ ...deleteStyle, marginLeft: "auto", opacity: deleting && deleting !== entry.fileName ? .55 : 1 }}
+                  >
+                    {deleting === entry.fileName ? "Deleting…" : "🗑 Delete"}
+                  </button>
                 </div>
               </div>
             </article>
@@ -198,4 +230,4 @@ const emptyStyle: React.CSSProperties = { border: "2px dashed #aaa", padding: 30
 const gridStyle: React.CSSProperties = { display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(220px,1fr))", gap: 18 };
 const cardStyle: React.CSSProperties = { border: "2px solid #2a2a2a", background: "white", boxShadow: "4px 4px 0 #2a2a2a" };
 const imageButtonStyle: React.CSSProperties = { position: "relative", width: "100%", aspectRatio: "16/9", border: 0, borderBottom: "1.5px solid #2a2a2a", background: "#ece7da", cursor: "pointer", fontSize: 32 };
-const deleteStyle: React.CSSProperties = { border: 0, background: "transparent", color: "#a32916", textDecoration: "underline", cursor: "pointer", fontFamily: "monospace" };
+const deleteStyle: React.CSSProperties = { ...buttonStyle, padding: "7px 9px", color: "#a32916", borderColor: "#a32916", boxShadow: "2px 2px 0 #a32916" };

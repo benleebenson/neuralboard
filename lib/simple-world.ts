@@ -266,6 +266,24 @@ export async function addSimpleWorldBoard(input: AddSimpleWorldBoardInput): Prom
   return board;
 }
 
+/** Drops a board from the space and deletes its composite; the source `.nbp` is left to the caller. */
+export async function removeSimpleWorldBoard(fileName: string, compositeDirectoryParent?: FileSystemDirectoryHandle): Promise<void> {
+  if (typeof indexedDB === "undefined") return;
+  const db = await openWorldDb();
+  await new Promise<void>((resolve, reject) => {
+    const request = db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).delete(fileName);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  if (!compositeDirectoryParent) return;
+  try {
+    const compositeDirectory = await compositeDirectoryParent.getDirectoryHandle(COMPOSITE_DIRECTORY);
+    await compositeDirectory.removeEntry(compositeFileName(fileName));
+  } catch {
+    // No composite was written for this board.
+  }
+}
+
 type PermissionFileHandle = FileSystemFileHandle & {
   queryPermission?: (options: { mode: "read" }) => Promise<PermissionState>;
   requestPermission?: (options: { mode: "read" }) => Promise<PermissionState>;
