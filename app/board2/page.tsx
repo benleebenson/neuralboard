@@ -28,8 +28,8 @@ import { ANONYMOUS_BOARD_TTL_DAYS, forgetCreatedBoard, normalizeJoinCode, readCr
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
-import { placeReply, planThreadDelete, threadDepths, threadDescendants, threadParents, threadShade } from "@/lib/sticky-threads";
+import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, STICKY_NOTE_RADIUS_EM, stickyNoteFrame } from "@/lib/sticky-notes";
+import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
   animatedImageSourceUrl,
@@ -3195,13 +3195,28 @@ function annotationLinesForEditor(annotation: Annotation): string[] {
     : (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
 }
 
-// A sticky note's text sits inset from its edges by a share of its font size.
-const STICKY_NOTE_PADDING_EM = 0.45;
-
 /** The box a sticky note's text wraps in: the note less its padding. Used on screen and in export. */
 function stickyNoteTextBox(annotation: Annotation): Annotation {
   const pad = (annotation.fontSize ?? 80) * STICKY_NOTE_PADDING_EM;
   return { ...annotation, boardX: annotation.boardX + pad, boardY: annotation.boardY + pad, boardW: Math.max(1, annotation.boardW - pad * 2) };
+}
+
+/** A sticky note's wrapped lines and the rounded frame they're drawn in. Used on screen and in export. */
+function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null) {
+  const fontSize = annotation.fontSize ?? 80;
+  const box = stickyNoteTextBox(annotation);
+  const lines = !annotation.text ? [] : context ? annotationLinesForContext(box, context) : annotationLinesForEditor(box);
+  // annotationLinesForContext leaves the context's font at the note's board size, so widths are in board units.
+  // With nothing to measure with, the note keeps its full width.
+  const widths = lines.map((line) => (context ? context.measureText(line).width : box.boardW));
+  return { lines, frame: stickyNoteFrame(annotation, widths, fontSize, ANNOTATION_LINE_HEIGHT) };
+}
+
+function stickyNoteLayoutForEditor(annotation: Annotation) {
+  if (typeof document !== "undefined" && !annotationMeasureContext) {
+    annotationMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  return stickyNoteLayout(annotation, annotationMeasureContext);
 }
 
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
@@ -3279,31 +3294,20 @@ function boardContentBounds(
   return { minX, minY, maxX, maxY };
 }
 
-// The line from each reply's center to its parent's, drawn under the notes. Board units, like strokes.
-const THREAD_CONNECTOR_WIDTH = 4;
-const THREAD_CONNECTOR_COLOR = "rgba(42,42,42,0.35)";
-
-function threadConnectors(annotations: readonly Annotation[]): Array<{ id: string; x1: number; y1: number; x2: number; y2: number }> {
-  const byId = new Map(annotations.map((annotation) => [annotation.id, annotation]));
-  return [...threadParents(annotations)].flatMap(([childId, parentId]) => {
-    const child = byId.get(childId)!, parent = byId.get(parentId)!;
-    return [{ id: childId, x1: parent.boardX + parent.boardW / 2, y1: parent.boardY + parent.boardH / 2, x2: child.boardX + child.boardW / 2, y2: child.boardY + child.boardH / 2 }];
-  });
-}
-
+// Sticky-note thread lines (see lib/sticky-threads), drawn under the notes. Board units, like strokes.
 function drawThreadConnectors(ctx: CanvasRenderingContext2D, annotations: readonly Annotation[], toScreen: (x: number, y: number) => [number, number], sf: number) {
   const lines = threadConnectors(annotations);
   if (lines.length === 0) return;
   ctx.save();
   ctx.strokeStyle = THREAD_CONNECTOR_COLOR;
-  ctx.lineWidth = Math.max(1, THREAD_CONNECTOR_WIDTH * sf);
   ctx.lineCap = "round";
-  ctx.beginPath();
   for (const line of lines) {
+    ctx.lineWidth = Math.max(1, line.width * sf);
+    ctx.beginPath();
     ctx.moveTo(...toScreen(line.x1, line.y1));
     ctx.lineTo(...toScreen(line.x2, line.y2));
+    ctx.stroke();
   }
-  ctx.stroke();
   ctx.restore();
 }
 
@@ -3320,7 +3324,7 @@ function drawAnnotationsToCanvas(
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
   const depths = threadDepths(annotations);
   drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
-  for (const ann of annotations) {
+  for (const ann of threadPaintOrder(annotations)) {
     const sw = Math.max(1, (ann.strokeWidth ?? 3) * sf);
     const roughSeed = ann.id.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0) & 0xffff;
     const roughOpts = { stroke: ann.color, strokeWidth: sw, roughness: 1.4, bowing: 1.2, seed: roughSeed };
@@ -3351,32 +3355,33 @@ function drawAnnotationsToCanvas(
       });
       ctx.restore();
     } else if (ann.type === "sticky") {
-      const x = toSX(ann.boardX), y = toSY(ann.boardY), w = ann.boardW * sf, h = ann.boardH * sf;
+      const cx = toSX(ann.boardX + ann.boardW / 2), cy = toSY(ann.boardY + ann.boardH / 2);
       ctx.save();
       if (ann.rotationDeg) {
-        ctx.translate(x + w / 2, y + h / 2);
+        ctx.translate(cx, cy);
         ctx.rotate(ann.rotationDeg * Math.PI / 180);
-        ctx.translate(-(x + w / 2), -(y + h / 2));
+        ctx.translate(-cx, -cy);
       }
+      const { lines, frame } = stickyNoteLayout(ann, ctx);
+      const x = toSX(frame.boardX), y = toSY(frame.boardY), w = frame.boardW * sf, h = frame.boardH * sf;
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, frame.radius * sf);
       ctx.shadowColor = "rgba(42,42,42,0.2)";
       ctx.shadowBlur = 18 * sf;
       ctx.shadowOffsetY = 8 * sf;
-      ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0);
-      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0, ann.id);
+      ctx.fill();
       ctx.shadowColor = "transparent";
-      if (ann.text) {
-        ctx.beginPath();
-        ctx.rect(x, y, w, h);
+      if (lines.length > 0) {
         ctx.clip();
-        const box = stickyNoteTextBox(ann);
         const boardFontSize = ann.fontSize ?? 80;
-        const lines = annotationLinesForContext(box, ctx);
+        const pad = boardFontSize * STICKY_NOTE_PADDING_EM;
         ctx.font = annotationFontCss(boardFontSize * sf, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
         ctx.fillStyle = ann.color || STICKY_NOTE_INK;
         ctx.textBaseline = "top";
         ctx.textAlign = "left";
         const lineHeight = boardFontSize * ANNOTATION_LINE_HEIGHT * sf;
-        lines.forEach((line, index) => ctx.fillText(line, toSX(box.boardX), toSY(box.boardY) + index * lineHeight));
+        lines.forEach((line, index) => ctx.fillText(line, toSX(frame.boardX + pad), toSY(frame.boardY + pad) + index * lineHeight));
       }
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
@@ -6756,6 +6761,8 @@ function Board2Editor({
   // Sticky-note threads: how deep each note sits (its shade) and the lines to its parent.
   const annotationThreadDepths = useMemo(() => threadDepths(annotations), [annotations]);
   const annotationThreadConnectors = useMemo(() => threadConnectors(annotations), [annotations]);
+  // Notes are stacked above their replies (see threadPaintOrder); the export draws in the same order.
+  const annotationsInPaintOrder = useMemo(() => threadPaintOrder(annotations), [annotations]);
   // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
   const boardViewEditable = chromeHidden && !viewOnly;
   const boardHasContent = annotations.length > 0 || clips.some((clip) => clip.boardX !== undefined);
@@ -27876,7 +27883,7 @@ function Board2Editor({
                 >
                   {annotationThreadConnectors.map((line) => (
                     <line key={`thread-${line.id}`} x1={line.x1 * boardZoom} y1={line.y1 * boardZoom} x2={line.x2 * boardZoom} y2={line.y2 * boardZoom}
-                      stroke={THREAD_CONNECTOR_COLOR} strokeWidth={Math.max(1, THREAD_CONNECTOR_WIDTH * boardZoom)} strokeLinecap="round" />
+                      stroke={THREAD_CONNECTOR_COLOR} strokeWidth={Math.max(1, line.width * boardZoom)} strokeLinecap="round" />
                   ))}
                   {(annotationDrawPreview ? [...annotations, annotationDrawPreview] : annotations).filter((a) => a.type !== "text").map((ann) => {
                     // Board-unit strokes scaled by zoom, as drawAnnotationsOnCanvas does for export.
@@ -27935,7 +27942,7 @@ function Board2Editor({
 
                 {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
                 {/* eslint-disable-next-line react-hooks/refs */}
-                {annotations.map((ann) => {
+                {annotationsInPaintOrder.map((ann) => {
                   const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
                   const canEdit = canEditBoardItem(ann);
@@ -28029,7 +28036,10 @@ function Board2Editor({
                         />
                       )}
                       {ann.type === "sticky" && (() => {
-                        const box = stickyNoteTextBox(ann);
+                        // Typing gets the note's whole box; otherwise the note hugs its text.
+                        const { lines, frame } = isEditing
+                          ? { lines: [], frame: { ...ann, radius: (ann.fontSize ?? 80) * STICKY_NOTE_RADIUS_EM } }
+                          : stickyNoteLayoutForEditor(ann);
                         const pad = (ann.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
                         const text: React.CSSProperties = {
                           fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
@@ -28040,8 +28050,10 @@ function Board2Editor({
                         };
                         return (
                           <div data-sticky-note style={{
-                            position: "absolute", inset: 0, boxSizing: "border-box", padding: pad, overflow: "hidden",
-                            background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0),
+                            position: "absolute", boxSizing: "border-box", padding: pad, overflow: "hidden",
+                            left: (frame.boardX - ann.boardX) * boardZoom, top: (frame.boardY - ann.boardY) * boardZoom,
+                            width: frame.boardW * boardZoom, height: frame.boardH * boardZoom, borderRadius: frame.radius * boardZoom,
+                            background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0, ann.id),
                             boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
                             pointerEvents: isEditing ? "auto" : "none", userSelect: "none",
                           }}>
@@ -28067,9 +28079,9 @@ function Board2Editor({
                                   background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflow: "hidden",
                                 }}
                               />
-                            ) : ann.text ? (
+                            ) : lines.length > 0 ? (
                               <div style={text}>
-                                {annotationLinesForEditor(box).map((line, index) => (
+                                {lines.map((line, index) => (
                                   <span key={index} style={{ display: "block", whiteSpace: "pre", height: `${ANNOTATION_LINE_HEIGHT}em` }}>{line || "\u00a0"}</span>
                                 ))}
                               </div>

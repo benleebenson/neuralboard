@@ -88,22 +88,87 @@ export function planThreadDelete<T extends ThreadItem>(items: readonly T[], ids:
   return { ok: true, ids: all };
 }
 
-// Each level down mixes this much more white into the note's color, up to a limit so deep
-// replies still read as part of their thread.
-const SHADE_PER_LEVEL = 0.8;
-const MAX_SHADE = 0.55;
+// Each level down lifts the color's HSL lightness by a few points and nudges its hue a little,
+// as the original boards did. The amounts come from the note's id, so every client and the
+// export draw the same shade. Lightness stops at MAX_LIGHTNESS so deep replies aren't white.
+const MIN_LIFT = 6;
+const MAX_LIFT = 24;
+const HUE_JITTER = 4;
+const MAX_LIGHTNESS = 96;
 
-/** The color a note is drawn in: its palette color, lightened by its depth in the thread. */
-export function threadShade(color: string, depth: number): string {
+/** A number in [0, 1) from a string, the same everywhere (FNV-1a). */
+function unitHash(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return (hash >>> 0) / 0x100000000;
+}
+
+function hexToHsl(value: number): [number, number, number] {
+  const r = ((value >> 16) & 0xff) / 255, g = ((value >> 8) & 0xff) / 255, b = (value & 0xff) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+  if (d === 0) return [0, 0, l * 100];
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s * 100, l * 100];
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const sat = s / 100, light = l / 100;
+  const k = (n: number) => (n + h / 30) % 12;
+  const a = sat * Math.min(light, 1 - light);
+  const channel = (n: number) => Math.round((light - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1))) * 255).toString(16).padStart(2, "0");
+  return `#${channel(0)}${channel(8)}${channel(4)}`.toUpperCase();
+}
+
+/** The color a note is drawn in: its palette color, lifted once per level of its depth in the thread. */
+export function threadShade(color: string, depth: number, id: string): string {
   const match = /^#([0-9a-f]{6})$/i.exec(color);
   if (!match || depth <= 0) return color;
-  const white = Math.min(MAX_SHADE, 1 - SHADE_PER_LEVEL ** depth);
-  const value = parseInt(match[1], 16);
-  const channel = (shift: number) => {
-    const c = (value >> shift) & 0xff;
-    return Math.round(c + (255 - c) * white).toString(16).padStart(2, "0");
-  };
-  return `#${channel(16)}${channel(8)}${channel(0)}`.toUpperCase();
+  const [hue, s, lightness] = hexToHsl(parseInt(match[1], 16));
+  let h = hue, l = lightness;
+  for (let level = 1; level <= depth; level++) {
+    h = (h + (unitHash(`${id}:hue:${level}`) * 2 - 1) * HUE_JITTER + 360) % 360;
+    l = Math.max(l, Math.min(l + MIN_LIFT + unitHash(`${id}:lift:${level}`) * (MAX_LIFT - MIN_LIFT), MAX_LIGHTNESS));
+  }
+  return hslToHex(h, s, l);
+}
+
+// The line from each reply's center to its parent's, drawn under the notes in solid slate. Its
+// width is a share of the parent's font size, so it scales with the note like its text does.
+export const THREAD_CONNECTOR_COLOR = "#4B5563";
+const THREAD_CONNECTOR_WIDTH_EM = 0.2;
+
+export type ThreadConnector = { id: string; x1: number; y1: number; x2: number; y2: number; width: number };
+
+/** One line per reply whose parent is on the board, in board units, from parent center to reply center. */
+export function threadConnectors(items: readonly (ThreadItem & Box & { fontSize?: number })[]): ThreadConnector[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  return [...threadParents(items)].map(([childId, parentId]) => {
+    const child = byId.get(childId)!, parent = byId.get(parentId)!;
+    return {
+      id: childId,
+      x1: parent.boardX + parent.boardW / 2, y1: parent.boardY + parent.boardH / 2,
+      x2: child.boardX + child.boardW / 2, y2: child.boardY + child.boardH / 2,
+      width: (parent.fontSize ?? 80) * THREAD_CONNECTOR_WIDTH_EM,
+    };
+  });
+}
+
+/**
+ * The items in the order they're drawn, last on top: a note sits above its replies, and each
+ * level above the one below it. Only thread members move, and only among the places they
+ * already held, so everything else keeps its stacking.
+ */
+export function threadPaintOrder<T extends ThreadItem>(items: readonly T[]): T[] {
+  const parents = threadParents(items);
+  if (parents.size === 0) return [...items];
+  const members = new Set([...parents.keys(), ...parents.values()]);
+  const depths = threadDepths(items);
+  const slots = items.flatMap((item, index) => (members.has(item.id) ? [index] : []));
+  const ordered = slots.map((index) => items[index]).sort((a, b) => depths.get(b.id)! - depths.get(a.id)!);
+  const result = [...items];
+  slots.forEach((slot, i) => { result[slot] = ordered[i]; });
+  return result;
 }
 
 // Where a reply goes, in units of its parent's size: right, below, left, above, then the corners.
