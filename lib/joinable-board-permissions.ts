@@ -1,5 +1,6 @@
 import { stableStringify, type JoinableBoardState } from "./joinable-board.ts";
 import { isStickyNoteColor, STICKY_NOTE_MAX_TEXT } from "./sticky-notes.ts";
+import { THREAD_DELETE_OWNER_ONLY } from "./sticky-threads.ts";
 
 // Owner vs joiner on a joinable board. The owner can change anything. A joiner adds to the board
 // and changes only what they added; whole-board settings belong to the owner. The server applies
@@ -35,7 +36,18 @@ function stickyNoteError(item: Item): string | null {
   if (item.type !== "sticky") return null;
   if (!isStickyNoteColor(item.noteColor)) return "Sticky notes must use one of the note colors.";
   if (item.text !== undefined && (typeof item.text !== "string" || item.text.length > STICKY_NOTE_MAX_TEXT)) return "That sticky note's text is too long.";
+  if (item.parentId !== undefined && (typeof item.parentId !== "string" || item.parentId.length > 200)) return "That reply doesn't point at a note.";
   return null;
+}
+
+// Deleting a note takes its replies with it, so a joiner can't delete a note that other people
+// have replied to: that would leave their replies hanging off nothing. The owner can.
+function threadDeleteError(previous: Item[], kept: Item[], participantId: string): string | null {
+  const keptIds = new Set(kept.map((item) => item.id));
+  const removed = new Set(previous.filter((item) => typeof item.id === "string" && !keptIds.has(item.id)).map((item) => item.id as string));
+  if (removed.size === 0) return null;
+  const strandsReply = kept.some((item) => typeof item.parentId === "string" && removed.has(item.parentId) && item.addedBy !== participantId);
+  return strandsReply ? THREAD_DELETE_OWNER_ONLY : null;
 }
 
 function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string): { ok: true; items: Item[] } | { ok: false; error: string } {
@@ -88,5 +100,7 @@ export function checkJoinerUpdate(previous: JoinableBoardState, next: JoinableBo
   if (!clips.ok) return clips;
   const annotations = checkItems("annotations", (prev.annotations as Item[] | undefined) ?? [], (nxt.annotations as Item[] | undefined) ?? [], participantId);
   if (!annotations.ok) return annotations;
+  const threadError = threadDeleteError((prev.annotations as Item[] | undefined) ?? [], annotations.items, participantId);
+  if (threadError) return { ok: false, error: threadError };
   return { ok: true, state: { ...previous, clips: clips.items, annotations: annotations.items } as JoinableBoardState };
 }

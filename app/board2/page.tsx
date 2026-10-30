@@ -29,6 +29,7 @@ import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
 import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
+import { placeReply, planThreadDelete, threadDepths, threadDescendants, threadParents, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
   animatedImageSourceUrl,
@@ -1934,6 +1935,7 @@ type Annotation = {
   points?: Array<{ x: number; y: number; pressure?: number }>;  // pen, in board space
   emoji?: string;                              // emoji
   noteColor?: string;                          // sticky: the note's color, one of STICKY_NOTE_COLORS
+  parentId?: string;                           // sticky: the note this one replies to (see lib/sticky-threads)
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
   autoLayoutSeed?: number;
@@ -3277,6 +3279,34 @@ function boardContentBounds(
   return { minX, minY, maxX, maxY };
 }
 
+// The line from each reply's center to its parent's, drawn under the notes. Board units, like strokes.
+const THREAD_CONNECTOR_WIDTH = 4;
+const THREAD_CONNECTOR_COLOR = "rgba(42,42,42,0.35)";
+
+function threadConnectors(annotations: readonly Annotation[]): Array<{ id: string; x1: number; y1: number; x2: number; y2: number }> {
+  const byId = new Map(annotations.map((annotation) => [annotation.id, annotation]));
+  return [...threadParents(annotations)].flatMap(([childId, parentId]) => {
+    const child = byId.get(childId)!, parent = byId.get(parentId)!;
+    return [{ id: childId, x1: parent.boardX + parent.boardW / 2, y1: parent.boardY + parent.boardH / 2, x2: child.boardX + child.boardW / 2, y2: child.boardY + child.boardH / 2 }];
+  });
+}
+
+function drawThreadConnectors(ctx: CanvasRenderingContext2D, annotations: readonly Annotation[], toScreen: (x: number, y: number) => [number, number], sf: number) {
+  const lines = threadConnectors(annotations);
+  if (lines.length === 0) return;
+  ctx.save();
+  ctx.strokeStyle = THREAD_CONNECTOR_COLOR;
+  ctx.lineWidth = Math.max(1, THREAD_CONNECTOR_WIDTH * sf);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  for (const line of lines) {
+    ctx.moveTo(...toScreen(line.x1, line.y1));
+    ctx.lineTo(...toScreen(line.x2, line.y2));
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
 function drawAnnotationsToCanvas(
   ctx: CanvasRenderingContext2D,
   annotations: Annotation[],
@@ -3288,6 +3318,8 @@ function drawAnnotationsToCanvas(
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
+  const depths = threadDepths(annotations);
+  drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
   for (const ann of annotations) {
     const sw = Math.max(1, (ann.strokeWidth ?? 3) * sf);
     const roughSeed = ann.id.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0) & 0xffff;
@@ -3329,7 +3361,7 @@ function drawAnnotationsToCanvas(
       ctx.shadowColor = "rgba(42,42,42,0.2)";
       ctx.shadowBlur = 18 * sf;
       ctx.shadowOffsetY = 8 * sf;
-      ctx.fillStyle = ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR;
+      ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0);
       ctx.fillRect(x, y, w, h);
       ctx.shadowColor = "transparent";
       if (ann.text) {
@@ -6721,6 +6753,9 @@ function Board2Editor({
   // Unmarked items not yet synced are new here, so they're theirs too.
   const canEditBoardItem = (item: { id: string; addedBy?: string }) =>
     isBoardOwner || (!!participantId && itemAuthor(item) === participantId);
+  // Sticky-note threads: how deep each note sits (its shade) and the lines to its parent.
+  const annotationThreadDepths = useMemo(() => threadDepths(annotations), [annotations]);
+  const annotationThreadConnectors = useMemo(() => threadConnectors(annotations), [annotations]);
   // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
   const boardViewEditable = chromeHidden && !viewOnly;
   const boardHasContent = annotations.length > 0 || clips.some((clip) => clip.boardX !== undefined);
@@ -17978,14 +18013,51 @@ function Board2Editor({
     setEditingAnnotationId((prev) => (prev === id ? null : prev));
   }
 
+  // Deleting a note takes its replies with it (see planThreadDelete). Returns false, with a toast,
+  // when the thread has replies this person can't delete.
+  function deleteAnnotationsWithReplies(ids: string[], confirm: boolean): boolean {
+    const plan = planThreadDelete(annotationsRef.current, ids, canEditBoardItem);
+    if (!plan.ok) { setToast(plan.error); return false; }
+    const replies = plan.ids.size - new Set(ids).size;
+    if (confirm && !window.confirm(replies > 0
+      ? `Delete this note and its ${replies} ${replies === 1 ? "reply" : "replies"} from the board?`
+      : "Delete this annotation from the board?")) return false;
+    plan.ids.forEach((id) => deleteAnnotation(id));
+    return true;
+  }
+
   function confirmDeleteAnnotation(id: string) {
-    if (!window.confirm("Delete this annotation from the board?")) return;
-    deleteAnnotation(id);
+    deleteAnnotationsWithReplies([id], true);
+  }
+
+  function hasReplies(id: string): boolean {
+    return threadDescendants(annotationsRef.current, [id]).size > 0;
+  }
+
+  // A reply: a new sticky note beside `parent`, in the thread's color, joined to it by a line.
+  function addStickyReply(parent: Annotation) {
+    const others = annotationsRef.current.filter((annotation) => annotation.type === "sticky");
+    const box = placeReply(parent, others, threadDescendants(annotationsRef.current, [parent.id]).size);
+    const annotation: Annotation = {
+      id: generateId(), type: "sticky", parentId: parent.id,
+      ...box,
+      color: STICKY_NOTE_INK, noteColor: parent.noteColor ?? DEFAULT_STICKY_NOTE_COLOR,
+      text: "", fontFamily: parent.fontFamily ?? "Caveat", fontSize: parent.fontSize ?? 80, fontWeight: "normal",
+    };
+    setBoardAddPrompt(null);
+    disarmAnnotationTool();
+    setAnnotations((prev) => [...prev, annotation]);
+    setAnnotationSelection([annotation.id]);
+    setEditingAnnotationId(annotation.id);
+    setEditingAnnotationText("");
   }
 
   function commitTextEdit(annId: string) {
     const text = editingAnnotationTextRef.current;
-    if (!text.trim()) {
+    if (!text.trim() && hasReplies(annId)) {
+      // Clearing a note that has replies keeps it, with its old text, rather than deleting the thread.
+      setEditingAnnotationId(null);
+    } else if (!text.trim()) {
       deleteAnnotation(annId);
     } else {
       const textarea = editingTextareaRef.current;
@@ -18031,11 +18103,20 @@ function Board2Editor({
   // ─ Annotation drag (pointer tool) ────────────────────────────────────────
 
   function handleAnnotationPointerDown(e: React.PointerEvent, ann: Annotation) {
-    if (!canEditBoardItem(ann)) return;
+    if (!canEditBoardItem(ann)) {
+      // Anyone can reply to a sticky note, so anyone can select one; only its author moves it.
+      if (ann.type !== "sticky" || viewOnly) return;
+      e.stopPropagation();
+      setAnnotationSelection([ann.id]);
+      return;
+    }
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const movingAnnotationIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedAnnotationIdsRef.current] : [ann.id];
+    const selectedIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedAnnotationIdsRef.current] : [ann.id];
+    // A note's replies come along when it's dragged, except ones this person can't move.
+    const movingAnnotationIds = [...selectedIds, ...[...threadDescendants(annotationsRef.current, selectedIds)]
+      .filter((id) => { const reply = annotationsRef.current.find((a) => a.id === id); return !!reply && canEditBoardItem(reply); })];
     const movingClipIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedClipIdsRef.current] : [];
     if (!selectedAnnotationIdsRef.current.includes(ann.id)) setAnnotationSelection([ann.id]);
     const startX = e.clientX, startY = e.clientY;
@@ -22366,7 +22447,7 @@ function Board2Editor({
           setSelectedClipId(null);
         } else if (annotationIds.length > 0) {
           e.preventDefault();
-          setAnnotations((prev) => prev.filter((ann) => !annotationIds.includes(ann.id)));
+          if (!deleteAnnotationsWithReplies(annotationIds, false)) return;
           selectedAnnotationIdsRef.current = [];
           setSelectedAnnotationIds([]);
           setSelectedAnnotationId(null);
@@ -22562,6 +22643,7 @@ function Board2Editor({
     setBoardPan({ ...boardPanRef.current });
   }
 
+  const mobileReplyTargetIdRef = useRef<string | null>(null);
   function handleMobileBoardPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     if (e.pointerType === "pen" || (annotationToolRef.current === "pen" && !stylusOnlyRef.current && mobileBoardPointersRef.current.size === 0)) return;
     e.stopPropagation();
@@ -22587,6 +22669,9 @@ function Board2Editor({
     const hitClipId = clipEl && !viewOnly ? editableClipId((clipEl as HTMLElement).dataset.mbclipid) : null;
     const hitAnnotationId = annotationEl && !viewOnly ? editableAnnotationId((annotationEl as HTMLElement).dataset.mbannotationid) : null;
     if (hitClipId) selectionSurfaceRef.current = "board";
+    // Someone else's sticky note: dragging on it pans, but a tap selects it so it can be replied to.
+    const touchedAnnotation = annotationEl && !viewOnly && !hitAnnotationId ? annotationsRef.current.find((a) => a.id === (annotationEl as HTMLElement).dataset.mbannotationid) : undefined;
+    mobileReplyTargetIdRef.current = touchedAnnotation?.type === "sticky" ? touchedAnnotation.id : null;
 
     g.type = "deciding";
     g.hitClipId = hitClipId;
@@ -22702,6 +22787,8 @@ function Board2Editor({
           setEditingAnnotationId(tapped.id);
           setEditingAnnotationText(tapped.text ?? "");
         }
+      } else if (mobileReplyTargetIdRef.current) {
+        setAnnotationSelection([mobileReplyTargetIdRef.current]);
       } else if (boardViewEditable) {
         handleBoardViewTap(e.clientX, e.clientY);
       } else {
@@ -27787,6 +27874,10 @@ function Board2Editor({
                 <svg
                   style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 4, overflow: "visible" }}
                 >
+                  {annotationThreadConnectors.map((line) => (
+                    <line key={`thread-${line.id}`} x1={line.x1 * boardZoom} y1={line.y1 * boardZoom} x2={line.x2 * boardZoom} y2={line.y2 * boardZoom}
+                      stroke={THREAD_CONNECTOR_COLOR} strokeWidth={Math.max(1, THREAD_CONNECTOR_WIDTH * boardZoom)} strokeLinecap="round" />
+                  ))}
                   {(annotationDrawPreview ? [...annotations, annotationDrawPreview] : annotations).filter((a) => a.type !== "text").map((ann) => {
                     // Board-unit strokes scaled by zoom, as drawAnnotationsOnCanvas does for export.
                     const sw = Math.max(1, (ann.strokeWidth ?? 3) * boardZoom);
@@ -27847,7 +27938,10 @@ function Board2Editor({
                 {annotations.map((ann) => {
                   const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
-                  const showHandles = isSel && annotationTool === "pointer" && !isEditing;
+                  const canEdit = canEditBoardItem(ann);
+                  // Someone else's note can be selected (to reply), but its handles are its author's.
+                  const showHandles = isSel && annotationTool === "pointer" && !isEditing && canEdit;
+                  const showReply = isSel && annotationTool === "pointer" && !isEditing && ann.type === "sticky" && !viewOnly && selectedAnnotationIds.length <= 1;
                   const textLines = ann.type === "text" && ann.text
                     ? annotationLinesForEditor(ann)
                     : [];
@@ -27912,7 +28006,7 @@ function Board2Editor({
                           onChange={(e) => setEditingAnnotationText(e.target.value)}
                           onKeyDown={(e) => {
                             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextEdit(ann.id); }
-                            else if (e.key === "Escape") { if (!ann.text) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
+                            else if (e.key === "Escape") { if (!ann.text && !hasReplies(ann.id)) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
                           }}
                           onBlur={() => commitTextEdit(ann.id)}
                           style={{
@@ -27947,7 +28041,7 @@ function Board2Editor({
                         return (
                           <div data-sticky-note style={{
                             position: "absolute", inset: 0, boxSizing: "border-box", padding: pad, overflow: "hidden",
-                            background: ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR,
+                            background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0),
                             boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
                             pointerEvents: isEditing ? "auto" : "none", userSelect: "none",
                           }}>
@@ -27963,7 +28057,7 @@ function Board2Editor({
                                 onFocus={(e) => { const end = e.currentTarget.value.length; e.currentTarget.setSelectionRange(end, end); }}
                                 onKeyDown={(e) => {
                                   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextEdit(ann.id); }
-                                  else if (e.key === "Escape") { if (!ann.text) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
+                                  else if (e.key === "Escape") { if (!ann.text && !hasReplies(ann.id)) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
                                 }}
                                 onBlur={() => commitTextEdit(ann.id)}
                                 style={{
@@ -27984,7 +28078,7 @@ function Board2Editor({
                         );
                       })()}
                       {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
-                      {ann.type === "sticky" && (showHandles || isEditing) && canEditBoardItem(ann) && (
+                      {ann.type === "sticky" && (showHandles || isEditing) && canEdit && (
                         <div
                           role="radiogroup"
                           aria-label="Note color"
@@ -28045,6 +28139,16 @@ function Board2Editor({
                             );
                           })
                         )
+                      )}
+                      {showReply && (
+                        <button
+                          type="button"
+                          aria-label="Reply to this note"
+                          title="Reply"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); addStickyReply(ann); }}
+                          style={{ position: "absolute", left: "100%", top: "50%", transform: `translate(${isMobile ? 10 : 8}px, -50%)`, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 10px", borderRadius: 999, border: "2px solid #fff", background: "#1E8C83", color: "#fff", fontSize: isMobile ? 16 : 12, fontWeight: 600, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap" }}
+                        >↳ Reply</button>
                       )}
                       {showHandles && (
                         <button
