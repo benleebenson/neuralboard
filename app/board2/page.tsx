@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -6499,6 +6499,9 @@ function Board2Editor({
   const boardAddImageInputRef = useRef<HTMLInputElement | null>(null);
   // The color the next sticky note gets: the last one picked.
   const [stickyColor, setStickyColor] = useState<string>(DEFAULT_STICKY_NOTE_COLOR);
+  // A new sticky note or reply being written in the compose modal, as the original boards did: it's
+  // on the board only once posted. `note` is placed, colored and has its id (so its shade is final).
+  const [stickyComposer, setStickyComposer] = useState<{ note: Annotation; text: string } | null>(null);
   const boardAddPointRef = useRef<{ x: number; y: number } | null>(null);
   // Touch pan/pinch preview: the layer the transform goes on, and the view React last rendered
   // (the transform's starting point) while a preview is showing.
@@ -17925,15 +17928,24 @@ function Board2Editor({
     };
     setBoardAddPrompt(null);
     disarmAnnotationTool();
-    setAnnotations((prev) => [...prev, annotation]);
-    setAnnotationSelection([annotation.id]);
-    setEditingAnnotationId(annotation.id);
-    setEditingAnnotationText("");
+    setStickyComposer({ note: annotation, text: "" });
   }
 
   function setStickyNoteColor(id: string, noteColor: string) {
     setStickyColor(noteColor);
     setAnnotations((prev) => prev.map((annotation) => annotation.id === id && annotation.type === "sticky" ? { ...annotation, noteColor } : annotation));
+  }
+
+  // Posting puts the note on the board at its final size: as tall as its text (see commitTextEdit).
+  function postStickyComposer() {
+    if (!stickyComposer) return;
+    const text = stickyComposer.text.trim();
+    if (!text) return;
+    const { note } = stickyComposer;
+    const annotation: Annotation = { ...note, text, boardH: Math.max(note.boardH, stickyNoteLayoutForEditor(note, text).frame.boardH) };
+    setStickyComposer(null);
+    setAnnotations((prev) => [...prev, annotation]);
+    setAnnotationSelection([annotation.id]);
   }
 
   function addImageFromBoardPrompt() {
@@ -18083,10 +18095,7 @@ function Board2Editor({
     };
     setBoardAddPrompt(null);
     disarmAnnotationTool();
-    setAnnotations((prev) => [...prev, annotation]);
-    setAnnotationSelection([annotation.id]);
-    setEditingAnnotationId(annotation.id);
-    setEditingAnnotationText("");
+    setStickyComposer({ note: annotation, text: "" });
   }
 
   function commitTextEdit(annId: string) {
@@ -23098,6 +23107,77 @@ function Board2Editor({
     setToast(enabled ? "Narration block added — it types out during this zoom" : "Narration block removed");
   }
 
+  // The sticky-note compose modal: over a dimmed, blurred board, a big textarea in the note's own
+  // shade. Enter posts, Shift+Enter is a new line, Escape or a click outside cancels.
+  function renderStickyComposer() {
+    if (!stickyComposer) return null;
+    const { note, text } = stickyComposer;
+    const isReply = !!note.parentId;
+    const depth = isReply ? (annotationThreadDepths.get(note.parentId!) ?? 0) + 1 : 0;
+    const noteColor = note.noteColor ?? DEFAULT_STICKY_NOTE_COLOR;
+    const cancel = () => setStickyComposer(null);
+    const buttonHeight = isMobile ? 44 : 30;
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={isReply ? "Reply to a sticky note" : "New sticky note"}
+        onPointerDown={(event) => { if (event.target === event.currentTarget) cancel(); }}
+        style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(42,42,42,.35)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }}
+      >
+        <div style={{ width: 520, maxWidth: "96vw", display: "flex", flexDirection: "column", gap: 12, padding: 14, borderRadius: 18, background: "#fffdf5", boxShadow: "0 18px 70px rgba(42,42,42,.28)", fontFamily: "monospace", boxSizing: "border-box" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: STICKY_NOTE_INK }}>{isReply ? "Reply" : "New note"}</div>
+            {/* A reply takes its thread's color; a new note's color can be picked. */}
+            {!isReply && (
+              <div role="radiogroup" aria-label="Note color" style={{ display: "flex", gap: isMobile ? 2 : 6 }}>
+                {STICKY_NOTE_COLORS.map(({ color, name }) => {
+                  const checked = noteColor === color;
+                  return (
+                    <button
+                      key={color}
+                      type="button"
+                      role="radio"
+                      aria-checked={checked}
+                      aria-label={name}
+                      title={name}
+                      onClick={() => { setStickyColor(color); setStickyComposer((current) => current && { ...current, note: { ...current.note, noteColor: color } }); }}
+                      style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <textarea
+            autoFocus
+            aria-label={isReply ? "Reply text" : "Note text"}
+            placeholder={isReply ? "Write a reply…" : "Write a note…"}
+            value={text}
+            maxLength={STICKY_NOTE_MAX_TEXT}
+            onChange={(event) => { const value = event.target.value; setStickyComposer((current) => current && { ...current, text: value }); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); postStickyComposer(); }
+              else if (event.key === "Escape") { event.preventDefault(); cancel(); }
+            }}
+            style={{
+              width: "100%", minHeight: isMobile ? 160 : 200, boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
+              background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
+              color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
+            }}
+          />
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 10, color: "#6a6a6a" }}>{isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels"}</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" onClick={cancel} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px" }}>Cancel</button>
+              <button type="button" onClick={postStickyComposer} disabled={!text.trim()} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px", background: "#2a2a2a", color: "#fffdf5", opacity: text.trim() ? 1 : 0.5, cursor: text.trim() ? "pointer" : "not-allowed" }}>Post</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderZoomEditorModal() {
     if (!zoomEditClipId) return null;
     const clip = clips.find((candidate) => candidate.id === zoomEditClipId);
@@ -25672,6 +25752,7 @@ function Board2Editor({
       {renderNarrationVideoModal()}
         {renderNarrationVideoModal()}
         {renderZoomEditorModal()}
+        {renderStickyComposer()}
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
         {renderImagePreviewModal()}
@@ -31543,6 +31624,7 @@ function Board2Editor({
       {renderMediaEditorModal()}
       {renderNarrationVideoModal()}
       {renderZoomEditorModal()}
+      {renderStickyComposer()}
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
       {renderImagePreviewModal()}
