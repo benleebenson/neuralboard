@@ -24,7 +24,8 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
-import { ANONYMOUS_BOARD_TTL_DAYS, forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
+import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
@@ -6098,6 +6099,8 @@ type ActiveBoard = BoardWorkspaceStatus & {
   initialFile?: File;
   /** Opened by the app shell's +: run "Make board joinable" once on mount. */
   makeJoinable?: boolean;
+  /** The type picked at the shell's + (old school or Neural). */
+  boardType?: BoardType;
 };
 
 function isTextDraft(annotation: Annotation): boolean {
@@ -6120,7 +6123,7 @@ function currentEditorUrl(): string {
 
 function createActiveBoard(
   source?: { file: File; fileName: string; name: string },
-  options: { fresh?: boolean; makeJoinable?: boolean } = {},
+  options: { fresh?: boolean; makeJoinable?: boolean; boardType?: BoardType } = {},
 ): ActiveBoard {
   const local = !source && !options.fresh;
   return {
@@ -6133,6 +6136,7 @@ function createActiveBoard(
     sourceFileName: source?.fileName,
     initialFile: source?.file,
     makeJoinable: options.makeJoinable,
+    boardType: options.boardType,
   };
 }
 
@@ -6151,8 +6155,9 @@ export default function Board2Page() {
     // instead of the autosaved one, chosen before the editor first mounts.
     const create = url.searchParams.get("create");
     if (create === "blank" || create === "joinable") {
-      setBoard(createActiveBoard(undefined, { fresh: true, makeJoinable: create === "joinable" }));
+      setBoard(createActiveBoard(undefined, { fresh: true, makeJoinable: create === "joinable", boardType: parseBoardType(url.searchParams.get(BOARD_TYPE_PARAM)) }));
       url.searchParams.delete("create");
+      url.searchParams.delete(BOARD_TYPE_PARAM);
       window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
     }
     const view = url.searchParams.get("view");
@@ -6312,6 +6317,7 @@ export default function Board2Page() {
             initialFile={board.initialFile}
             initialFileName={board.sourceFileName}
             autoMakeJoinable={board.makeJoinable === true}
+            initialBoardType={board.boardType}
             onWorkspaceStatus={updateBoardStatus}
             onWorkspaceSource={updateBoardSource}
             chromeHidden={chromeHidden}
@@ -6421,10 +6427,11 @@ function Board2Editor({
   initialFile,
   initialFileName,
   autoMakeJoinable = false,
+  initialBoardType = "neural",
   onWorkspaceStatus,
   onWorkspaceSource,
   chromeHidden,
-  worldBoards,
+  worldBoards: allWorldBoards,
   activeWorldBoard,
   onToggleChrome,
   onOpenEditor,
@@ -6439,6 +6446,7 @@ function Board2Editor({
   initialFile?: File;
   initialFileName?: string;
   autoMakeJoinable?: boolean;
+  initialBoardType?: BoardType;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
   onWorkspaceSource: (workspaceId: string, fileName: string) => void;
   chromeHidden: boolean;
@@ -6456,6 +6464,11 @@ function Board2Editor({
   const { data: session, status: sessionStatus } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
 
+  // An old-school ("simple") board is sticky notes and photos: no video editor, no other boards
+  // around it. Shared with joiners in the board state; the owner can turn it into a Neural board.
+  const [boardType, setBoardType] = useState<BoardType>(initialBoardType);
+  const isSimpleBoard = boardType === "simple";
+  const worldBoards = isSimpleBoard ? NO_WORLD_BOARDS : allWorldBoards;
   const [joinCode, setJoinCode] = useState("");
   const [joinOwnerToken, setJoinOwnerToken] = useState("");
   // From the server: whether the shared board has no account owner yet, and when it expires
@@ -8222,8 +8235,9 @@ function Board2Editor({
     showCharacter2,
     canvasAspect,
     boardColor,
+    boardType,
     };
-  }, [annotations, boardColor, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, itemAuthor, showCharacter, showCharacter2]);
+  }, [annotations, boardColor, boardDimensions, boardType, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, itemAuthor, showCharacter, showCharacter2]);
   const joinableSignature = useMemo(() => stableStringify(joinableSnapshot), [joinableSnapshot]);
   useEffect(() => { joinableSnapshotRef.current = joinableSnapshot; }, [joinableSnapshot]);
 
@@ -8267,6 +8281,7 @@ function Board2Editor({
       setBoardColor(state.boardColor);
     }
     if (state.canvasAspect === "16:9" || state.canvasAspect === "9:16") setCanvasAspect(state.canvasAspect);
+    setBoardType(parseBoardType(state.boardType));
   }, []);
 
   useEffect(() => {
@@ -8304,6 +8319,12 @@ function Board2Editor({
     // claimCreatedBoard is component-local; it runs once per board when the creator is signed in.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joinAnonymous, joinCode, joinOwnerToken, session?.user?.email]);
+
+  // An old-school board has no video editor: whatever would open it (a remembered editor, a
+  // shortcut) lands back on the board.
+  useEffect(() => {
+    if (isSimpleBoard && !chromeHidden) onToggleChrome();
+  }, [chromeHidden, isSimpleBoard, onToggleChrome]);
 
   const autoMakeJoinableStartedRef = useRef(false);
   useEffect(() => {
@@ -9047,6 +9068,7 @@ function Board2Editor({
         boardPan,
         boardDimensions,
         boardColor,
+        boardType,
         spawnDoor,
         customZoomDurationSeconds: customZoomDuration,
         characters: [
@@ -9078,7 +9100,7 @@ function Board2Editor({
     };
   }, [
     autosaveEnabled, isLoadingProject, saveName, clips, annotations, cameraKeyframes, canvasAspect, pxPerSec, boardZoom, boardPan,
-    boardDimensions, boardColor, spawnDoor, customZoomDuration, showCharacter, characterMode, characterSkin, characterType,
+    boardDimensions, boardColor, boardType, spawnDoor, customZoomDuration, showCharacter, characterMode, characterSkin, characterType,
     characterExpression, characterActions, characterStart, showCharacter2, characterMode2, characterSkin2, characterType2,
     characterExpression2, characterActions2, characterStart2, narrationVisemeTrack, narrationVisemeTrackSource,
     narrationGestureTrack, narrationGestureTrackSource, smartGestures, captionsEnabled, captionFontSize, captionPosition,
@@ -15742,6 +15764,8 @@ function Board2Editor({
     // Animated GIF/WebP stays an image clip whose decoded frames loop (lib/board2/animated-image).
     const animated = isGifFile(file, name) || isAnimatableImageType(file.type) ? await decodeAnimatedImage(file) : null;
     const type: "image" | "video" = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(name)) ? "video" : "image";
+    // The server rejects anything else on an old-school board; say so before uploading it.
+    if (isSimpleBoard && (type !== "image" || /^(audio|video)\//.test(file.type))) throw new Error(SIMPLE_BOARD_ITEMS_ONLY);
     let url: string;
     let notShared = "";
     if (type === "image" && joinCode) url = await uploadJoinableImage(file, name);
@@ -25938,6 +25962,7 @@ function Board2Editor({
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
         spawnDoor: spawnDoorRef.current,
+        boardType,
       },
       timeline: {
         blocks: timelineBlocks,
@@ -26161,6 +26186,7 @@ function Board2Editor({
         captions: rawManifest.narration?.captions,
         customZoomDurationSeconds: rawManifest.timeline?.customZoomDurationSeconds,
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
+        boardType: rawManifest.board?.boardType,
       } : rawManifest;
       if (schemaVersion >= 1) {
         if (typeof (rawManifest.meta?.id ?? rawManifest.meta?.projectId) === "string") recipeProjectIdRef.current = rawManifest.meta.id ?? rawManifest.meta.projectId;
@@ -26366,6 +26392,7 @@ function Board2Editor({
       }
       if (manifest.name) setSaveName(manifest.name);
       if (typeof manifest.boardColor === "string" && /^#[0-9a-f]{6}$/i.test(manifest.boardColor)) setBoardColor(manifest.boardColor);
+      setBoardType(parseBoardType(manifest.boardType));
       const loadFace = (face: ManifestFace | null | undefined): CharacterFaceSettings | null => {
         if (!face?.assetFile || !files[face.assetFile]) return null;
         const faceData = files[face.assetFile];
@@ -26908,7 +26935,7 @@ function Board2Editor({
   async function makeBoardJoinable(): Promise<{ code: string; token: string } | null> {
     setJoinStatus("connecting");
     try {
-      const response = await fetch("/api/joinable-board", { method: "POST" });
+      const response = await fetch("/api/joinable-board", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ boardType }) });
       const result = await response.json() as { code?: string; token?: string; error?: string; expiresAt?: string | null; anonymous?: boolean };
       if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
       // Persist the owner token the moment the board exists: the uploads below can take a while,
@@ -27094,7 +27121,14 @@ function Board2Editor({
                           </div>
                         </div>
                       )}
-                      {isBoardOwner && (
+                      {isBoardOwner && isSimpleBoard && (
+                        <div className={shellStyles.popoverSection}>
+                          <span className={shellStyles.caption}>Make a video</span>
+                          <p className={shellStyles.caption} style={{ color: "var(--body)" }}>Turn this into a Neural board to make a video from what&apos;s on it. Everything stays, and so does the code. This can&apos;t be undone.</p>
+                          <button type="button" className={shellStyles.outlineButton} onClick={() => { setBoardSettingsOpen(false); setBoardType("neural"); setToast("This is now a Neural board. Open the video editor from the top bar."); }}>Turn into a Neural board</button>
+                        </div>
+                      )}
+                      {isBoardOwner && !isSimpleBoard && (
                         <div className={shellStyles.popoverSection}>
                           <span className={shellStyles.caption}>Board file</span>
                           <div className={shellStyles.popoverRow}>
@@ -27110,7 +27144,7 @@ function Board2Editor({
                           {(joinOwnerToken || joinServerOwner) && <button type="button" className={`${shellStyles.outlineButton} ${shellStyles.dangerButton}`} onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }}>Stop sharing {joinCode}</button>}
                         </div>
                       )}
-                      {LIVE_FEATURES_ENABLED && (
+                      {LIVE_FEATURES_ENABLED && !isSimpleBoard && (
                         <ProGated featureName="Play Mode">
                           <button type="button" className={shellStyles.outlineButton} onClick={enterPlayMode} title="Full-window direct character control">▶ Play</button>
                         </ProGated>
@@ -27130,7 +27164,7 @@ function Board2Editor({
               <button type="button" className={shellStyles.glassButton} onClick={() => { void toggleFullscreen(); }} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
                 {isFullscreen ? <CompressIcon size={18} /> : <ExpandIcon size={18} />}
               </button>
-              {isBoardOwner && (
+              {isBoardOwner && !isSimpleBoard && (
                 <button type="button" className={shellStyles.glassButton} aria-label="Open video editor" aria-pressed={false} title="Open the video editor for the board centered on screen" onClick={restoreChromeForCenteredBoard}>
                   <ClapperboardIcon open={false} stripe="#ffffff" size={19} />
                 </button>
@@ -27578,18 +27612,27 @@ function Board2Editor({
                       onKeyDown={(event) => { if (event.key === "Escape") setBoardAddPrompt(null); }}
                       style={{ left, top, width, height, boxSizing: "border-box" }}
                     >
-                      <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>
-                      <button type="button" role="menuitem" onClick={addStickyFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 2, background: stickyColor, boxShadow: "inset 0 0 0 1px rgba(42,42,42,.25)" }} />Sticky</button>
-                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true">🖼</span>Image</button>
+                      {!isSimpleBoard && <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>}
+                      {/* Old-school boards: a sticky note is the text, so it's the first choice. */}
+                      <button type="button" role="menuitem" autoFocus={isSimpleBoard} onClick={addStickyFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 2, background: stickyColor, boxShadow: "inset 0 0 0 1px rgba(42,42,42,.25)" }} />{isSimpleBoard ? "Sticky note" : "Sticky"}</button>
+                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true">🖼</span>{isSimpleBoard ? "Photo" : "Image"}</button>
                     </div>
                   </>
                 );
               })()}
               {pendingMediaPlacement && (
-                <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
-                  <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
-                  <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
-                </div>
+                // The board view uses the app-shell look; the video editor keeps its own.
+                chromeHidden ? (
+                  <div data-media-placement-ui role="status" className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.placementBanner}`}>
+                    <span>Placing <strong>{pendingMediaPlacement.item.name}</strong>. Zoom or pan, then tap the board</span>
+                    <button type="button" onClick={cancelPendingMediaPlacement} className={shellStyles.outlineButton}>Cancel</button>
+                  </div>
+                ) : (
+                  <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+                    <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
+                    <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
+                  </div>
+                )
               )}
               {/* Everything that sits at board coordinates. During a touch pan or pinch it moves as one
                   CSS transform (previewBoardView) and React catches up once, when the gesture ends. */}
@@ -27629,7 +27672,7 @@ function Board2Editor({
                     aria-hidden={boardHasContent}
                     style={{
                       position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                      pointerEvents: "none", userSelect: "none", color: "rgba(42,42,42,0.16)", fontFamily: "monospace", textAlign: "center",
+                      pointerEvents: "none", userSelect: "none", color: "rgba(42,42,42,0.16)", fontFamily: "var(--font-shell), \"Open Sans\", system-ui, sans-serif", textAlign: "center",
                       opacity: boardHasContent ? 0 : 1, transition: "opacity 600ms ease", zIndex: 0,
                     }}
                   >

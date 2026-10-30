@@ -6,16 +6,18 @@ import { AccountControl } from "@/app/components/AccountControl";
 import { useIsPro } from "@/app/components/useIsPro";
 import { editorBoardUrl, rememberShellTab, type ShellTab } from "@/lib/app-shell";
 import { type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory } from "@/lib/board-library";
-import { ANONYMOUS_BOARD_TTL_DAYS, JOIN_CODE_LENGTH, normalizeJoinCode, readCreatedBoards } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, JOIN_CODE_LENGTH, normalizeJoinCode, readCreatedBoards, type BoardType } from "@/lib/joinable-board";
 import { publishBoard, unpublishBoard, type PublishPhase } from "@/lib/published-board-package";
 import type { MyPublishedBoard, PublishedBoardCard } from "@/lib/published-boards";
 import { boardCompositePreview } from "@/lib/simple-world";
 import styles from "./AppShell.module.css";
 import { shellFont } from "./shell-font";
 
-// The editor reads `create` once and opens a fresh board tab; `joinable` also makes it joinable
-// right away. Signed out, that's an anonymous board kept for ANONYMOUS_BOARD_TTL_DAYS.
-const CREATE_JOINABLE_URL = "/board2?create=joinable&mobileEditor=1";
+// The editor reads `create` (and the board type) once and opens a fresh board tab; `joinable` also
+// makes it joinable right away. Signed out, that's an anonymous board kept for ANONYMOUS_BOARD_TTL_DAYS.
+function createBoardUrl(type: BoardType): string {
+  return `/board2?create=joinable&${BOARD_TYPE_PARAM}=${type}&mobileEditor=1`;
+}
 
 // Dismissing the join overlay keeps it closed for the rest of this tab's visit; the header's
 // "Join with code" brings it back.
@@ -59,11 +61,11 @@ export function AppShell() {
     window.scrollTo({ top: 0 });
   }, []);
 
-  // A new board needs no account and is immediately joinable by code. AI features still ask
-  // for sign-in inside the editor.
-  const createBoard = useCallback(() => {
-    window.location.assign(CREATE_JOINABLE_URL);
-  }, []);
+  // + first asks which kind of board. A new board needs no account and is immediately joinable by
+  // code. AI features still ask for sign-in inside the editor.
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const createBoard = useCallback(() => setChooserOpen(true), []);
+  const closeChooser = useCallback(() => setChooserOpen(false), []);
 
   const [query, setQuery] = useState("");
   // Null until read after hydration so the overlay never flashes for someone who dismissed it.
@@ -116,7 +118,8 @@ export function AppShell() {
         {tab === "home" ? <HomeView query={query} onCreate={createBoard} /> : tab === "profile" ? <ProfileView userLabel={userLabel} onCreate={createBoard} /> : null}
       </main>
       {/* Shown on arrival at Home (and from "Join with code" anywhere), in front of the boards. */}
-      {joinOpen && tab !== null && <JoinOverlay onClose={closeJoin} onCreate={createBoard} />}
+      {joinOpen && tab !== null && !chooserOpen && <JoinOverlay onClose={closeJoin} onCreate={createBoard} />}
+      {chooserOpen && <NewBoardChooser onClose={closeChooser} />}
 
       <nav className={styles.tabBar} aria-label="Neural Board">
         <button type="button" className={styles.tab} aria-label="Home" title="Home" aria-current={tab === "home" ? "page" : undefined} onClick={() => selectTab("home")}>
@@ -134,6 +137,31 @@ export function AppShell() {
 }
 
 const viewUrl = (id: string) => `/board2?view=${id}`;
+
+function NewBoardChooser({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className={styles.joinBackdrop} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className={styles.joinCard} role="dialog" aria-modal="true" aria-labelledby="new-board-title">
+      <button type="button" className={styles.joinClose} aria-label="Close" title="Close" onClick={onClose}><CloseIcon /></button>
+      <h2 id="new-board-title" className={styles.joinTitle}>New board</h2>
+      <a className={styles.boardTypeOption} href={createBoardUrl("simple")} autoFocus>
+        <StickyNotesIcon />
+        <span><strong>Old school board</strong>Sticky notes and photos, together. Share the code and everyone adds ideas.</span>
+      </a>
+      <a className={styles.boardTypeOption} href={createBoardUrl("neural")}>
+        <ClapperIcon />
+        <span><strong>Neural board</strong>Everything, plus the video editor to turn the board into a video.</span>
+      </a>
+      <p className={styles.caption}>Either way, people join with a code. An old school board can become a Neural board later.</p>
+    </section>
+    </div>
+  );
+}
 
 function JoinOverlay({ onClose, onCreate }: { onClose: () => void; onCreate: () => void }) {
   const [code, setCode] = useState("");
@@ -665,6 +693,26 @@ function CloseIcon() {
 function HouseIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11 12 3.5l8.5 7.5" /><path d="M5.5 9.5V20h13V9.5" /><path d="M10 20v-5.5h4V20" /></svg>;
 }
+function StickyNotesIcon() {
+  return (
+    <svg viewBox="0 0 40 40" aria-hidden="true">
+      <rect x="4" y="9" width="20" height="20" rx="2" fill="#FFE58A" transform="rotate(-6 14 19)" />
+      <rect x="16" y="13" width="20" height="20" rx="2" fill="#BFE3FF" transform="rotate(5 26 23)" />
+      <path d="M20 20h11M20 25h8" stroke="#2F3533" strokeWidth="2" strokeLinecap="round" transform="rotate(5 26 23)" />
+    </svg>
+  );
+}
+
+function ClapperIcon() {
+  return (
+    <svg viewBox="0 0 40 40" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round">
+      <rect x="6" y="15" width="28" height="18" rx="2" />
+      <path d="M6 15l26-6.5-1.4-4.6L5 10.2z" />
+      <path d="M17 20.5v8l7-4z" fill="currentColor" />
+    </svg>
+  );
+}
+
 function PlusIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16M4 12h16" /></svg>;
 }
