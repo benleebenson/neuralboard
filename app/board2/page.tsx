@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -3311,7 +3311,8 @@ function drawThreadConnectors(ctx: CanvasRenderingContext2D, annotations: readon
 
 function drawAnnotationsToCanvas(
   ctx: CanvasRenderingContext2D,
-  annotations: Annotation[],
+  storedAnnotations: Annotation[],
+  likes: BoardLikes,
   cam: { cameraX: number; cameraY: number; boardZoom: number },
   sf: number,
   W: number,
@@ -3320,6 +3321,8 @@ function drawAnnotationsToCanvas(
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
+  // Sticky notes as the board shows them (lib/sticky-notes): bigger with likes.
+  const annotations = stickyNotesForDisplay(storedAnnotations, likes);
   const depths = threadDepths(annotations);
   drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
   for (const ann of threadPaintOrder(annotations)) {
@@ -6487,6 +6490,9 @@ function Board2Editor({
   // Likes on the shared board's items, as the server last sent them (only the server changes them),
   // and the items with a like request on its way.
   const [boardLikes, setBoardLikes] = useState<BoardLikes>({});
+  // For the export and previews, which draw outside React's render (likes make sticky notes bigger).
+  const boardLikesRef = useRef<BoardLikes>({});
+  useEffect(() => { boardLikesRef.current = boardLikes; }, [boardLikes]);
   const likeInFlightRef = useRef(new Set<string>());
   // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
   const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
@@ -6770,7 +6776,10 @@ function Board2Editor({
     isBoardOwner || (!!participantId && itemAuthor(item) === participantId);
   // Sticky-note threads: how deep each note sits (its shade) and the lines to its parent.
   const annotationThreadDepths = useMemo(() => threadDepths(annotations), [annotations]);
-  const annotationThreadConnectors = useMemo(() => threadConnectors(annotations), [annotations]);
+  // Sticky notes as shown (lib/sticky-notes: bigger with likes), by id; the export draws the same.
+  const displayedAnnotations = useMemo(() => stickyNotesForDisplay(annotations, boardLikes), [annotations, boardLikes]);
+  const displayedAnnotationById = useMemo(() => new Map(displayedAnnotations.map((annotation) => [annotation.id, annotation])), [displayedAnnotations]);
+  const annotationThreadConnectors = useMemo(() => threadConnectors(displayedAnnotations), [displayedAnnotations]);
   // Notes are stacked above their replies (see threadPaintOrder); the export draws in the same order.
   const annotationsInPaintOrder = useMemo(() => threadPaintOrder(annotations), [annotations]);
   // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
@@ -10176,7 +10185,7 @@ function Board2Editor({
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
     if (currentAnnotations.length > 0) {
-      drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
+      drawAnnotationsToCanvas(ctx, currentAnnotations, boardLikesRef.current, cam, sf, W, H);
     }
     ctx.restore();
     drawCutToOverlays(ctx, time, currentClips, W, H, (clip) => cutToSourceFor(clip, offlineVideoRendering), quality === "preview" ? previewCutToClipIdRef.current : null);
@@ -20698,7 +20707,7 @@ function Board2Editor({
       // anywhere on the infinite board, well outside the nominal boardDimensions box, so exporting
       // that fixed box would crop real content or capture mostly empty parchment. Fall back to the
       // nominal box only when the board is empty.
-      const bounds = boardContentBounds(currentClips, currentAnnotations);
+      const bounds = boardContentBounds(currentClips, stickyNotesForDisplay(currentAnnotations, boardLikesRef.current));
       const frame = bounds
         ? {
             minX: bounds.minX - BOARD_EXPORT_PADDING,
@@ -28000,22 +28009,24 @@ function Board2Editor({
                   // A sticky note shows all its text, so it can run past a box that's too short
                   // (until the text is posted and the box grows); its outline, handles and color
                   // choices follow the note rather than the box. Typing gets the box's whole width.
+                  // `shown` is where it's drawn: a liked note is bigger, text and all (lib/sticky-notes).
+                  const shown = displayedAnnotationById.get(ann.id) ?? ann;
                   const sticky = ann.type !== "sticky" ? null : isEditing
                     ? (() => {
-                        const { lines } = stickyNoteLayoutForEditor(ann, editingAnnotationText);
-                        return { lines: [], frame: stickyNoteTypingFrame(ann, lines.length, ann.fontSize ?? 80) };
+                        const { lines } = stickyNoteLayoutForEditor(shown, editingAnnotationText);
+                        return { lines: [], frame: stickyNoteTypingFrame(shown, lines.length, shown.fontSize ?? 80) };
                       })()
-                    : stickyNoteLayoutForEditor(ann);
-                  const shownH = sticky ? Math.max(ann.boardH, sticky.frame.boardY + sticky.frame.boardH - ann.boardY) : ann.boardH;
+                    : stickyNoteLayoutForEditor(shown);
+                  const shownH = sticky ? Math.max(shown.boardH, sticky.frame.boardY + sticky.frame.boardH - shown.boardY) : shown.boardH;
                   return (
                     <div
                       key={ann.id}
                       data-mbannotationid={ann.id}
                       style={{
                         position: "absolute",
-                        left: ann.boardX * boardZoom,
-                        top: ann.boardY * boardZoom,
-                        width: ann.boardW * boardZoom,
+                        left: shown.boardX * boardZoom,
+                        top: shown.boardY * boardZoom,
+                        width: shown.boardW * boardZoom,
                         height: shownH * boardZoom,
                         transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
@@ -28092,10 +28103,10 @@ function Board2Editor({
                       )}
                       {sticky && (() => {
                         const { lines, frame } = sticky;
-                        const pad = (ann.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
+                        const pad = (shown.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
                         const text: React.CSSProperties = {
                           fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
-                          fontSize: (ann.fontSize ?? 80) * boardZoom,
+                          fontSize: (shown.fontSize ?? 80) * boardZoom,
                           fontWeight: ann.fontWeight ?? "normal",
                           color: ann.color || STICKY_NOTE_INK,
                           lineHeight: ANNOTATION_LINE_HEIGHT,
@@ -28103,7 +28114,7 @@ function Board2Editor({
                         return (
                           <div data-sticky-note style={{
                             position: "absolute", boxSizing: "border-box", padding: pad, overflow: "hidden",
-                            left: (frame.boardX - ann.boardX) * boardZoom, top: (frame.boardY - ann.boardY) * boardZoom,
+                            left: (frame.boardX - shown.boardX) * boardZoom, top: (frame.boardY - shown.boardY) * boardZoom,
                             width: frame.boardW * boardZoom, height: frame.boardH * boardZoom, borderRadius: frame.radius * boardZoom,
                             background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0, ann.id),
                             boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
@@ -28235,7 +28246,7 @@ function Board2Editor({
                     one-heart-and-count form. */}
                 {joinCode && [
                   ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
-                  ...annotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                  ...displayedAnnotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
                 ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
                   const likers = boardLikes[item.id] ?? [];
                   const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;

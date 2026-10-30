@@ -101,3 +101,37 @@ export function stickyNoteTypingFrame(box: NoteBox, lineCount: number, fontSize:
   const h = Math.max(box.boardH, (Math.max(1, lineCount) + 1) * fontSize * ANNOTATION_LINE_HEIGHT + pad * 2);
   return { ...box, boardH: h, radius: Math.min(fontSize * STICKY_NOTE_RADIUS_EM, box.boardW / 2, h / 2) };
 }
+
+// Likes make a note bigger, as votes did on the original boards (there each vote added half the
+// note's size, up to 6×; here up to 3×), so popular notes loom over the rest. Display only: the
+// stored note keeps its size, so permissions and merging never see it.
+export const STICKY_NOTE_SCALE_PER_LIKE = 0.5;
+export const STICKY_NOTE_MAX_SCALE = 3;
+
+export function stickyNoteLikeScale(likeCount: number): number {
+  return Math.min(STICKY_NOTE_MAX_SCALE, 1 + STICKY_NOTE_SCALE_PER_LIKE * Math.max(0, likeCount));
+}
+
+type DisplayItem = NoteBox & { id: string; type: string; fontSize?: number };
+
+/** A note scaled about its middle, text and all (the board's notes default to an 80-unit font). */
+export function scaleStickyNote<T extends DisplayItem>(note: T, scale: number): T {
+  if (scale === 1) return note;
+  const w = note.boardW * scale, h = note.boardH * scale;
+  return {
+    ...note,
+    boardX: note.boardX + (note.boardW - w) / 2,
+    boardY: note.boardY + (note.boardH - h) / 2,
+    boardW: w,
+    boardH: h,
+    fontSize: (note.fontSize ?? 80) * scale,
+  };
+}
+
+/**
+ * The board's items as they're shown: sticky notes bigger by their likes, everything else as
+ * stored. The board and the export both draw from this, so they agree.
+ */
+export function stickyNotesForDisplay<T extends DisplayItem>(items: readonly T[], likes: Readonly<Record<string, readonly unknown[]>>): T[] {
+  return items.map((item) => item.type === "sticky" ? scaleStickyNote(item, stickyNoteLikeScale(likes[item.id]?.length ?? 0)) : item);
+}
