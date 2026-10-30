@@ -128,10 +128,86 @@ export function scaleStickyNote<T extends DisplayItem>(note: T, scale: number): 
   };
 }
 
+// Notes make room for each other, as the original boards' notes did: a collision-relaxation
+// pass in which each overlapping pair pushes itself apart, a share of the overlap at a time.
+// Display only, like the like scaling: stored positions are untouched.
+export const STICKY_PUSH_ITERATIONS = 30;
+export const STICKY_PUSH_STIFFNESS = 0.25;
+/** The gap pushed notes keep between them, as a share of the larger one's font size. */
+export const STICKY_PUSH_GAP_EM = 0.3;
+
+export type PushRect = { id: string; x: number; y: number; w: number; h: number; gap: number };
+
 /**
- * The board's items as they're shown: sticky notes bigger by their likes, everything else as
- * stored. The board and the export both draw from this, so they agree.
+ * How far to shift each rectangle so overlapping ones stand apart. Each pass, an overlapping pair
+ * is pushed apart along the axis it overlaps least, by STICKY_PUSH_STIFFNESS of the overlap,
+ * shared equally; a pinned rectangle (one being dragged) doesn't move and the other takes the
+ * whole push. The result depends only on the input, so every board and the export agree.
  */
-export function stickyNotesForDisplay<T extends DisplayItem>(items: readonly T[], likes: Readonly<Record<string, readonly unknown[]>>): T[] {
-  return items.map((item) => item.type === "sticky" ? scaleStickyNote(item, stickyNoteLikeScale(likes[item.id]?.length ?? 0)) : item);
+export function pushStickyNotesApart(rects: readonly PushRect[], pinned: ReadonlySet<string> = new Set()): Map<string, { dx: number; dy: number }> {
+  const items = rects.map((rect) => ({ ...rect, cx: rect.x + rect.w / 2, cy: rect.y + rect.h / 2, pinned: pinned.has(rect.id) }));
+  for (let pass = 0; pass < STICKY_PUSH_ITERATIONS; pass++) {
+    let moved = false;
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i], b = items[j];
+        if (a.pinned && b.pinned) continue;
+        const gap = Math.max(a.gap, b.gap);
+        const ox = (a.w + b.w) / 2 + gap - Math.abs(b.cx - a.cx);
+        const oy = (a.h + b.h) / 2 + gap - Math.abs(b.cy - a.cy);
+        if (ox <= 0 || oy <= 0) continue;
+        // Exactly level notes go apart in list order, so the result is still the same everywhere.
+        const alongX = ox <= oy;
+        const sign = (alongX ? b.cx - a.cx : b.cy - a.cy) < 0 ? -1 : 1;
+        const push = (alongX ? ox : oy) * STICKY_PUSH_STIFFNESS * sign;
+        const aShare = a.pinned ? 0 : b.pinned ? 1 : 0.5;
+        if (alongX) { a.cx -= push * aShare; b.cx += push * (1 - aShare); }
+        else { a.cy -= push * aShare; b.cy += push * (1 - aShare); }
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return new Map(items.map((item) => [item.id, { dx: item.cx - item.x - item.w / 2, dy: item.cy - item.y - item.h / 2 }]));
+}
+
+// The last pushes worked out, by their input: the board asks again on every change to any item,
+// and the export on every frame, but notes only move when the notes themselves change. Two, so
+// the board mid-drag (with a pinned note) and a canvas drawing the board don't evict each other.
+let recentPushes: { key: string; offsets: Map<string, { dx: number; dy: number }> }[] = [];
+
+function pushStickyNotesApartCached(rects: readonly PushRect[], pinned: ReadonlySet<string>) {
+  const key = JSON.stringify([rects.map(({ id, x, y, w, h, gap }) => [id, x, y, w, h, gap]), [...pinned].sort()]);
+  const known = recentPushes.find((push) => push.key === key);
+  if (known) return known.offsets;
+  const offsets = pushStickyNotesApart(rects, pinned);
+  recentPushes = [{ key, offsets }, ...recentPushes.slice(0, 1)];
+  return offsets;
+}
+
+/**
+ * The board's items as they're shown: sticky notes bigger by their likes and pushed apart where
+ * they'd overlap, everything else as stored. `frameOf` gives a (shown) note's drawn frame, so
+ * notes make room for what's visible rather than their boxes; `pinned` notes stay put (they're
+ * being dragged). The board and the export both draw from this, so they agree.
+ */
+export function stickyNotesForDisplay<T extends DisplayItem>(
+  items: readonly T[],
+  likes: Readonly<Record<string, readonly unknown[]>>,
+  frameOf?: (note: T) => NoteBox,
+  pinned: ReadonlySet<string> = new Set(),
+): T[] {
+  const shown = items.map((item) => item.type === "sticky" ? scaleStickyNote(item, stickyNoteLikeScale(likes[item.id]?.length ?? 0)) : item);
+  if (!frameOf) return shown;
+  const rects = shown.flatMap((item): PushRect[] => {
+    if (item.type !== "sticky") return [];
+    const frame = frameOf(item);
+    return [{ id: item.id, x: frame.boardX, y: frame.boardY, w: frame.boardW, h: frame.boardH, gap: (item.fontSize ?? 80) * STICKY_PUSH_GAP_EM }];
+  });
+  if (rects.length < 2) return shown;
+  const offsets = pushStickyNotesApartCached(rects, pinned);
+  return shown.map((item) => {
+    const offset = offsets.get(item.id);
+    return offset && (offset.dx || offset.dy) ? { ...item, boardX: item.boardX + offset.dx, boardY: item.boardY + offset.dy } : item;
+  });
 }

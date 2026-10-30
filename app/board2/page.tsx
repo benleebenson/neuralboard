@@ -3215,6 +3215,42 @@ function stickyNoteLayoutForEditor(annotation: Annotation, text?: string) {
   return stickyNoteLayout(annotation, annotationMeasureContext, text);
 }
 
+// Each sticky note's frame relative to its box, by what decides it, so pushing notes apart
+// (which runs on every move of a drag) doesn't measure every note's text again. Fonts loading
+// replaces the measure context, which starts the cache afresh.
+let stickyFrameCache: { context: CanvasRenderingContext2D | null; frames: Map<string, { x: number; y: number; w: number; h: number }> } = { context: null, frames: new Map() };
+
+function stickyNoteFrameOnBoard(note: Annotation) {
+  if (typeof document !== "undefined" && !annotationMeasureContext) {
+    annotationMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  if (stickyFrameCache.context !== annotationMeasureContext) stickyFrameCache = { context: annotationMeasureContext, frames: new Map() };
+  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH]);
+  let frame = stickyFrameCache.frames.get(key);
+  if (!frame) {
+    const laidOut = stickyNoteLayout(note, annotationMeasureContext).frame;
+    frame = { x: laidOut.boardX - note.boardX, y: laidOut.boardY - note.boardY, w: laidOut.boardW, h: laidOut.boardH };
+    if (stickyFrameCache.frames.size > 2000) stickyFrameCache.frames.clear();
+    stickyFrameCache.frames.set(key, frame);
+  }
+  return { boardX: note.boardX + frame.x, boardY: note.boardY + frame.y, boardW: frame.w, boardH: frame.h };
+}
+
+const NO_PINNED_STICKIES: ReadonlySet<string> = new Set();
+
+/**
+ * The board's annotations as shown (lib/sticky-notes): sticky notes bigger with likes and pushed
+ * apart where they'd overlap; `pinned` notes (being dragged) stay put. Board and export both use it.
+ */
+function annotationsAsShown(annotations: readonly Annotation[], likes: BoardLikes, pinned: ReadonlySet<string> = NO_PINNED_STICKIES): Annotation[] {
+  return stickyNotesForDisplay(annotations, likes, stickyNoteFrameOnBoard, pinned);
+}
+
+/** How far a note is drawn from where it's stored by pushing (centers, which like scaling keeps). */
+function stickyPushOffset(stored: Annotation, shown: Annotation | undefined) {
+  return shown ? { dx: shown.boardX + shown.boardW / 2 - stored.boardX - stored.boardW / 2, dy: shown.boardY + shown.boardH / 2 - stored.boardY - stored.boardH / 2 } : { dx: 0, dy: 0 };
+}
+
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
   if (typeof document === "undefined" || !document.fonts) return;
   const fonts = new Set(
@@ -3321,8 +3357,8 @@ function drawAnnotationsToCanvas(
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
-  // Sticky notes as the board shows them (lib/sticky-notes): bigger with likes.
-  const annotations = stickyNotesForDisplay(storedAnnotations, likes);
+  // Sticky notes as the board shows them: bigger with likes, pushed apart.
+  const annotations = annotationsAsShown(storedAnnotations, likes);
   const depths = threadDepths(annotations);
   drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
   for (const ann of threadPaintOrder(annotations)) {
@@ -6779,10 +6815,37 @@ function Board2Editor({
     isBoardOwner || (!!participantId && itemAuthor(item) === participantId);
   // Sticky-note threads: how deep each note sits (its shade) and the lines to its parent.
   const annotationThreadDepths = useMemo(() => threadDepths(annotations), [annotations]);
-  // Sticky notes as shown (lib/sticky-notes: bigger with likes), by id; the export draws the same.
-  const displayedAnnotations = useMemo(() => stickyNotesForDisplay(annotations, boardLikes), [annotations, boardLikes]);
+  // Sticky notes being dragged: they follow the pointer while the others make room around them.
+  const [pinnedStickyIds, setPinnedStickyIds] = useState<ReadonlySet<string>>(NO_PINNED_STICKIES);
+  // Sticky notes as shown (bigger with likes, pushed apart), by id; the export draws the same.
+  // Worked out only when the annotations, likes or dragged notes change, never on pan or zoom.
+  const displayedAnnotations = useMemo(() => annotationsAsShown(annotations, boardLikes, pinnedStickyIds), [annotations, boardLikes, pinnedStickyIds]);
   const displayedAnnotationById = useMemo(() => new Map(displayedAnnotations.map((annotation) => [annotation.id, annotation])), [displayedAnnotations]);
   const annotationThreadConnectors = useMemo(() => threadConnectors(displayedAnnotations), [displayedAnnotations]);
+  // When pushing moves notes, they slide there over 160ms, as on the original boards. Only the
+  // push is animated (not moves, which follow the pointer), and by the Web Animations API on the
+  // note's element rather than a CSS transition, which would also animate every zoom.
+  const stickyPushOffsetsRef = useRef(new Map<string, { dx: number; dy: number }>());
+  useLayoutEffect(() => {
+    const previous = stickyPushOffsetsRef.current;
+    const next = new Map<string, { dx: number; dy: number }>();
+    const storedById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
+    const animate = typeof window !== "undefined" && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    for (const shown of displayedAnnotations) {
+      const stored = storedById.get(shown.id);
+      if (shown.type !== "sticky" || !stored) continue;
+      const offset = stickyPushOffset(stored, shown);
+      next.set(shown.id, offset);
+      const before = previous.get(shown.id);
+      if (!animate || !before || pinnedStickyIds.has(shown.id)) continue;
+      const zoom = boardZoomRef.current;
+      const fromX = (before.dx - offset.dx) * zoom, fromY = (before.dy - offset.dy) * zoom;
+      if (Math.abs(fromX) < 0.5 && Math.abs(fromY) < 0.5) continue;
+      const element = document.querySelector<HTMLElement>(`[data-mbannotationid="${CSS.escape(shown.id)}"]`);
+      element?.animate([{ translate: `${fromX}px ${fromY}px` }, { translate: "0px 0px" }], { duration: 160, easing: "ease" });
+    }
+    stickyPushOffsetsRef.current = next;
+  }, [annotations, displayedAnnotations, pinnedStickyIds]);
   // Notes are stacked above their replies (see threadPaintOrder); the export draws in the same order.
   const annotationsInPaintOrder = useMemo(() => threadPaintOrder(annotations), [annotations]);
   // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
@@ -18171,11 +18234,16 @@ function Board2Editor({
     const movingClipIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedClipIdsRef.current] : [];
     if (!selectedAnnotationIdsRef.current.includes(ann.id)) setAnnotationSelection([ann.id]);
     const startX = e.clientX, startY = e.clientY;
+    // Moved sticky notes start from where they're drawn (pushed aside, maybe) and are pinned there,
+    // so they follow the pointer while the others make room; dropping them unpins them.
+    const movingStickyIds = new Set(annotationsRef.current.filter((a) => a.type === "sticky" && movingAnnotationIds.includes(a.id)).map((a) => a.id));
+    let pinned = false;
     const origAnnotations = new Map(
       annotationsRef.current
         .filter((a) => movingAnnotationIds.includes(a.id))
         .map((a) => [a.id, {
-          x: a.boardX, y: a.boardY,
+          x: a.boardX + (movingStickyIds.has(a.id) ? stickyPushOffset(a, displayedAnnotationById.get(a.id)).dx : 0),
+          y: a.boardY + (movingStickyIds.has(a.id) ? stickyPushOffset(a, displayedAnnotationById.get(a.id)).dy : 0),
           arrowStartX: a.arrowStartX, arrowStartY: a.arrowStartY, arrowEndX: a.arrowEndX, arrowEndY: a.arrowEndY,
           points: a.points ? a.points.map((p) => ({ ...p })) : undefined,
         }])
@@ -18189,6 +18257,7 @@ function Board2Editor({
       const zoom = boardZoomRef.current;
       const dx = (ev.clientX - startX) / zoom;
       const dy = (ev.clientY - startY) / zoom;
+      if (!pinned && movingStickyIds.size > 0) { pinned = true; setPinnedStickyIds(movingStickyIds); }
       setAnnotations((prev) =>
         prev.map((a) => {
           const orig = origAnnotations.get(a.id);
@@ -18212,7 +18281,11 @@ function Board2Editor({
         }));
       }
     };
-    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (pinned) setPinnedStickyIds(NO_PINNED_STICKIES);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -20716,7 +20789,7 @@ function Board2Editor({
       // anywhere on the infinite board, well outside the nominal boardDimensions box, so exporting
       // that fixed box would crop real content or capture mostly empty parchment. Fall back to the
       // nominal box only when the board is empty.
-      const bounds = boardContentBounds(currentClips, stickyNotesForDisplay(currentAnnotations, boardLikesRef.current));
+      const bounds = boardContentBounds(currentClips, annotationsAsShown(currentAnnotations, boardLikesRef.current));
       const frame = bounds
         ? {
             minX: bounds.minX - BOARD_EXPORT_PADDING,
@@ -22788,6 +22861,14 @@ function Board2Editor({
         if (g.type === "pan") setBoardAddPrompt(null);
         else if (g.hitClipId && !g.hitClipIsSelected) setClipSelection([g.hitClipId]);
         else if (g.hitAnnotationId && !g.hitAnnotationIsSelected) setAnnotationSelection([g.hitAnnotationId]);
+        // A moved sticky note starts from where it's drawn and is pinned there (see handleAnnotationPointerDown).
+        const movedSticky = g.type === "move" && !g.hitClipId ? annotationsRef.current.find((a) => a.id === g.hitAnnotationId && a.type === "sticky") : undefined;
+        if (movedSticky) {
+          const offset = stickyPushOffset(movedSticky, displayedAnnotationById.get(movedSticky.id));
+          g.annotationOrigX += offset.dx;
+          g.annotationOrigY += offset.dy;
+          setPinnedStickyIds(new Set([movedSticky.id]));
+        }
       }
     }
 
@@ -22825,6 +22906,7 @@ function Board2Editor({
     if (!pointers.has(e.pointerId)) return;
     const g = mobileGestureRef.current;
     if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+    setPinnedStickyIds((current) => current.size > 0 ? NO_PINNED_STICKIES : current);
 
     if (e.type !== "pointercancel" && g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
       if (g.hitClipId) {
@@ -28090,7 +28172,7 @@ function Board2Editor({
                   // A sticky note shows all its text, so it can run past a box that's too short
                   // (until the text is posted and the box grows); its outline, handles and color
                   // choices follow the note rather than the box. Typing gets the box's whole width.
-                  // `shown` is where it's drawn: a liked note is bigger, text and all (lib/sticky-notes).
+                  // `shown` is where it's drawn: a liked note is bigger, text and all, and notes are pushed apart (lib/sticky-notes).
                   const shown = displayedAnnotationById.get(ann.id) ?? ann;
                   const sticky = ann.type !== "sticky" ? null : isEditing
                     ? (() => {
