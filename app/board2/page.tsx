@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, STICKY_NOTE_RADIUS_EM, stickyNoteFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_PADDING_EM, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -3196,28 +3196,23 @@ function annotationLinesForEditor(annotation: Annotation): string[] {
     : (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
 }
 
-/** The box a sticky note's text wraps in: the note less its padding. Used on screen and in export. */
-function stickyNoteTextBox(annotation: Annotation): Annotation {
-  const pad = (annotation.fontSize ?? 80) * STICKY_NOTE_PADDING_EM;
-  return { ...annotation, boardX: annotation.boardX + pad, boardY: annotation.boardY + pad, boardW: Math.max(1, annotation.boardW - pad * 2) };
-}
-
-/** A sticky note's wrapped lines and the rounded frame they're drawn in. Used on screen and in export. */
-function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null) {
+/**
+ * A sticky note's wrapped lines and the rounded frame they're drawn in (lib/sticky-notes), for
+ * `text` (the note's own by default). Used on screen, while typing and in export.
+ */
+function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null, text = annotation.text ?? "") {
   const fontSize = annotation.fontSize ?? 80;
-  const box = stickyNoteTextBox(annotation);
-  const lines = !annotation.text ? [] : context ? annotationLinesForContext(box, context) : annotationLinesForEditor(box);
-  // annotationLinesForContext leaves the context's font at the note's board size, so widths are in board units.
-  // With nothing to measure with, the note keeps its full width.
-  const widths = lines.map((line) => (context ? context.measureText(line).width : box.boardW));
-  return { lines, frame: stickyNoteFrame(annotation, widths, fontSize, ANNOTATION_LINE_HEIGHT) };
+  // Measured at the note's board font size, so widths are in board units. With nothing to
+  // measure with, lines break only at newlines.
+  if (context) context.font = annotationFontCss(fontSize, annotation.fontFamily ?? "Caveat", annotation.fontWeight ?? "normal");
+  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0));
 }
 
-function stickyNoteLayoutForEditor(annotation: Annotation) {
+function stickyNoteLayoutForEditor(annotation: Annotation, text?: string) {
   if (typeof document !== "undefined" && !annotationMeasureContext) {
     annotationMeasureContext = document.createElement("canvas").getContext("2d");
   }
-  return stickyNoteLayout(annotation, annotationMeasureContext);
+  return stickyNoteLayout(annotation, annotationMeasureContext, text);
 }
 
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
@@ -3286,10 +3281,12 @@ function boardContentBounds(
     maxY = Math.max(maxY, clip.boardY + clip.boardH);
   }
   for (const ann of annotations) {
-    minX = Math.min(minX, ann.boardX);
+    // A sticky note's text can run it past its box (see stickyNoteFrame); count all of it.
+    const frame = ann.type === "sticky" ? stickyNoteLayoutForEditor(ann).frame : null;
+    minX = Math.min(minX, ann.boardX, frame?.boardX ?? Infinity);
     minY = Math.min(minY, ann.boardY);
-    maxX = Math.max(maxX, ann.boardX + ann.boardW);
-    maxY = Math.max(maxY, ann.boardY + ann.boardH);
+    maxX = Math.max(maxX, ann.boardX + ann.boardW, frame ? frame.boardX + frame.boardW : -Infinity);
+    maxY = Math.max(maxY, ann.boardY + ann.boardH, frame ? frame.boardY + frame.boardH : -Infinity);
   }
   if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
   return { minX, minY, maxX, maxY };
@@ -18094,13 +18091,18 @@ function Board2Editor({
       const textarea = editingTextareaRef.current;
       const measuredWidth = textarea ? textarea.scrollWidth / Math.max(0.05, boardZoomRef.current) : 0;
       const measuredHeight = textarea ? textarea.scrollHeight / Math.max(0.05, boardZoomRef.current) : 0;
-      setAnnotations((prev) => prev.map((a) => (a.id === annId ? {
+      setAnnotations((prev) => prev.map((a) => (a.id !== annId ? a : a.type === "sticky" ? {
         ...a,
         text,
-        // A sticky note's text wraps inside the note, so only its height grows to fit.
-        boardW: a.type === "sticky" ? a.boardW : Math.max(a.boardW, measuredWidth),
+        // A sticky note's text wraps at the note's width, so only its height grows to fit, by the
+        // same layout the board and export draw with.
+        boardH: Math.max(a.boardH, stickyNoteLayoutForEditor(a, text).frame.boardH),
+      } : {
+        ...a,
+        text,
+        boardW: Math.max(a.boardW, measuredWidth),
         boardH: Math.max(a.boardH, measuredHeight),
-      } : a)));
+      })));
       setEditingAnnotationId(null);
     }
     annotationToolRef.current = "pointer";
@@ -27995,6 +27997,16 @@ function Board2Editor({
                   const textLines = ann.type === "text" && ann.text
                     ? annotationLinesForEditor(ann)
                     : [];
+                  // A sticky note shows all its text, so it can run past a box that's too short
+                  // (until the text is posted and the box grows); its outline, handles and color
+                  // choices follow the note rather than the box. Typing gets the box's whole width.
+                  const sticky = ann.type !== "sticky" ? null : isEditing
+                    ? (() => {
+                        const { lines } = stickyNoteLayoutForEditor(ann, editingAnnotationText);
+                        return { lines: [], frame: stickyNoteTypingFrame(ann, lines.length, ann.fontSize ?? 80) };
+                      })()
+                    : stickyNoteLayoutForEditor(ann);
+                  const shownH = sticky ? Math.max(ann.boardH, sticky.frame.boardY + sticky.frame.boardH - ann.boardY) : ann.boardH;
                   return (
                     <div
                       key={ann.id}
@@ -28004,7 +28016,7 @@ function Board2Editor({
                         left: ann.boardX * boardZoom,
                         top: ann.boardY * boardZoom,
                         width: ann.boardW * boardZoom,
-                        height: ann.boardH * boardZoom,
+                        height: shownH * boardZoom,
                         transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
@@ -28078,11 +28090,8 @@ function Board2Editor({
                           }}
                         />
                       )}
-                      {ann.type === "sticky" && (() => {
-                        // Typing gets the note's whole box; otherwise the note hugs its text.
-                        const { lines, frame } = isEditing
-                          ? { lines: [], frame: { ...ann, radius: (ann.fontSize ?? 80) * STICKY_NOTE_RADIUS_EM } }
-                          : stickyNoteLayoutForEditor(ann);
+                      {sticky && (() => {
+                        const { lines, frame } = sticky;
                         const pad = (ann.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
                         const text: React.CSSProperties = {
                           fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
@@ -28117,9 +28126,9 @@ function Board2Editor({
                                 onBlur={() => commitTextEdit(ann.id)}
                                 style={{
                                   ...text,
-                                  // The note's full height, so commitTextEdit's scrollHeight is the height the note needs.
+                                  // Wraps inside words too, as wrapStickyNoteText does.
                                   position: "absolute", inset: 0, width: "100%", height: "100%", boxSizing: "border-box", padding: pad,
-                                  background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflow: "hidden",
+                                  background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflowWrap: "break-word", overflow: "hidden",
                                 }}
                               />
                             ) : lines.length > 0 ? (
