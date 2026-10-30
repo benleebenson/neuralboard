@@ -151,13 +151,13 @@ function NewBoardChooser({ onClose }: { onClose: () => void }) {
       <h2 id="new-board-title" className={styles.joinTitle}>New board</h2>
       <a className={styles.boardTypeOption} href={createBoardUrl("simple")} autoFocus>
         <StickyNotesIcon />
-        <span><strong>Old school board</strong>Sticky notes and photos, together. Share the code and everyone adds ideas.</span>
+        <span><strong>Neural Board (Teacher)</strong>Sticky notes and photos, together. Share the code and everyone adds ideas.</span>
       </a>
       <a className={styles.boardTypeOption} href={createBoardUrl("neural")}>
         <ClapperIcon />
-        <span><strong>Neural board</strong>Everything, plus the video editor to turn the board into a video.</span>
+        <span><strong>Neural Board</strong>Everything, plus the video editor to turn the board into a video.</span>
       </a>
-      <p className={styles.caption}>Either way, people join with a code. An old school board can become a Neural board later.</p>
+      <p className={styles.caption}>Either way, people join with a code. A Neural Board (Teacher) can become a Neural Board later.</p>
     </section>
     </div>
   );
