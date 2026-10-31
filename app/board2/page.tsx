@@ -24,12 +24,13 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
-import { ANONYMOUS_BOARD_TTL_DAYS, forgetCreatedBoard, normalizeJoinCode, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type JoinableBoardState } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
+import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, STICKY_NOTE_COLORS, STICKY_NOTE_INK } from "@/lib/sticky-notes";
-import { placeReply, planThreadDelete, threadDepths, threadDescendants, threadParents, threadShade } from "@/lib/sticky-threads";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
   animatedImageSourceUrl,
@@ -3195,13 +3196,59 @@ function annotationLinesForEditor(annotation: Annotation): string[] {
     : (annotation.text ?? "").replace(/\r\n?/g, "\n").split("\n");
 }
 
-// A sticky note's text sits inset from its edges by a share of its font size.
-const STICKY_NOTE_PADDING_EM = 0.45;
+/**
+ * A sticky note's wrapped lines and the rounded frame they're drawn in (lib/sticky-notes), for
+ * `text` (the note's own by default). Used on screen, while typing and in export.
+ */
+function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null, text = annotation.text ?? "") {
+  const fontSize = annotation.fontSize ?? 80;
+  // Measured at the note's board font size, so widths are in board units. With nothing to
+  // measure with, lines break only at newlines.
+  if (context) context.font = annotationFontCss(fontSize, annotation.fontFamily ?? "Caveat", annotation.fontWeight ?? "normal");
+  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0));
+}
 
-/** The box a sticky note's text wraps in: the note less its padding. Used on screen and in export. */
-function stickyNoteTextBox(annotation: Annotation): Annotation {
-  const pad = (annotation.fontSize ?? 80) * STICKY_NOTE_PADDING_EM;
-  return { ...annotation, boardX: annotation.boardX + pad, boardY: annotation.boardY + pad, boardW: Math.max(1, annotation.boardW - pad * 2) };
+function stickyNoteLayoutForEditor(annotation: Annotation, text?: string) {
+  if (typeof document !== "undefined" && !annotationMeasureContext) {
+    annotationMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  return stickyNoteLayout(annotation, annotationMeasureContext, text);
+}
+
+// Each sticky note's frame relative to its box, by what decides it, so pushing notes apart
+// (which runs on every move of a drag) doesn't measure every note's text again. Fonts loading
+// replaces the measure context, which starts the cache afresh.
+let stickyFrameCache: { context: CanvasRenderingContext2D | null; frames: Map<string, { x: number; y: number; w: number; h: number }> } = { context: null, frames: new Map() };
+
+function stickyNoteFrameOnBoard(note: Annotation) {
+  if (typeof document !== "undefined" && !annotationMeasureContext) {
+    annotationMeasureContext = document.createElement("canvas").getContext("2d");
+  }
+  if (stickyFrameCache.context !== annotationMeasureContext) stickyFrameCache = { context: annotationMeasureContext, frames: new Map() };
+  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH]);
+  let frame = stickyFrameCache.frames.get(key);
+  if (!frame) {
+    const laidOut = stickyNoteLayout(note, annotationMeasureContext).frame;
+    frame = { x: laidOut.boardX - note.boardX, y: laidOut.boardY - note.boardY, w: laidOut.boardW, h: laidOut.boardH };
+    if (stickyFrameCache.frames.size > 2000) stickyFrameCache.frames.clear();
+    stickyFrameCache.frames.set(key, frame);
+  }
+  return { boardX: note.boardX + frame.x, boardY: note.boardY + frame.y, boardW: frame.w, boardH: frame.h };
+}
+
+const NO_PINNED_STICKIES: ReadonlySet<string> = new Set();
+
+/**
+ * The board's annotations as shown (lib/sticky-notes): sticky notes bigger with likes and pushed
+ * apart where they'd overlap; `pinned` notes (being dragged) stay put. Board and export both use it.
+ */
+function annotationsAsShown(annotations: readonly Annotation[], likes: BoardLikes, pinned: ReadonlySet<string> = NO_PINNED_STICKIES): Annotation[] {
+  return stickyNotesForDisplay(annotations, likes, stickyNoteFrameOnBoard, pinned);
+}
+
+/** How far a note is drawn from where it's stored by pushing (centers, which like scaling keeps). */
+function stickyPushOffset(stored: Annotation, shown: Annotation | undefined) {
+  return shown ? { dx: shown.boardX + shown.boardW / 2 - stored.boardX - stored.boardW / 2, dy: shown.boardY + shown.boardH / 2 - stored.boardY - stored.boardH / 2 } : { dx: 0, dy: 0 };
 }
 
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
@@ -3270,46 +3317,38 @@ function boardContentBounds(
     maxY = Math.max(maxY, clip.boardY + clip.boardH);
   }
   for (const ann of annotations) {
-    minX = Math.min(minX, ann.boardX);
+    // A sticky note's text can run it past its box (see stickyNoteFrame); count all of it.
+    const frame = ann.type === "sticky" ? stickyNoteLayoutForEditor(ann).frame : null;
+    minX = Math.min(minX, ann.boardX, frame?.boardX ?? Infinity);
     minY = Math.min(minY, ann.boardY);
-    maxX = Math.max(maxX, ann.boardX + ann.boardW);
-    maxY = Math.max(maxY, ann.boardY + ann.boardH);
+    maxX = Math.max(maxX, ann.boardX + ann.boardW, frame ? frame.boardX + frame.boardW : -Infinity);
+    maxY = Math.max(maxY, ann.boardY + ann.boardH, frame ? frame.boardY + frame.boardH : -Infinity);
   }
   if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return null;
   return { minX, minY, maxX, maxY };
 }
 
-// The line from each reply's center to its parent's, drawn under the notes. Board units, like strokes.
-const THREAD_CONNECTOR_WIDTH = 4;
-const THREAD_CONNECTOR_COLOR = "rgba(42,42,42,0.35)";
-
-function threadConnectors(annotations: readonly Annotation[]): Array<{ id: string; x1: number; y1: number; x2: number; y2: number }> {
-  const byId = new Map(annotations.map((annotation) => [annotation.id, annotation]));
-  return [...threadParents(annotations)].flatMap(([childId, parentId]) => {
-    const child = byId.get(childId)!, parent = byId.get(parentId)!;
-    return [{ id: childId, x1: parent.boardX + parent.boardW / 2, y1: parent.boardY + parent.boardH / 2, x2: child.boardX + child.boardW / 2, y2: child.boardY + child.boardH / 2 }];
-  });
-}
-
+// Sticky-note thread lines (see lib/sticky-threads), drawn under the notes. Board units, like strokes.
 function drawThreadConnectors(ctx: CanvasRenderingContext2D, annotations: readonly Annotation[], toScreen: (x: number, y: number) => [number, number], sf: number) {
   const lines = threadConnectors(annotations);
   if (lines.length === 0) return;
   ctx.save();
   ctx.strokeStyle = THREAD_CONNECTOR_COLOR;
-  ctx.lineWidth = Math.max(1, THREAD_CONNECTOR_WIDTH * sf);
   ctx.lineCap = "round";
-  ctx.beginPath();
   for (const line of lines) {
+    ctx.lineWidth = Math.max(1, line.width * sf);
+    ctx.beginPath();
     ctx.moveTo(...toScreen(line.x1, line.y1));
     ctx.lineTo(...toScreen(line.x2, line.y2));
+    ctx.stroke();
   }
-  ctx.stroke();
   ctx.restore();
 }
 
 function drawAnnotationsToCanvas(
   ctx: CanvasRenderingContext2D,
-  annotations: Annotation[],
+  storedAnnotations: Annotation[],
+  likes: BoardLikes,
   cam: { cameraX: number; cameraY: number; boardZoom: number },
   sf: number,
   W: number,
@@ -3318,9 +3357,11 @@ function drawAnnotationsToCanvas(
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
+  // Sticky notes as the board shows them: bigger with likes, pushed apart.
+  const annotations = annotationsAsShown(storedAnnotations, likes);
   const depths = threadDepths(annotations);
   drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
-  for (const ann of annotations) {
+  for (const ann of threadPaintOrder(annotations)) {
     const sw = Math.max(1, (ann.strokeWidth ?? 3) * sf);
     const roughSeed = ann.id.split("").reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0) & 0xffff;
     const roughOpts = { stroke: ann.color, strokeWidth: sw, roughness: 1.4, bowing: 1.2, seed: roughSeed };
@@ -3351,32 +3392,33 @@ function drawAnnotationsToCanvas(
       });
       ctx.restore();
     } else if (ann.type === "sticky") {
-      const x = toSX(ann.boardX), y = toSY(ann.boardY), w = ann.boardW * sf, h = ann.boardH * sf;
+      const cx = toSX(ann.boardX + ann.boardW / 2), cy = toSY(ann.boardY + ann.boardH / 2);
       ctx.save();
       if (ann.rotationDeg) {
-        ctx.translate(x + w / 2, y + h / 2);
+        ctx.translate(cx, cy);
         ctx.rotate(ann.rotationDeg * Math.PI / 180);
-        ctx.translate(-(x + w / 2), -(y + h / 2));
+        ctx.translate(-cx, -cy);
       }
+      const { lines, frame } = stickyNoteLayout(ann, ctx);
+      const x = toSX(frame.boardX), y = toSY(frame.boardY), w = frame.boardW * sf, h = frame.boardH * sf;
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, frame.radius * sf);
       ctx.shadowColor = "rgba(42,42,42,0.2)";
       ctx.shadowBlur = 18 * sf;
       ctx.shadowOffsetY = 8 * sf;
-      ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0);
-      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0, ann.id);
+      ctx.fill();
       ctx.shadowColor = "transparent";
-      if (ann.text) {
-        ctx.beginPath();
-        ctx.rect(x, y, w, h);
+      if (lines.length > 0) {
         ctx.clip();
-        const box = stickyNoteTextBox(ann);
         const boardFontSize = ann.fontSize ?? 80;
-        const lines = annotationLinesForContext(box, ctx);
+        const pad = boardFontSize * STICKY_NOTE_PADDING_EM;
         ctx.font = annotationFontCss(boardFontSize * sf, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
         ctx.fillStyle = ann.color || STICKY_NOTE_INK;
         ctx.textBaseline = "top";
         ctx.textAlign = "left";
         const lineHeight = boardFontSize * ANNOTATION_LINE_HEIGHT * sf;
-        lines.forEach((line, index) => ctx.fillText(line, toSX(box.boardX), toSY(box.boardY) + index * lineHeight));
+        lines.forEach((line, index) => ctx.fillText(line, toSX(frame.boardX + pad), toSY(frame.boardY + pad) + index * lineHeight));
       }
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
@@ -6093,6 +6135,8 @@ type ActiveBoard = BoardWorkspaceStatus & {
   initialFile?: File;
   /** Opened by the app shell's +: run "Make board joinable" once on mount. */
   makeJoinable?: boolean;
+  /** The type picked at the shell's + (old school or Neural). */
+  boardType?: BoardType;
 };
 
 function isTextDraft(annotation: Annotation): boolean {
@@ -6115,7 +6159,7 @@ function currentEditorUrl(): string {
 
 function createActiveBoard(
   source?: { file: File; fileName: string; name: string },
-  options: { fresh?: boolean; makeJoinable?: boolean } = {},
+  options: { fresh?: boolean; makeJoinable?: boolean; boardType?: BoardType } = {},
 ): ActiveBoard {
   const local = !source && !options.fresh;
   return {
@@ -6128,6 +6172,7 @@ function createActiveBoard(
     sourceFileName: source?.fileName,
     initialFile: source?.file,
     makeJoinable: options.makeJoinable,
+    boardType: options.boardType,
   };
 }
 
@@ -6146,8 +6191,9 @@ export default function Board2Page() {
     // instead of the autosaved one, chosen before the editor first mounts.
     const create = url.searchParams.get("create");
     if (create === "blank" || create === "joinable") {
-      setBoard(createActiveBoard(undefined, { fresh: true, makeJoinable: create === "joinable" }));
+      setBoard(createActiveBoard(undefined, { fresh: true, makeJoinable: create === "joinable", boardType: parseBoardType(url.searchParams.get(BOARD_TYPE_PARAM)) }));
       url.searchParams.delete("create");
+      url.searchParams.delete(BOARD_TYPE_PARAM);
       window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
     }
     const view = url.searchParams.get("view");
@@ -6307,6 +6353,7 @@ export default function Board2Page() {
             initialFile={board.initialFile}
             initialFileName={board.sourceFileName}
             autoMakeJoinable={board.makeJoinable === true}
+            initialBoardType={board.boardType}
             onWorkspaceStatus={updateBoardStatus}
             onWorkspaceSource={updateBoardSource}
             chromeHidden={chromeHidden}
@@ -6416,10 +6463,11 @@ function Board2Editor({
   initialFile,
   initialFileName,
   autoMakeJoinable = false,
+  initialBoardType = "neural",
   onWorkspaceStatus,
   onWorkspaceSource,
   chromeHidden,
-  worldBoards,
+  worldBoards: allWorldBoards,
   activeWorldBoard,
   onToggleChrome,
   onOpenEditor,
@@ -6434,6 +6482,7 @@ function Board2Editor({
   initialFile?: File;
   initialFileName?: string;
   autoMakeJoinable?: boolean;
+  initialBoardType?: BoardType;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
   onWorkspaceSource: (workspaceId: string, fileName: string) => void;
   chromeHidden: boolean;
@@ -6451,6 +6500,11 @@ function Board2Editor({
   const { data: session, status: sessionStatus } = useSession();
   const { isPro: isProUser, isAdmin: isAdminUser, loading: isProLoading } = useIsPro();
 
+  // An old-school ("simple") board is sticky notes and photos: no video editor, no other boards
+  // around it. Shared with joiners in the board state; the owner can turn it into a Neural board.
+  const [boardType, setBoardType] = useState<BoardType>(initialBoardType);
+  const isSimpleBoard = boardType === "simple";
+  const worldBoards = isSimpleBoard ? NO_WORLD_BOARDS : allWorldBoards;
   const [joinCode, setJoinCode] = useState("");
   const [joinOwnerToken, setJoinOwnerToken] = useState("");
   // From the server: whether the shared board has no account owner yet, and when it expires
@@ -6472,12 +6526,18 @@ function Board2Editor({
   // Likes on the shared board's items, as the server last sent them (only the server changes them),
   // and the items with a like request on its way.
   const [boardLikes, setBoardLikes] = useState<BoardLikes>({});
+  // For the export and previews, which draw outside React's render (likes make sticky notes bigger).
+  const boardLikesRef = useRef<BoardLikes>({});
+  useEffect(() => { boardLikesRef.current = boardLikes; }, [boardLikes]);
   const likeInFlightRef = useRef(new Set<string>());
   // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
   const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
   const boardAddImageInputRef = useRef<HTMLInputElement | null>(null);
   // The color the next sticky note gets: the last one picked.
   const [stickyColor, setStickyColor] = useState<string>(DEFAULT_STICKY_NOTE_COLOR);
+  // A new sticky note or reply being written in the compose modal, as the original boards did: it's
+  // on the board only once posted. `note` is placed, colored and has its id (so its shade is final).
+  const [stickyComposer, setStickyComposer] = useState<{ note: Annotation; text: string } | null>(null);
   const boardAddPointRef = useRef<{ x: number; y: number } | null>(null);
   // Touch pan/pinch preview: the layer the transform goes on, and the view React last rendered
   // (the transform's starting point) while a preview is showing.
@@ -6755,7 +6815,39 @@ function Board2Editor({
     isBoardOwner || (!!participantId && itemAuthor(item) === participantId);
   // Sticky-note threads: how deep each note sits (its shade) and the lines to its parent.
   const annotationThreadDepths = useMemo(() => threadDepths(annotations), [annotations]);
-  const annotationThreadConnectors = useMemo(() => threadConnectors(annotations), [annotations]);
+  // Sticky notes being dragged: they follow the pointer while the others make room around them.
+  const [pinnedStickyIds, setPinnedStickyIds] = useState<ReadonlySet<string>>(NO_PINNED_STICKIES);
+  // Sticky notes as shown (bigger with likes, pushed apart), by id; the export draws the same.
+  // Worked out only when the annotations, likes or dragged notes change, never on pan or zoom.
+  const displayedAnnotations = useMemo(() => annotationsAsShown(annotations, boardLikes, pinnedStickyIds), [annotations, boardLikes, pinnedStickyIds]);
+  const displayedAnnotationById = useMemo(() => new Map(displayedAnnotations.map((annotation) => [annotation.id, annotation])), [displayedAnnotations]);
+  const annotationThreadConnectors = useMemo(() => threadConnectors(displayedAnnotations), [displayedAnnotations]);
+  // When pushing moves notes, they slide there over 160ms, as on the original boards. Only the
+  // push is animated (not moves, which follow the pointer), and by the Web Animations API on the
+  // note's element rather than a CSS transition, which would also animate every zoom.
+  const stickyPushOffsetsRef = useRef(new Map<string, { dx: number; dy: number }>());
+  useLayoutEffect(() => {
+    const previous = stickyPushOffsetsRef.current;
+    const next = new Map<string, { dx: number; dy: number }>();
+    const storedById = new Map(annotations.map((annotation) => [annotation.id, annotation]));
+    const animate = typeof window !== "undefined" && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    for (const shown of displayedAnnotations) {
+      const stored = storedById.get(shown.id);
+      if (shown.type !== "sticky" || !stored) continue;
+      const offset = stickyPushOffset(stored, shown);
+      next.set(shown.id, offset);
+      const before = previous.get(shown.id);
+      if (!animate || !before || pinnedStickyIds.has(shown.id)) continue;
+      const zoom = boardZoomRef.current;
+      const fromX = (before.dx - offset.dx) * zoom, fromY = (before.dy - offset.dy) * zoom;
+      if (Math.abs(fromX) < 0.5 && Math.abs(fromY) < 0.5) continue;
+      const element = document.querySelector<HTMLElement>(`[data-mbannotationid="${CSS.escape(shown.id)}"]`);
+      element?.animate([{ translate: `${fromX}px ${fromY}px` }, { translate: "0px 0px" }], { duration: 160, easing: "ease" });
+    }
+    stickyPushOffsetsRef.current = next;
+  }, [annotations, displayedAnnotations, pinnedStickyIds]);
+  // Notes are stacked above their replies (see threadPaintOrder); the export draws in the same order.
+  const annotationsInPaintOrder = useMemo(() => threadPaintOrder(annotations), [annotations]);
   // With the editor closed, the open board is still edited directly; only the published viewer is look-only.
   const boardViewEditable = chromeHidden && !viewOnly;
   const boardHasContent = annotations.length > 0 || clips.some((clip) => clip.boardX !== undefined);
@@ -8215,8 +8307,9 @@ function Board2Editor({
     showCharacter2,
     canvasAspect,
     boardColor,
+    boardType,
     };
-  }, [annotations, boardColor, boardDimensions, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, itemAuthor, showCharacter, showCharacter2]);
+  }, [annotations, boardColor, boardDimensions, boardType, cameraKeyframes, canvasAspect, characterActions, characterActions2, clips, itemAuthor, showCharacter, showCharacter2]);
   const joinableSignature = useMemo(() => stableStringify(joinableSnapshot), [joinableSnapshot]);
   useEffect(() => { joinableSnapshotRef.current = joinableSnapshot; }, [joinableSnapshot]);
 
@@ -8260,6 +8353,7 @@ function Board2Editor({
       setBoardColor(state.boardColor);
     }
     if (state.canvasAspect === "16:9" || state.canvasAspect === "9:16") setCanvasAspect(state.canvasAspect);
+    setBoardType(parseBoardType(state.boardType));
   }, []);
 
   useEffect(() => {
@@ -8297,6 +8391,12 @@ function Board2Editor({
     // claimCreatedBoard is component-local; it runs once per board when the creator is signed in.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joinAnonymous, joinCode, joinOwnerToken, session?.user?.email]);
+
+  // An old-school board has no video editor: whatever would open it (a remembered editor, a
+  // shortcut) lands back on the board.
+  useEffect(() => {
+    if (isSimpleBoard && !chromeHidden) onToggleChrome();
+  }, [chromeHidden, isSimpleBoard, onToggleChrome]);
 
   const autoMakeJoinableStartedRef = useRef(false);
   useEffect(() => {
@@ -9040,6 +9140,7 @@ function Board2Editor({
         boardPan,
         boardDimensions,
         boardColor,
+        boardType,
         spawnDoor,
         customZoomDurationSeconds: customZoomDuration,
         characters: [
@@ -9071,7 +9172,7 @@ function Board2Editor({
     };
   }, [
     autosaveEnabled, isLoadingProject, saveName, clips, annotations, cameraKeyframes, canvasAspect, pxPerSec, boardZoom, boardPan,
-    boardDimensions, boardColor, spawnDoor, customZoomDuration, showCharacter, characterMode, characterSkin, characterType,
+    boardDimensions, boardColor, boardType, spawnDoor, customZoomDuration, showCharacter, characterMode, characterSkin, characterType,
     characterExpression, characterActions, characterStart, showCharacter2, characterMode2, characterSkin2, characterType2,
     characterExpression2, characterActions2, characterStart2, narrationVisemeTrack, narrationVisemeTrackSource,
     narrationGestureTrack, narrationGestureTrackSource, smartGestures, captionsEnabled, captionFontSize, captionPosition,
@@ -10150,7 +10251,7 @@ function Board2Editor({
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
     if (currentAnnotations.length > 0) {
-      drawAnnotationsToCanvas(ctx, currentAnnotations, cam, sf, W, H);
+      drawAnnotationsToCanvas(ctx, currentAnnotations, boardLikesRef.current, cam, sf, W, H);
     }
     ctx.restore();
     drawCutToOverlays(ctx, time, currentClips, W, H, (clip) => cutToSourceFor(clip, offlineVideoRendering), quality === "preview" ? previewCutToClipIdRef.current : null);
@@ -15735,6 +15836,8 @@ function Board2Editor({
     // Animated GIF/WebP stays an image clip whose decoded frames loop (lib/board2/animated-image).
     const animated = isGifFile(file, name) || isAnimatableImageType(file.type) ? await decodeAnimatedImage(file) : null;
     const type: "image" | "video" = file.type.startsWith("video/") || (!file.type.startsWith("image/") && /\.(mp4|mov|webm|mkv)$/i.test(name)) ? "video" : "image";
+    // The server rejects anything else on an old-school board; say so before uploading it.
+    if (isSimpleBoard && (type !== "image" || /^(audio|video)\//.test(file.type))) throw new Error(SIMPLE_BOARD_ITEMS_ONLY);
     let url: string;
     let notShared = "";
     if (type === "image" && joinCode) url = await uploadJoinableImage(file, name);
@@ -17888,15 +17991,24 @@ function Board2Editor({
     };
     setBoardAddPrompt(null);
     disarmAnnotationTool();
-    setAnnotations((prev) => [...prev, annotation]);
-    setAnnotationSelection([annotation.id]);
-    setEditingAnnotationId(annotation.id);
-    setEditingAnnotationText("");
+    setStickyComposer({ note: annotation, text: "" });
   }
 
   function setStickyNoteColor(id: string, noteColor: string) {
     setStickyColor(noteColor);
     setAnnotations((prev) => prev.map((annotation) => annotation.id === id && annotation.type === "sticky" ? { ...annotation, noteColor } : annotation));
+  }
+
+  // Posting puts the note on the board at its final size: as tall as its text (see commitTextEdit).
+  function postStickyComposer() {
+    if (!stickyComposer) return;
+    const text = stickyComposer.text.trim();
+    if (!text) return;
+    const { note } = stickyComposer;
+    const annotation: Annotation = { ...note, text, boardH: Math.max(note.boardH, stickyNoteLayoutForEditor(note, text).frame.boardH) };
+    setStickyComposer(null);
+    setAnnotations((prev) => [...prev, annotation]);
+    setAnnotationSelection([annotation.id]);
   }
 
   function addImageFromBoardPrompt() {
@@ -18046,10 +18158,7 @@ function Board2Editor({
     };
     setBoardAddPrompt(null);
     disarmAnnotationTool();
-    setAnnotations((prev) => [...prev, annotation]);
-    setAnnotationSelection([annotation.id]);
-    setEditingAnnotationId(annotation.id);
-    setEditingAnnotationText("");
+    setStickyComposer({ note: annotation, text: "" });
   }
 
   function commitTextEdit(annId: string) {
@@ -18063,13 +18172,18 @@ function Board2Editor({
       const textarea = editingTextareaRef.current;
       const measuredWidth = textarea ? textarea.scrollWidth / Math.max(0.05, boardZoomRef.current) : 0;
       const measuredHeight = textarea ? textarea.scrollHeight / Math.max(0.05, boardZoomRef.current) : 0;
-      setAnnotations((prev) => prev.map((a) => (a.id === annId ? {
+      setAnnotations((prev) => prev.map((a) => (a.id !== annId ? a : a.type === "sticky" ? {
         ...a,
         text,
-        // A sticky note's text wraps inside the note, so only its height grows to fit.
-        boardW: a.type === "sticky" ? a.boardW : Math.max(a.boardW, measuredWidth),
+        // A sticky note's text wraps at the note's width, so only its height grows to fit, by the
+        // same layout the board and export draw with.
+        boardH: Math.max(a.boardH, stickyNoteLayoutForEditor(a, text).frame.boardH),
+      } : {
+        ...a,
+        text,
+        boardW: Math.max(a.boardW, measuredWidth),
         boardH: Math.max(a.boardH, measuredHeight),
-      } : a)));
+      })));
       setEditingAnnotationId(null);
     }
     annotationToolRef.current = "pointer";
@@ -18120,11 +18234,16 @@ function Board2Editor({
     const movingClipIds = selectedAnnotationIdsRef.current.includes(ann.id) ? [...selectedClipIdsRef.current] : [];
     if (!selectedAnnotationIdsRef.current.includes(ann.id)) setAnnotationSelection([ann.id]);
     const startX = e.clientX, startY = e.clientY;
+    // Moved sticky notes start from where they're drawn (pushed aside, maybe) and are pinned there,
+    // so they follow the pointer while the others make room; dropping them unpins them.
+    const movingStickyIds = new Set(annotationsRef.current.filter((a) => a.type === "sticky" && movingAnnotationIds.includes(a.id)).map((a) => a.id));
+    let pinned = false;
     const origAnnotations = new Map(
       annotationsRef.current
         .filter((a) => movingAnnotationIds.includes(a.id))
         .map((a) => [a.id, {
-          x: a.boardX, y: a.boardY,
+          x: a.boardX + (movingStickyIds.has(a.id) ? stickyPushOffset(a, displayedAnnotationById.get(a.id)).dx : 0),
+          y: a.boardY + (movingStickyIds.has(a.id) ? stickyPushOffset(a, displayedAnnotationById.get(a.id)).dy : 0),
           arrowStartX: a.arrowStartX, arrowStartY: a.arrowStartY, arrowEndX: a.arrowEndX, arrowEndY: a.arrowEndY,
           points: a.points ? a.points.map((p) => ({ ...p })) : undefined,
         }])
@@ -18138,6 +18257,7 @@ function Board2Editor({
       const zoom = boardZoomRef.current;
       const dx = (ev.clientX - startX) / zoom;
       const dy = (ev.clientY - startY) / zoom;
+      if (!pinned && movingStickyIds.size > 0) { pinned = true; setPinnedStickyIds(movingStickyIds); }
       setAnnotations((prev) =>
         prev.map((a) => {
           const orig = origAnnotations.get(a.id);
@@ -18161,7 +18281,11 @@ function Board2Editor({
         }));
       }
     };
-    const onUp = () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (pinned) setPinnedStickyIds(NO_PINNED_STICKIES);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   }
@@ -20665,7 +20789,7 @@ function Board2Editor({
       // anywhere on the infinite board, well outside the nominal boardDimensions box, so exporting
       // that fixed box would crop real content or capture mostly empty parchment. Fall back to the
       // nominal box only when the board is empty.
-      const bounds = boardContentBounds(currentClips, currentAnnotations);
+      const bounds = boardContentBounds(currentClips, annotationsAsShown(currentAnnotations, boardLikesRef.current));
       const frame = bounds
         ? {
             minX: bounds.minX - BOARD_EXPORT_PADDING,
@@ -22737,6 +22861,14 @@ function Board2Editor({
         if (g.type === "pan") setBoardAddPrompt(null);
         else if (g.hitClipId && !g.hitClipIsSelected) setClipSelection([g.hitClipId]);
         else if (g.hitAnnotationId && !g.hitAnnotationIsSelected) setAnnotationSelection([g.hitAnnotationId]);
+        // A moved sticky note starts from where it's drawn and is pinned there (see handleAnnotationPointerDown).
+        const movedSticky = g.type === "move" && !g.hitClipId ? annotationsRef.current.find((a) => a.id === g.hitAnnotationId && a.type === "sticky") : undefined;
+        if (movedSticky) {
+          const offset = stickyPushOffset(movedSticky, displayedAnnotationById.get(movedSticky.id));
+          g.annotationOrigX += offset.dx;
+          g.annotationOrigY += offset.dy;
+          setPinnedStickyIds(new Set([movedSticky.id]));
+        }
       }
     }
 
@@ -22774,6 +22906,7 @@ function Board2Editor({
     if (!pointers.has(e.pointerId)) return;
     const g = mobileGestureRef.current;
     if (g.longPressTimer) { clearTimeout(g.longPressTimer); g.longPressTimer = null; }
+    setPinnedStickyIds((current) => current.size > 0 ? NO_PINNED_STICKIES : current);
 
     if (e.type !== "pointercancel" && g.type === "deciding" && performance.now() - g.startTime <= BOARD_TOUCH_TAP_MAX_MS) {
       if (g.hitClipId) {
@@ -23054,6 +23187,77 @@ function Board2Editor({
   function setZoomNarrationTypewriter(clipId: string, enabled: boolean) {
     setClips((prev) => prev.map((clip) => clip.id === clipId ? { ...clip, narrationTypewriter: enabled || undefined } : clip));
     setToast(enabled ? "Narration block added — it types out during this zoom" : "Narration block removed");
+  }
+
+  // The sticky-note compose modal: over a dimmed, blurred board, a big textarea in the note's own
+  // shade. Enter posts, Shift+Enter is a new line, Escape or a click outside cancels.
+  function renderStickyComposer() {
+    if (!stickyComposer) return null;
+    const { note, text } = stickyComposer;
+    const isReply = !!note.parentId;
+    const depth = isReply ? (annotationThreadDepths.get(note.parentId!) ?? 0) + 1 : 0;
+    const noteColor = note.noteColor ?? DEFAULT_STICKY_NOTE_COLOR;
+    const cancel = () => setStickyComposer(null);
+    const buttonHeight = isMobile ? 44 : 30;
+    return (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={isReply ? "Reply to a sticky note" : "New sticky note"}
+        onPointerDown={(event) => { if (event.target === event.currentTarget) cancel(); }}
+        style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(42,42,42,.35)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }}
+      >
+        <div style={{ width: 520, maxWidth: "96vw", display: "flex", flexDirection: "column", gap: 12, padding: 14, borderRadius: 18, background: "#fffdf5", boxShadow: "0 18px 70px rgba(42,42,42,.28)", fontFamily: "monospace", boxSizing: "border-box" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: STICKY_NOTE_INK }}>{isReply ? "Reply" : "New note"}</div>
+            {/* A reply takes its thread's color; a new note's color can be picked. */}
+            {!isReply && (
+              <div role="radiogroup" aria-label="Note color" style={{ display: "flex", gap: isMobile ? 2 : 6 }}>
+                {STICKY_NOTE_COLORS.map(({ color, name }) => {
+                  const checked = noteColor === color;
+                  return (
+                    <button
+                      key={color}
+                      type="button"
+                      role="radio"
+                      aria-checked={checked}
+                      aria-label={name}
+                      title={name}
+                      onClick={() => { setStickyColor(color); setStickyComposer((current) => current && { ...current, note: { ...current.note, noteColor: color } }); }}
+                      style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <textarea
+            autoFocus
+            aria-label={isReply ? "Reply text" : "Note text"}
+            placeholder={isReply ? "Write a reply…" : "Write a note…"}
+            value={text}
+            maxLength={STICKY_NOTE_MAX_TEXT}
+            onChange={(event) => { const value = event.target.value; setStickyComposer((current) => current && { ...current, text: value }); }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); postStickyComposer(); }
+              else if (event.key === "Escape") { event.preventDefault(); cancel(); }
+            }}
+            style={{
+              width: "100%", minHeight: isMobile ? 160 : 200, boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
+              background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
+              color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
+            }}
+          />
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 10, color: "#6a6a6a" }}>{isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels"}</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" onClick={cancel} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px" }}>Cancel</button>
+              <button type="button" onClick={postStickyComposer} disabled={!text.trim()} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px", background: "#2a2a2a", color: "#fffdf5", opacity: text.trim() ? 1 : 0.5, cursor: text.trim() ? "pointer" : "not-allowed" }}>Post</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   function renderZoomEditorModal() {
@@ -25630,6 +25834,7 @@ function Board2Editor({
       {renderNarrationVideoModal()}
         {renderNarrationVideoModal()}
         {renderZoomEditorModal()}
+        {renderStickyComposer()}
         {renderNeuralSearchModal()}
         {renderTop5Modal()}
         {renderImagePreviewModal()}
@@ -25931,6 +26136,7 @@ function Board2Editor({
         boardZoom: boardZoomRef.current,
         boardPan: boardPanRef.current,
         spawnDoor: spawnDoorRef.current,
+        boardType,
       },
       timeline: {
         blocks: timelineBlocks,
@@ -26154,6 +26360,7 @@ function Board2Editor({
         captions: rawManifest.narration?.captions,
         customZoomDurationSeconds: rawManifest.timeline?.customZoomDurationSeconds,
         spawnDoor: rawManifest.board?.spawnDoor ?? null,
+        boardType: rawManifest.board?.boardType,
       } : rawManifest;
       if (schemaVersion >= 1) {
         if (typeof (rawManifest.meta?.id ?? rawManifest.meta?.projectId) === "string") recipeProjectIdRef.current = rawManifest.meta.id ?? rawManifest.meta.projectId;
@@ -26359,6 +26566,7 @@ function Board2Editor({
       }
       if (manifest.name) setSaveName(manifest.name);
       if (typeof manifest.boardColor === "string" && /^#[0-9a-f]{6}$/i.test(manifest.boardColor)) setBoardColor(manifest.boardColor);
+      setBoardType(parseBoardType(manifest.boardType));
       const loadFace = (face: ManifestFace | null | undefined): CharacterFaceSettings | null => {
         if (!face?.assetFile || !files[face.assetFile]) return null;
         const faceData = files[face.assetFile];
@@ -26901,7 +27109,7 @@ function Board2Editor({
   async function makeBoardJoinable(): Promise<{ code: string; token: string } | null> {
     setJoinStatus("connecting");
     try {
-      const response = await fetch("/api/joinable-board", { method: "POST" });
+      const response = await fetch("/api/joinable-board", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ boardType }) });
       const result = await response.json() as { code?: string; token?: string; error?: string; expiresAt?: string | null; anonymous?: boolean };
       if (!response.ok || !result.code || !result.token) throw new Error(result.error || "Could not make this board joinable.");
       // Persist the owner token the moment the board exists: the uploads below can take a while,
@@ -27087,7 +27295,14 @@ function Board2Editor({
                           </div>
                         </div>
                       )}
-                      {isBoardOwner && (
+                      {isBoardOwner && isSimpleBoard && (
+                        <div className={shellStyles.popoverSection}>
+                          <span className={shellStyles.caption}>Make a video</span>
+                          <p className={shellStyles.caption} style={{ color: "var(--body)" }}>Turn this into a Neural board to make a video from what&apos;s on it. Everything stays, and so does the code. This can&apos;t be undone.</p>
+                          <button type="button" className={shellStyles.outlineButton} onClick={() => { setBoardSettingsOpen(false); setBoardType("neural"); setToast("This is now a Neural board. Open the video editor from the top bar."); }}>Turn into a Neural board</button>
+                        </div>
+                      )}
+                      {isBoardOwner && !isSimpleBoard && (
                         <div className={shellStyles.popoverSection}>
                           <span className={shellStyles.caption}>Board file</span>
                           <div className={shellStyles.popoverRow}>
@@ -27103,7 +27318,7 @@ function Board2Editor({
                           {(joinOwnerToken || joinServerOwner) && <button type="button" className={`${shellStyles.outlineButton} ${shellStyles.dangerButton}`} onClick={() => { setBoardSettingsOpen(false); void stopBoardJoinability(); }}>Stop sharing {joinCode}</button>}
                         </div>
                       )}
-                      {LIVE_FEATURES_ENABLED && (
+                      {LIVE_FEATURES_ENABLED && !isSimpleBoard && (
                         <ProGated featureName="Play Mode">
                           <button type="button" className={shellStyles.outlineButton} onClick={enterPlayMode} title="Full-window direct character control">▶ Play</button>
                         </ProGated>
@@ -27123,7 +27338,7 @@ function Board2Editor({
               <button type="button" className={shellStyles.glassButton} onClick={() => { void toggleFullscreen(); }} aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-pressed={isFullscreen} title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}>
                 {isFullscreen ? <CompressIcon size={18} /> : <ExpandIcon size={18} />}
               </button>
-              {isBoardOwner && (
+              {isBoardOwner && !isSimpleBoard && (
                 <button type="button" className={shellStyles.glassButton} aria-label="Open video editor" aria-pressed={false} title="Open the video editor for the board centered on screen" onClick={restoreChromeForCenteredBoard}>
                   <ClapperboardIcon open={false} stripe="#ffffff" size={19} />
                 </button>
@@ -27571,18 +27786,27 @@ function Board2Editor({
                       onKeyDown={(event) => { if (event.key === "Escape") setBoardAddPrompt(null); }}
                       style={{ left, top, width, height, boxSizing: "border-box" }}
                     >
-                      <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>
-                      <button type="button" role="menuitem" onClick={addStickyFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 2, background: stickyColor, boxShadow: "inset 0 0 0 1px rgba(42,42,42,.25)" }} />Sticky</button>
-                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true">🖼</span>Image</button>
+                      {!isSimpleBoard && <button type="button" role="menuitem" autoFocus onClick={addTextFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ fontFamily: "Georgia, serif", fontSize: 17 }}>T</span>Text</button>}
+                      {/* Old-school boards: a sticky note is the text, so it's the first choice. */}
+                      <button type="button" role="menuitem" autoFocus={isSimpleBoard} onClick={addStickyFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 2, background: stickyColor, boxShadow: "inset 0 0 0 1px rgba(42,42,42,.25)" }} />{isSimpleBoard ? "Sticky note" : "Sticky"}</button>
+                      <button type="button" role="menuitem" onClick={addImageFromBoardPrompt} className={shellStyles.outlineButton}><span aria-hidden="true">🖼</span>{isSimpleBoard ? "Photo" : "Image"}</button>
                     </div>
                   </>
                 );
               })()}
               {pendingMediaPlacement && (
-                <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
-                  <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
-                  <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
-                </div>
+                // The board view uses the app-shell look; the video editor keeps its own.
+                chromeHidden ? (
+                  <div data-media-placement-ui role="status" className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.placementBanner}`}>
+                    <span>Placing <strong>{pendingMediaPlacement.item.name}</strong>. Zoom or pan, then tap the board</span>
+                    <button type="button" onClick={cancelPendingMediaPlacement} className={shellStyles.outlineButton}>Cancel</button>
+                  </div>
+                ) : (
+                  <div data-media-placement-ui style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 80, display: "flex", alignItems: "center", gap: 8, maxWidth: "calc(100% - 24px)", padding: "8px 10px", border: "1.5px solid #2a2a2a", background: "rgba(255,253,245,.96)", boxShadow: "2px 2px 0 #2a2a2a", fontFamily: "monospace", fontSize: 10 }}>
+                    <span>Placing <strong>{pendingMediaPlacement.item.name}</strong> ({pendingMediaPlacement.width}×{pendingMediaPlacement.height}) — zoom/pan, then click the board</span>
+                    <button type="button" onClick={cancelPendingMediaPlacement} style={{ ...miniButton, padding: "3px 6px", flexShrink: 0 }}>Cancel</button>
+                  </div>
+                )
               )}
               {/* Everything that sits at board coordinates. During a touch pan or pinch it moves as one
                   CSS transform (previewBoardView) and React catches up once, when the gesture ends. */}
@@ -27622,7 +27846,7 @@ function Board2Editor({
                     aria-hidden={boardHasContent}
                     style={{
                       position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                      pointerEvents: "none", userSelect: "none", color: "rgba(42,42,42,0.16)", fontFamily: "monospace", textAlign: "center",
+                      pointerEvents: "none", userSelect: "none", color: "rgba(42,42,42,0.16)", fontFamily: "var(--font-shell), \"Open Sans\", system-ui, sans-serif", textAlign: "center",
                       opacity: boardHasContent ? 0 : 1, transition: "opacity 600ms ease", zIndex: 0,
                     }}
                   >
@@ -27876,7 +28100,7 @@ function Board2Editor({
                 >
                   {annotationThreadConnectors.map((line) => (
                     <line key={`thread-${line.id}`} x1={line.x1 * boardZoom} y1={line.y1 * boardZoom} x2={line.x2 * boardZoom} y2={line.y2 * boardZoom}
-                      stroke={THREAD_CONNECTOR_COLOR} strokeWidth={Math.max(1, THREAD_CONNECTOR_WIDTH * boardZoom)} strokeLinecap="round" />
+                      stroke={THREAD_CONNECTOR_COLOR} strokeWidth={Math.max(1, line.width * boardZoom)} strokeLinecap="round" />
                   ))}
                   {(annotationDrawPreview ? [...annotations, annotationDrawPreview] : annotations).filter((a) => a.type !== "text").map((ann) => {
                     // Board-unit strokes scaled by zoom, as drawAnnotationsOnCanvas does for export.
@@ -27935,7 +28159,7 @@ function Board2Editor({
 
                 {/* Annotation DOM overlays (hit targets + text rendering + resize handles) */}
                 {/* eslint-disable-next-line react-hooks/refs */}
-                {annotations.map((ann) => {
+                {annotationsInPaintOrder.map((ann) => {
                   const isSel = ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id);
                   const isEditing = ann.id === editingAnnotationId;
                   const canEdit = canEditBoardItem(ann);
@@ -27945,16 +28169,28 @@ function Board2Editor({
                   const textLines = ann.type === "text" && ann.text
                     ? annotationLinesForEditor(ann)
                     : [];
+                  // A sticky note shows all its text, so it can run past a box that's too short
+                  // (until the text is posted and the box grows); its outline, handles and color
+                  // choices follow the note rather than the box. Typing gets the box's whole width.
+                  // `shown` is where it's drawn: a liked note is bigger, text and all, and notes are pushed apart (lib/sticky-notes).
+                  const shown = displayedAnnotationById.get(ann.id) ?? ann;
+                  const sticky = ann.type !== "sticky" ? null : isEditing
+                    ? (() => {
+                        const { lines } = stickyNoteLayoutForEditor(shown, editingAnnotationText);
+                        return { lines: [], frame: stickyNoteTypingFrame(shown, lines.length, shown.fontSize ?? 80) };
+                      })()
+                    : stickyNoteLayoutForEditor(shown);
+                  const shownH = sticky ? Math.max(shown.boardH, sticky.frame.boardY + sticky.frame.boardH - shown.boardY) : shown.boardH;
                   return (
                     <div
                       key={ann.id}
                       data-mbannotationid={ann.id}
                       style={{
                         position: "absolute",
-                        left: ann.boardX * boardZoom,
-                        top: ann.boardY * boardZoom,
-                        width: ann.boardW * boardZoom,
-                        height: ann.boardH * boardZoom,
+                        left: shown.boardX * boardZoom,
+                        top: shown.boardY * boardZoom,
+                        width: shown.boardW * boardZoom,
+                        height: shownH * boardZoom,
                         transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
                         outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
@@ -28028,20 +28264,22 @@ function Board2Editor({
                           }}
                         />
                       )}
-                      {ann.type === "sticky" && (() => {
-                        const box = stickyNoteTextBox(ann);
-                        const pad = (ann.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
+                      {sticky && (() => {
+                        const { lines, frame } = sticky;
+                        const pad = (shown.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
                         const text: React.CSSProperties = {
                           fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
-                          fontSize: (ann.fontSize ?? 80) * boardZoom,
+                          fontSize: (shown.fontSize ?? 80) * boardZoom,
                           fontWeight: ann.fontWeight ?? "normal",
                           color: ann.color || STICKY_NOTE_INK,
                           lineHeight: ANNOTATION_LINE_HEIGHT,
                         };
                         return (
                           <div data-sticky-note style={{
-                            position: "absolute", inset: 0, boxSizing: "border-box", padding: pad, overflow: "hidden",
-                            background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0),
+                            position: "absolute", boxSizing: "border-box", padding: pad, overflow: "hidden",
+                            left: (frame.boardX - shown.boardX) * boardZoom, top: (frame.boardY - shown.boardY) * boardZoom,
+                            width: frame.boardW * boardZoom, height: frame.boardH * boardZoom, borderRadius: frame.radius * boardZoom,
+                            background: threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, annotationThreadDepths.get(ann.id) ?? 0, ann.id),
                             boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
                             pointerEvents: isEditing ? "auto" : "none", userSelect: "none",
                           }}>
@@ -28062,14 +28300,14 @@ function Board2Editor({
                                 onBlur={() => commitTextEdit(ann.id)}
                                 style={{
                                   ...text,
-                                  // The note's full height, so commitTextEdit's scrollHeight is the height the note needs.
+                                  // Wraps inside words too, as wrapStickyNoteText does.
                                   position: "absolute", inset: 0, width: "100%", height: "100%", boxSizing: "border-box", padding: pad,
-                                  background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflow: "hidden",
+                                  background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflowWrap: "break-word", overflow: "hidden",
                                 }}
                               />
-                            ) : ann.text ? (
+                            ) : lines.length > 0 ? (
                               <div style={text}>
-                                {annotationLinesForEditor(box).map((line, index) => (
+                                {lines.map((line, index) => (
                                   <span key={index} style={{ display: "block", whiteSpace: "pre", height: `${ANNOTATION_LINE_HEIGHT}em` }}>{line || "\u00a0"}</span>
                                 ))}
                               </div>
@@ -28171,7 +28409,7 @@ function Board2Editor({
                     one-heart-and-count form. */}
                 {joinCode && [
                   ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
-                  ...annotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                  ...displayedAnnotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
                 ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
                   const likers = boardLikes[item.id] ?? [];
                   const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;
@@ -31468,6 +31706,7 @@ function Board2Editor({
       {renderMediaEditorModal()}
       {renderNarrationVideoModal()}
       {renderZoomEditorModal()}
+      {renderStickyComposer()}
       {renderNeuralSearchModal()}
       {renderTop5Modal()}
       {renderImagePreviewModal()}

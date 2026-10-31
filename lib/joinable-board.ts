@@ -39,6 +39,15 @@ export const SHARED_AV_EXTENSIONS: Record<string, string> = {
 };
 export const SHARED_MEDIA_EXTENSIONS = new Set(["webp", ...Object.values(SHARED_AV_EXTENSIONS)]);
 
+// "simple" is the old-school board: sticky notes and photos, no video editor. A board without a
+// type is a full Neural board. Owner-only, and only ever changes from simple to neural.
+export type BoardType = "simple" | "neural";
+export const BOARD_TYPE_PARAM = "type";
+
+export function parseBoardType(value: unknown): BoardType {
+  return value === "simple" ? "simple" : "neural";
+}
+
 export type JoinableBoardState = {
   clips: Array<Record<string, unknown>>;
   annotations: Array<Record<string, unknown>>;
@@ -50,6 +59,7 @@ export type JoinableBoardState = {
   showCharacter2?: boolean;
   canvasAspect?: "16:9" | "9:16";
   boardColor?: string;
+  boardType?: BoardType;
   // Item id -> participant ids that like it. Server-owned: see lib/joinable-board-likes.
   likes?: Record<string, string[]>;
 };
@@ -67,7 +77,7 @@ export function stableStringify(value: unknown): string {
 }
 
 const MERGED_LISTS = ["clips", "annotations", "characterActions", "characterActions2"] as const;
-const MERGED_VALUES = ["boardDimensions", "cameraKeyframes", "showCharacter", "showCharacter2", "canvasAspect", "boardColor"] as const;
+const MERGED_VALUES = ["boardDimensions", "cameraKeyframes", "showCharacter", "showCharacter2", "canvasAspect", "boardColor", "boardType"] as const;
 
 type Identified = Record<string, unknown> & { id?: unknown };
 

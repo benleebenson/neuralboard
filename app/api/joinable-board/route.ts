@@ -3,9 +3,9 @@ import { getServerSession } from "next-auth";
 import { NextResponse } from "next/server";
 import { authOptions } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
-import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, type JoinableBoardState } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, parseBoardType, type JoinableBoardState } from "@/lib/joinable-board";
 import { joinableBoardError, joinTokenHash, participantIdFromToken, unexpiredBoardFilter } from "@/lib/joinable-board-server";
-import { checkJoinerUpdate } from "@/lib/joinable-board-permissions";
+import { checkJoinerUpdate, withStoredBoardType } from "@/lib/joinable-board-permissions";
 import { withStoredLikes } from "@/lib/joinable-board-likes";
 import { unpublishJoinCodes } from "@/lib/published-boards-server";
 
@@ -13,16 +13,20 @@ const active = () => new Date().toISOString();
 
 // No account needed: anonymous boards have no owner and expire after ANONYMOUS_BOARD_TTL_DAYS
 // unless claimed; boards created while signed in belong to the account and never expire. The
-// returned owner token proves the creator (stop sharing, claim) and is only stored hashed.
-export async function POST() {
+// returned owner token proves the creator (stop sharing, claim) and is only stored hashed. The
+// board type is stored from the start, so joiner rules for an old-school board apply before the
+// owner's first save.
+export async function POST(request: Request) {
   try {
+    const body = await request.json().catch(() => ({})) as { boardType?: unknown };
+    const boardType = parseBoardType(body.boardType);
     const session = await getServerSession(authOptions);
     const ownerEmail = session?.user?.email ?? null;
     const token = crypto.randomBytes(24).toString("base64url");
     const expiresAt = ownerEmail ? null : new Date(Date.now() + ANONYMOUS_BOARD_TTL_DAYS * 86_400_000).toISOString();
     for (let attempt = 0; attempt < 8; attempt++) {
       const code = generateJoinCode();
-      const { error } = await getSupabase().from("joinable_boards").insert({ code, owner_email: ownerEmail, owner_token_hash: joinTokenHash(token), expires_at: expiresAt });
+      const { error } = await getSupabase().from("joinable_boards").insert({ code, owner_email: ownerEmail, owner_token_hash: joinTokenHash(token), expires_at: expiresAt, state: { boardType } });
       if (!error) return NextResponse.json({ code, token, expiresAt, anonymous: !ownerEmail }, { status: 201 });
       if (error.code !== "23505") throw error;
     }
@@ -70,6 +74,7 @@ export async function PATCH(request: Request) {
     }
     // Likes change only through /api/joinable-board/like; a save, even the owner's, keeps the stored ones.
     state = withStoredLikes(board.state, state);
+    state = withStoredBoardType(board.state, state);
     // Only applies if nobody saved since this board was read.
     const { data, error } = await supabase.from("joinable_boards").update({ state, version: board.version + 1, updated_at: active() }).eq("id", board.id).eq("version", board.version).select("version").maybeSingle();
     if (error) throw error;

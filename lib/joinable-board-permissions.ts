@@ -1,4 +1,4 @@
-import { stableStringify, type JoinableBoardState } from "./joinable-board.ts";
+import { parseBoardType, stableStringify, type JoinableBoardState } from "./joinable-board.ts";
 import { isStickyNoteColor, STICKY_NOTE_MAX_TEXT } from "./sticky-notes.ts";
 import { THREAD_DELETE_OWNER_ONLY } from "./sticky-threads.ts";
 
@@ -9,11 +9,15 @@ import { THREAD_DELETE_OWNER_ONLY } from "./sticky-threads.ts";
 /** Settings that affect the whole board for everyone. */
 export const OWNER_ONLY_FIELDS = [
   "boardColor", "boardDimensions", "canvasAspect", "showCharacter", "showCharacter2",
-  "characterActions", "characterActions2", "cameraKeyframes",
+  "characterActions", "characterActions2", "cameraKeyframes", "boardType",
 ] as const;
 
 /** Clip types a joiner may put on the board (text goes on as an annotation). */
 export const JOINER_CLIP_TYPES = new Set(["image", "video"]);
+
+// An old-school board holds sticky notes and photos, and nothing else a joiner sends.
+const SIMPLE_BOARD_ITEM_TYPES = { clips: new Set(["image"]), annotations: new Set(["sticky"]) };
+export const SIMPLE_BOARD_ITEMS_ONLY = "This board takes sticky notes and photos only.";
 
 // Per-device values a browser may fill in on any clip it displays (e.g. a video's measured
 // duration). They never make another person's item count as changed.
@@ -50,7 +54,7 @@ function threadDeleteError(previous: Item[], kept: Item[], participantId: string
   return strandsReply ? THREAD_DELETE_OWNER_ONLY : null;
 }
 
-function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string): { ok: true; items: Item[] } | { ok: false; error: string } {
+function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string, simple: boolean): { ok: true; items: Item[] } | { ok: false; error: string } {
   const prevById = new Map(previous.filter((item) => typeof item.id === "string").map((item) => [item.id as string, item]));
   const nextIds = new Set<string>();
   const items: Item[] = [];
@@ -63,6 +67,7 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
       if (kind === "clips" && (!JOINER_CLIP_TYPES.has(String(item.type)) || typeof item.boardX !== "number")) {
         return { ok: false, error: "You can add images, video and text to the board; only the owner can change the video timeline." };
       }
+      if (simple && !SIMPLE_BOARD_ITEM_TYPES[kind].has(String(item.type))) return { ok: false, error: SIMPLE_BOARD_ITEMS_ONLY };
       const stickyError = stickyNoteError(item);
       if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
@@ -70,6 +75,7 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
       items.push(before); // unchanged: keep exactly what's stored
     } else {
       if (before.addedBy !== participantId || item.addedBy !== participantId) return { ok: false, error: "You can only move or change what you added." };
+      if (simple && !SIMPLE_BOARD_ITEM_TYPES[kind].has(String(item.type))) return { ok: false, error: SIMPLE_BOARD_ITEMS_ONLY };
       const stickyError = stickyNoteError(item);
       if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
@@ -91,16 +97,31 @@ export function checkJoinerUpdate(previous: JoinableBoardState, next: JoinableBo
   const prev = previous as unknown as Record<string, unknown>;
   const nxt = next as unknown as Record<string, unknown>;
   for (const field of OWNER_ONLY_FIELDS) {
-    // A setting the board doesn't have yet stays unset; the joiner's value is ignored.
+    // A setting the board doesn't have yet stays unset; the joiner's value is ignored. A board type
+    // left out (a tab from before board types) is kept as stored.
+    if (field === "boardType" && nxt[field] === undefined) continue;
     if (prev[field] !== undefined && stableStringify(prev[field]) !== stableStringify(nxt[field])) {
       return { ok: false, error: "Only the board owner can change board settings." };
     }
   }
-  const clips = checkItems("clips", (prev.clips as Item[] | undefined) ?? [], (nxt.clips as Item[] | undefined) ?? [], participantId);
+  // The stored type decides, never the joiner's copy.
+  const simple = parseBoardType(prev.boardType) === "simple";
+  const clips = checkItems("clips", (prev.clips as Item[] | undefined) ?? [], (nxt.clips as Item[] | undefined) ?? [], participantId, simple);
   if (!clips.ok) return clips;
-  const annotations = checkItems("annotations", (prev.annotations as Item[] | undefined) ?? [], (nxt.annotations as Item[] | undefined) ?? [], participantId);
+  const annotations = checkItems("annotations", (prev.annotations as Item[] | undefined) ?? [], (nxt.annotations as Item[] | undefined) ?? [], participantId, simple);
   if (!annotations.ok) return annotations;
   const threadError = threadDeleteError((prev.annotations as Item[] | undefined) ?? [], annotations.items, participantId);
   if (threadError) return { ok: false, error: threadError };
   return { ok: true, state: { ...previous, clips: clips.items, annotations: annotations.items } as JoinableBoardState };
+}
+
+/**
+ * The board type a save stores. A board only ever goes from old school to Neural, and only by the
+ * owner saying so: a save that leaves the type out (or asks for old school again) keeps what's stored.
+ */
+export function withStoredBoardType(stored: unknown, next: JoinableBoardState): JoinableBoardState {
+  const storedType = (stored as JoinableBoardState | null)?.boardType;
+  if (storedType === undefined) return next;
+  const boardType = parseBoardType(storedType) === "simple" && next.boardType === "neural" ? "neural" : parseBoardType(storedType);
+  return { ...next, boardType };
 }
