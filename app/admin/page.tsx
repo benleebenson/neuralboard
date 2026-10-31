@@ -1,6 +1,7 @@
 import { getServerSession } from "next-auth";
 import { authOptions, ADMIN_EMAIL } from "@/lib/auth";
 import { redirect } from "next/navigation";
+import LiveBoardPicker from "./LiveBoardPicker";
 import { getAllUsers, getRecentEvents, getTotalCostPerUser, getRecentApiCosts } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -47,6 +48,8 @@ export default async function AdminPage() {
       <p style={{ fontSize: 11, color: "#6a6a6a", marginBottom: 32 }}>
         Total API spend: <strong>${totalSpend.toFixed(4)}</strong>
       </p>
+
+      <LiveBoardPicker />
 
       {/* Users */}
       <section style={{ marginBottom: 48 }}>
