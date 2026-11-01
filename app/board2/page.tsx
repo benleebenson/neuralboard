@@ -23496,8 +23496,22 @@ function Board2Editor({
           />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-              <button type="button" onClick={choosePicture} disabled={busy} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 12px", cursor: busy ? "not-allowed" : "pointer" }}>
-                <span aria-hidden="true">🖼 </span>{pictureLabel}
+              {/* Attaching a picture is as much a part of posting as typing: the app shell's brand
+                  pill (.theme tokens), a 44px target on every screen. */}
+              <button
+                type="button"
+                onClick={choosePicture}
+                disabled={busy}
+                data-compose-attach
+                className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.gradientButton}`}
+                style={{ minWidth: 44, minHeight: 44, padding: "0 18px", opacity: busy ? 0.6 : 1, cursor: busy ? "not-allowed" : "pointer" }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true" style={{ width: 20, height: 20, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }}>
+                  <rect x="3" y="4.5" width="18" height="15" rx="3" />
+                  <circle cx="8.5" cy="9.5" r="1.75" />
+                  <path d="m21 16-5-5-8.5 8.5" />
+                </svg>
+                {pictureLabel}
               </button>
               <div role="status" style={{ fontSize: 10, color: "#6a6a6a" }}>
                 {status === "loading" ? "Reading the picture…" : status === "posting" ? "Uploading…" : isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels · paste an image"}
