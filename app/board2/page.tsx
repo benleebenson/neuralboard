@@ -2430,6 +2430,10 @@ const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const SAVE_BUTTON_COLOR = "#ffb347";
 const BOARD_RESIZE_PX = 10;
+// Likes pill under a shared item (BoardItemLikes.module.css): its button's hit height and the
+// visible pill's height, on desktop and touch, and the gap left between the item and the pill.
+const LIKES_HIT_PX = 28, LIKES_PILL_PX = 24, LIKES_HIT_TOUCH_PX = 44, LIKES_PILL_TOUCH_PX = 30;
+const LIKES_GAP_PX = 2;
 const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
 const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -28672,17 +28676,24 @@ function Board2Editor({
                   );
                 })}
 
-                {/* Likes, hanging just below each shared item's bottom-right corner so they never cover
-                    it. Only items the server has (synced) can be liked; a selected item's resize
-                    handle sits on that corner, so its likes drop below the handle. Items too small on
-                    screen to tell whose likes are whose show none until zoomed in; small ones get the
-                    one-heart-and-count form. */}
+                {/* Likes, tucked right under each shared item's bottom-right corner so they read as part
+                    of it without covering it: the pill's top sits LIKES_GAP_PX below the item's drawn
+                    edge (a sticky note's frame, not its box). Only items the server has (synced) can be
+                    liked; a selected item's resize handle sits on that corner, so its likes drop below
+                    the handle. Items too small on screen to tell whose likes are whose show none until
+                    zoomed in; small ones get the one-heart-and-count form. */}
                 {joinCode && [
                   ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
-                  ...displayedAnnotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                  ...displayedAnnotations.map((ann) => {
+                    const drawn = ann.type === "sticky" ? stickyNoteFrameOnBoard(ann) : ann;
+                    return { id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: drawn.boardX, y: drawn.boardY, w: drawn.boardW, h: drawn.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) };
+                  }),
                 ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
                   const likers = boardLikes[item.id] ?? [];
                   const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;
+                  // The button's hit area is taller than the pill it centers (BoardItemLikes.module.css),
+                  // so lift it by that slack: the visible pill then starts LIKES_GAP_PX under the edge.
+                  const slack = ((isMobile ? LIKES_HIT_TOUCH_PX : LIKES_HIT_PX) - (isMobile ? LIKES_PILL_TOUCH_PX : LIKES_PILL_PX)) / 2;
                   return (
                     <BoardItemLikes
                       key={`likes-${item.id}`}
@@ -28692,7 +28703,7 @@ function Board2Editor({
                       touch={isMobile}
                       itemName={item.name}
                       onToggle={viewOnly ? undefined : () => { void toggleBoardLike(item.id); }}
-                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + 2, transform: "translateX(-100%)", zIndex: 7 }}
+                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + LIKES_GAP_PX - slack, transform: "translateX(-100%)", zIndex: 7 }}
                     />
                   );
                 })}

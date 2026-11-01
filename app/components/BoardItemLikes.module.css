@@ -1,5 +1,6 @@
 /* Likes under a shared-board item's bottom-right corner. Lives inside .theme (AppShell.module.css)
-   for its tokens. The button is the hit area (44px on touch screens); .pill is what shows. */
+   for its tokens. Heights here are mirrored by LIKES_*_PX in app/board2/page.tsx, which tucks the
+   pill right under the item. The button is the hit area (44px on touch screens); .pill is what shows. */
 .likes{display:inline-flex;align-items:center;justify-content:flex-end;min-width:28px;min-height:28px;padding:0;border:0;background:transparent;line-height:1;cursor:pointer;pointer-events:auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
 span.likes{cursor:default}
 .touch{min-width:44px;min-height:44px}
