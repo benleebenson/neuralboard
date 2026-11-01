@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { signIn, useSession } from "next-auth/react";
 import { AccountControl } from "@/app/components/AccountControl";
 import { useIsPro } from "@/app/components/useIsPro";
@@ -657,30 +657,14 @@ function Avatar({ label, large = false }: { label: string; large?: boolean }) {
   );
 }
 
-// A tiny neural network: one input node, two hidden nodes, one output node, each layer wired to
-// the next, in a green-to-teal gradient.
+// The Neural Board node mark (public/logo.svg, used as-is). The file's 1080x1080 canvas has empty
+// margin around the drawing, so the frame crops to the drawn nodes and sizes them to the
+// wordmark's cap height (see .logo in AppShell.module.css).
 export function LogoMark() {
-  const gradientId = `nb-logo-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const ink = `url(#${gradientId})`;
   return (
     <span className={styles.logo} aria-hidden="true">
-      <svg viewBox="0 0 32 32">
-        <defs>
-          <linearGradient id={gradientId} x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-            <stop offset="0" stopColor="#10b981" />
-            <stop offset="1" stopColor="#14b8a6" />
-          </linearGradient>
-        </defs>
-        <g stroke={ink} strokeWidth="2" strokeLinecap="round" opacity="0.55">
-          <path d="M6 16 16 8M6 16l10 8M16 8l10 8M16 24l10-8" />
-        </g>
-        <g fill={ink}>
-          <circle cx="6" cy="16" r="3.25" />
-          <circle cx="16" cy="8" r="3.25" />
-          <circle cx="16" cy="24" r="3.25" />
-          <circle cx="26" cy="16" r="3.75" />
-        </g>
-      </svg>
+      {/* eslint-disable-next-line @next/next/no-img-element -- static SVG, no optimisation needed */}
+      <img src="/logo.svg" alt="" draggable={false} />
     </span>
   );
 }
