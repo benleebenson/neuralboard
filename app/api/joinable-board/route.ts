@@ -68,7 +68,7 @@ export async function PATCH(request: Request) {
     if (!ownerByToken && !ownerByAccount) {
       const participantId = participantIdFromToken(body.participantToken);
       if (!participantId) return NextResponse.json({ error: "Missing participant identity.", forbidden: true }, { status: 403 });
-      const check = checkJoinerUpdate((board.state ?? {}) as JoinableBoardState, body.state, participantId);
+      const check = checkJoinerUpdate((board.state ?? {}) as JoinableBoardState, body.state, participantId, code);
       if (!check.ok) return NextResponse.json({ error: check.error, forbidden: true }, { status: 403 });
       state = check.state;
     }

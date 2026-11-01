@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNoteContent, type StickyNoteImage, stickyNotePictureSize, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -1937,6 +1937,7 @@ type Annotation = {
   emoji?: string;                              // emoji
   noteColor?: string;                          // sticky: the note's color, one of STICKY_NOTE_COLORS
   parentId?: string;                           // sticky: the note this one replies to (see lib/sticky-threads)
+  noteImage?: StickyNoteImage;                 // sticky: a picture on the note (an image post), above any text
   source?: ClipSource; // provenance: manual drawing, or auto-generated (transcript/Top 5 title cards)
   autoTopicId?: string;
   autoLayoutSeed?: number;
@@ -1945,6 +1946,10 @@ type Annotation = {
   narrationTime?: number;
   rationale?: string;
 };
+
+/** A picture chosen in the sticky-note compose modal, not yet uploaded. */
+type StickyComposerPicture = { blob: Blob; name: string; previewUrl: string; width: number; height: number; animated: boolean };
+type StickyComposer = { note: Annotation; text: string; picture?: StickyComposerPicture; status?: "loading" | "posting" };
 
 type AnnotationTool = "pointer" | "text" | "arrow" | "circle" | "highlight" | "pen" | "emoji";
 
@@ -3205,7 +3210,7 @@ function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContex
   // Measured at the note's board font size, so widths are in board units. With nothing to
   // measure with, lines break only at newlines.
   if (context) context.font = annotationFontCss(fontSize, annotation.fontFamily ?? "Caveat", annotation.fontWeight ?? "normal");
-  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0));
+  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0), annotation.noteImage);
 }
 
 function stickyNoteLayoutForEditor(annotation: Annotation, text?: string) {
@@ -3225,7 +3230,7 @@ function stickyNoteFrameOnBoard(note: Annotation) {
     annotationMeasureContext = document.createElement("canvas").getContext("2d");
   }
   if (stickyFrameCache.context !== annotationMeasureContext) stickyFrameCache = { context: annotationMeasureContext, frames: new Map() };
-  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH]);
+  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH, note.noteImage?.width, note.noteImage?.height]);
   let frame = stickyFrameCache.frames.get(key);
   if (!frame) {
     const laidOut = stickyNoteLayout(note, annotationMeasureContext).frame;
@@ -3249,6 +3254,54 @@ function annotationsAsShown(annotations: readonly Annotation[], likes: BoardLike
 /** How far a note is drawn from where it's stored by pushing (centers, which like scaling keeps). */
 function stickyPushOffset(stored: Annotation, shown: Annotation | undefined) {
   return shown ? { dx: shown.boardX + shown.boardW / 2 - stored.boardX - stored.boardW / 2, dy: shown.boardY + shown.boardH / 2 - stored.boardY - stored.boardH / 2 } : { dx: 0, dy: 0 };
+}
+
+/**
+ * A note picture as an image clip, for the image machinery (export preloading, animated frames),
+ * which works per clip. It's never on the board or the timeline.
+ */
+function noteImageClip(image: StickyNoteImage): Clip {
+  return { id: `note-image:${image.url}`, type: "image", name: "Note picture", sourceUrl: image.url, startTime: 0, duration: 0, ...(image.animated ? { animatedImage: true } : {}) };
+}
+
+/** An image's pixel size, read from a URL this browser can load. */
+function imageNaturalSize(url: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => image.naturalWidth > 0 && image.naturalHeight > 0 ? resolve({ width: image.naturalWidth, height: image.naturalHeight }) : reject(new Error("Image has no size"));
+    image.onerror = () => reject(new Error("Could not read that image"));
+    image.src = url;
+  });
+}
+
+// Off a shared board a note's picture is kept in the board itself (saves and autosave are JSON,
+// and a note has no media file of its own), so it's a data URL, scaled down. A small animated GIF
+// keeps its own file so it still animates; a larger one becomes a still.
+const NOTE_PICTURE_MAX_EDGE = 1280;
+const NOTE_PICTURE_MAX_GIF_BYTES = 2 * 1024 * 1024;
+
+async function notePictureDataUrl(blob: Blob, animated: boolean): Promise<{ url: string; animated: boolean }> {
+  if (animated && blob.size <= NOTE_PICTURE_MAX_GIF_BYTES) return { url: await blobToDataUri(blob), animated: true };
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const scale = Math.min(1, NOTE_PICTURE_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Could not prepare that picture");
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return { url: canvas.toDataURL("image/webp", 0.86), animated: false };
+  } finally {
+    bitmap.close();
+  }
+}
+
+/** Every note picture on the board, once each, as image clips (see noteImageClip). */
+function noteImageClips(annotations: readonly Annotation[]): Clip[] {
+  const byUrl = new Map<string, Clip>();
+  for (const annotation of annotations) if (annotation.type === "sticky" && annotation.noteImage) byUrl.set(annotation.noteImage.url, noteImageClip(annotation.noteImage));
+  return [...byUrl.values()];
 }
 
 async function ensureAnnotationFontsLoaded(annotations: readonly Annotation[]): Promise<void> {
@@ -3345,6 +3398,9 @@ function drawThreadConnectors(ctx: CanvasRenderingContext2D, annotations: readon
   ctx.restore();
 }
 
+// The image to draw for a note's picture, when it has loaded (an animated one's current frame).
+type NoteImageSource = (image: StickyNoteImage) => CanvasImageSource | undefined;
+
 function drawAnnotationsToCanvas(
   ctx: CanvasRenderingContext2D,
   storedAnnotations: Annotation[],
@@ -3352,7 +3408,8 @@ function drawAnnotationsToCanvas(
   cam: { cameraX: number; cameraY: number; boardZoom: number },
   sf: number,
   W: number,
-  H: number
+  H: number,
+  noteImageSource?: NoteImageSource,
 ) {
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
@@ -3399,7 +3456,7 @@ function drawAnnotationsToCanvas(
         ctx.rotate(ann.rotationDeg * Math.PI / 180);
         ctx.translate(-cx, -cy);
       }
-      const { lines, frame } = stickyNoteLayout(ann, ctx);
+      const { lines, frame, picture, textX, textY } = stickyNoteLayout(ann, ctx);
       const x = toSX(frame.boardX), y = toSY(frame.boardY), w = frame.boardW * sf, h = frame.boardH * sf;
       ctx.beginPath();
       ctx.roundRect(x, y, w, h, frame.radius * sf);
@@ -3409,16 +3466,26 @@ function drawAnnotationsToCanvas(
       ctx.fillStyle = threadShade(ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR, depths.get(ann.id) ?? 0, ann.id);
       ctx.fill();
       ctx.shadowColor = "transparent";
-      if (lines.length > 0) {
+      if (lines.length > 0 || picture) ctx.clip();
+      // A picture post: the image fills its spot on the note, its corners rounded like the note's.
+      const pictureImage = picture && ann.noteImage ? noteImageSource?.(ann.noteImage) : undefined;
+      if (picture && pictureImage) {
+        const px = toSX(picture.boardX), py = toSY(picture.boardY), pw = picture.boardW * sf, ph = picture.boardH * sf;
+        ctx.save();
+        ctx.beginPath();
+        ctx.roundRect(px, py, pw, ph, picture.radius * sf);
         ctx.clip();
+        ctx.drawImage(pictureImage, px, py, pw, ph);
+        ctx.restore();
+      }
+      if (lines.length > 0) {
         const boardFontSize = ann.fontSize ?? 80;
-        const pad = boardFontSize * STICKY_NOTE_PADDING_EM;
         ctx.font = annotationFontCss(boardFontSize * sf, ann.fontFamily ?? "Caveat", ann.fontWeight ?? "normal");
         ctx.fillStyle = ann.color || STICKY_NOTE_INK;
         ctx.textBaseline = "top";
         ctx.textAlign = "left";
         const lineHeight = boardFontSize * ANNOTATION_LINE_HEIGHT * sf;
-        lines.forEach((line, index) => ctx.fillText(line, toSX(frame.boardX + pad), toSY(frame.boardY + pad) + index * lineHeight));
+        lines.forEach((line, index) => ctx.fillText(line, toSX(textX), toSY(textY) + index * lineHeight));
       }
       ctx.restore();
     } else if (ann.type === "arrow" && ann.arrowStartX !== undefined) {
@@ -6140,7 +6207,7 @@ type ActiveBoard = BoardWorkspaceStatus & {
 };
 
 function isTextDraft(annotation: Annotation): boolean {
-  return (annotation.type === "text" || annotation.type === "sticky") && !annotation.text?.trim();
+  return (annotation.type === "text" || annotation.type === "sticky") && !annotation.text?.trim() && !annotation.noteImage;
 }
 
 /** Who added each item in a shared board state (undefined: unmarked, i.e. the owner's). */
@@ -6537,7 +6604,15 @@ function Board2Editor({
   const [stickyColor, setStickyColor] = useState<string>(DEFAULT_STICKY_NOTE_COLOR);
   // A new sticky note or reply being written in the compose modal, as the original boards did: it's
   // on the board only once posted. `note` is placed, colored and has its id (so its shade is final).
-  const [stickyComposer, setStickyComposer] = useState<{ note: Annotation; text: string } | null>(null);
+  // A post is text, a picture, or both; the picture is uploaded only when it's posted.
+  const [stickyComposer, setStickyComposer] = useState<StickyComposer | null>(null);
+  const stickyComposerFileRef = useRef<HTMLInputElement | null>(null);
+  const stickyComposerTextRef = useRef<HTMLTextAreaElement | null>(null);
+  const stickyComposerOpenRef = useRef(false);
+  useEffect(() => { stickyComposerOpenRef.current = stickyComposer !== null; }, [stickyComposer]);
+  // The chosen picture's preview is an object URL, freed once it's replaced, removed or the modal closes.
+  const stickyComposerPreviewUrl = stickyComposer?.picture?.previewUrl;
+  useEffect(() => () => { if (stickyComposerPreviewUrl) URL.revokeObjectURL(stickyComposerPreviewUrl); }, [stickyComposerPreviewUrl]);
   const boardAddPointRef = useRef<{ x: number; y: number } | null>(null);
   // Touch pan/pinch preview: the layer the transform goes on, and the view React last rendered
   // (the transform's starting point) while a preview is showing.
@@ -10251,7 +10326,14 @@ function Board2Editor({
     }
     for (const event of authoredBazooka.events) drawBazookaEffect(ctx,event,cam,sf,W,H,time*1000);
     if (currentAnnotations.length > 0) {
-      drawAnnotationsToCanvas(ctx, currentAnnotations, boardLikesRef.current, cam, sf, W, H);
+      // Note pictures come from the same caches as image clips (and animate the same way).
+      drawAnnotationsToCanvas(ctx, currentAnnotations, boardLikesRef.current, cam, sf, W, H, (image) => {
+        const frame = animatedImageFrame(noteImageClip(image), time);
+        if (frame) return frame;
+        const img = preparedImageRendering ? exportImgCacheRef.current.get(image.url) : cachedPreviewImage(image.url);
+        if (!img && quality === "preview") loadMedia(image.url, "image");
+        return img?.complete && img.naturalWidth > 0 ? img : undefined;
+      });
     }
     ctx.restore();
     drawCutToOverlays(ctx, time, currentClips, W, H, (clip) => cutToSourceFor(clip, offlineVideoRendering), quality === "preview" ? previewCutToClipIdRef.current : null);
@@ -10518,10 +10600,10 @@ function Board2Editor({
   useEffect(() => { drawBoardImageOverlaysRef.current = drawBoardImageOverlays; }, [drawBoardImageOverlays]);
 
   // Animated GIFs on the board: redraw just their canvases at up to 30 fps while any exist, and
-  // free decoded frames once no clip uses them.
+  // free decoded frames once no clip (or note picture) uses them.
   const hasAnimatedImages = clips.some((clip) => clip.type === "image" && clip.animatedImage);
   useEffect(() => {
-    const inUse = new Set(clips.filter((clip) => clip.type === "image" && clip.animatedImage).map((clip) => clip.sourceUrl));
+    const inUse = new Set([...clips, ...noteImageClips(annotations)].filter((clip) => clip.type === "image" && clip.animatedImage).map((clip) => clip.sourceUrl));
     for (const [url, decoded] of animatedImagesRef.current) {
       if (inUse.has(url)) continue;
       if (decoded) releaseAnimatedImage(decoded);
@@ -10529,7 +10611,7 @@ function Board2Editor({
     }
     const liveIds = new Set(clips.map((clip) => clip.id));
     for (const id of boardAnimatedFrameRef.current.keys()) if (!liveIds.has(id)) boardAnimatedFrameRef.current.delete(id);
-  }, [clips]);
+  }, [annotations, clips]);
   useEffect(() => {
     if (!hasAnimatedImages) return;
     let rafId = 0;
@@ -12241,6 +12323,7 @@ function Board2Editor({
     await Promise.all([
       ensureAnnotationFontsLoaded(currentAnnotations),
       ...currentClips.filter((clip) => clip.type === "image").map((clip) => ensureExportImage(clip)),
+      ...noteImageClips(currentAnnotations).map((clip) => ensureExportImage(clip)),
     ]);
     const canvas = document.createElement("canvas");
     canvas.width = width;
@@ -17941,7 +18024,9 @@ function Board2Editor({
   }
 
   // A click or tap on empty board in board view: if anything is selected (or the prompt is open),
-  // it just clears that; otherwise it offers to add text or an image right there.
+  // it just clears that; otherwise it offers to add text or an image right there. An old-school
+  // board has only one kind of post (a note, with or without a picture), so it skips the choice
+  // and opens the compose modal straight away, as the original boards did.
   function handleBoardViewTap(clientX: number, clientY: number) {
     blurBoardTextEditor();
     const hadSelection = selectedClipIdsRef.current.length > 0 || selectedAnnotationIdsRef.current.length > 0 || selectedClipId !== null || editingAnnotationId !== null;
@@ -17952,6 +18037,10 @@ function Board2Editor({
     // Anywhere on screen counts: the board space has no visible edge (on a phone most of the
     // screen is outside the board's original rectangle), and new items aren't clamped to it.
     const point = clientToBoardPoint(clientX, clientY);
+    if (isSimpleBoard) {
+      if (boardViewEditable) openStickyComposerAt(point.x, point.y);
+      return;
+    }
     const rect = container.getBoundingClientRect();
     setBoardAddPrompt({ x: clientX - rect.left, y: clientY - rect.top, boardX: point.x, boardY: point.y });
   }
@@ -17978,13 +18067,18 @@ function Board2Editor({
 
   function addStickyFromBoardPrompt() {
     if (!boardAddPrompt) return;
+    openStickyComposerAt(boardAddPrompt.boardX, boardAddPrompt.boardY);
+  }
+
+  // Opens the compose modal for a new note centered on a board point.
+  function openStickyComposerAt(boardX: number, boardY: number) {
     // Text reads at about 22px at the current zoom; the note is a square about 7 lines tall,
     // centered where the person tapped.
     const fontSize = Math.round(Math.min(400, Math.max(32, 22 / Math.max(0.05, boardZoomRef.current))));
     const size = fontSize * 7;
     const annotation: Annotation = {
       id: generateId(), type: "sticky",
-      boardX: boardAddPrompt.boardX - size / 2, boardY: boardAddPrompt.boardY - size / 2,
+      boardX: boardX - size / 2, boardY: boardY - size / 2,
       boardW: size, boardH: size,
       color: STICKY_NOTE_INK, noteColor: stickyColor,
       text: "", fontFamily: "Caveat", fontSize, fontWeight: "normal",
@@ -17999,16 +18093,92 @@ function Board2Editor({
     setAnnotations((prev) => prev.map((annotation) => annotation.id === id && annotation.type === "sticky" ? { ...annotation, noteColor } : annotation));
   }
 
-  // Posting puts the note on the board at its final size: as tall as its text (see commitTextEdit).
-  function postStickyComposer() {
-    if (!stickyComposer) return;
+  // Posting puts the note on the board at its final size: as tall as its picture and text (see
+  // commitTextEdit). A picture is uploaded first, to the board's shared media on a joinable board.
+  async function postStickyComposer() {
+    if (!stickyComposer || stickyComposer.status) return;
     const text = stickyComposer.text.trim();
-    if (!text) return;
-    const { note } = stickyComposer;
-    const annotation: Annotation = { ...note, text, boardH: Math.max(note.boardH, stickyNoteLayoutForEditor(note, text).frame.boardH) };
+    const { note, picture } = stickyComposer;
+    if (!text && !picture) return;
+    let noteImage: StickyNoteImage | undefined;
+    if (picture) {
+      setStickyComposer((current) => current && { ...current, status: "posting" });
+      try {
+        // The shared-media route keeps every frame of an animated image (as animated WebP).
+        const { url, animated } = joinCode
+          ? { url: await uploadJoinableImage(picture.blob, picture.name), animated: picture.animated }
+          : await notePictureDataUrl(picture.blob, picture.animated);
+        noteImage = { url, width: picture.width, height: picture.height, ...(animated ? { animated: true } : {}) };
+        // Loaded before it's shown, so the note doesn't appear with an empty picture.
+        await decodeImageForPlacement(url).catch(() => undefined);
+      } catch (error) {
+        setStickyComposer((current) => current && { ...current, status: undefined });
+        setToast(error instanceof Error ? error.message : "Could not add that picture");
+        return;
+      }
+    }
+    const posted: Annotation = { ...note, text, ...(noteImage ? { noteImage } : {}) };
+    const annotation: Annotation = { ...posted, boardH: Math.max(note.boardH, stickyNoteLayoutForEditor(posted).frame.boardH) };
     setStickyComposer(null);
     setAnnotations((prev) => [...prev, annotation]);
     setAnnotationSelection([annotation.id]);
+  }
+
+  // A picture for the post being written: its size fixes the note's shape, and an animated GIF
+  // (or WebP) is flagged so the export plays it. Replaces any picture already chosen.
+  async function attachStickyComposerPicture(blob: Blob, name: string) {
+    if (!blob.type.startsWith("image/") && !isGifFile(blob, name)) { setToast("Choose an image file"); return; }
+    if (blob.size > MAX_PASTED_IMAGE_BYTES) { setToast("Pictures must be 15 MB or smaller"); return; }
+    setStickyComposer((current) => current && { ...current, status: "loading" });
+    const previewUrl = URL.createObjectURL(blob);
+    try {
+      const { width, height } = await imageNaturalSize(previewUrl);
+      const decoded = isGifFile(blob, name) || isAnimatableImageType(blob.type) ? await decodeAnimatedImage(blob) : null;
+      if (decoded) releaseAnimatedImage(decoded);
+      // Closed while the image was read: nothing to show it in.
+      if (!stickyComposerOpenRef.current) { URL.revokeObjectURL(previewUrl); return; }
+      setStickyComposer((current) => current && { ...current, status: undefined, picture: { blob, name, previewUrl, width, height, animated: !!decoded } });
+      // Back to the text after the file picker, so Enter posts and typing adds a caption.
+      stickyComposerTextRef.current?.focus();
+    } catch {
+      URL.revokeObjectURL(previewUrl);
+      setStickyComposer((current) => current && { ...current, status: undefined });
+      setToast("Could not read that image");
+    }
+  }
+
+  // Pasting into the compose modal: an image on the clipboard becomes the post's picture, and so
+  // does a GIF's URL (what "Copy image" on a GIF also puts there, the real animated file; see
+  // lib/board2/animated-image). Anything else pastes as text.
+  function handleStickyComposerPaste(event: React.ClipboardEvent) {
+    const data = event.clipboardData;
+    const itemImages = Array.from(data.items ?? []).filter((item) => item.type.startsWith("image/")).map((item) => item.getAsFile()).filter((file): file is File => !!file);
+    const imageFiles = itemImages.length > 0 ? itemImages : Array.from(data.files ?? []).filter((file) => file.type.startsWith("image/"));
+    const clipboardText = (type: string) => { try { return data.getData(type) ?? ""; } catch { return ""; } };
+    const animatedUrl = imageFiles.some((file) => isGifFile(file, file.name))
+      ? null
+      : animatedImageSourceUrl(imageSourceFromHtml(clipboardText("text/html")))
+        ?? animatedImageSourceUrl(firstUriListEntry(clipboardText("text/uri-list")))
+        ?? animatedImageSourceUrl(clipboardText("text/plain"));
+    const still = imageFiles[0];
+    const stillName = `Pasted image ${Date.now()}.${still?.type.split("/")[1] || "png"}`;
+    if (animatedUrl) {
+      event.preventDefault();
+      setStickyComposer((current) => current && { ...current, status: "loading" });
+      void fetchDroppedImage(animatedUrl).then(
+        (blob) => attachStickyComposerPicture(blob, droppedUrlName(animatedUrl, blob)),
+        async (error) => {
+          setStickyComposer((current) => current && { ...current, status: undefined });
+          const reason = error instanceof Error ? error.message : "it could not be fetched";
+          if (!still) { setToast(`Couldn't fetch that GIF: ${reason}`); return; }
+          await attachStickyComposerPicture(still, stillName);
+          setToast(`Couldn't fetch the animated GIF (${reason}) — using a still frame instead`);
+        },
+      );
+    } else if (still) {
+      event.preventDefault();
+      void attachStickyComposerPicture(still, stillName);
+    }
   }
 
   function addImageFromBoardPrompt() {
@@ -18162,8 +18332,14 @@ function Board2Editor({
   }
 
   function commitTextEdit(annId: string) {
-    const text = editingAnnotationTextRef.current;
-    if (!text.trim() && hasReplies(annId)) {
+    const typed = editingAnnotationTextRef.current;
+    // A picture post's text can be cleared: it stays on the board as just its picture.
+    const hasPicture = !!annotationsRef.current.find((annotation) => annotation.id === annId)?.noteImage;
+    const text = hasPicture && !typed.trim() ? "" : typed;
+    if (!text.trim() && hasPicture) {
+      setAnnotations((prev) => prev.map((a) => a.id === annId ? { ...a, text } : a));
+      setEditingAnnotationId(null);
+    } else if (!text.trim() && hasReplies(annId)) {
       // Clearing a note that has replies keeps it, with its old text, rather than deleting the thread.
       setEditingAnnotationId(null);
     } else if (!text.trim()) {
@@ -19831,7 +20007,16 @@ function Board2Editor({
       const clip = revealImageClip(mediaId, currentClips);
       return clip ? [clip] : [];
     });
-    const neededImages = [...new Map([...visibleImages, ...revealImages].map((clip) => [clip.sourceUrl, clip])).values()];
+    // Note pictures on notes near the frame (a note's picture can run below its box, hence the margin).
+    const visibleNoteImages = noteImageClips(annotationsRef.current.filter((annotation) => annotation.noteImage && boardRectIntersectsCameraFrame(
+      { x: annotation.boardX, y: annotation.boardY, width: annotation.boardW, height: annotation.boardH },
+      camera,
+      W,
+      H,
+      boardDimensionsRef.current.width,
+      0.5,
+    )));
+    const neededImages = [...new Map([...visibleImages, ...revealImages, ...visibleNoteImages].map((clip) => [clip.sourceUrl, clip])).values()];
     const keepUrls = new Set(neededImages.map((clip) => clip.sourceUrl));
     for (const clip of neededImages) {
       if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
@@ -20080,7 +20265,7 @@ function Board2Editor({
     const scheduledAudio: Array<{ source: AudioBufferSourceNode; gain: GainNode; id: string }> = [];
     try {
       const uniqueImages = [...new Map(
-        currentClips.filter((clip) => clip.type === "image").map((clip) => [clip.sourceUrl, clip]),
+        [...currentClips.filter((clip) => clip.type === "image"), ...noteImageClips(currentAnnotations)].map((clip) => [clip.sourceUrl, clip]),
       ).values()];
       const videoClips = currentClips.filter((clip) => clip.type === "video");
       const imageAssetTotal = uniqueImages.length + Number(!!characterFaceImageRef.current) + Number(!!characterFace2ImageRef.current) + thumbnailImagesRef.current.size;
@@ -20782,6 +20967,7 @@ function Board2Editor({
       await Promise.all([
         ensureAnnotationFontsLoaded(currentAnnotations),
         ...currentClips.filter((clip) => clip.type === "image").map((clip) => ensureExportImage(clip)),
+        ...noteImageClips(currentAnnotations).map((clip) => ensureExportImage(clip)),
       ]);
       if (snapshotIncludeCharacter && characterFaceImageRef.current) await characterFaceImageRef.current.decode();
       if (snapshotIncludeCharacter && characterFace2ImageRef.current) await characterFace2ImageRef.current.decode();
@@ -22618,7 +22804,7 @@ function Board2Editor({
       const inInput = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable;
       if (inInput) return;
       const anyModalOpen = ytModalOpen || neuralModalOpen || top5ModalOpen || saveModalOpen ||
-        aiModalOpen || directCharacterOpen || !!imagePreviewTarget || !!mediaEditDraft;
+        aiModalOpen || directCharacterOpen || !!imagePreviewTarget || !!mediaEditDraft || !!stickyComposer;
       if (anyModalOpen) return;
       const items = Array.from(e.clipboardData?.items ?? []);
       const itemImages = items
@@ -23189,25 +23375,33 @@ function Board2Editor({
     setToast(enabled ? "Narration block added — it types out during this zoom" : "Narration block removed");
   }
 
-  // The sticky-note compose modal: over a dimmed, blurred board, a big textarea in the note's own
-  // shade. Enter posts, Shift+Enter is a new line, Escape or a click outside cancels.
+  // The sticky-note compose modal: over a dimmed, blurred board, the post as it will look, in the
+  // note's own shade: its picture (if any) above a big textarea. Enter posts, Shift+Enter is a new
+  // line, Escape or a click outside cancels. A picture is chosen with the button or pasted.
   function renderStickyComposer() {
     if (!stickyComposer) return null;
-    const { note, text } = stickyComposer;
+    const { note, text, picture, status } = stickyComposer;
     const isReply = !!note.parentId;
     const depth = isReply ? (annotationThreadDepths.get(note.parentId!) ?? 0) + 1 : 0;
     const noteColor = note.noteColor ?? DEFAULT_STICKY_NOTE_COLOR;
-    const cancel = () => setStickyComposer(null);
+    const busy = !!status;
+    const canPost = !busy && (!!text.trim() || !!picture);
+    // Nothing is lost mid-upload: the modal stays until the post is on the board.
+    const cancel = () => { if (status !== "posting") setStickyComposer(null); };
+    const removePicture = () => setStickyComposer((current) => current && { ...current, picture: undefined });
+    const choosePicture = () => stickyComposerFileRef.current?.click();
     const buttonHeight = isMobile ? 44 : 30;
+    const pictureLabel = picture ? (isSimpleBoard ? "Change photo" : "Change image") : (isSimpleBoard ? "Add photo" : "Add image");
     return (
       <div
         role="dialog"
         aria-modal="true"
         aria-label={isReply ? "Reply to a sticky note" : "New sticky note"}
         onPointerDown={(event) => { if (event.target === event.currentTarget) cancel(); }}
+        onPaste={handleStickyComposerPaste}
         style={{ position: "fixed", inset: 0, zIndex: 10020, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(42,42,42,.35)", backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }}
       >
-        <div style={{ width: 520, maxWidth: "96vw", display: "flex", flexDirection: "column", gap: 12, padding: 14, borderRadius: 18, background: "#fffdf5", boxShadow: "0 18px 70px rgba(42,42,42,.28)", fontFamily: "monospace", boxSizing: "border-box" }}>
+        <div style={{ width: 520, maxWidth: "96vw", maxHeight: "calc(100dvh - 32px)", overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, padding: 14, borderRadius: 18, background: "#fffdf5", boxShadow: "0 18px 70px rgba(42,42,42,.28)", fontFamily: "monospace", boxSizing: "border-box" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: STICKY_NOTE_INK }}>{isReply ? "Reply" : "New note"}</div>
             {/* A reply takes its thread's color; a new note's color can be picked. */}
@@ -23231,28 +23425,70 @@ function Board2Editor({
               </div>
             )}
           </div>
-          <textarea
-            autoFocus
-            aria-label={isReply ? "Reply text" : "Note text"}
-            placeholder={isReply ? "Write a reply…" : "Write a note…"}
-            value={text}
-            maxLength={STICKY_NOTE_MAX_TEXT}
-            onChange={(event) => { const value = event.target.value; setStickyComposer((current) => current && { ...current, text: value }); }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); postStickyComposer(); }
-              else if (event.key === "Escape") { event.preventDefault(); cancel(); }
-            }}
-            style={{
-              width: "100%", minHeight: isMobile ? 160 : 200, boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
-              background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
-              color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
+          {/* The post: one note, its picture above its text, framed the way the board frames it. */}
+          <div style={{ display: "flex", flexDirection: "column", gap: picture ? 12 : 0, padding: picture ? "12px 12px 0" : 0, borderRadius: 12, background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)" }}>
+            {picture && (
+              <div style={{ position: "relative", alignSelf: "center", maxWidth: "100%" }}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={picture.previewUrl}
+                  alt="The picture for this post"
+                  style={{ display: "block", maxWidth: "100%", maxHeight: isMobile ? 220 : 280, borderRadius: 6, objectFit: "contain" }}
+                />
+                <button
+                  type="button"
+                  onClick={removePicture}
+                  disabled={busy}
+                  aria-label="Remove picture"
+                  title="Remove picture"
+                  style={{ position: "absolute", top: 6, right: 6, width: isMobile ? 40 : 28, height: isMobile ? 40 : 28, padding: 0, border: 0, borderRadius: "50%", background: "rgba(42,42,42,.72)", color: "#fffdf5", fontSize: 16, lineHeight: 1, cursor: busy ? "not-allowed" : "pointer" }}
+                >×</button>
+              </div>
+            )}
+            <textarea
+              ref={stickyComposerTextRef}
+              autoFocus
+              aria-label={isReply ? "Reply text" : "Note text"}
+              placeholder={picture ? "Add a caption…" : isReply ? "Write a reply…" : "Write a note…"}
+              value={text}
+              maxLength={STICKY_NOTE_MAX_TEXT}
+              onChange={(event) => { const value = event.target.value; setStickyComposer((current) => current && { ...current, text: value }); }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void postStickyComposer(); }
+                else if (event.key === "Escape") { event.preventDefault(); cancel(); }
+              }}
+              style={{
+                width: "100%", minHeight: picture ? (isMobile ? 90 : 110) : (isMobile ? 160 : 200), boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
+                background: "transparent",
+                color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
+              }}
+            />
+          </div>
+          <input
+            ref={stickyComposerFileRef}
+            type="file"
+            accept="image/*"
+            aria-hidden="true"
+            tabIndex={-1}
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) void attachStickyComposerPicture(file, file.name);
             }}
           />
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <div style={{ fontSize: 10, color: "#6a6a6a" }}>{isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels"}</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <button type="button" onClick={choosePicture} disabled={busy} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 12px", cursor: busy ? "not-allowed" : "pointer" }}>
+                <span aria-hidden="true">🖼 </span>{pictureLabel}
+              </button>
+              <div role="status" style={{ fontSize: 10, color: "#6a6a6a" }}>
+                {status === "loading" ? "Reading the picture…" : status === "posting" ? "Uploading…" : isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels · paste an image"}
+              </div>
+            </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button type="button" onClick={cancel} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px" }}>Cancel</button>
-              <button type="button" onClick={postStickyComposer} disabled={!text.trim()} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px", background: "#2a2a2a", color: "#fffdf5", opacity: text.trim() ? 1 : 0.5, cursor: text.trim() ? "pointer" : "not-allowed" }}>Post</button>
+              <button type="button" onClick={cancel} disabled={status === "posting"} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px" }}>Cancel</button>
+              <button type="button" onClick={() => { void postStickyComposer(); }} disabled={!canPost} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 14px", background: "#2a2a2a", color: "#fffdf5", opacity: canPost ? 1 : 0.5, cursor: canPost ? "pointer" : "not-allowed" }}>{status === "posting" ? "Posting…" : "Post"}</button>
             </div>
           </div>
         </div>
@@ -27135,6 +27371,23 @@ function Board2Editor({
       }
       clipsRef.current = sharedClips;
       setClips(sharedClips);
+      // Note pictures kept in the board (data URLs, see notePictureDataUrl) move to its shared media.
+      if (annotationsRef.current.some((annotation) => annotation.noteImage?.url.startsWith("data:"))) {
+        const sharedAnnotations: Annotation[] = [];
+        for (const annotation of annotationsRef.current) {
+          const image = annotation.noteImage;
+          if (!image?.url.startsWith("data:")) { sharedAnnotations.push(annotation); continue; }
+          try {
+            const blob = await fetch(image.url).then((response) => response.blob());
+            sharedAnnotations.push({ ...annotation, noteImage: { ...image, url: await uploadJoinableImage(blob, "note picture", result.code) } });
+          } catch (error) {
+            notShared.push(`a note's picture (${error instanceof Error ? error.message : "upload failed"})`);
+            sharedAnnotations.push(annotation);
+          }
+        }
+        annotationsRef.current = sharedAnnotations;
+        setAnnotations(sharedAnnotations);
+      }
       joinVersionRef.current = 0;
       joinBaseRef.current = null;
       setJoinBaseAuthors(new Map());
@@ -28176,8 +28429,10 @@ function Board2Editor({
                   const shown = displayedAnnotationById.get(ann.id) ?? ann;
                   const sticky = ann.type !== "sticky" ? null : isEditing
                     ? (() => {
+                        const fontSize = shown.fontSize ?? 80;
                         const { lines } = stickyNoteLayoutForEditor(shown, editingAnnotationText);
-                        return { lines: [], frame: stickyNoteTypingFrame(shown, lines.length, shown.fontSize ?? 80) };
+                        const frame = stickyNoteTypingFrame(shown, lines.length, fontSize, shown.noteImage);
+                        return { lines: [], frame, ...stickyNoteContent(frame, fontSize, stickyNotePictureSize(shown.boardW, fontSize, shown.noteImage)) };
                       })()
                     : stickyNoteLayoutForEditor(shown);
                   const shownH = sticky ? Math.max(shown.boardH, sticky.frame.boardY + sticky.frame.boardH - shown.boardY) : shown.boardH;
@@ -28265,8 +28520,10 @@ function Board2Editor({
                         />
                       )}
                       {sticky && (() => {
-                        const { lines, frame } = sticky;
+                        const { lines, frame, picture, textY } = sticky;
                         const pad = (shown.fontSize ?? 80) * STICKY_NOTE_PADDING_EM * boardZoom;
+                        // Text sits below a picture (lib/sticky-notes stickyNoteContent); without one, at the padding.
+                        const textTop = (textY - frame.boardY) * boardZoom;
                         const text: React.CSSProperties = {
                           fontFamily: `'${ann.fontFamily ?? "Caveat"}', cursive`,
                           fontSize: (shown.fontSize ?? 80) * boardZoom,
@@ -28283,6 +28540,19 @@ function Board2Editor({
                             boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)",
                             pointerEvents: isEditing ? "auto" : "none", userSelect: "none",
                           }}>
+                            {picture && ann.noteImage && (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                src={ann.noteImage.url}
+                                alt=""
+                                draggable={false}
+                                style={{
+                                  position: "absolute", display: "block", objectFit: "cover", pointerEvents: "none",
+                                  left: (picture.boardX - frame.boardX) * boardZoom, top: (picture.boardY - frame.boardY) * boardZoom,
+                                  width: picture.boardW * boardZoom, height: picture.boardH * boardZoom, borderRadius: picture.radius * boardZoom,
+                                }}
+                              />
+                            )}
                             {isEditing ? (
                               <textarea
                                 ref={(el) => { if (isEditing) editingTextareaRef.current = el; }}
@@ -28295,18 +28565,18 @@ function Board2Editor({
                                 onFocus={(e) => { const end = e.currentTarget.value.length; e.currentTarget.setSelectionRange(end, end); }}
                                 onKeyDown={(e) => {
                                   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitTextEdit(ann.id); }
-                                  else if (e.key === "Escape") { if (!ann.text && !hasReplies(ann.id)) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
+                                  else if (e.key === "Escape") { if (!ann.text && !ann.noteImage && !hasReplies(ann.id)) deleteAnnotation(ann.id); else setEditingAnnotationId(null); }
                                 }}
                                 onBlur={() => commitTextEdit(ann.id)}
                                 style={{
                                   ...text,
                                   // Wraps inside words too, as wrapStickyNoteText does.
-                                  position: "absolute", inset: 0, width: "100%", height: "100%", boxSizing: "border-box", padding: pad,
+                                  position: "absolute", left: 0, top: textTop - pad, width: "100%", height: `calc(100% - ${textTop - pad}px)`, boxSizing: "border-box", padding: pad,
                                   background: "transparent", border: 0, outline: "none", resize: "none", whiteSpace: "pre-wrap", overflowWrap: "break-word", overflow: "hidden",
                                 }}
                               />
                             ) : lines.length > 0 ? (
-                              <div style={text}>
+                              <div style={{ ...text, position: "absolute", left: pad, right: pad, top: textTop }}>
                                 {lines.map((line, index) => (
                                   <span key={index} style={{ display: "block", whiteSpace: "pre", height: `${ANNOTATION_LINE_HEIGHT}em` }}>{line || "\u00a0"}</span>
                                 ))}

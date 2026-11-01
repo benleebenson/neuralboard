@@ -30,6 +30,30 @@ export const STICKY_NOTE_PADDING_EM = 0.45;
 
 type NoteBox = { boardX: number; boardY: number; boardW: number; boardH: number };
 type NoteFrame = NoteBox & { radius: number };
+type PictureSize = { w: number; h: number };
+
+/**
+ * A picture on a note (an image post): an image uploaded to the board's shared media, and its
+ * pixel size, which fixes the note's shape before the image has loaded anywhere. A post can be
+ * text, a picture, or both, in one note.
+ */
+export type StickyNoteImage = { url: string; width: number; height: number; animated?: boolean };
+
+// Images a joiner's note may show: the board's own shared media (what /api/joinable-board/media
+// returns for an image), never an outside link.
+const STICKY_NOTE_IMAGE_URL = /^\/api\/joinable-board\/media\/([A-Z0-9]{6})\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const STICKY_NOTE_IMAGE_MAX_PIXELS = 20_000;
+
+/** Whether `value` is a note picture on the board with join code `code` (any board, without one). */
+export function isStickyNoteImage(value: unknown, code?: string): value is StickyNoteImage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { url, width, height, animated, ...rest } = value as Record<string, unknown>;
+  if (Object.keys(rest).length > 0) return false;
+  const match = typeof url === "string" ? STICKY_NOTE_IMAGE_URL.exec(url) : null;
+  if (!match || (code !== undefined && match[1] !== code)) return false;
+  const validSide = (side: unknown) => typeof side === "number" && Number.isFinite(side) && side > 0 && side <= STICKY_NOTE_IMAGE_MAX_PIXELS;
+  return validSide(width) && validSide(height) && (animated === undefined || typeof animated === "boolean");
+}
 
 // A note always shows all of its text, as the original boards' notes did (a shrink-to-fit box
 // with a max width, wrapping even inside long words, and no height limit). Here the max width is
@@ -59,19 +83,35 @@ export function wrapStickyNoteText(text: string, maxWidth: number, measureText: 
   return lines;
 }
 
+// A picture spans the note's text width (its box less padding), unless that would make it taller
+// than STICKY_NOTE_PICTURE_MAX_TALL of that width; then it's narrower, so tall photos don't tower.
+export const STICKY_NOTE_PICTURE_MAX_TALL = 1.25;
+
+/** The size a note's picture is drawn at, in board units; null for a note without one. */
+export function stickyNotePictureSize(boardW: number, fontSize: number, image: { width: number; height: number } | null | undefined): PictureSize | null {
+  if (!image || !(image.width > 0) || !(image.height > 0)) return null;
+  const maxW = stickyNoteWrapWidth(boardW, fontSize);
+  const w = Math.min(maxW, maxW * STICKY_NOTE_PICTURE_MAX_TALL * image.width / image.height);
+  return { w, h: w * image.height / image.width };
+}
+
 /**
  * The rounded rectangle a note is drawn as: hugging its wrapped text (which wraps within the box,
  * so it's only wider than the box when one character is), centered across its box (so rotation
  * and thread lines still meet its middle), and as tall as its text needs. It's
  * centered in the box when it fits; when the box is too short, it starts at the box's top and
  * runs past its bottom rather than cropping. `lineWidths` are the wrapped lines' widths in board
- * units; with none, the note is one empty line tall.
+ * units; with none, the note is one empty line tall. A `picture` sits above the text, padded like
+ * it, and the note hugs whichever is wider.
  */
-export function stickyNoteFrame(box: NoteBox, lineWidths: readonly number[], fontSize: number, lineHeight: number): NoteFrame {
+export function stickyNoteFrame(box: NoteBox, lineWidths: readonly number[], fontSize: number, lineHeight: number, picture: PictureSize | null = null): NoteFrame {
   const pad = fontSize * STICKY_NOTE_PADDING_EM;
-  const textW = Math.max(fontSize, ...lineWidths);
-  const textH = Math.max(1, lineWidths.length) * fontSize * lineHeight;
-  const w = textW + pad * 2, h = textH + pad * 2;
+  const textH = (lines: number) => lines * fontSize * lineHeight;
+  const contentW = picture ? Math.max(picture.w, ...lineWidths) : Math.max(fontSize, ...lineWidths);
+  const contentH = picture
+    ? picture.h + (lineWidths.length > 0 ? pad + textH(lineWidths.length) : 0)
+    : textH(Math.max(1, lineWidths.length));
+  const w = contentW + pad * 2, h = contentH + pad * 2;
   return {
     boardX: box.boardX + (box.boardW - w) / 2,
     boardY: box.boardY + Math.max(0, (box.boardH - h) / 2),
@@ -82,23 +122,51 @@ export function stickyNoteFrame(box: NoteBox, lineWidths: readonly number[], fon
 }
 
 /**
- * A note's wrapped lines and the frame they're drawn in. The board, the typing view's height and
- * the export all come from this, so they wrap the same. `measureText` gives widths in board units
- * at the note's font size.
+ * Where a note's picture and text go inside its frame: the picture at the top, centered, with
+ * corners rounded to sit concentric with the note's; the text below it (or at the top without
+ * one), at the padding's left edge.
  */
-export function layoutStickyNote(box: NoteBox, text: string, fontSize: number, measureText: AnnotationTextMeasurer): { lines: string[]; frame: NoteFrame } {
+export function stickyNoteContent(frame: NoteFrame, fontSize: number, picture: PictureSize | null): { picture: NoteFrame | null; textX: number; textY: number } {
+  const pad = fontSize * STICKY_NOTE_PADDING_EM;
+  const textX = frame.boardX + pad;
+  if (!picture) return { picture: null, textX, textY: frame.boardY + pad };
+  return {
+    picture: {
+      boardX: frame.boardX + (frame.boardW - picture.w) / 2,
+      boardY: frame.boardY + pad,
+      boardW: picture.w,
+      boardH: picture.h,
+      radius: Math.max(0, Math.min(frame.radius - pad, picture.w / 2, picture.h / 2)),
+    },
+    textX,
+    textY: frame.boardY + pad + picture.h + pad,
+  };
+}
+
+type NoteLayout = { lines: string[]; frame: NoteFrame; picture: NoteFrame | null; textX: number; textY: number };
+
+/**
+ * A note's wrapped lines, the frame they're drawn in, and where its picture and text sit. The
+ * board, the typing view's height and the export all come from this, so they wrap and frame the
+ * same. `measureText` gives widths in board units at the note's font size.
+ */
+export function layoutStickyNote(box: NoteBox, text: string, fontSize: number, measureText: AnnotationTextMeasurer, image?: { width: number; height: number } | null): NoteLayout {
   const lines = text ? wrapStickyNoteText(text, stickyNoteWrapWidth(box.boardW, fontSize), measureText) : [];
-  return { lines, frame: stickyNoteFrame(box, lines.map(measureText), fontSize, ANNOTATION_LINE_HEIGHT) };
+  const picture = stickyNotePictureSize(box.boardW, fontSize, image);
+  const frame = stickyNoteFrame(box, lines.map(measureText), fontSize, ANNOTATION_LINE_HEIGHT, picture);
+  return { lines, frame, ...stickyNoteContent(frame, fontSize, picture) };
 }
 
 /**
  * The note while it's being typed in: the box's full width (where the text wraps) and tall enough
  * for every line plus one more, so the caret and a line the browser wraps a little differently
- * stay inside it. It grows downward from the box's top.
+ * stay inside it. It grows downward from the box's top. A note's picture stays above the text.
  */
-export function stickyNoteTypingFrame(box: NoteBox, lineCount: number, fontSize: number): NoteFrame {
+export function stickyNoteTypingFrame(box: NoteBox, lineCount: number, fontSize: number, image?: { width: number; height: number } | null): NoteFrame {
   const pad = fontSize * STICKY_NOTE_PADDING_EM;
-  const h = Math.max(box.boardH, (Math.max(1, lineCount) + 1) * fontSize * ANNOTATION_LINE_HEIGHT + pad * 2);
+  const picture = stickyNotePictureSize(box.boardW, fontSize, image);
+  const textH = (Math.max(1, lineCount) + 1) * fontSize * ANNOTATION_LINE_HEIGHT;
+  const h = Math.max(box.boardH, (picture ? picture.h + pad : 0) + textH + pad * 2);
   return { ...box, boardH: h, radius: Math.min(fontSize * STICKY_NOTE_RADIUS_EM, box.boardW / 2, h / 2) };
 }
 

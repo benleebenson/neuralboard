@@ -1,5 +1,5 @@
 import { parseBoardType, stableStringify, type JoinableBoardState } from "./joinable-board.ts";
-import { isStickyNoteColor, STICKY_NOTE_MAX_TEXT } from "./sticky-notes.ts";
+import { isStickyNoteColor, isStickyNoteImage, STICKY_NOTE_MAX_TEXT } from "./sticky-notes.ts";
 import { THREAD_DELETE_OWNER_ONLY } from "./sticky-threads.ts";
 
 // Owner vs joiner on a joinable board. The owner can change anything. A joiner adds to the board
@@ -35,11 +35,13 @@ function comparable(item: Item): string {
   return stableStringify(copy);
 }
 
-// A sticky note a joiner adds or changes must use the shared palette and carry plain text.
-function stickyNoteError(item: Item): string | null {
-  if (item.type !== "sticky") return null;
+// A sticky note a joiner adds or changes must use the shared palette and carry plain text, and a
+// picture on it must be this board's own shared media. Only notes carry pictures.
+function stickyNoteError(item: Item, code: string | undefined): string | null {
+  if (item.type !== "sticky") return item.noteImage === undefined ? null : "Only sticky notes can carry a picture.";
   if (!isStickyNoteColor(item.noteColor)) return "Sticky notes must use one of the note colors.";
   if (item.text !== undefined && (typeof item.text !== "string" || item.text.length > STICKY_NOTE_MAX_TEXT)) return "That sticky note's text is too long.";
+  if (item.noteImage !== undefined && !isStickyNoteImage(item.noteImage, code)) return "A note's picture must be uploaded to this board.";
   if (item.parentId !== undefined && (typeof item.parentId !== "string" || item.parentId.length > 200)) return "That reply doesn't point at a note.";
   return null;
 }
@@ -54,7 +56,7 @@ function threadDeleteError(previous: Item[], kept: Item[], participantId: string
   return strandsReply ? THREAD_DELETE_OWNER_ONLY : null;
 }
 
-function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string, simple: boolean): { ok: true; items: Item[] } | { ok: false; error: string } {
+function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[], participantId: string, simple: boolean, code: string | undefined): { ok: true; items: Item[] } | { ok: false; error: string } {
   const prevById = new Map(previous.filter((item) => typeof item.id === "string").map((item) => [item.id as string, item]));
   const nextIds = new Set<string>();
   const items: Item[] = [];
@@ -68,7 +70,7 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
         return { ok: false, error: "You can add images, video and text to the board; only the owner can change the video timeline." };
       }
       if (simple && !SIMPLE_BOARD_ITEM_TYPES[kind].has(String(item.type))) return { ok: false, error: SIMPLE_BOARD_ITEMS_ONLY };
-      const stickyError = stickyNoteError(item);
+      const stickyError = stickyNoteError(item, code);
       if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
     } else if (comparable(before) === comparable(item)) {
@@ -76,7 +78,7 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
     } else {
       if (before.addedBy !== participantId || item.addedBy !== participantId) return { ok: false, error: "You can only move or change what you added." };
       if (simple && !SIMPLE_BOARD_ITEM_TYPES[kind].has(String(item.type))) return { ok: false, error: SIMPLE_BOARD_ITEMS_ONLY };
-      const stickyError = stickyNoteError(item);
+      const stickyError = stickyNoteError(item, code);
       if (stickyError) return { ok: false, error: stickyError };
       items.push(item);
     }
@@ -90,9 +92,10 @@ function checkItems(kind: "clips" | "annotations", previous: Item[], next: Item[
 /**
  * Validates a joiner's save against the stored board. Rejects any change to owner-only settings
  * or to items someone else added. On success returns the state to store: the stored board with
- * only the joiner's own items changed.
+ * only the joiner's own items changed. `code` is the board's join code: pictures on a joiner's notes
+ * must be that board's shared media.
  */
-export function checkJoinerUpdate(previous: JoinableBoardState, next: JoinableBoardState, participantId: string): JoinerCheck {
+export function checkJoinerUpdate(previous: JoinableBoardState, next: JoinableBoardState, participantId: string, code?: string): JoinerCheck {
   if (!/^[0-9a-f]{64}$/.test(participantId)) return { ok: false, error: "Missing participant identity." };
   const prev = previous as unknown as Record<string, unknown>;
   const nxt = next as unknown as Record<string, unknown>;
@@ -106,9 +109,9 @@ export function checkJoinerUpdate(previous: JoinableBoardState, next: JoinableBo
   }
   // The stored type decides, never the joiner's copy.
   const simple = parseBoardType(prev.boardType) === "simple";
-  const clips = checkItems("clips", (prev.clips as Item[] | undefined) ?? [], (nxt.clips as Item[] | undefined) ?? [], participantId, simple);
+  const clips = checkItems("clips", (prev.clips as Item[] | undefined) ?? [], (nxt.clips as Item[] | undefined) ?? [], participantId, simple, code);
   if (!clips.ok) return clips;
-  const annotations = checkItems("annotations", (prev.annotations as Item[] | undefined) ?? [], (nxt.annotations as Item[] | undefined) ?? [], participantId, simple);
+  const annotations = checkItems("annotations", (prev.annotations as Item[] | undefined) ?? [], (nxt.annotations as Item[] | undefined) ?? [], participantId, simple, code);
   if (!annotations.ok) return annotations;
   const threadError = threadDeleteError((prev.annotations as Item[] | undefined) ?? [], annotations.items, participantId);
   if (threadError) return { ok: false, error: threadError };
