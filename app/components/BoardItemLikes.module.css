@@ -1,19 +1,34 @@
-/* Likes under a shared-board item's bottom-right corner. Lives inside .theme (AppShell.module.css)
-   for its tokens. Heights here are mirrored by LIKES_*_PX in app/board2/page.tsx, which tucks the
-   pill right under the item. The button is the hit area (44px on touch screens); .pill is what shows. */
-.likes{display:inline-flex;align-items:center;justify-content:flex-end;min-width:28px;min-height:28px;padding:0;border:0;background:transparent;line-height:1;cursor:pointer;pointer-events:auto;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none}
-span.likes{cursor:default}
-.touch{min-width:44px;min-height:44px}
-.pill{display:inline-flex;align-items:center;gap:1px;height:24px;padding:0 8px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);box-shadow:0 1px 4px rgba(47,53,51,.16);color:var(--link);font-size:12px;font-weight:700;white-space:nowrap;transition:background .12s ease,box-shadow .12s ease}
-.touch .pill{height:30px;padding:0 10px;font-size:13px}
-.likes svg{display:block;width:14px;height:14px}
-.touch svg{width:16px;height:16px}
-.heartFilled{fill:var(--section)}
-.heartEmpty{fill:none;stroke:var(--icon-muted);stroke-width:2;stroke-linejoin:round}
-.extra{margin-left:3px}
-/* Yours: the brand gradient, so a liked item reads differently at a glance. */
-.likes[aria-pressed="true"] .pill{border-color:transparent;background:var(--brand-gradient);color:var(--on-gradient)}
-.likes[aria-pressed="true"] .heartFilled{fill:var(--on-gradient)}
-button.likes:hover .pill{box-shadow:0 0 0 1px var(--new-border),0 1px 4px rgba(47,53,51,.16)}
-button.likes:focus-visible{outline:none}
-button.likes:focus-visible .pill{box-shadow:0 0 0 2px var(--section)}
+/* A shared-board item's likes: a count pill beside a round heart button, as votes showed on the
+   original boards' notes. Lives inside .theme (AppShell.module.css) for its tokens.
+   .onNote: in a sticky note's likes row, every size in ems of the note's font (set inline), so it
+   scales with the note. .under: a small white pill under an image, video or text item. */
+.likes{display:flex;align-items:center;justify-content:flex-end;line-height:1;user-select:none;-webkit-tap-highlight-color:transparent}
+
+/* The count */
+.count{display:inline-block;box-sizing:border-box;text-align:center;font-weight:700;color:var(--ink);white-space:nowrap}
+.onNote .count{min-width:1.1em;padding:.08em .32em;border-radius:.5em;background:rgba(255,255,255,.6);font-size:.5em}
+.under .count{min-width:10px;padding:0 2px;color:var(--link);font-size:12px}
+.under.touch .count{font-size:13px}
+
+/* The heart: the like button (a span when display only) */
+.heart{position:relative;display:inline-grid;place-items:center;flex:0 0 auto;box-sizing:border-box;margin:0;padding:0;border:1px solid rgba(94,102,100,.55);border-radius:50%;background:rgba(94,102,100,.14);color:var(--icon-muted);cursor:pointer;touch-action:manipulation;transition:background .12s ease,border-color .12s ease,box-shadow .12s ease}
+span.heart{cursor:default}
+.heart svg{display:block;width:58%;height:58%;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linejoin:round}
+.heart[data-mine="true"]{border-color:transparent;background:var(--brand-gradient);color:var(--on-gradient)}
+.heart[data-mine="true"] svg{fill:currentColor;stroke:none}
+button.heart:hover{box-shadow:0 0 0 1px var(--new-border)}
+button.heart:focus-visible{outline:2px solid var(--section);outline-offset:1px}
+/* The button's hit area, however small the heart is drawn. */
+button.heart::before{content:"";position:absolute;left:50%;top:50%;width:max(100%,28px);height:max(100%,28px);transform:translate(-50%,-50%);border-radius:50%}
+.touch button.heart::before{width:max(100%,44px);height:max(100%,44px)}
+
+/* On a note: the row is the note itself (clicks select and drag it); only the heart is a control. */
+.onNote{gap:.2em;pointer-events:none}
+.onNote .heart{width:1em;height:1em;border-width:max(1px,.04em)}
+.onNote button.heart{pointer-events:auto}
+
+/* Under an item: a white pill holding both, LIKES_GAP_PX (app/board2/page.tsx) under its corner. */
+.under{display:inline-flex;gap:4px;height:24px;box-sizing:border-box;padding:0 3px 0 8px;border:1px solid var(--hairline);border-radius:var(--radius-pill);background:var(--ground);box-shadow:0 1px 4px rgba(47,53,51,.16);pointer-events:auto;cursor:default}
+.under .heart{width:18px;height:18px}
+.under.touch{height:30px;gap:6px;padding:0 3px 0 10px}
+.under.touch .heart{width:24px;height:24px}

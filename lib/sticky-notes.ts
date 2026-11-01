@@ -83,6 +83,19 @@ export function wrapStickyNoteText(text: string, maxWidth: number, measureText: 
   return lines;
 }
 
+// On a shared board each note carries its likes on itself, as votes sat on the original boards'
+// notes: a row below the text, right-aligned, with the count beside the like button. It's sized in
+// ems of the note's font so it scales with the note (likes make notes bigger). The row is display
+// only, like the like scaling: a note's stored box never includes it.
+/** The likes row's height (the like button's diameter), in ems of the note's font. */
+export const STICKY_NOTE_LIKES_ROW_EM = 1;
+/** Space between the note's content and its likes row, in ems. */
+export const STICKY_NOTE_LIKES_GAP_EM = 0.15;
+/** The narrowest a note with a likes row gets inside its padding (count + button), in ems. */
+export const STICKY_NOTE_LIKES_MIN_W_EM = 2.4;
+
+type LikesRow = { boardX: number; boardY: number; boardW: number; boardH: number };
+
 // A picture spans the note's text width (its box less padding), unless that would make it taller
 // than STICKY_NOTE_PICTURE_MAX_TALL of that width; then it's narrower, so tall photos don't tower.
 export const STICKY_NOTE_PICTURE_MAX_TALL = 1.25;
@@ -102,19 +115,22 @@ export function stickyNotePictureSize(boardW: number, fontSize: number, image: {
  * centered in the box when it fits; when the box is too short, it starts at the box's top and
  * runs past its bottom rather than cropping. `lineWidths` are the wrapped lines' widths in board
  * units; with none, the note is one empty line tall. A `picture` sits above the text, padded like
- * it, and the note hugs whichever is wider.
+ * it, and the note hugs whichever is wider. With `likesRow` (a shared board), the note runs
+ * a likes row taller at the bottom and is at least wide enough for it; its top stays put.
  */
-export function stickyNoteFrame(box: NoteBox, lineWidths: readonly number[], fontSize: number, lineHeight: number, picture: PictureSize | null = null): NoteFrame {
+export function stickyNoteFrame(box: NoteBox, lineWidths: readonly number[], fontSize: number, lineHeight: number, picture: PictureSize | null = null, likesRow = false): NoteFrame {
   const pad = fontSize * STICKY_NOTE_PADDING_EM;
   const textH = (lines: number) => lines * fontSize * lineHeight;
-  const contentW = picture ? Math.max(picture.w, ...lineWidths) : Math.max(fontSize, ...lineWidths);
+  const contentW = Math.max(picture ? picture.w : fontSize, ...lineWidths, likesRow ? fontSize * STICKY_NOTE_LIKES_MIN_W_EM : 0);
   const contentH = picture
     ? picture.h + (lineWidths.length > 0 ? pad + textH(lineWidths.length) : 0)
     : textH(Math.max(1, lineWidths.length));
-  const w = contentW + pad * 2, h = contentH + pad * 2;
+  // A likes row only adds to the bottom: the note's top (and so its content) is placed as without it.
+  const coreH = contentH + pad * 2;
+  const w = contentW + pad * 2, h = coreH + (likesRow ? fontSize * (STICKY_NOTE_LIKES_GAP_EM + STICKY_NOTE_LIKES_ROW_EM) : 0);
   return {
     boardX: box.boardX + (box.boardW - w) / 2,
-    boardY: box.boardY + Math.max(0, (box.boardH - h) / 2),
+    boardY: box.boardY + Math.max(0, (box.boardH - coreH) / 2),
     boardW: w,
     boardH: h,
     radius: Math.min(fontSize * STICKY_NOTE_RADIUS_EM, w / 2, h / 2),
@@ -143,18 +159,25 @@ export function stickyNoteContent(frame: NoteFrame, fontSize: number, picture: P
   };
 }
 
-type NoteLayout = { lines: string[]; frame: NoteFrame; picture: NoteFrame | null; textX: number; textY: number };
+type NoteLayout = { lines: string[]; frame: NoteFrame; picture: NoteFrame | null; textX: number; textY: number; likesRow: LikesRow | null };
+
+/** Where a note's likes row sits in its frame: the bottom of its padded area, full width. */
+export function stickyNoteLikesRow(frame: NoteBox, fontSize: number): LikesRow {
+  const pad = fontSize * STICKY_NOTE_PADDING_EM;
+  const h = fontSize * STICKY_NOTE_LIKES_ROW_EM;
+  return { boardX: frame.boardX + pad, boardY: frame.boardY + frame.boardH - pad - h, boardW: Math.max(0, frame.boardW - pad * 2), boardH: h };
+}
 
 /**
  * A note's wrapped lines, the frame they're drawn in, and where its picture and text sit. The
  * board, the typing view's height and the export all come from this, so they wrap and frame the
  * same. `measureText` gives widths in board units at the note's font size.
  */
-export function layoutStickyNote(box: NoteBox, text: string, fontSize: number, measureText: AnnotationTextMeasurer, image?: { width: number; height: number } | null): NoteLayout {
+export function layoutStickyNote(box: NoteBox, text: string, fontSize: number, measureText: AnnotationTextMeasurer, image?: { width: number; height: number } | null, likesRow = false): NoteLayout {
   const lines = text ? wrapStickyNoteText(text, stickyNoteWrapWidth(box.boardW, fontSize), measureText) : [];
   const picture = stickyNotePictureSize(box.boardW, fontSize, image);
-  const frame = stickyNoteFrame(box, lines.map(measureText), fontSize, ANNOTATION_LINE_HEIGHT, picture);
-  return { lines, frame, ...stickyNoteContent(frame, fontSize, picture) };
+  const frame = stickyNoteFrame(box, lines.map(measureText), fontSize, ANNOTATION_LINE_HEIGHT, picture, likesRow);
+  return { lines, frame, ...stickyNoteContent(frame, fontSize, picture), likesRow: likesRow ? stickyNoteLikesRow(frame, fontSize) : null };
 }
 
 /**
