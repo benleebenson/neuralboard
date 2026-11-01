@@ -2434,6 +2434,9 @@ const BOARD_RESIZE_PX = 10;
 // visible pill's height, on desktop and touch, and the gap left between the item and the pill.
 const LIKES_HIT_PX = 28, LIKES_PILL_PX = 24, LIKES_HIT_TOUCH_PX = 44, LIKES_PILL_TOUCH_PX = 30;
 const LIKES_GAP_PX = 2;
+// A sticky note's selection chrome is full size from this many on-screen px (its frame's shorter
+// side) and shrinks with the note below that, down to 60%.
+const STICKY_CHROME_FULL_PX = 90;
 const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
 const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -28440,6 +28443,14 @@ function Board2Editor({
                       })()
                     : stickyNoteLayoutForEditor(shown);
                   const shownH = sticky ? Math.max(shown.boardH, sticky.frame.boardY + sticky.frame.boardH - shown.boardY) : shown.boardH;
+                  // Selection chrome (outline, corner handles, delete, reply, colors) wraps what's
+                  // drawn: a sticky note's frame, which hugs its text inside a wider box, and is sized
+                  // to it so a small note isn't swamped (touch targets stay 44px). Typing keeps the box.
+                  const chromeFrame = sticky && !isEditing ? sticky.frame : null;
+                  const chromeScale = chromeFrame ? Math.min(1, Math.max(0.6, Math.min(chromeFrame.boardW, chromeFrame.boardH) * boardZoom / STICKY_CHROME_FULL_PX)) : 1;
+                  const chromeOutline = isSel && !isEditing ? `${Math.max(1, 2 * chromeScale)}px dashed #ff5e3a` : "none";
+                  const handlePx = Math.max(6, Math.round(BOARD_RESIZE_PX * chromeScale));
+                  const deletePx = isMobile ? 44 : Math.round(28 * chromeScale);
                   return (
                     <div
                       key={ann.id}
@@ -28451,7 +28462,7 @@ function Board2Editor({
                         width: shown.boardW * boardZoom,
                         height: shownH * boardZoom,
                         transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
-                        outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
+                        outline: chromeFrame ? "none" : chromeOutline,
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
                         zIndex: 5,
@@ -28589,89 +28600,100 @@ function Board2Editor({
                           </div>
                         );
                       })()}
-                      {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
-                      {ann.type === "sticky" && (showHandles || isEditing) && canEdit && (
-                        <div
-                          role="radiogroup"
-                          aria-label="Note color"
-                          data-sticky-colors
-                          onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
-                          style={{ position: "absolute", left: "50%", top: `calc(100% + ${isMobile ? 14 : 10}px)`, transform: "translateX(-50%)", zIndex: 25, display: "flex", gap: isMobile ? 2 : 6, padding: isMobile ? 2 : 6, borderRadius: 999, background: "#fff", boxShadow: "0 4px 14px rgba(42,42,42,.18)", touchAction: "manipulation" }}
-                        >
-                          {STICKY_NOTE_COLORS.map(({ color, name }) => {
-                            const checked = (ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR) === color;
-                            return (
-                              <button
-                                key={color}
-                                type="button"
-                                role="radio"
-                                aria-checked={checked}
-                                aria-label={name}
-                                title={name}
-                                onClick={(e) => { e.stopPropagation(); setStickyNoteColor(ann.id, color); }}
-                                style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
-                              />
-                            );
-                          })}
-                        </div>
-                      )}
-                      {/* Resize handles */}
-                      {showHandles && (
-                        ann.type === "arrow" && ann.arrowStartX !== undefined ? (
-                          // Arrow: two endpoint handles
-                          (["start", "end"] as const).map((which) => {
-                            const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
-                            const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
-                            const { half, ...handle } = boardHandleStyle(isMobile, 12, true);
-                            return (
-                              <div key={which} data-resize-handle style={{
-                                position: "absolute", left: hx - half, top: hy - half,
+                      {/* The note's drawn frame (or the whole item), which its selection chrome hangs off. */}
+                      <div data-selection-chrome style={chromeFrame ? {
+                        position: "absolute",
+                        left: (chromeFrame.boardX - shown.boardX) * boardZoom, top: (chromeFrame.boardY - shown.boardY) * boardZoom,
+                        width: chromeFrame.boardW * boardZoom, height: chromeFrame.boardH * boardZoom,
+                        borderRadius: chromeFrame.radius * boardZoom,
+                        outline: chromeOutline, outlineOffset: Math.max(2, 3 * chromeScale),
+                        // Clicks on the note itself (and its typing area) go through; the controls opt back in.
+                        pointerEvents: "none",
+                      } : { position: "absolute", inset: 0, pointerEvents: "none" }}>
+                        {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
+                        {ann.type === "sticky" && (showHandles || isEditing) && canEdit && (
+                          <div
+                            role="radiogroup"
+                            aria-label="Note color"
+                            data-sticky-colors
+                            onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                            style={{ position: "absolute", pointerEvents: "auto", left: "50%", top: `calc(100% + ${isMobile ? 14 : 10}px)`, transform: "translateX(-50%)", zIndex: 25, display: "flex", gap: isMobile ? 2 : 6, padding: isMobile ? 2 : 6, borderRadius: 999, background: "#fff", boxShadow: "0 4px 14px rgba(42,42,42,.18)", touchAction: "manipulation" }}
+                          >
+                            {STICKY_NOTE_COLORS.map(({ color, name }) => {
+                              const checked = (ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR) === color;
+                              return (
+                                <button
+                                  key={color}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={checked}
+                                  aria-label={name}
+                                  title={name}
+                                  onClick={(e) => { e.stopPropagation(); setStickyNoteColor(ann.id, color); }}
+                                  style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
+                                />
+                              );
+                            })}
+                          </div>
+                        )}
+                        {/* Resize handles */}
+                        {showHandles && (
+                          ann.type === "arrow" && ann.arrowStartX !== undefined ? (
+                            // Arrow: two endpoint handles
+                            (["start", "end"] as const).map((which) => {
+                              const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
+                              const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
+                              const { half, ...handle } = boardHandleStyle(isMobile, 12, true);
+                              return (
+                                <div key={which} data-resize-handle style={{
+                                  position: "absolute", left: hx - half, top: hy - half,
+                                  ...handle,
+                                  cursor: "move", zIndex: 20, pointerEvents: "auto",
+                                }}
+                                onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
+                              );
+                            })
+                          ) : (
+                            // All other types: four corner handles
+                            (["nw", "ne", "sw", "se"] as const).map((corner) => {
+                              const { half, ...handle } = boardHandleStyle(isMobile, handlePx);
+                              return (
+                              <div key={corner} data-resize-handle style={{
+                                position: "absolute",
+                                ...(corner === "nw" ? { left: -half, top: -half } :
+                                    corner === "ne" ? { right: -half, top: -half } :
+                                    corner === "sw" ? { left: -half, bottom: -half } :
+                                                      { right: -half, bottom: -half }),
                                 ...handle,
-                                cursor: "move", zIndex: 20,
+                                cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
+                                zIndex: 20, pointerEvents: "auto",
                               }}
-                              onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
-                            );
-                          })
-                        ) : (
-                          // All other types: four corner handles
-                          (["nw", "ne", "sw", "se"] as const).map((corner) => {
-                            const { half, ...handle } = boardHandleStyle(isMobile, 10);
-                            return (
-                            <div key={corner} data-resize-handle style={{
-                              position: "absolute",
-                              ...(corner === "nw" ? { left: -half, top: -half } :
-                                  corner === "ne" ? { right: -half, top: -half } :
-                                  corner === "sw" ? { left: -half, bottom: -half } :
-                                                    { right: -half, bottom: -half }),
-                              ...handle,
-                              cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
-                              zIndex: 20,
-                            }}
-                            onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
-                            );
-                          })
-                        )
-                      )}
-                      {showReply && (
-                        <button
-                          type="button"
-                          aria-label="Reply to this note"
-                          title="Reply"
-                          onPointerDown={(e) => e.stopPropagation()}
-                          onClick={(e) => { e.stopPropagation(); addStickyReply(ann); }}
-                          style={{ position: "absolute", left: "100%", top: "50%", transform: `translate(${isMobile ? 10 : 8}px, -50%)`, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 10px", borderRadius: 999, border: "2px solid #fff", background: "#1E8C83", color: "#fff", fontSize: isMobile ? 16 : 12, fontWeight: 600, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap" }}
-                        >↳ Reply</button>
-                      )}
-                      {showHandles && (
-                        <button
-                          type="button"
-                          aria-label="Delete annotation"
-                          title="Delete annotation"
-                          onPointerDown={(e) => e.stopPropagation()}
-                          onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
-                          style={{ position: "absolute", left: "50%", top: isMobile ? -52 : -30, transform: "translateX(-50%)", width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
-                        >✕</button>
-                      )}
+                              onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
+                              );
+                            })
+                          )
+                        )}
+                        {showReply && (
+                          <button
+                            type="button"
+                            aria-label="Reply to this note"
+                            title="Reply"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); addStickyReply(ann); }}
+                            style={{ position: "absolute", pointerEvents: "auto", left: "100%", top: "50%", transform: `translate(${isMobile ? 10 : 8}px, -50%)`, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 10px", borderRadius: 999, border: "2px solid #fff", background: "#1E8C83", color: "#fff", fontSize: isMobile ? 16 : 12, fontWeight: 600, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap" }}
+                          >↳ Reply</button>
+                        )}
+                        {showHandles && (
+                          <button
+                            type="button"
+                            aria-label="Delete annotation"
+                            title="Delete annotation"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
+                            style={{ position: "absolute", pointerEvents: "auto", left: "50%", top: isMobile ? -52 : -(deletePx + 2), transform: "translateX(-50%)", width: deletePx, height: deletePx, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : Math.round(14 * chromeScale), lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                          >✕</button>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
