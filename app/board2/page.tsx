@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNoteContent, type StickyNoteImage, stickyNotePictureSize, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, STICKY_NOTE_PICTURE_MAX_TALL, STICKY_NOTE_RADIUS_EM, stickyNoteContent, type StickyNoteImage, stickyNotePictureSize, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -23398,6 +23398,16 @@ function Board2Editor({
     const removePicture = () => setStickyComposer((current) => current && { ...current, picture: undefined });
     const choosePicture = () => stickyComposerFileRef.current?.click();
     const buttonHeight = isMobile ? 44 : 30;
+    // The post is framed as the board frames a note (lib/sticky-notes), at the modal's text size:
+    // padding and corner radius in ems of the font, the picture spanning the text width at its
+    // own aspect (narrower when taller than STICKY_NOTE_PICTURE_MAX_TALL of that width), corners
+    // concentric with the note's. It's only kept under 45% of the screen's height, so a tall photo
+    // leaves room to type; that narrows it, never crops or letterboxes it.
+    const composeFontPx = isMobile ? 26 : 28;
+    const composePadPx = composeFontPx * STICKY_NOTE_PADDING_EM;
+    const composeRadiusPx = composeFontPx * STICKY_NOTE_RADIUS_EM;
+    const pictureAspect = picture ? picture.width / picture.height : 1;
+    const pictureWidth = `min(100%, ${(STICKY_NOTE_PICTURE_MAX_TALL * pictureAspect * 100).toFixed(3)}%, ${(45 * pictureAspect).toFixed(3)}dvh)`;
     const pictureLabel = picture ? (isSimpleBoard ? "Change photo" : "Change image") : (isSimpleBoard ? "Add photo" : "Add image");
     return (
       <div
@@ -23433,14 +23443,14 @@ function Board2Editor({
             )}
           </div>
           {/* The post: one note, its picture above its text, framed the way the board frames it. */}
-          <div style={{ display: "flex", flexDirection: "column", gap: picture ? 12 : 0, padding: picture ? "12px 12px 0" : 0, borderRadius: 12, background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: picture ? composePadPx : 0, padding: composePadPx, borderRadius: composeRadiusPx, background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)" }}>
             {picture && (
-              <div style={{ position: "relative", alignSelf: "center", maxWidth: "100%" }}>
+              <div data-compose-picture style={{ position: "relative", alignSelf: "center", width: pictureWidth, aspectRatio: `${picture.width} / ${picture.height}`, borderRadius: Math.max(0, composeRadiusPx - composePadPx), overflow: "hidden" }}>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={picture.previewUrl}
                   alt="The picture for this post"
-                  style={{ display: "block", maxWidth: "100%", maxHeight: isMobile ? 220 : 280, borderRadius: 6, objectFit: "contain" }}
+                  style={{ display: "block", width: "100%", height: "100%", objectFit: "cover" }}
                 />
                 <button
                   type="button"
@@ -23465,9 +23475,9 @@ function Board2Editor({
                 else if (event.key === "Escape") { event.preventDefault(); cancel(); }
               }}
               style={{
-                width: "100%", minHeight: picture ? (isMobile ? 90 : 110) : (isMobile ? 160 : 200), boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
+                width: "100%", minHeight: picture ? (isMobile ? 90 : 110) : (isMobile ? 160 : 200), boxSizing: "border-box", resize: "vertical", padding: 0, border: 0, outline: "none",
                 background: "transparent",
-                color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
+                color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: composeFontPx, lineHeight: ANNOTATION_LINE_HEIGHT,
               }}
             />
           </div>
