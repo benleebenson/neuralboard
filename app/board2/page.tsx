@@ -28672,27 +28672,30 @@ function Board2Editor({
                   );
                 })}
 
-                {/* Likes, hanging just below each shared item's bottom-right corner so they never cover
-                    it. Only items the server has (synced) can be liked; a selected item's resize
-                    handle sits on that corner, so its likes drop below the handle. Items too small on
-                    screen to tell whose likes are whose show none until zoomed in; small ones get the
-                    one-heart-and-count form. */}
+                {/* Likes, a small heart straddling each shared item's bottom-right corner (mostly on
+                    the item, clear of its last line of text). A sticky
+                    note is drawn smaller than its box, so its heart follows the drawn frame. Only
+                    items the server has (synced) can be liked; a selected item's resize handle sits
+                    on that corner, so its heart moves left of the handle. Items too small on screen
+                    to tell whose likes are whose show none until zoomed in. */}
                 {joinCode && [
                   ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
-                  ...displayedAnnotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                  ...displayedAnnotations.map((ann) => {
+                    const box = ann.type === "sticky" ? stickyNoteLayoutForEditor(ann).frame : ann;
+                    return { id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: box.boardX, y: box.boardY, w: box.boardW, h: box.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) };
+                  }),
                 ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
                   const likers = boardLikes[item.id] ?? [];
-                  const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;
+                  const handle = item.selected ? (isMobile ? 44 : BOARD_RESIZE_PX * 2) : 0;
                   return (
                     <BoardItemLikes
                       key={`likes-${item.id}`}
                       count={likers.length}
                       mine={!!participantId && likers.includes(participantId)}
-                      compact={item.w * boardZoom < 110}
                       touch={isMobile}
                       itemName={item.name}
                       onToggle={viewOnly ? undefined : () => { void toggleBoardLike(item.id); }}
-                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + 2, transform: "translateX(-100%)", zIndex: 7 }}
+                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom - handle - 10, top: (item.y + item.h) * boardZoom - 2, transform: "translate(-50%, -50%)", zIndex: 7 }}
                     />
                   );
                 })}
