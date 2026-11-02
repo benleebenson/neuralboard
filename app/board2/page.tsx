@@ -29,7 +29,7 @@ import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
 import { BOARD_SURFACE_COLOR } from "@/lib/board-theme";
-import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, STICKY_NOTE_PICTURE_MAX_TALL, STICKY_NOTE_RADIUS_EM, stickyNoteContent, type StickyNoteImage, stickyNotePictureSize, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
+import { DEFAULT_STICKY_NOTE_COLOR, layoutStickyNote, STICKY_NOTE_COLORS, STICKY_NOTE_INK, STICKY_NOTE_MAX_TEXT, STICKY_NOTE_PADDING_EM, stickyNoteContent, type StickyNoteImage, stickyNotePictureSize, stickyNotesForDisplay, stickyNoteTypingFrame } from "@/lib/sticky-notes";
 import { placeReply, planThreadDelete, THREAD_CONNECTOR_COLOR, threadConnectors, threadDepths, threadDescendants, threadPaintOrder, threadShade } from "@/lib/sticky-threads";
 import {
   animatedImageFrameIndex,
@@ -2430,11 +2430,6 @@ const NARRATION_COLOR = "#ffd6e8";
 const HANDLE_W = 6;
 const SAVE_BUTTON_COLOR = "#ffb347";
 const BOARD_RESIZE_PX = 10;
-// The gap between a shared image/video/text item and the likes pill under it (BoardItemLikes).
-const LIKES_GAP_PX = 2;
-// A sticky note's selection chrome is full size from this many on-screen px (its frame's shorter
-// side) and shrinks with the note below that, down to 60%.
-const STICKY_CHROME_FULL_PX = 90;
 const EMOJI_SET = ["🤔","⭐","🎯","❗","💡","🔥","✨","📈","📉","⚠️","❓","💬","👀","🚀","❤️","✅","❌","🌍","🧠","🎨","🏆","💎","🔑","📌","🎬","📊","💰","🔍","🤝","🌟","💥","🎤","📣","🌈","⏰","🎁","😂"];
 const MAGNETIC_SNAP_PX = 10;
 const MAX_PASTED_IMAGE_BYTES = 15 * 1024 * 1024;
@@ -3210,20 +3205,19 @@ function annotationLinesForEditor(annotation: Annotation): string[] {
  * A sticky note's wrapped lines and the rounded frame they're drawn in (lib/sticky-notes), for
  * `text` (the note's own by default). Used on screen, while typing and in export.
  */
-// `likesRow`: the note carries its likes below its text (shared boards; display only, see lib/sticky-notes).
-function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null, text = annotation.text ?? "", likesRow = false) {
+function stickyNoteLayout(annotation: Annotation, context: CanvasRenderingContext2D | null, text = annotation.text ?? "") {
   const fontSize = annotation.fontSize ?? 80;
   // Measured at the note's board font size, so widths are in board units. With nothing to
   // measure with, lines break only at newlines.
   if (context) context.font = annotationFontCss(fontSize, annotation.fontFamily ?? "Caveat", annotation.fontWeight ?? "normal");
-  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0), annotation.noteImage, likesRow);
+  return layoutStickyNote(annotation, text, fontSize, (line) => (context ? context.measureText(line).width : 0), annotation.noteImage);
 }
 
-function stickyNoteLayoutForEditor(annotation: Annotation, text?: string, likesRow = false) {
+function stickyNoteLayoutForEditor(annotation: Annotation, text?: string) {
   if (typeof document !== "undefined" && !annotationMeasureContext) {
     annotationMeasureContext = document.createElement("canvas").getContext("2d");
   }
-  return stickyNoteLayout(annotation, annotationMeasureContext, text, likesRow);
+  return stickyNoteLayout(annotation, annotationMeasureContext, text);
 }
 
 // Each sticky note's frame relative to its box, by what decides it, so pushing notes apart
@@ -3231,15 +3225,15 @@ function stickyNoteLayoutForEditor(annotation: Annotation, text?: string, likesR
 // replaces the measure context, which starts the cache afresh.
 let stickyFrameCache: { context: CanvasRenderingContext2D | null; frames: Map<string, { x: number; y: number; w: number; h: number }> } = { context: null, frames: new Map() };
 
-function stickyNoteFrameOnBoard(note: Annotation, likesRow = false) {
+function stickyNoteFrameOnBoard(note: Annotation) {
   if (typeof document !== "undefined" && !annotationMeasureContext) {
     annotationMeasureContext = document.createElement("canvas").getContext("2d");
   }
   if (stickyFrameCache.context !== annotationMeasureContext) stickyFrameCache = { context: annotationMeasureContext, frames: new Map() };
-  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH, note.noteImage?.width, note.noteImage?.height, likesRow]);
+  const key = JSON.stringify([note.text ?? "", note.fontFamily, note.fontWeight, note.fontSize, note.boardW, note.boardH, note.noteImage?.width, note.noteImage?.height]);
   let frame = stickyFrameCache.frames.get(key);
   if (!frame) {
-    const laidOut = stickyNoteLayout(note, annotationMeasureContext, undefined, likesRow).frame;
+    const laidOut = stickyNoteLayout(note, annotationMeasureContext).frame;
     frame = { x: laidOut.boardX - note.boardX, y: laidOut.boardY - note.boardY, w: laidOut.boardW, h: laidOut.boardH };
     if (stickyFrameCache.frames.size > 2000) stickyFrameCache.frames.clear();
     stickyFrameCache.frames.set(key, frame);
@@ -3252,15 +3246,9 @@ const NO_PINNED_STICKIES: ReadonlySet<string> = new Set();
 /**
  * The board's annotations as shown (lib/sticky-notes): sticky notes bigger with likes and pushed
  * apart where they'd overlap; `pinned` notes (being dragged) stay put. Board and export both use it.
- * `likesRow` (a shared board): notes make room for each other with their likes rows, so the board
- * and the export push them apart the same, though only the board draws the row.
  */
-function annotationsAsShown(annotations: readonly Annotation[], likes: BoardLikes, pinned: ReadonlySet<string> = NO_PINNED_STICKIES, likesRow = false): Annotation[] {
-  return stickyNotesForDisplay(annotations, likes, likesRow ? stickyNoteFrameWithLikesRow : stickyNoteFrameOnBoard, pinned);
-}
-
-function stickyNoteFrameWithLikesRow(note: Annotation) {
-  return stickyNoteFrameOnBoard(note, true);
+function annotationsAsShown(annotations: readonly Annotation[], likes: BoardLikes, pinned: ReadonlySet<string> = NO_PINNED_STICKIES): Annotation[] {
+  return stickyNotesForDisplay(annotations, likes, stickyNoteFrameOnBoard, pinned);
 }
 
 /** How far a note is drawn from where it's stored by pushing (centers, which like scaling keeps). */
@@ -3422,13 +3410,12 @@ function drawAnnotationsToCanvas(
   W: number,
   H: number,
   noteImageSource?: NoteImageSource,
-  likesRow = false,
 ) {
   const rc = rough.canvas(ctx.canvas);
   const toSX = (bx: number) => (bx - cam.cameraX) * sf + W / 2;
   const toSY = (by: number) => (by - cam.cameraY) * sf + H / 2;
   // Sticky notes as the board shows them: bigger with likes, pushed apart.
-  const annotations = annotationsAsShown(storedAnnotations, likes, undefined, likesRow);
+  const annotations = annotationsAsShown(storedAnnotations, likes);
   const depths = threadDepths(annotations);
   drawThreadConnectors(ctx, annotations, (x, y) => [toSX(x), toSY(y)], sf);
   for (const ann of threadPaintOrder(annotations)) {
@@ -6609,10 +6596,6 @@ function Board2Editor({
   // For the export and previews, which draw outside React's render (likes make sticky notes bigger).
   const boardLikesRef = useRef<BoardLikes>({});
   useEffect(() => { boardLikesRef.current = boardLikes; }, [boardLikes]);
-  // On a shared board each sticky note carries its likes row (lib/sticky-notes), which the export
-  // and previews make room for too, so they push notes apart as the board does.
-  const boardLikesRowRef = useRef(false);
-  useEffect(() => { boardLikesRowRef.current = !!joinCode; }, [joinCode]);
   const likeInFlightRef = useRef(new Set<string>());
   // Board view's "add here" prompt: where it was opened (container px) and the board point it adds at.
   const [boardAddPrompt, setBoardAddPrompt] = useState<{ x: number; y: number; boardX: number; boardY: number } | null>(null);
@@ -6911,7 +6894,7 @@ function Board2Editor({
   const [pinnedStickyIds, setPinnedStickyIds] = useState<ReadonlySet<string>>(NO_PINNED_STICKIES);
   // Sticky notes as shown (bigger with likes, pushed apart), by id; the export draws the same.
   // Worked out only when the annotations, likes or dragged notes change, never on pan or zoom.
-  const displayedAnnotations = useMemo(() => annotationsAsShown(annotations, boardLikes, pinnedStickyIds, !!joinCode), [annotations, boardLikes, pinnedStickyIds, joinCode]);
+  const displayedAnnotations = useMemo(() => annotationsAsShown(annotations, boardLikes, pinnedStickyIds), [annotations, boardLikes, pinnedStickyIds]);
   const displayedAnnotationById = useMemo(() => new Map(displayedAnnotations.map((annotation) => [annotation.id, annotation])), [displayedAnnotations]);
   const annotationThreadConnectors = useMemo(() => threadConnectors(displayedAnnotations), [displayedAnnotations]);
   // When pushing moves notes, they slide there over 160ms, as on the original boards. Only the
@@ -10350,7 +10333,7 @@ function Board2Editor({
         const img = preparedImageRendering ? exportImgCacheRef.current.get(image.url) : cachedPreviewImage(image.url);
         if (!img && quality === "preview") loadMedia(image.url, "image");
         return img?.complete && img.naturalWidth > 0 ? img : undefined;
-      }, boardLikesRowRef.current);
+      });
     }
     ctx.restore();
     drawCutToOverlays(ctx, time, currentClips, W, H, (clip) => cutToSourceFor(clip, offlineVideoRendering), quality === "preview" ? previewCutToClipIdRef.current : null);
@@ -20992,7 +20975,7 @@ function Board2Editor({
       // anywhere on the infinite board, well outside the nominal boardDimensions box, so exporting
       // that fixed box would crop real content or capture mostly empty parchment. Fall back to the
       // nominal box only when the board is empty.
-      const bounds = boardContentBounds(currentClips, annotationsAsShown(currentAnnotations, boardLikesRef.current, undefined, boardLikesRowRef.current));
+      const bounds = boardContentBounds(currentClips, annotationsAsShown(currentAnnotations, boardLikesRef.current));
       const frame = bounds
         ? {
             minX: bounds.minX - BOARD_EXPORT_PADDING,
@@ -23408,16 +23391,6 @@ function Board2Editor({
     const removePicture = () => setStickyComposer((current) => current && { ...current, picture: undefined });
     const choosePicture = () => stickyComposerFileRef.current?.click();
     const buttonHeight = isMobile ? 44 : 30;
-    // The post is framed as the board frames a note (lib/sticky-notes), at the modal's text size:
-    // padding and corner radius in ems of the font, the picture spanning the text width at its
-    // own aspect (narrower when taller than STICKY_NOTE_PICTURE_MAX_TALL of that width), corners
-    // concentric with the note's. It's only kept under 45% of the screen's height, so a tall photo
-    // leaves room to type; that narrows it, never crops or letterboxes it.
-    const composeFontPx = isMobile ? 26 : 28;
-    const composePadPx = composeFontPx * STICKY_NOTE_PADDING_EM;
-    const composeRadiusPx = composeFontPx * STICKY_NOTE_RADIUS_EM;
-    const pictureAspect = picture ? picture.width / picture.height : 1;
-    const pictureWidth = `min(100%, ${(STICKY_NOTE_PICTURE_MAX_TALL * pictureAspect * 100).toFixed(3)}%, ${(45 * pictureAspect).toFixed(3)}dvh)`;
     const pictureLabel = picture ? (isSimpleBoard ? "Change photo" : "Change image") : (isSimpleBoard ? "Add photo" : "Add image");
     return (
       <div
@@ -23453,14 +23426,14 @@ function Board2Editor({
             )}
           </div>
           {/* The post: one note, its picture above its text, framed the way the board frames it. */}
-          <div style={{ display: "flex", flexDirection: "column", gap: picture ? composePadPx : 0, padding: composePadPx, borderRadius: composeRadiusPx, background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: picture ? 12 : 0, padding: picture ? "12px 12px 0" : 0, borderRadius: 12, background: threadShade(noteColor, depth, note.id), boxShadow: "0 1px 2px rgba(42,42,42,0.12), 0 6px 16px rgba(42,42,42,0.16)" }}>
             {picture && (
-              <div data-compose-picture style={{ position: "relative", alignSelf: "center", width: pictureWidth, aspectRatio: `${picture.width} / ${picture.height}`, borderRadius: Math.max(0, composeRadiusPx - composePadPx), overflow: "hidden" }}>
+              <div style={{ position: "relative", alignSelf: "center", maxWidth: "100%" }}>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={picture.previewUrl}
                   alt="The picture for this post"
-                  style={{ display: "block", width: "100%", height: "100%", objectFit: "cover" }}
+                  style={{ display: "block", maxWidth: "100%", maxHeight: isMobile ? 220 : 280, borderRadius: 6, objectFit: "contain" }}
                 />
                 <button
                   type="button"
@@ -23485,9 +23458,9 @@ function Board2Editor({
                 else if (event.key === "Escape") { event.preventDefault(); cancel(); }
               }}
               style={{
-                width: "100%", minHeight: picture ? (isMobile ? 90 : 110) : (isMobile ? 160 : 200), boxSizing: "border-box", resize: "vertical", padding: 0, border: 0, outline: "none",
+                width: "100%", minHeight: picture ? (isMobile ? 90 : 110) : (isMobile ? 160 : 200), boxSizing: "border-box", resize: "vertical", padding: 16, border: 0, outline: "none", borderRadius: 12,
                 background: "transparent",
-                color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: composeFontPx, lineHeight: ANNOTATION_LINE_HEIGHT,
+                color: note.color || STICKY_NOTE_INK, fontFamily: `'${note.fontFamily ?? "Caveat"}', cursive`, fontSize: isMobile ? 26 : 28, lineHeight: ANNOTATION_LINE_HEIGHT,
               }}
             />
           </div>
@@ -23506,22 +23479,8 @@ function Board2Editor({
           />
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-              {/* Attaching a picture is as much a part of posting as typing: the app shell's brand
-                  pill (.theme tokens), a 44px target on every screen. */}
-              <button
-                type="button"
-                onClick={choosePicture}
-                disabled={busy}
-                data-compose-attach
-                className={`${shellStyles.theme} ${shellFont.variable} ${shellStyles.gradientButton}`}
-                style={{ minWidth: 44, minHeight: 44, padding: "0 18px", opacity: busy ? 0.6 : 1, cursor: busy ? "not-allowed" : "pointer" }}
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true" style={{ width: 20, height: 20, fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" }}>
-                  <rect x="3" y="4.5" width="18" height="15" rx="3" />
-                  <circle cx="8.5" cy="9.5" r="1.75" />
-                  <path d="m21 16-5-5-8.5 8.5" />
-                </svg>
-                {pictureLabel}
+              <button type="button" onClick={choosePicture} disabled={busy} style={{ ...miniButton, minHeight: buttonHeight, padding: "0 12px", cursor: busy ? "not-allowed" : "pointer" }}>
+                <span aria-hidden="true">🖼 </span>{pictureLabel}
               </button>
               <div role="status" style={{ fontSize: 10, color: "#6a6a6a" }}>
                 {status === "loading" ? "Reading the picture…" : status === "posting" ? "Uploading…" : isMobile ? "" : "Enter posts · Shift+Enter new line · Esc cancels · paste an image"}
@@ -28473,18 +28432,10 @@ function Board2Editor({
                         const fontSize = shown.fontSize ?? 80;
                         const { lines } = stickyNoteLayoutForEditor(shown, editingAnnotationText);
                         const frame = stickyNoteTypingFrame(shown, lines.length, fontSize, shown.noteImage);
-                        return { lines: [], frame, ...stickyNoteContent(frame, fontSize, stickyNotePictureSize(shown.boardW, fontSize, shown.noteImage)), likesRow: null };
+                        return { lines: [], frame, ...stickyNoteContent(frame, fontSize, stickyNotePictureSize(shown.boardW, fontSize, shown.noteImage)) };
                       })()
-                    : stickyNoteLayoutForEditor(shown, undefined, !!joinCode);
+                    : stickyNoteLayoutForEditor(shown);
                   const shownH = sticky ? Math.max(shown.boardH, sticky.frame.boardY + sticky.frame.boardH - shown.boardY) : shown.boardH;
-                  // Selection chrome (outline, corner handles, delete, reply, colors) wraps what's
-                  // drawn: a sticky note's frame, which hugs its text inside a wider box, and is sized
-                  // to it so a small note isn't swamped (touch targets stay 44px). Typing keeps the box.
-                  const chromeFrame = sticky && !isEditing ? sticky.frame : null;
-                  const chromeScale = chromeFrame ? Math.min(1, Math.max(0.6, Math.min(chromeFrame.boardW, chromeFrame.boardH) * boardZoom / STICKY_CHROME_FULL_PX)) : 1;
-                  const chromeOutline = isSel && !isEditing ? `${Math.max(1, 2 * chromeScale)}px dashed #ff5e3a` : "none";
-                  const handlePx = Math.max(6, Math.round(BOARD_RESIZE_PX * chromeScale));
-                  const deletePx = isMobile ? 44 : Math.round(28 * chromeScale);
                   return (
                     <div
                       key={ann.id}
@@ -28496,7 +28447,7 @@ function Board2Editor({
                         width: shown.boardW * boardZoom,
                         height: shownH * boardZoom,
                         transform: ann.rotationDeg ? `rotate(${ann.rotationDeg}deg)` : undefined,
-                        outline: chromeFrame ? "none" : chromeOutline,
+                        outline: isSel && !isEditing ? "2px dashed #ff5e3a" : "none",
                         outlineOffset: 3,
                         cursor: annotationTool === "pointer" ? "pointer" : "default",
                         zIndex: 5,
@@ -28634,136 +28585,101 @@ function Board2Editor({
                           </div>
                         );
                       })()}
-                      {/* A shared note's likes, on the note as the original boards' votes were: the count
-                          beside the heart, right-aligned in the row below its text, scaled with the
-                          note. Only notes the server has can be liked; too small on screen, none. */}
-                      {joinCode && sticky?.likesRow && !isEditing && joinBaseAuthors.has(ann.id) && Math.max(sticky.frame.boardW, sticky.frame.boardH) * boardZoom >= (isMobile ? 44 : 24) && (() => {
-                        const row = sticky.likesRow;
-                        const likers = boardLikes[ann.id] ?? [];
-                        return (
-                          <BoardItemLikes
-                            onNote
-                            count={likers.length}
-                            mine={!!participantId && likers.includes(participantId)}
-                            touch={isMobile}
-                            itemName="sticky note"
-                            onToggle={viewOnly ? undefined : () => { void toggleBoardLike(ann.id); }}
-                            style={{
-                              position: "absolute", zIndex: 1,
-                              left: (row.boardX - shown.boardX) * boardZoom, top: (row.boardY - shown.boardY) * boardZoom,
-                              width: row.boardW * boardZoom, height: row.boardH * boardZoom,
-                              fontSize: (shown.fontSize ?? 80) * boardZoom,
-                            }}
-                          />
-                        );
-                      })()}
-                      {/* The note's drawn frame (or the whole item), which its selection chrome hangs off. */}
-                      <div data-selection-chrome style={chromeFrame ? {
-                        position: "absolute",
-                        left: (chromeFrame.boardX - shown.boardX) * boardZoom, top: (chromeFrame.boardY - shown.boardY) * boardZoom,
-                        width: chromeFrame.boardW * boardZoom, height: chromeFrame.boardH * boardZoom,
-                        borderRadius: chromeFrame.radius * boardZoom,
-                        outline: chromeOutline, outlineOffset: Math.max(2, 3 * chromeScale),
-                        // Clicks on the note itself (and its typing area) go through; the controls opt back in.
-                        pointerEvents: "none",
-                      } : { position: "absolute", inset: 0, pointerEvents: "none" }}>
-                        {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
-                        {ann.type === "sticky" && (showHandles || isEditing) && canEdit && (
-                          <div
-                            role="radiogroup"
-                            aria-label="Note color"
-                            data-sticky-colors
-                            onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
-                            style={{ position: "absolute", pointerEvents: "auto", left: "50%", top: `calc(100% + ${isMobile ? 14 : 10}px)`, transform: "translateX(-50%)", zIndex: 25, display: "flex", gap: isMobile ? 2 : 6, padding: isMobile ? 2 : 6, borderRadius: 999, background: "#fff", boxShadow: "0 4px 14px rgba(42,42,42,.18)", touchAction: "manipulation" }}
-                          >
-                            {STICKY_NOTE_COLORS.map(({ color, name }) => {
-                              const checked = (ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR) === color;
-                              return (
-                                <button
-                                  key={color}
-                                  type="button"
-                                  role="radio"
-                                  aria-checked={checked}
-                                  aria-label={name}
-                                  title={name}
-                                  onClick={(e) => { e.stopPropagation(); setStickyNoteColor(ann.id, color); }}
-                                  style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
-                                />
-                              );
-                            })}
-                          </div>
-                        )}
-                        {/* Resize handles */}
-                        {showHandles && (
-                          ann.type === "arrow" && ann.arrowStartX !== undefined ? (
-                            // Arrow: two endpoint handles
-                            (["start", "end"] as const).map((which) => {
-                              const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
-                              const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
-                              const { half, ...handle } = boardHandleStyle(isMobile, 12, true);
-                              return (
-                                <div key={which} data-resize-handle style={{
-                                  position: "absolute", left: hx - half, top: hy - half,
-                                  ...handle,
-                                  cursor: "move", zIndex: 20, pointerEvents: "auto",
-                                }}
-                                onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
-                              );
-                            })
-                          ) : (
-                            // All other types: four corner handles
-                            (["nw", "ne", "sw", "se"] as const).map((corner) => {
-                              const { half, ...handle } = boardHandleStyle(isMobile, handlePx);
-                              return (
-                              <div key={corner} data-resize-handle style={{
-                                position: "absolute",
-                                ...(corner === "nw" ? { left: -half, top: -half } :
-                                    corner === "ne" ? { right: -half, top: -half } :
-                                    corner === "sw" ? { left: -half, bottom: -half } :
-                                                      { right: -half, bottom: -half }),
+                      {/* A sticky note's color choices, under the note while it's selected or being typed in. */}
+                      {ann.type === "sticky" && (showHandles || isEditing) && canEdit && (
+                        <div
+                          role="radiogroup"
+                          aria-label="Note color"
+                          data-sticky-colors
+                          onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                          style={{ position: "absolute", left: "50%", top: `calc(100% + ${isMobile ? 14 : 10}px)`, transform: "translateX(-50%)", zIndex: 25, display: "flex", gap: isMobile ? 2 : 6, padding: isMobile ? 2 : 6, borderRadius: 999, background: "#fff", boxShadow: "0 4px 14px rgba(42,42,42,.18)", touchAction: "manipulation" }}
+                        >
+                          {STICKY_NOTE_COLORS.map(({ color, name }) => {
+                            const checked = (ann.noteColor ?? DEFAULT_STICKY_NOTE_COLOR) === color;
+                            return (
+                              <button
+                                key={color}
+                                type="button"
+                                role="radio"
+                                aria-checked={checked}
+                                aria-label={name}
+                                title={name}
+                                onClick={(e) => { e.stopPropagation(); setStickyNoteColor(ann.id, color); }}
+                                style={{ width: isMobile ? 40 : 22, height: isMobile ? 40 : 22, padding: 0, border: 0, borderRadius: "50%", cursor: "pointer", background: `radial-gradient(circle, ${color} 0 ${isMobile ? 11 : 9}px, ${checked ? "#1E8C83" : "rgba(42,42,42,.15)"} ${isMobile ? 11 : 9}px ${isMobile ? 13 : 11}px, transparent ${isMobile ? 13 : 11}px)` }}
+                              />
+                            );
+                          })}
+                        </div>
+                      )}
+                      {/* Resize handles */}
+                      {showHandles && (
+                        ann.type === "arrow" && ann.arrowStartX !== undefined ? (
+                          // Arrow: two endpoint handles
+                          (["start", "end"] as const).map((which) => {
+                            const hx = ((which === "start" ? ann.arrowStartX! : ann.arrowEndX!) - ann.boardX) * boardZoom;
+                            const hy = ((which === "start" ? ann.arrowStartY! : ann.arrowEndY!) - ann.boardY) * boardZoom;
+                            const { half, ...handle } = boardHandleStyle(isMobile, 12, true);
+                            return (
+                              <div key={which} data-resize-handle style={{
+                                position: "absolute", left: hx - half, top: hy - half,
                                 ...handle,
-                                cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
-                                zIndex: 20, pointerEvents: "auto",
+                                cursor: "move", zIndex: 20,
                               }}
-                              onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
-                              );
-                            })
-                          )
-                        )}
-                        {showReply && (
-                          <button
-                            type="button"
-                            aria-label="Reply to this note"
-                            title="Reply"
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => { e.stopPropagation(); addStickyReply(ann); }}
-                            style={{ position: "absolute", pointerEvents: "auto", left: "100%", top: "50%", transform: `translate(${isMobile ? 10 : 8}px, -50%)`, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 10px", borderRadius: 999, border: "2px solid #fff", background: "#1E8C83", color: "#fff", fontSize: isMobile ? 16 : 12, fontWeight: 600, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap" }}
-                          >↳ Reply</button>
-                        )}
-                        {showHandles && (
-                          <button
-                            type="button"
-                            aria-label="Delete annotation"
-                            title="Delete annotation"
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
-                            style={{ position: "absolute", pointerEvents: "auto", left: "50%", top: isMobile ? -52 : -(deletePx + 2), transform: "translateX(-50%)", width: deletePx, height: deletePx, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : Math.round(14 * chromeScale), lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
-                          >✕</button>
-                        )}
-                      </div>
+                              onPointerDown={(e) => handleArrowEndpointDrag(e, ann, which)} />
+                            );
+                          })
+                        ) : (
+                          // All other types: four corner handles
+                          (["nw", "ne", "sw", "se"] as const).map((corner) => {
+                            const { half, ...handle } = boardHandleStyle(isMobile, 10);
+                            return (
+                            <div key={corner} data-resize-handle style={{
+                              position: "absolute",
+                              ...(corner === "nw" ? { left: -half, top: -half } :
+                                  corner === "ne" ? { right: -half, top: -half } :
+                                  corner === "sw" ? { left: -half, bottom: -half } :
+                                                    { right: -half, bottom: -half }),
+                              ...handle,
+                              cursor: corner === "nw" || corner === "se" ? "nwse-resize" : "nesw-resize",
+                              zIndex: 20,
+                            }}
+                            onPointerDown={(e) => { e.stopPropagation(); handleAnnotationCornerResize(e, ann, corner); }} />
+                            );
+                          })
+                        )
+                      )}
+                      {showReply && (
+                        <button
+                          type="button"
+                          aria-label="Reply to this note"
+                          title="Reply"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); addStickyReply(ann); }}
+                          style={{ position: "absolute", left: "100%", top: "50%", transform: `translate(${isMobile ? 10 : 8}px, -50%)`, height: isMobile ? 44 : 28, padding: isMobile ? "0 14px" : "0 10px", borderRadius: 999, border: "2px solid #fff", background: "#1E8C83", color: "#fff", fontSize: isMobile ? 16 : 12, fontWeight: 600, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)", whiteSpace: "nowrap" }}
+                        >↳ Reply</button>
+                      )}
+                      {showHandles && (
+                        <button
+                          type="button"
+                          aria-label="Delete annotation"
+                          title="Delete annotation"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => { e.stopPropagation(); confirmDeleteAnnotation(ann.id); }}
+                          style={{ position: "absolute", left: "50%", top: isMobile ? -52 : -30, transform: "translateX(-50%)", width: isMobile ? 44 : 28, height: isMobile ? 44 : 28, borderRadius: "50%", border: "2px solid #fff", background: "#cc2200", color: "#fff", fontSize: isMobile ? 20 : 14, lineHeight: 1, cursor: "pointer", zIndex: 25, touchAction: "manipulation", boxShadow: "0 1px 4px rgba(0,0,0,.35)" }}
+                        >✕</button>
+                      )}
                     </div>
                   );
                 })}
 
-                {/* Likes on shared images, videos and text: the count and heart in a small pill tucked
-                    LIKES_GAP_PX under the item's bottom-right corner, so they read as part of it
-                    without covering it. (Sticky notes carry theirs on the note, below the text.) Only
-                    items the server has (synced) can be liked; a selected item's resize handle sits
-                    on that corner, so its likes drop below the handle. Items too small on screen to
-                    tell whose likes are whose show none until zoomed in. */}
+                {/* Likes, hanging just below each shared item's bottom-right corner so they never cover
+                    it. Only items the server has (synced) can be liked; a selected item's resize
+                    handle sits on that corner, so its likes drop below the handle. Items too small on
+                    screen to tell whose likes are whose show none until zoomed in; small ones get the
+                    one-heart-and-count form. */}
                 {joinCode && [
                   ...visibleBoardClips.filter((clip) => clip.type !== "customZoom").map((clip) => ({ id: clip.id, name: clip.name, x: clip.boardX!, y: clip.boardY!, w: clip.boardW!, h: clip.boardH!, selected: clip.id === selectedClipId || selectedClipIds.includes(clip.id) })),
-                  ...displayedAnnotations.filter((ann) => ann.type !== "sticky").map((ann) => ({ id: ann.id, name: ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
+                  ...displayedAnnotations.map((ann) => ({ id: ann.id, name: ann.type === "sticky" ? "sticky note" : ann.type === "text" ? "text" : ann.type, x: ann.boardX, y: ann.boardY, w: ann.boardW, h: ann.boardH, selected: ann.id === selectedAnnotationId || selectedAnnotationIds.includes(ann.id) })),
                 ].filter((item) => joinBaseAuthors.has(item.id) && Math.max(item.w, item.h) * boardZoom >= (isMobile ? 44 : 24)).map((item) => {
                   const likers = boardLikes[item.id] ?? [];
                   const handle = item.selected ? (isMobile ? 22 : BOARD_RESIZE_PX / 2) : 0;
@@ -28772,10 +28688,11 @@ function Board2Editor({
                       key={`likes-${item.id}`}
                       count={likers.length}
                       mine={!!participantId && likers.includes(participantId)}
+                      compact={item.w * boardZoom < 110}
                       touch={isMobile}
                       itemName={item.name}
                       onToggle={viewOnly ? undefined : () => { void toggleBoardLike(item.id); }}
-                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + LIKES_GAP_PX, transform: "translateX(-100%)", zIndex: 7 }}
+                      style={{ position: "absolute", left: (item.x + item.w) * boardZoom, top: (item.y + item.h) * boardZoom + handle + 2, transform: "translateX(-100%)", zIndex: 7 }}
                     />
                   );
                 })}
