@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="153.5 139.5 853.1 853.1">
+  <defs>
+    <linearGradient id="L0" gradientUnits="userSpaceOnUse" x1="471.8" y1="441.5" x2="412.4" y2="275.9"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#2DD4BF"/></linearGradient>
+    <linearGradient id="L1" gradientUnits="userSpaceOnUse" x1="537.0" y1="457.3" x2="627.6" y2="372.8"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#38BDF8"/></linearGradient>
+    <linearGradient id="L2" gradientUnits="userSpaceOnUse" x1="553.1" y1="493.4" x2="831.7" y2="468.1"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#4F7DF7"/></linearGradient>
+    <linearGradient id="L3" gradientUnits="userSpaceOnUse" x1="431.6" y1="503.4" x2="318.0" y2="511.7"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#06B6D4"/></linearGradient>
+    <linearGradient id="L4" gradientUnits="userSpaceOnUse" x1="526.2" y1="549.7" x2="591.0" y2="646.8"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#60A5FA"/></linearGradient>
+    <linearGradient id="L5" gradientUnits="userSpaceOnUse" x1="470.1" y1="555.7" x2="346.8" y2="869.3"><stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#7C8CF8"/></linearGradient>
+  </defs>
+  <line x1="471.8" y1="441.5" x2="412.4" y2="275.9" stroke="url(#L0)" stroke-width="13" stroke-linecap="round"/>
+  <line x1="537.0" y1="457.3" x2="627.6" y2="372.8" stroke="url(#L1)" stroke-width="13" stroke-linecap="round"/>
+  <line x1="553.1" y1="493.4" x2="831.7" y2="468.1" stroke="url(#L2)" stroke-width="13" stroke-linecap="round"/>
+  <line x1="431.6" y1="503.4" x2="318.0" y2="511.7" stroke="url(#L3)" stroke-width="13" stroke-linecap="round"/>
+  <line x1="526.2" y1="549.7" x2="591.0" y2="646.8" stroke="url(#L4)" stroke-width="13" stroke-linecap="round"/>
+  <line x1="470.1" y1="555.7" x2="346.8" y2="869.3" stroke="url(#L5)" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="492.4" cy="499.0" r="65.0" fill="#22D3EE"/>
+  <circle cx="393.6" cy="223.4" r="59.8" fill="#2DD4BF"/>
+  <circle cx="648.4" cy="353.4" r="32.5" fill="#38BDF8"/>
+  <circle cx="875.6" cy="464.1" r="48.1" fill="#4F7DF7"/>
+  <circle cx="279.2" cy="514.6" r="42.9" fill="#06B6D4"/>
+  <circle cx="606.8" cy="670.6" r="32.5" fill="#60A5FA"/>
+  <circle cx="328.7" cy="915.1" r="53.3" fill="#7C8CF8"/>
+</svg>
