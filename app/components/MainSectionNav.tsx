@@ -13,13 +13,15 @@ const sections: Array<{ id: MainSection; href: string; label: string; icon: stri
   { id: "board", href: "/board2?mobileEditor=1", label: "Board", icon: "✎" },
   { id: "clips", href: "/clips", label: "Clips", icon: "✂" },
   { id: "projects", href: "/projects", label: "Projects", icon: "☁" },
+  { id: "boards", href: "/boards", label: "My Boards", icon: "▤" },
   { id: "library", href: "/board2/library", label: "Library", icon: "▦" },
 ];
 
 export function MainSectionNav({ active, desktopOnly = false }: { active: MainSection; desktopOnly?: boolean }) {
   const [open, setOpen] = useState(false);
   const { data: session } = useSession(); const owner = session?.user?.email === ADMIN_EMAIL;
-  const visibleSections = owner ? sections : sections.filter((section) => section.id === "public");
+  // Everyone can join a board; any signed-in account can list its own boards; the rest is admin-only.
+  const visibleSections = owner ? sections : sections.filter((section) => section.id === "public" || (section.id === "boards" && !!session?.user?.email));
   const links = visibleSections.map((section) => (
     <Link key={section.id} href={section.href} aria-current={section.id === active ? "page" : undefined} className={styles.link} onClick={() => setOpen(false)}>
       <span aria-hidden="true">{section.icon}</span> {section.label}
