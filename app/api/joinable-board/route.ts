@@ -3,7 +3,7 @@ import { getServerSession } from "next-auth";
 import { NextResponse } from "next/server";
 import { authOptions } from "@/lib/auth";
 import { getSupabase } from "@/lib/supabase";
-import { ANONYMOUS_BOARD_TTL_DAYS, generateJoinCode, normalizeJoinCode, parseBoardType, type JoinableBoardState } from "@/lib/joinable-board";
+import { generateJoinCode, newBoardExpiresAt, normalizeJoinCode, parseBoardType, type JoinableBoardState } from "@/lib/joinable-board";
 import { joinableBoardError, joinTokenHash, participantIdFromToken, unexpiredBoardFilter } from "@/lib/joinable-board-server";
 import { checkJoinerUpdate, withStoredBoardType } from "@/lib/joinable-board-permissions";
 import { withStoredLikes } from "@/lib/joinable-board-likes";
@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     const session = await getServerSession(authOptions);
     const ownerEmail = session?.user?.email ?? null;
     const token = crypto.randomBytes(24).toString("base64url");
-    const expiresAt = ownerEmail ? null : new Date(Date.now() + ANONYMOUS_BOARD_TTL_DAYS * 86_400_000).toISOString();
+    const expiresAt = newBoardExpiresAt(ownerEmail);
     for (let attempt = 0; attempt < 8; attempt++) {
       const code = generateJoinCode();
       const { error } = await getSupabase().from("joinable_boards").insert({ code, owner_email: ownerEmail, owner_token_hash: joinTokenHash(token), expires_at: expiresAt, state: { boardType } });

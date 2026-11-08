@@ -3,6 +3,15 @@ export const JOIN_CODE_LENGTH = 6;
 export const ANONYMOUS_BOARD_TTL_DAYS = 5;
 export const JOINABLE_BOARD_UNAVAILABLE = "Board sharing is temporarily unavailable.";
 
+/**
+ * Expiry for a newly created board. A board created while signed in belongs to that account and
+ * never expires (null), as after a claim: cleanup-expired only deletes ownerless rows, so an owned
+ * board with an expiry would become unreadable while its row survived.
+ */
+export function newBoardExpiresAt(ownerEmail: string | null, now = Date.now()): string | null {
+  return ownerEmail ? null : new Date(now + ANONYMOUS_BOARD_TTL_DAYS * 86_400_000).toISOString();
+}
+
 export function normalizeJoinCode(value: unknown): string {
   return String(value ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, JOIN_CODE_LENGTH);
 }
