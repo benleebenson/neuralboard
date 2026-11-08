@@ -57,6 +57,18 @@ export function parseBoardType(value: unknown): BoardType {
   return value === "simple" ? "simple" : "neural";
 }
 
+/** A board in the signed-in owner's list (GET /api/joinable-board/mine). */
+export type OwnedBoardSummary = { code: string; title: string; updatedAt: string; boardType: BoardType };
+
+/**
+ * Board state has no title today, so the join code stands in; a non-blank string `title` in the
+ * state is used if one is ever stored.
+ */
+export function ownedBoardSummary(row: { code: string; updated_at: string; title?: unknown; boardType?: unknown }): OwnedBoardSummary {
+  const title = typeof row.title === "string" && row.title.trim() ? row.title.trim() : row.code;
+  return { code: row.code, title, updatedAt: row.updated_at, boardType: parseBoardType(row.boardType) };
+}
+
 export type JoinableBoardState = {
   clips: Array<Record<string, unknown>>;
   annotations: Array<Record<string, unknown>>;
