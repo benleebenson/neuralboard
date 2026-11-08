@@ -6,7 +6,7 @@ import { useSession } from "next-auth/react";
 import { ADMIN_EMAIL } from "@/lib/admin";
 import styles from "./MainSectionNav.module.css";
 
-export type MainSection = "board" | "clips" | "projects" | "library" | "public";
+export type MainSection = "board" | "clips" | "projects" | "boards" | "library" | "public";
 
 const sections: Array<{ id: MainSection; href: string; label: string; icon: string }> = [
   { id: "public", href: "/public", label: "Join Board", icon: "◎" },
