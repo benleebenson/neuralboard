@@ -16,6 +16,13 @@ export function editorBoardUrl(fileName: string): string {
   return `/board2?${EDITOR_BOARD_PARAM}=${encodeURIComponent(fileName)}&mobileEditor=1`;
 }
 
+/** Editor query param naming a published board to open in the video editor as the viewer's own copy. */
+export const PUBLISHED_EDIT_PARAM = "edit";
+
+export function publishedBoardEditorUrl(id: string): string {
+  return `/board2?${PUBLISHED_EDIT_PARAM}=${encodeURIComponent(id)}&mobileEditor=1`;
+}
+
 export function rememberedShellTab(): ShellTab {
   try {
     return sessionStorage.getItem(SHELL_TAB_STORAGE_KEY) === "profile" ? "profile" : "home";

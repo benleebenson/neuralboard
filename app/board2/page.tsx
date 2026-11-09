@@ -42,7 +42,7 @@ import {
   type AnimatedImage,
 } from "@/lib/board2/animated-image";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
-import { EDITOR_BOARD_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
+import { EDITOR_BOARD_PARAM, PUBLISHED_EDIT_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, listBoards, loadStarredBoardStyleSummaries, safeBoardFilename, supportsBoardDirectory, writeBoardFile, type BoardLibraryEntry } from "@/lib/board-library";
 import { takeClipBoardHandoff, type ClipBoardHandoff } from "@/lib/clip-finder/handoff";
 import { takeProjectImageHandoff } from "@/lib/project-image-handoff";
@@ -6208,6 +6208,8 @@ type BoardWorkspaceStatus = {
 type ActiveBoard = BoardWorkspaceStatus & {
   sourceFileName?: string;
   initialFile?: File;
+  /** initialFile is a copy of someone's public board: it has no boards-folder file until saved. */
+  detachedCopy?: boolean;
   /** Opened by the app shell's +: run "Make board joinable" once on mount. */
   makeJoinable?: boolean;
   /** The type picked at the shell's + (old school or Neural). */
@@ -6233,8 +6235,8 @@ function currentEditorUrl(): string {
 }
 
 function createActiveBoard(
-  source?: { file: File; fileName: string; name: string },
-  options: { fresh?: boolean; makeJoinable?: boolean; boardType?: BoardType } = {},
+  source?: { file: File; fileName?: string; name: string },
+  options: { fresh?: boolean; makeJoinable?: boolean; boardType?: BoardType; detachedCopy?: boolean } = {},
 ): ActiveBoard {
   const local = !source && !options.fresh;
   return {
@@ -6246,6 +6248,7 @@ function createActiveBoard(
     isDirty: false,
     sourceFileName: source?.fileName,
     initialFile: source?.file,
+    detachedCopy: options.detachedCopy,
     makeJoinable: options.makeJoinable,
     boardType: options.boardType,
   };
@@ -6256,6 +6259,8 @@ export default function Board2Page() {
   // A published board id (?view=) opens the read-only viewer instead of the editor. Null until
   // hydrated, so the autosaved board never mounts — even briefly — underneath a viewer.
   const [viewBoardId, setViewBoardId] = useState<string | null>(null);
+  // A published board id (?edit=) still downloading, to open in the video editor as this person's own copy.
+  const [editBoardId, setEditBoardId] = useState<string | null>(null);
   const [board, setBoard] = useState<ActiveBoard>(() => createActiveBoard());
   // Query-derived initial state is applied after hydration so server/client markup stays aligned.
   useEffect(() => {
@@ -6273,6 +6278,8 @@ export default function Board2Page() {
     }
     const view = url.searchParams.get("view");
     setViewBoardId(validPublishedBoardId(view) ? view : "");
+    const edit = url.searchParams.get(PUBLISHED_EDIT_PARAM);
+    setEditBoardId(validPublishedBoardId(edit) ? edit : null);
   }, []);
   // "Chrome hidden" is the closed-editor state: only the board (and the wider board space) shows.
   // Read on the client's first render; the server and hydration pass render a blank shell anyway.
@@ -6281,6 +6288,7 @@ export default function Board2Page() {
     // Shared boards are boards first: a new one (+) and a joined one open on the board, not the
     // video editor, which the owner can open from the top bar.
     const params = new URLSearchParams(window.location.search);
+    if (params.get(PUBLISHED_EDIT_PARAM)) return false;
     if (params.get("join") || params.get("create") === "joinable") return true;
     try { return window.localStorage.getItem(EDITOR_OPEN_STORAGE_KEY) !== "1"; } catch { return true; }
   });
@@ -6368,8 +6376,11 @@ export default function Board2Page() {
     const fileName = board.id !== BOARD_AUTOSAVE_WORKSPACE_ID ? board.sourceFileName : undefined;
     const url = new URL(window.location.href);
     if ((url.searchParams.get(EDITOR_BOARD_PARAM) ?? undefined) === fileName) return;
-    if (fileName) url.searchParams.set(EDITOR_BOARD_PARAM, fileName);
-    else url.searchParams.delete(EDITOR_BOARD_PARAM);
+    if (fileName) {
+      url.searchParams.set(EDITOR_BOARD_PARAM, fileName);
+      // A saved copy of a public board now reopens from its own file, keeping its edits.
+      url.searchParams.delete(PUBLISHED_EDIT_PARAM);
+    } else url.searchParams.delete(EDITOR_BOARD_PARAM);
     window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
   }, [board.id, board.sourceFileName, boardReopen, urlBoardRestoring, viewBoardId]);
 
@@ -6404,8 +6415,16 @@ export default function Board2Page() {
     setChromeHidden(false);
   }, [board.sourceFileName, confirmDiscardBoard]);
 
+  // No file name: this copy isn't in the boards folder, so saving it can never overwrite one by name.
+  const openPublishedBoardCopy = useCallback((file: File, title: string) => {
+    setBoard(createActiveBoard({ file, name: title }, { detachedCopy: true }));
+    setEditBoardId(null);
+    setChromeHidden(false);
+  }, []);
+
   if (viewBoardId === null) return <div style={{ height: "100dvh", background: BOARD_SURFACE_COLOR }} />;
   if (viewBoardId) return <PublishedBoardViewer id={viewBoardId} />;
+  if (editBoardId) return <PublishedBoardOpener id={editBoardId} onReady={openPublishedBoardCopy} />;
 
   return (
     <div style={{ height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
@@ -6427,6 +6446,7 @@ export default function Board2Page() {
             initialJoinCode={board.id === BOARD_AUTOSAVE_WORKSPACE_ID ? initialJoinCode : ""}
             initialFile={board.initialFile}
             initialFileName={board.sourceFileName}
+            initialFileDetached={board.detachedCopy === true}
             autoMakeJoinable={board.makeJoinable === true}
             initialBoardType={board.boardType}
             onWorkspaceStatus={updateBoardStatus}
@@ -6456,8 +6476,7 @@ type PublishedViewState =
   | { kind: "error"; message: string }
   | { kind: "ready"; file: File; title: string };
 
-/** Read-only view of a board from the Home feed: downloads its published package and shows it in a locked editor. */
-function PublishedBoardViewer({ id }: { id: string }) {
+function usePublishedBoardFile(id: string): PublishedViewState {
   const [state, setState] = useState<PublishedViewState>({ kind: "loading", fraction: null });
   useEffect(() => {
     const controller = new AbortController();
@@ -6489,25 +6508,42 @@ function PublishedBoardViewer({ id }: { id: string }) {
     return () => controller.abort();
   }, [id]);
 
-  if (state.kind !== "ready") {
-    return (
-      <main style={{ height: "100dvh", display: "grid", placeItems: "center", padding: 16, background: BOARD_SURFACE_COLOR, color: "#2a2a2a", fontFamily: "monospace" }}>
-        <div style={{ width: "min(360px, 100%)", textAlign: "center", fontSize: 13, lineHeight: 1.6 }}>
-          {state.kind === "loading" ? (
-            <>
-              <div style={{ fontWeight: 800 }}>Loading board{state.fraction === null ? "…" : ` ${Math.round(state.fraction * 100)}%`}</div>
-              <div aria-hidden="true" style={{ height: 6, marginTop: 10, border: "1.5px solid #2a2a2a", background: "#fffdf5" }}>
-                <div style={{ width: `${Math.round((state.fraction ?? 0) * 100)}%`, height: "100%", background: "#c8f135", transition: "width .2s ease" }} />
-              </div>
-            </>
-          ) : (
-            <div role="alert" style={{ fontWeight: 800 }}>{state.message}</div>
-          )}
-          <Link href="/" style={{ display: "inline-block", marginTop: 16, color: "#2a2a2a", fontWeight: 800 }}>← Home</Link>
-        </div>
-      </main>
-    );
-  }
+  return state;
+}
+
+function PublishedBoardLoadScreen({ state }: { state: Exclude<PublishedViewState, { kind: "ready" }> }) {
+  return (
+    <main style={{ height: "100dvh", display: "grid", placeItems: "center", padding: 16, background: BOARD_SURFACE_COLOR, color: "#2a2a2a", fontFamily: "monospace" }}>
+      <div style={{ width: "min(360px, 100%)", textAlign: "center", fontSize: 13, lineHeight: 1.6 }}>
+        {state.kind === "loading" ? (
+          <>
+            <div style={{ fontWeight: 800 }}>Loading board{state.fraction === null ? "…" : ` ${Math.round(state.fraction * 100)}%`}</div>
+            <div aria-hidden="true" style={{ height: 6, marginTop: 10, border: "1.5px solid #2a2a2a", background: "#fffdf5" }}>
+              <div style={{ width: `${Math.round((state.fraction ?? 0) * 100)}%`, height: "100%", background: "#c8f135", transition: "width .2s ease" }} />
+            </div>
+          </>
+        ) : (
+          <div role="alert" style={{ fontWeight: 800 }}>{state.message}</div>
+        )}
+        <Link href="/" style={{ display: "inline-block", marginTop: 16, color: "#2a2a2a", fontWeight: 800 }}>← Home</Link>
+      </div>
+    </main>
+  );
+}
+
+/** Opens a board from the Home feed in the video editor, as a copy that never writes back to the original. */
+function PublishedBoardOpener({ id, onReady }: { id: string; onReady: (file: File, title: string) => void }) {
+  const state = usePublishedBoardFile(id);
+  useEffect(() => {
+    if (state.kind === "ready") onReady(state.file, state.title);
+  }, [onReady, state]);
+  return <PublishedBoardLoadScreen state={state.kind === "ready" ? { kind: "loading", fraction: 1 } : state} />;
+}
+
+/** Read-only view of a published board: downloads its package and shows it in a locked editor. */
+function PublishedBoardViewer({ id }: { id: string }) {
+  const state = usePublishedBoardFile(id);
+  if (state.kind !== "ready") return <PublishedBoardLoadScreen state={state} />;
   return (
     <div style={{ position: "relative", height: "100dvh", minHeight: 0, overflow: "hidden", background: BOARD_SURFACE_COLOR }}>
       <Board2Editor
@@ -6537,6 +6573,7 @@ function Board2Editor({
   initialJoinCode,
   initialFile,
   initialFileName,
+  initialFileDetached = false,
   autoMakeJoinable = false,
   initialBoardType = "neural",
   onWorkspaceStatus,
@@ -6556,6 +6593,7 @@ function Board2Editor({
   initialJoinCode: string;
   initialFile?: File;
   initialFileName?: string;
+  initialFileDetached?: boolean;
   autoMakeJoinable?: boolean;
   initialBoardType?: BoardType;
   onWorkspaceStatus: (status: BoardWorkspaceStatus) => void;
@@ -26578,7 +26616,7 @@ function Board2Editor({
       const files: Record<string, Uint8Array> = fromAutosave ? {} : unzipSync(new Uint8Array(await source.arrayBuffer()));
       if (!fromAutosave && !files["manifest.json"]) throw new Error("Not a valid .nbp file");
       const rawManifest = JSON.parse(fromAutosave ? source.autosaveJson : strFromU8(files["manifest.json"]));
-      if (!fromAutosave) {
+      if (!fromAutosave && !(initialFileDetached && source === initialFile)) {
         recipeLibraryFilenameRef.current = source.name;
         onWorkspaceSource(workspaceId, source.name);
       }

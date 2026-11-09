@@ -4,7 +4,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { signIn, useSession } from "next-auth/react";
 import { AccountControl } from "@/app/components/AccountControl";
 import { useIsPro } from "@/app/components/useIsPro";
-import { editorBoardUrl, rememberShellTab, type ShellTab } from "@/lib/app-shell";
+import { editorBoardUrl, publishedBoardEditorUrl, rememberShellTab, type ShellTab } from "@/lib/app-shell";
 import { type BoardLibraryEntry, getBoardsDirectory, listBoards, supportsBoardDirectory } from "@/lib/board-library";
 import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, JOIN_CODE_LENGTH, normalizeJoinCode, readCreatedBoards, type BoardType } from "@/lib/joinable-board";
 import { publishBoard, unpublishBoard, type PublishPhase } from "@/lib/published-board-package";
@@ -272,7 +272,7 @@ function HomeView({ query, onCreate }: { query: string; onCreate: () => void }) 
         <ul className={styles.feedGrid}>
           {boards.map((board) => (
             <li key={board.id} className={styles.feedItem}>
-              <a className={styles.card} href={viewUrl(board.id)} aria-label={`View ${board.title}`}>
+              <a className={styles.card} href={publishedBoardEditorUrl(board.id)} aria-label={`Open ${board.title} in the video editor`}>
                 <span className={styles.thumb}>
                   {/* eslint-disable-next-line @next/next/no-img-element -- signed Storage redirect */}
                   <img src={`/api/published-boards/${board.id}/preview`} alt="" loading="lazy" />
