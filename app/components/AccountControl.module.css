@@ -1,8 +1,7 @@
 .root{position:relative;min-width:0;font-family:var(--font-geist-mono),monospace}
-.trigger{display:flex;align-items:center;gap:6px;max-width:290px;min-height:27px;padding:3px 7px;border:1.5px solid #2a2a2a;background:#fffdf5;color:#2a2a2a;box-shadow:1.5px 1.5px 0 #2a2a2a;font:700 10px/1.2 var(--font-geist-mono),monospace;cursor:pointer}
+.trigger{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1.5px solid #2a2a2a;border-radius:50%;background:#fffdf5;color:#2a2a2a;box-shadow:1.5px 1.5px 0 #2a2a2a;font:800 14px/1 var(--font-geist-mono),monospace;cursor:pointer}
 .trigger:hover,.trigger:focus-visible{background:#f5f1e8;outline:2px solid #c8f135;outline-offset:1px}
-.triggerEmail{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#5b5b5b}
-.triggerBadge,.status{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;padding:2px 5px;border:1px solid #2a2a2a;border-radius:999px;font-size:8px;font-weight:900;letter-spacing:.5px}
+.status{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;padding:2px 5px;border:1px solid #2a2a2a;border-radius:999px;font-size:8px;font-weight:900;letter-spacing:.5px}
 .pro{background:#c8f135;color:#2a2a2a}
 .free{background:#fffdf5;color:#6a6a6a}
 .panel,.inlinePanel{color:#2a2a2a;font-family:var(--font-geist-mono),monospace}

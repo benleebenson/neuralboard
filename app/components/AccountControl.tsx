@@ -157,11 +157,11 @@ export function AccountControl({
         className={styles.trigger}
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-label={`Account: ${email}`}
+        title={email}
         onClick={() => setOpen((value) => !value)}
       >
-        <span className={styles.triggerEmail}>{email}</span>
-        {!isProLoading && <span className={`${styles.triggerBadge} ${isPro ? styles.pro : styles.free}`}>{isAdmin ? "OWNER" : isPro ? "PRO" : "UPGRADE"}</span>}
-        <span aria-hidden="true">⌄</span>
+        <span aria-hidden="true">{email.charAt(0).toUpperCase()}</span>
       </button>
       {open && panel}
     </div>

@@ -102,7 +102,7 @@ export function AppShell() {
             {user?.email ? (
               tab === "home" ? (
                 <button type="button" className={styles.avatarButton} aria-label="Your profile" title="Your profile" onClick={() => selectTab("profile")}>
-                  <Avatar label={userLabel} />
+                  <Avatar label={user.email.charAt(0)} />
                 </button>
               ) : (
                 <AccountControl email={user.email} isPro={isPro} isAdmin={isAdmin} isProLoading={isProLoading} />
