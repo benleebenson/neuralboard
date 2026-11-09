@@ -545,6 +545,9 @@ type Clip = {
   ytStart?: number;
   ytEnd?: number;
   needsRedownload?: boolean;
+  // Video clips only: the timeline block just restarts the board video from its beginning. It is
+  // never a camera stop or character destination; the video loops ambiently outside the block.
+  restartOnly?: boolean;
   // Image/video clips are board media projected into a timeline block. `featured: false`
   // means the board entity still exists but currently has no timeline appearance.
   // `mediaId` is persisted by timeline blocks so multiple blocks can reference one asset.
@@ -635,6 +638,10 @@ function isBoardBackedClip(clip: Clip): clip is Clip & { type: "image" | "video"
 
 function isFeaturedTimelineClip(clip: Clip): boolean {
   return !isBoardBackedClip(clip) || clip.featured !== false;
+}
+
+function isCameraStopClip(clip: Clip): boolean {
+  return isFeaturedTimelineClip(clip) && !clip.restartOnly;
 }
 
 type TranscriptSegment = { start: number; end: number; text: string };
@@ -2243,6 +2250,7 @@ type MediaItem = {
   duration?: number;
   blob?: Blob; // retained source bytes; videos use this to clone a fresh per-clip blob
   youtubeId?: string;
+  restartOnly?: boolean;
   ytStart?: number;
   ytEnd?: number;
   source?: ClipSource; // provenance passthrough for the resulting Clip; defaults to "manual"
@@ -4338,7 +4346,7 @@ function deriveAutoCharActions(
   outputH = CANVAS_H_LAND
 ): CharacterAction[] {
   const focusClips = clips
-    .filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined))
+    .filter((c) => isCameraStopClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined))
     .sort((a, b) => a.startTime - b.startTime);
   if (focusClips.length === 0) return [];
 
@@ -7167,7 +7175,7 @@ function Board2Editor({
   const previewRenderH = Math.max(1, Math.round(canvasH * previewRenderScale));
   const mobilePreviewH = Math.max(88, Math.min(150, previewHeight * 0.55));
   const mobilePreviewW = Math.round(mobilePreviewH * previewAspect);
-  const canGenerateCamera = clips.some((clip) => isFeaturedTimelineClip(clip) && (clip.boardX !== undefined || clip.type === "pan"));
+  const canGenerateCamera = clips.some((clip) => isCameraStopClip(clip) && (clip.boardX !== undefined || clip.type === "pan"));
   const boardImageCount = useMemo(
     () => boardEntitiesForDisplay(clips).filter((clip) => clip.type === "image").length,
     [clips],
@@ -9375,7 +9383,7 @@ function Board2Editor({
   }, [clips, characterActions, characterMode, characterType, charInit, cameraKeyframes, canvasW, canvasH]);
   const characterEntranceTime = useMemo(() => {
     if (characterMode !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    const focusClips = clips.filter((c) => isCameraStopClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
     if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
@@ -9400,7 +9408,7 @@ function Board2Editor({
   // pan-only (no media to flip onto, so he never appears) or -Infinity outside auto mode.
   const characterEntranceTime2 = useMemo(() => {
     if (characterMode2 !== "auto") return -Infinity;
-    const focusClips = clips.filter((c) => isFeaturedTimelineClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
+    const focusClips = clips.filter((c) => isCameraStopClip(c) && c.type !== "narration" && c.type !== "characterFocus" && (c.type === "pan" || c.boardX !== undefined));
     if (focusClips.length > 0 && focusClips.every((c) => c.type === "pan")) return Infinity;
     const entrance = resolvedCharActions2.find((a) => a.entranceFlip);
     return entrance ? entrance.startTime : -Infinity;
@@ -10726,8 +10734,13 @@ function Board2Editor({
   }
 
   function activeVideoWindow(clip: Clip, time: number): { start: number; end: number } | undefined {
-    return isFeaturedTimelineClip(clip) && time >= clip.startTime && time < clip.startTime + clip.duration
-      ? { start: clip.startTime, end: clip.startTime + clip.duration }
+    // A restart block outlasting its source hands back to the ambient loop instead of re-seeking past the end.
+    const sourceLeft = clip.restartOnly && clip.sourceDurationSec
+      ? Math.max(0, clip.sourceDurationSec - (clip.sourceOffsetSec ?? 0) - 0.05)
+      : Infinity;
+    const end = clip.startTime + Math.min(clip.duration, sourceLeft);
+    return isFeaturedTimelineClip(clip) && time >= clip.startTime && time < end
+      ? { start: clip.startTime, end }
       : undefined;
   }
 
@@ -11680,6 +11693,7 @@ function Board2Editor({
           youtubeId: item.youtubeId,
           ytStart: item.ytStart,
           ytEnd: item.ytEnd,
+          ...(item.restartOnly ? { restartOnly: true } : {}),
           source: item.source ?? "manual",
           ...(!shouldFeatureOnTimeline ? { mediaId: clipId, featured: false as const } : {}),
         },
@@ -16347,6 +16361,7 @@ function Board2Editor({
             youtubeId: ytSel.id,
             ytStart: start,
             ytEnd: end,
+            restartOnly: true,
             source: clipSource,
           });
         } else {
@@ -16363,7 +16378,7 @@ function Board2Editor({
               boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
               sourceDurationSec: meta.sourceDurationSec,
               sourceBlob: blob,
-              youtubeId: ytSel.id, ytStart: start, ytEnd: end,
+              youtubeId: ytSel.id, ytStart: start, ytEnd: end, restartOnly: true,
               source: clipSource,
             }];
           });
@@ -19300,7 +19315,7 @@ function Board2Editor({
       setCameraGenerationPhase(null);
     });
     const topicAwareClips = clipsRef.current
-      .filter((clip) => isFeaturedTimelineClip(clip) && clip.autoRole !== "annotationTarget" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
+      .filter((clip) => isFeaturedTimelineClip(clip) && !clip.restartOnly && clip.autoRole !== "annotationTarget" && clip.boardX !== undefined && clip.boardY !== undefined && clip.boardW !== undefined && clip.boardH !== undefined)
       .sort((a, b) => a.startTime - b.startTime || a.id.localeCompare(b.id));
     const hasTopicClusters = topicAwareClips.some((clip) => !!clip.autoTopicId);
     const hasPanBlocks = clipsRef.current.some((clip) => isFeaturedTimelineClip(clip) && clip.type === "pan");
@@ -19361,7 +19376,7 @@ function Board2Editor({
       }
     }
     const allClipsSorted = clipsRef.current
-      .filter((c) => isFeaturedTimelineClip(c) && (c.boardX !== undefined || c.type === "pan" || c.type === "characterFocus"))
+      .filter((c) => isFeaturedTimelineClip(c) && !c.restartOnly && (c.boardX !== undefined || c.type === "pan" || c.type === "characterFocus"))
       .sort((a, b) => a.startTime - b.startTime);
 
     if (allClipsSorted.length === 0) {
@@ -19767,7 +19782,7 @@ function Board2Editor({
 
   async function handleGenerateChoreography() {
     const allClips = clipsRef.current;
-    const boardClips = allClips.filter((c) => isFeaturedTimelineClip(c) && c.boardX !== undefined && (c.type === "image" || c.type === "video"));
+    const boardClips = allClips.filter((c) => isCameraStopClip(c) && c.boardX !== undefined && (c.type === "image" || c.type === "video"));
     if (boardClips.length === 0) { setChoreoError("Place some clips on the board first"); return; }
 
     const narrationClips = allClips.filter((c) => c.type === "narration");
@@ -20080,6 +20095,7 @@ function Board2Editor({
         sourceOffsetSec: clip.sourceOffsetSec,
         active,
         ambient: !active && ambientVideoEnabledRef.current,
+        continueFromClipStart: !!clip.restartOnly,
       });
       exportVideoFramesRef.current.set(clip.id, await seekAndDecodeVideoFrame(video, sourceTime));
     }
@@ -24495,7 +24511,7 @@ function Board2Editor({
           boardX: pos.boardX, boardY: pos.boardY, boardW: meta.w, boardH: meta.h,
           sourceDurationSec: meta.sourceDurationSec,
           sourceBlob: blob,
-          youtubeId, ytStart: start, ytEnd: end,
+          youtubeId, ytStart: start, ytEnd: end, restartOnly: true,
           source: "manual" as const,
         }];
       });

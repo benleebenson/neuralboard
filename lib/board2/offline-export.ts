@@ -60,12 +60,16 @@ export function deterministicVideoSourceTime(options: {
   sourceOffsetSec?: number;
   active: boolean;
   ambient: boolean;
+  // Restart blocks: once the block has started, the ambient loop carries on from where it left the video.
+  continueFromClipStart?: boolean;
 }): number {
   const sourceDuration = Math.max(0, options.sourceDuration);
   const lastDrawableTime = Math.max(0, sourceDuration - 0.001);
   let requested: number;
   if (options.active) {
     requested = (options.sourceOffsetSec ?? 0) + Math.max(0, options.timelineTime - options.clipStart);
+  } else if (options.ambient && sourceDuration > 0 && options.continueFromClipStart && options.timelineTime >= options.clipStart) {
+    requested = ((options.sourceOffsetSec ?? 0) + options.timelineTime - options.clipStart) % sourceDuration;
   } else if (options.ambient && sourceDuration > 0) {
     // Ambient motion is anchored to timeline zero, so seeking frame N in isolation returns the
     // same image as rendering every preceding frame. It never inherits a live element clock.
