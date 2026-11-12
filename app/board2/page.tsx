@@ -308,6 +308,7 @@ import {
   type ExportQuality,
 } from "@/lib/board2/export-encoding";
 import { describeExportFailure, discardPartialExport } from "@/lib/board2/export-file-sink";
+import { brokenExportMediaMessage, collectExportMedia, findBrokenExportMedia, probeMediaUrl } from "@/lib/board2/export-preflight";
 import {
   decodedImageBytes,
   previewCachePolicy as calculatePreviewCachePolicy,
@@ -20721,6 +20722,28 @@ function Board2Editor({
       await yieldForExportUi();
       if (!("VideoEncoder" in window) || !("AudioEncoder" in window) || !("VideoFrame" in window)) {
         throw new Error("This browser does not provide the WebCodecs video/audio APIs required for deterministic export");
+      }
+      // Before the save dialog (which creates the file): every referenced media source must load.
+      const exportMedia = collectExportMedia([...currentClips, ...noteImageClips(currentAnnotations)], [
+        { name: "character face", url: characterFaceImageRef.current?.src, kind: "image" as const },
+        { name: "second character face", url: characterFace2ImageRef.current?.src, kind: "image" as const },
+      ].filter((face) => face.url));
+      const brokenMedia = [
+        ...exportMedia.missing,
+        ...await findBrokenExportMedia(exportMedia.refs, (url) => probeMediaUrl(url, { fetch: (input, init) => fetch(input, init) }), {
+          onProgress: (checked, total) => setExportStatus({
+            stage: "choosing",
+            frame: 0,
+            totalFrames: requestedTotalFrames,
+            etaSeconds: Number.NaN,
+            detail: `Checking media… ${checked}/${total}`,
+          }),
+        }),
+      ];
+      if (exportCancelRef.current) throw new DOMException("Export cancelled", "AbortError");
+      if (brokenMedia.length > 0) {
+        console.error("[board2:export] pre-flight found unloadable media", brokenMedia);
+        throw new Error(brokenExportMediaMessage(brokenMedia));
       }
 
       const audioIsExpected = currentClips.some((clip) =>
