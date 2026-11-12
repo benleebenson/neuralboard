@@ -307,6 +307,7 @@ import {
   type ExportEncodingCandidate,
   type ExportQuality,
 } from "@/lib/board2/export-encoding";
+import { describeExportFailure, discardPartialExport } from "@/lib/board2/export-file-sink";
 import {
   decodedImageBytes,
   previewCachePolicy as calculatePreviewCachePolicy,
@@ -20712,6 +20713,8 @@ function Board2Editor({
     let videoEncoder: VideoEncoder | null = null;
     let audioEncoder: AudioEncoder | null = null;
     let wakeLock: WakeLockSentinel | null = null;
+    let pickerDismissed = false;
+    let failureMessage: string | null = null;
     try {
       // React needs an actual paint opportunity before capability probing, file picking, or asset
       // decoding begins. This is what makes the progress/cancel surface visible immediately.
@@ -20802,10 +20805,15 @@ function Board2Editor({
       const mimeType = selectedCandidate.container === "mp4" ? "video/mp4" : "video/webm";
       const savePicker = (window as SavePickerWindow).showSaveFilePicker;
       if (savePicker) {
-        fileHandle = await savePicker.call(window, {
-          suggestedName: `board2-export.${extension}`,
-          types: [{ description: selectedCandidate.container === "mp4" ? "MP4 video" : "WebM video", accept: { [mimeType]: [`.${extension}`] } }],
-        });
+        try {
+          fileHandle = await savePicker.call(window, {
+            suggestedName: `board2-export.${extension}`,
+            types: [{ description: selectedCandidate.container === "mp4" ? "MP4 video" : "WebM video", accept: { [mimeType]: [`.${extension}`] } }],
+          });
+        } catch (error) {
+          pickerDismissed = true;
+          throw error;
+        }
       }
 
       const exportCanvas = document.createElement("canvas");
@@ -20974,6 +20982,7 @@ function Board2Editor({
       if (writable) {
         await writable.close();
         writable = null;
+        fileHandle = null; // committed: nothing for the failure path to delete
       } else if (outputBuffer) {
         deliverExportedVideo(new Blob([outputBuffer()], { type: mimeType }), `board2-export.${extension}`);
       }
@@ -20982,15 +20991,21 @@ function Board2Editor({
         ? `Exported ${extension.toUpperCase()} at ${W}×${H}, ${fps} fps. ${fallbackNotice}`
         : `Exported ${totalFrames.toLocaleString()} deterministic frames at ${W}×${H}, ${fps} fps`);
     } catch (error) {
-      await writable?.abort().catch(() => {});
+      // Abort (never close) the stream and delete the file the save dialog created, so a failed
+      // export can't leave a real-looking 0-byte video behind (lib/board2/export-file-sink).
+      const fileName = fileHandle?.name;
+      const cleanup = await discardPartialExport(fileHandle, writable, error);
       writable = null;
-      if (error instanceof DOMException && error.name === "AbortError") {
-        if (exportCancelRef.current) setToast("Export cancelled");
-      }
-      else setToast(error instanceof Error ? error.message : "Export failed");
+      fileHandle = null;
+      const report = describeExportFailure(error, { userCancelled: exportCancelRef.current, pickerDismissed, cleanup, fileName });
+      if (report.kind !== "silent") console.error("[board2:export] export failed", { cleanup, error });
+      if (report.kind === "cancelled") setToast(report.message);
+      else if (report.kind === "error") failureMessage = report.message;
     } finally {
-      videoEncoder?.close();
-      audioEncoder?.close();
+      // A codec that hit an error is already closed, and close() on it throws — which would skip
+      // the rest of this cleanup and leave the editor stuck in "exporting".
+      if (videoEncoder && videoEncoder.state !== "closed") videoEncoder.close();
+      if (audioEncoder && audioEncoder.state !== "closed") audioEncoder.close();
       await wakeLock?.release().catch(() => {});
       releaseOfflineRenderAssets();
       stopAllVideoPlayback("offline-export-ended");
@@ -20999,6 +21014,11 @@ function Board2Editor({
       setExportProgress(0);
       setExportStatus(null);
       drawFrameRef.current(playheadRef.current);
+    }
+    if (failureMessage) {
+      // A 3-second toast is too easy to miss for a failed export; show the actual error until dismissed.
+      await yieldForExportUi();
+      window.alert(failureMessage);
     }
   }
 
