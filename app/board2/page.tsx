@@ -311,7 +311,10 @@ import { describeExportFailure, discardPartialExport } from "@/lib/board2/export
 import { createTaskQueue, imageForAssetUpload } from "@/lib/board2/asset-autosave";
 import { brokenExportMediaMessage, collectExportMedia, findBrokenExportMedia, probeMediaUrl } from "@/lib/board2/export-preflight";
 import {
+  PREVIEW_CACHE_PROTECT_MS,
+  createFailedSourceMemo,
   decodedImageBytes,
+  trimTieredCache,
   previewCachePolicy as calculatePreviewCachePolicy,
   type PreviewCachePolicy,
 } from "@/lib/board2/image-cache-policy";
@@ -7317,6 +7320,11 @@ function Board2Editor({
   const placementImageDecodeRef = useRef<Map<string, Promise<HTMLImageElement>>>(new Map());
   const previewIdleLoadRef = useRef<Map<string, number>>(new Map());
   const previewDecodeStatsRef = useRef({ count: 0, wallMs: 0, longTaskMs: 0 });
+  // When each cached preview image was last drawn: the recent ones are never evicted (see trimTieredCache).
+  const previewImageLastUsedRef = useRef<Map<string, number>>(new Map());
+  // Sources whose load failed: not requested again on every draw (a revoked blob: URL, never).
+  const previewImageFailuresRef = useRef(createFailedSourceMemo());
+  const previewCacheLogRef = useRef({ lastAt: 0, suppressed: 0, evicted: 0 });
   const exportImgCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const exportImgLoadRef = useRef<Map<string, Promise<void>>>(new Map());
   const exportVideoFramesRef = useRef<Map<string, ImageBitmap>>(new Map());
@@ -8832,6 +8840,7 @@ function Board2Editor({
     for (const image of [...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()]) image.src = "";
     imgCacheRef.current.clear();
     warmImgCacheRef.current.clear();
+    previewImageLastUsedRef.current.clear();
     previewImagePendingRef.current.clear();
     boardImageCanvasRefs.current.clear();
     stopAllVideoPlayback("board-offscreen");
@@ -11369,38 +11378,40 @@ function Board2Editor({
       decode: { ...previewDecodeStatsRef.current },
     };
     (window as Window & { __board2Performance?: Board2PerformanceStats }).__board2Performance = stats;
-    if (reason === "policy" || stats.decode.count % 12 === 0) {
-      console.info("[board2:image-cache]", reason, stats);
+    // "trim" logs only when something was actually evicted, at most every 5 s with a tally of what
+    // was folded in — it used to log on every warm→hot promotion while the decode count sat still.
+    if (reason !== "policy") {
+      const log = previewCacheLogRef.current;
+      const now = performance.now();
+      if (now - log.lastAt < 5000) { log.suppressed++; return; }
+      console.info("[board2:image-cache]", reason, { ...stats, evictedSinceLastLog: log.evicted, logsSuppressed: log.suppressed });
+      log.lastAt = now;
+      log.suppressed = 0;
+      log.evicted = 0;
+      return;
     }
+    console.info("[board2:image-cache]", reason, stats);
   }
 
   function trimPreviewImageCaches() {
-    const policy = previewCachePolicyRef.current;
-    while (imgCacheRef.current.size > policy.hotEntries) {
-      const oldestUrl = imgCacheRef.current.keys().next().value as string | undefined;
-      if (!oldestUrl) break;
-      const oldest = imgCacheRef.current.get(oldestUrl);
-      imgCacheRef.current.delete(oldestUrl);
-      if (oldest) {
-        warmImgCacheRef.current.delete(oldestUrl);
-        warmImgCacheRef.current.set(oldestUrl, oldest);
-      }
+    const now = performance.now();
+    const lastUsed = previewImageLastUsedRef.current;
+    // Dropping the final JS reference lets the browser reclaim decoded pixels. Do not blank
+    // `src`: a mounted canvas/background keeps its last frame instead of flashing immediately.
+    const { evicted } = trimTieredCache(imgCacheRef.current, warmImgCacheRef.current, previewCachePolicyRef.current, {
+      bytes: decodedImageBytes,
+      isProtected: (url) => now - (lastUsed.get(url) ?? Number.NEGATIVE_INFINITY) < PREVIEW_CACHE_PROTECT_MS,
+    });
+    for (const url of evicted) lastUsed.delete(url);
+    if (evicted.length > 0) {
+      previewCacheLogRef.current.evicted += evicted.length;
+      reportPreviewCacheStats("trim");
     }
-    while (
-      warmImgCacheRef.current.size > policy.warmEntries ||
-      decodedImageBytes([...imgCacheRef.current.values(), ...warmImgCacheRef.current.values()]) > policy.decodedBudgetBytes
-    ) {
-      const oldestUrl = warmImgCacheRef.current.keys().next().value as string | undefined;
-      if (!oldestUrl) break;
-      // Dropping the final JS reference lets the browser reclaim decoded pixels. Do not blank
-      // `src`: a mounted canvas/background keeps its last frame instead of flashing immediately.
-      warmImgCacheRef.current.delete(oldestUrl);
-    }
-    reportPreviewCacheStats("trim");
   }
 
   function cachedPreviewImage(url: string): HTMLImageElement | undefined {
     const hot = imgCacheRef.current.get(url);
+    if (hot || warmImgCacheRef.current.has(url)) previewImageLastUsedRef.current.set(url, performance.now());
     if (hot) {
       imgCacheRef.current.delete(url);
       imgCacheRef.current.set(url, hot);
@@ -11416,7 +11427,7 @@ function Board2Editor({
 
   function loadMedia(url: string, type: "image" | "video", priority: "visible" | "preload" = "visible") {
     if (type === "image") {
-      if (!cachedPreviewImage(url) && !previewImagePendingRef.current.has(url)) {
+      if (!cachedPreviewImage(url) && !previewImagePendingRef.current.has(url) && !previewImageFailuresRef.current.shouldSkip(url)) {
         previewImagePendingRef.current.add(url);
         const startDecode = () => {
           previewIdleLoadRef.current.delete(url);
@@ -11428,13 +11439,24 @@ function Board2Editor({
               previewImagePendingRef.current.delete(url);
               previewDecodeStatsRef.current.count++;
               previewDecodeStatsRef.current.wallMs += performance.now() - startedAt;
+              previewImageFailuresRef.current.recordSuccess(url);
               imgCacheRef.current.set(url, img);
+              previewImageLastUsedRef.current.set(url, performance.now());
               trimPreviewImageCaches();
               drawFrame(playheadRef.current);
               drawBoardImageOverlaysRef.current(playheadRef.current);
             });
           };
-          img.onerror = () => previewImagePendingRef.current.delete(url);
+          img.onerror = () => {
+            previewImagePendingRef.current.delete(url);
+            const retryMs = previewImageFailuresRef.current.recordFailure(url);
+            if (previewImageFailuresRef.current.failureCount(url) === 1) {
+              console.warn("[board2:image-cache] image failed to load", {
+                url: url.slice(0, 120),
+                retry: Number.isFinite(retryMs) ? `in ${Math.round(retryMs / 1000)}s` : "never (the local file is gone)",
+              });
+            }
+          };
           img.src = url;
         };
         if (priority === "preload") {
@@ -11481,7 +11503,9 @@ function Board2Editor({
         try {
           await image.decode();
           if (image.naturalWidth <= 0 || image.naturalHeight <= 0) throw new Error("Image has no intrinsic dimensions");
+          previewImageFailuresRef.current.recordSuccess(url);
           imgCacheRef.current.set(url, image);
+          previewImageLastUsedRef.current.set(url, performance.now());
           trimPreviewImageCaches();
           drawFrame(playheadRef.current);
           drawBoardImageOverlaysRef.current(playheadRef.current);
