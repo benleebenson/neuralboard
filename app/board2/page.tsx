@@ -308,6 +308,7 @@ import {
   type ExportQuality,
 } from "@/lib/board2/export-encoding";
 import { describeExportFailure, discardPartialExport } from "@/lib/board2/export-file-sink";
+import { createTaskQueue, imageForAssetUpload } from "@/lib/board2/asset-autosave";
 import { brokenExportMediaMessage, collectExportMedia, findBrokenExportMedia, probeMediaUrl } from "@/lib/board2/export-preflight";
 import {
   decodedImageBytes,
@@ -629,6 +630,18 @@ type MediaEditDraft = {
   sourceDuration: number;
   swapFrame: boolean;
 };
+
+// Library auto-saves run a few at a time, not one request per board image all at once.
+const queueAssetSave = createTaskQueue(2);
+function postAssetSave(init: RequestInit, label: string): Promise<void> {
+  return queueAssetSave(async () => {
+    const response = await fetch("/api/board2/assets", { method: "POST", ...init });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null) as { error?: string; stage?: string; requestId?: string } | null;
+      console.warn("[asset-save] library save failed", { label, status: response.status, ...data });
+    }
+  }).catch((error) => console.warn("[asset-save] library save failed", { label, error }));
+}
 
 function isBoardMediaClip(clip: Clip): clip is Clip & { type: "image" | "video" } {
   return clip.type === "image" || clip.type === "video";
@@ -8681,25 +8694,29 @@ function Board2Editor({
       if (clip.type === "image" && (stableImageUrl || clip.sourceBlob)) {
         savedAssetIdsRef.current.add(clip.id);
         if (clip.sourceBlob) {
-          const form = new FormData();
-          form.set("file", new File([clip.sourceBlob], `${clip.name || "board-image"}.webp`, { type: clip.sourceBlob.type || "image/webp" }));
-          form.set("label", clip.name);
-          form.set("source", clip.source ?? "manual");
-          void fetch("/api/board2/assets", { method: "POST", body: form }).catch(() => {});
+          const { sourceBlob, name, source } = clip;
+          // Multipart goes through the function body (Vercel caps it at 4.5 MB → 413), so oversized
+          // images are shrunk to the 1800 px the library stores anyway (lib/board2/asset-autosave).
+          void imageForAssetUpload(sourceBlob).then((upload) => {
+            if (!upload) { console.warn("[asset-save] image too large to save to the library", { name, bytes: sourceBlob.size }); return; }
+            const form = new FormData();
+            form.set("file", new File([upload], `${name || "board-image"}.webp`, { type: upload.type || "image/webp" }));
+            form.set("label", name);
+            form.set("source", source ?? "manual");
+            return postAssetSave({ body: form }, name);
+          });
         } else {
-          void fetch("/api/board2/assets", {
-            method: "POST",
+          void postAssetSave({
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ type: "image", url: stableImageUrl, label: clip.name, source: clip.source ?? "manual" }),
-          }).catch(() => {});
+          }, clip.name);
         }
       } else if (clip.type === "video" && clip.youtubeId) {
         savedAssetIdsRef.current.add(clip.id);
-        void fetch("/api/board2/assets", {
-          method: "POST",
+        void postAssetSave({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ type: "youtube", youtubeId: clip.youtubeId, ytStart: clip.ytStart, ytEnd: clip.ytEnd, label: clip.name, source: clip.source ?? "manual" }),
-        }).catch(() => {});
+        }, clip.name);
       }
     }
   }, [clips, session?.user?.email, viewOnly]);
