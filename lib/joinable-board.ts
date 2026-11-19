@@ -17,11 +17,34 @@ export function generateJoinCode(): string {
   return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
 }
 
-// Video and narration on a joinable board upload straight from the browser to Storage (a Vercel
-// function body is capped at 4.5 MB), so every collaborator can load them. Images still go through
-// /api/joinable-board/media, which converts them to webp. Keep in sync with the bucket's
-// file_size_limit and allowed_mime_types (supabase/migrations/20261011_joinable_board_av_media.sql).
+// Every file shared on a joinable board (image, video, narration) uploads straight from the browser
+// to Storage through a signed upload URL from /api/joinable-board/media/upload-url: a Vercel
+// function body is capped at 4.5 MB, well under a phone photo. Keep in sync with the bucket's
+// file_size_limit and allowed_mime_types (supabase/migrations/20261011_joinable_board_av_media.sql,
+// supabase/migrations/20261118_joinable_board_direct_image_uploads.sql).
 export const SHARED_AV_MAX_BYTES = 50 * 1024 * 1024;
+export const SHARED_IMAGE_MAX_BYTES = 15 * 1024 * 1024;
+// No image/svg+xml: an SVG served from Storage could run script.
+export const SHARED_IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/heic": "heic",
+  "image/heif": "heif",
+};
+const IMAGE_EXTENSION_MIMES: Record<string, string> = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", heic: "image/heic", heif: "image/heif" };
+
+/**
+ * The shareable image type of a file, or "" when it can't be shared. Browsers often leave `type`
+ * empty for HEIC (and sometimes give application/octet-stream), so the name's extension decides then.
+ */
+export function sharedImageMime(type: string, name = ""): string {
+  const mime = type.split(";")[0].trim().toLowerCase();
+  if (SHARED_IMAGE_EXTENSIONS[mime]) return mime;
+  if (mime && mime !== "application/octet-stream") return "";
+  return IMAGE_EXTENSION_MIMES[/\.([a-z0-9]+)$/i.exec(name)?.[1].toLowerCase() ?? ""] ?? "";
+}
 export const SHARED_AV_EXTENSIONS: Record<string, string> = {
   "video/mp4": "mp4",
   "video/webm": "webm",
@@ -37,7 +60,8 @@ export const SHARED_AV_EXTENSIONS: Record<string, string> = {
   "audio/ogg": "ogg",
   "audio/flac": "flac",
 };
-export const SHARED_MEDIA_EXTENSIONS = new Set(["webp", ...Object.values(SHARED_AV_EXTENSIONS)]);
+export const SHARED_IMAGE_FILE_EXTENSIONS = new Set(Object.values(SHARED_IMAGE_EXTENSIONS));
+export const SHARED_MEDIA_EXTENSIONS = new Set([...SHARED_IMAGE_FILE_EXTENSIONS, ...Object.values(SHARED_AV_EXTENSIONS)]);
 
 // "simple" is the old-school board: sticky notes and photos, no video editor. A board without a
 // type is a full Neural board. Owner-only, and only ever changes from simple to neural.

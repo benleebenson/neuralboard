@@ -39,9 +39,10 @@ type PictureSize = { w: number; h: number };
  */
 export type StickyNoteImage = { url: string; width: number; height: number; animated?: boolean };
 
-// Images a joiner's note may show: the board's own shared media (what /api/joinable-board/media
-// returns for an image), never an outside link.
-const STICKY_NOTE_IMAGE_URL = /^\/api\/joinable-board\/media\/([A-Z0-9]{6})\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// Images a joiner's note may show: the board's own shared media (an image URL from
+// /api/joinable-board/media/upload-url, or an older extensionless webp one), never an outside link
+// and never shared video or audio. Extensions match SHARED_IMAGE_EXTENSIONS in joinable-board.ts.
+const STICKY_NOTE_IMAGE_URL = /^\/api\/joinable-board\/media\/([A-Z0-9]{6})\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.(?:jpg|png|webp|gif|heic|heif))?$/;
 const STICKY_NOTE_IMAGE_MAX_PIXELS = 20_000;
 
 /** Whether `value` is a note picture on the board with join code `code` (any board, without one). */

@@ -24,7 +24,7 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
-import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, SHARED_IMAGE_MAX_BYTES, sharedImageMime, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
 import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
@@ -15979,32 +15979,35 @@ function Board2Editor({
 
   // ─ Media upload ───────────────────────────────────────────────────────────
 
-  async function uploadJoinableImage(file: File | Blob, name: string, code = joinCode): Promise<string> {
-    if (!code) return URL.createObjectURL(file);
-    const form = new FormData();
-    form.append("code", code);
-    form.append("file", file, name);
-    const response = await fetch("/api/joinable-board/media", { method: "POST", body: form });
-    const result = await response.json() as { url?: string; error?: string };
-    if (!response.ok || !result.url) throw new Error(result.error || "Could not share that image.");
-    return result.url;
-  }
-
-  // Video and narration bytes go straight to Storage through a signed upload URL (too large for a
-  // function body). Throws with a user-facing reason, e.g. over SHARED_AV_MAX_BYTES.
-  async function uploadJoinableAv(file: Blob, code = joinCode): Promise<string> {
-    const mime = (file.type || "").split(";")[0].trim().toLowerCase();
-    if (!SHARED_AV_EXTENSIONS[mime]) throw new Error(`${mime || "This file type"} can't be shared`);
-    if (file.size > SHARED_AV_MAX_BYTES) throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is over the ${SHARED_AV_MAX_BYTES / 1024 / 1024} MB sharing limit`);
+  // Images, video and narration all go straight to Storage through a signed upload URL: a Vercel
+  // function rejects request bodies over 4.5 MB, and phone photos are often bigger. Throws with a
+  // user-facing reason.
+  async function uploadToJoinableStorage(file: Blob, mime: string, code: string): Promise<string> {
     const response = await fetch("/api/joinable-board/media/upload-url", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, mime, size: file.size }) });
     const result = await response.json().catch(() => ({})) as { uploadUrl?: string; url?: string; error?: string };
     if (!response.ok || !result.uploadUrl || !result.url) throw new Error(result.error || "Could not share that file");
     const form = new FormData();
     form.append("cacheControl", "3600");
-    form.append("", file);
+    // Re-typed so Storage records (and checks against the bucket) the type the URL was signed for.
+    form.append("", file.type === mime ? file : new Blob([file], { type: mime }));
     const upload = await fetch(result.uploadUrl, { method: "PUT", headers: { "x-upsert": "false" }, body: form });
     if (!upload.ok) throw new Error(upload.status === 413 ? "The file is larger than storage allows" : `Upload failed (${upload.status})`);
     return result.url;
+  }
+
+  async function uploadJoinableImage(file: File | Blob, name: string, code = joinCode): Promise<string> {
+    if (!code) return URL.createObjectURL(file);
+    const mime = sharedImageMime(file.type, name);
+    if (!mime) throw new Error(`${file.type || "This file type"} can't be shared`);
+    if (file.size > SHARED_IMAGE_MAX_BYTES) throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is over the ${SHARED_IMAGE_MAX_BYTES / 1024 / 1024} MB limit for shared images`);
+    return uploadToJoinableStorage(file, mime, code);
+  }
+
+  async function uploadJoinableAv(file: Blob, code = joinCode): Promise<string> {
+    const mime = (file.type || "").split(";")[0].trim().toLowerCase();
+    if (!SHARED_AV_EXTENSIONS[mime]) throw new Error(`${mime || "This file type"} can't be shared`);
+    if (file.size > SHARED_AV_MAX_BYTES) throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is over the ${SHARED_AV_MAX_BYTES / 1024 / 1024} MB sharing limit`);
+    return uploadToJoinableStorage(file, mime, code);
   }
 
   // Shared by file-input uploads and clipboard image paste — takes any File/Blob, registers it
@@ -18200,7 +18203,7 @@ function Board2Editor({
     if (picture) {
       setStickyComposer((current) => current && { ...current, status: "posting" });
       try {
-        // The shared-media route keeps every frame of an animated image (as animated WebP).
+        // Shared media keeps an animated image's original bytes, so every frame survives.
         const { url, animated } = joinCode
           ? { url: await uploadJoinableImage(picture.blob, picture.name), animated: picture.animated }
           : await notePictureDataUrl(picture.blob, picture.animated);
