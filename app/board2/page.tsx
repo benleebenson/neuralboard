@@ -41,6 +41,7 @@ import {
   releaseAnimatedImage,
   type AnimatedImage,
 } from "@/lib/board2/animated-image";
+import { penSvgPath, tracePenPath } from "@/lib/board2/pen-path";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { EDITOR_BOARD_PARAM, PUBLISHED_EDIT_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, listBoards, loadStarredBoardStyleSummaries, safeBoardFilename, supportsBoardDirectory, writeBoardFile, type BoardLibraryEntry } from "@/lib/board-library";
@@ -3550,14 +3551,10 @@ function drawAnnotationsToCanvas(
       ctx.strokeStyle = ann.color;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      for (let i = 1; i < ann.points.length; i++) {
-        const a = ann.points[i - 1], b = ann.points[i];
-        ctx.beginPath();
-        ctx.moveTo(toSX(a.x), toSY(a.y));
-        ctx.quadraticCurveTo(toSX(a.x), toSY(a.y), toSX((a.x + b.x) / 2), toSY((a.y + b.y) / 2));
-        ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf);
-        ctx.stroke();
-      }
+      ctx.lineWidth = Math.max(1, (ann.strokeWidth ?? 4) * sf);
+      ctx.beginPath();
+      tracePenPath(ctx, ann.points, toSX, toSY);
+      ctx.stroke();
       ctx.restore();
     } else if (ann.type === "emoji" && ann.emoji) {
       const fs = Math.max(8, (ann.fontSize ?? 120) * sf);
@@ -18707,7 +18704,11 @@ function Board2Editor({
         overlayCtx.lineCap = "round";
         overlayCtx.lineJoin = "round";
       }
+      // Live ink, drawn piece by piece as the pen moves, the same shape penPathCommands gives the
+      // finished stroke: each piece runs from the last midpoint, curving through the last sample,
+      // to the next midpoint, so consecutive pieces join with no gaps.
       let lastClient = { x: e.clientX - containerRect.left, y: e.clientY - containerRect.top };
+      let lastMid = lastClient;
       const onMove = (ev: PointerEvent) => {
         if (ev.pointerId !== activePenPointerRef.current) return;
         const samples = typeof ev.getCoalescedEvents === "function" ? ev.getCoalescedEvents() : [ev];
@@ -18719,11 +18720,13 @@ function Board2Editor({
           pts.push({ x: px, y: py });
           if (overlayCtx) {
             const next = { x: sample.clientX - r.left, y: sample.clientY - r.top };
+            const mid = { x: (lastClient.x + next.x) / 2, y: (lastClient.y + next.y) / 2 };
             overlayCtx.beginPath();
-            overlayCtx.moveTo(lastClient.x, lastClient.y);
-            overlayCtx.lineTo((lastClient.x + next.x) / 2, (lastClient.y + next.y) / 2);
+            overlayCtx.moveTo(lastMid.x, lastMid.y);
+            overlayCtx.quadraticCurveTo(lastClient.x, lastClient.y, mid.x, mid.y);
             overlayCtx.lineWidth = baseWidth * boardZoomRef.current;
             overlayCtx.stroke();
+            lastMid = mid;
             lastClient = next;
           }
         }
@@ -28527,12 +28530,7 @@ function Board2Editor({
                       const cx = bx + bw, mid = by + bh / 2, q = Math.min(20, bh * 0.15);
                       return <path key={ann.id} d={`M ${cx} ${by} C ${cx+q} ${by}, ${cx+q} ${mid - bh*0.05}, ${cx} ${mid} C ${cx+q} ${mid + bh*0.05}, ${cx+q} ${by+bh}, ${cx} ${by+bh}`} fill="none" stroke={ann.color} strokeWidth={sw} strokeLinecap="round" />;
                     } else if (ann.type === "pen" && ann.points && ann.points.length >= 2) {
-                      return <g key={ann.id}>{ann.points.slice(1).map((point, index) => {
-                        const previous = ann.points![index];
-                        const d = `M ${previous.x * boardZoom} ${previous.y * boardZoom} Q ${previous.x * boardZoom} ${previous.y * boardZoom} ${(previous.x + point.x) * boardZoom / 2} ${(previous.y + point.y) * boardZoom / 2}`;
-                        const strokeWidth = (ann.strokeWidth ?? 4) * boardZoom;
-                        return <path key={index} d={d} fill="none" stroke={ann.color} strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />;
-                      })}</g>;
+                      return <path key={ann.id} d={penSvgPath(ann.points, boardZoom)} fill="none" stroke={ann.color} strokeWidth={(ann.strokeWidth ?? 4) * boardZoom} strokeLinecap="round" strokeLinejoin="round" />;
                     } else if (ann.type === "emoji" && ann.emoji) {
                       return (
                         <text key={ann.id}
