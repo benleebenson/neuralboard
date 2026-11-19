@@ -24,7 +24,7 @@ import {
 } from "webm-muxer";
 import { getBrowserSupabase } from "@/lib/supabase-browser";
 import { compressBoardPackage, publishAnonymousBoard, publishPreviewWebp } from "@/lib/published-board-package";
-import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, SHARED_IMAGE_MAX_BYTES, sharedImageMime, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
+import { ANONYMOUS_BOARD_TTL_DAYS, BOARD_TYPE_PARAM, forgetCreatedBoard, normalizeJoinCode, parseBoardType, readCreatedBoards, mergeJoinableStates, participantIdFor, readParticipantToken, rememberCreatedBoard, SHARED_AV_EXTENSIONS, SHARED_AV_MAX_BYTES, SHARED_IMAGE_MAX_BYTES, stableStringify, type BoardType, type JoinableBoardState } from "@/lib/joinable-board";
 import { SIMPLE_BOARD_ITEMS_ONLY } from "@/lib/joinable-board-permissions";
 import { validPublishedBoardId } from "@/lib/published-boards";
 import { readLikes, type BoardLikes } from "@/lib/joinable-board-likes";
@@ -41,6 +41,7 @@ import {
   releaseAnimatedImage,
   type AnimatedImage,
 } from "@/lib/board2/animated-image";
+import { prepareImageForSharing } from "@/lib/board2/share-image";
 import { getFile as getCachedMedia, mediaCacheKeyForFile, saveFile as saveCachedMedia } from "@/lib/board2/media-cache";
 import { EDITOR_BOARD_PARAM, PUBLISHED_EDIT_PARAM, rememberedShellTab, shellTabUrl } from "@/lib/app-shell";
 import { BOARD_LIBRARY_PENDING_FILE, getBoardsDirectory, listBoards, loadStarredBoardStyleSummaries, safeBoardFilename, supportsBoardDirectory, writeBoardFile, type BoardLibraryEntry } from "@/lib/board-library";
@@ -15997,10 +15998,11 @@ function Board2Editor({
 
   async function uploadJoinableImage(file: File | Blob, name: string, code = joinCode): Promise<string> {
     if (!code) return URL.createObjectURL(file);
-    const mime = sharedImageMime(file.type, name);
+    // Large photos shrink to JPEG first (lib/board2/share-image); GIFs and undecodable HEIC go as they are.
+    const { blob, mime } = await prepareImageForSharing(file, name);
     if (!mime) throw new Error(`${file.type || "This file type"} can't be shared`);
-    if (file.size > SHARED_IMAGE_MAX_BYTES) throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is over the ${SHARED_IMAGE_MAX_BYTES / 1024 / 1024} MB limit for shared images`);
-    return uploadToJoinableStorage(file, mime, code);
+    if (blob.size > SHARED_IMAGE_MAX_BYTES) throw new Error(`${Math.ceil(blob.size / 1024 / 1024)} MB is over the ${SHARED_IMAGE_MAX_BYTES / 1024 / 1024} MB limit for shared images`);
+    return uploadToJoinableStorage(blob, mime, code);
   }
 
   async function uploadJoinableAv(file: Blob, code = joinCode): Promise<string> {
