@@ -354,6 +354,13 @@ import {
 import { AI_FEATURES_ENABLED, DEBUG_STREAM, LIVE_FEATURES_ENABLED, STREAM_OWNER_USER_ID } from "./config";
 type BoardFullscreenElement = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
 type BoardFullscreenDocument = Document & { webkitFullscreenElement?: Element | null; webkitExitFullscreen?: () => Promise<void> | void };
+/** A shared-board image upload that failed: `message` names the file, `reason` is just the why. */
+class SharedImageUploadError extends Error {
+  constructor(readonly fileName: string, readonly reason: string) {
+    super(`Couldn't share ${fileName}: ${reason}`);
+  }
+}
+
 const FULLSCREEN_REQUEST_TIMEOUT_MS = 1500;
 
 // Runs a Fullscreen API request and reports how it went: "entered", "failed" (threw or rejected)
@@ -15984,25 +15991,41 @@ function Board2Editor({
   // function rejects request bodies over 4.5 MB, and phone photos are often bigger. Throws with a
   // user-facing reason.
   async function uploadToJoinableStorage(file: Blob, mime: string, code: string): Promise<string> {
-    const response = await fetch("/api/joinable-board/media/upload-url", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, mime, size: file.size }) });
+    const offline = "the connection dropped — check your internet and try again";
+    const response = await fetch("/api/joinable-board/media/upload-url", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code, mime, size: file.size }) }).catch(() => null);
+    if (!response) throw new Error(offline);
     const result = await response.json().catch(() => ({})) as { uploadUrl?: string; url?: string; error?: string };
-    if (!response.ok || !result.uploadUrl || !result.url) throw new Error(result.error || "Could not share that file");
+    if (!response.ok || !result.uploadUrl || !result.url) throw new Error(result.error ? result.error.replace(/\.$/, "") : `the server couldn't start the upload (HTTP ${response.status})`);
     const form = new FormData();
     form.append("cacheControl", "3600");
     // Re-typed so Storage records (and checks against the bucket) the type the URL was signed for.
     form.append("", file.type === mime ? file : new Blob([file], { type: mime }));
-    const upload = await fetch(result.uploadUrl, { method: "PUT", headers: { "x-upsert": "false" }, body: form });
-    if (!upload.ok) throw new Error(upload.status === 413 ? "The file is larger than storage allows" : `Upload failed (${upload.status})`);
+    const upload = await fetch(result.uploadUrl, { method: "PUT", headers: { "x-upsert": "false" }, body: form }).catch(() => null);
+    if (!upload) throw new Error(offline);
+    if (!upload.ok) {
+      // Storage answers with JSON like {"statusCode":"415","error":"invalid_mime_type","message":"mime type image/heic is not supported"}.
+      const failure = await upload.json().catch(() => ({})) as { statusCode?: string; error?: string; message?: string };
+      const status = Number(failure.statusCode) || upload.status;
+      if (status === 413 || failure.error === "Payload too large") throw new Error(`${Math.ceil(file.size / 1024 / 1024)} MB is larger than storage allows`);
+      if (status === 415 || failure.error === "invalid_mime_type") throw new Error(`storage doesn't accept ${mime} files`);
+      throw new Error(`storage rejected the upload (${failure.message || `HTTP ${upload.status}`})`);
+    }
     return result.url;
   }
 
+  // Throws a SharedImageUploadError, whose message names the file and says why, e.g.
+  // "Couldn't share IMG_0412.HEIC: 22 MB is over the 15 MB limit for shared images".
   async function uploadJoinableImage(file: File | Blob, name: string, code = joinCode): Promise<string> {
     if (!code) return URL.createObjectURL(file);
-    // Large photos shrink to JPEG first (lib/board2/share-image); GIFs and undecodable HEIC go as they are.
-    const { blob, mime } = await prepareImageForSharing(file, name);
-    if (!mime) throw new Error(`${file.type || "This file type"} can't be shared`);
-    if (blob.size > SHARED_IMAGE_MAX_BYTES) throw new Error(`${Math.ceil(blob.size / 1024 / 1024)} MB is over the ${SHARED_IMAGE_MAX_BYTES / 1024 / 1024} MB limit for shared images`);
-    return uploadToJoinableStorage(blob, mime, code);
+    try {
+      // Large photos shrink to JPEG first (lib/board2/share-image); GIFs and undecodable HEIC go as they are.
+      const { blob, mime } = await prepareImageForSharing(file, name);
+      if (!mime) throw new Error(`${file.type || "this file type"} can't be shared — use JPEG, PNG, WebP, GIF or HEIC`);
+      if (blob.size > SHARED_IMAGE_MAX_BYTES) throw new Error(`${Math.ceil(blob.size / 1024 / 1024)} MB is over the ${SHARED_IMAGE_MAX_BYTES / 1024 / 1024} MB limit for shared images`);
+      return await uploadToJoinableStorage(blob, mime, code);
+    } catch (error) {
+      throw new SharedImageUploadError(name, error instanceof Error ? error.message : "the upload failed");
+    }
   }
 
   async function uploadJoinableAv(file: Blob, code = joinCode): Promise<string> {
@@ -27147,7 +27170,7 @@ function Board2Editor({
 
       // Shared boards get the media on the server before the items appear, so joiners never see
       // an item whose media is only on this device unless the upload failed.
-      let notShared = 0;
+      const notShared: string[] = [];
       if (sharedUploads.length) {
         setToast(`Sharing ${sharedUploads.length} media file${sharedUploads.length === 1 ? "" : "s"} from ${label}…`);
         let next = 0;
@@ -27159,8 +27182,9 @@ function Board2Editor({
                 ? await uploadJoinableImage(upload.asset, upload.asset.name.split("/").pop() || "image")
                 : await uploadJoinableAv(upload.asset);
               importedClips[upload.index] = { ...importedClips[upload.index], sourceUrl: url };
-            } catch {
-              notShared++;
+            } catch (error) {
+              const reason = error instanceof SharedImageUploadError ? error.reason : error instanceof Error ? error.message : "upload failed";
+              notShared.push(`${upload.asset.name.split("/").pop() || upload.type} (${reason})`);
             }
           }
         };
@@ -27214,7 +27238,7 @@ function Board2Editor({
       const count = placedClips.length + placedAnnotations.length;
       setToast([
         `Imported ${count} item${count === 1 ? "" : "s"} from ${label}${again ? " (a second copy)" : ""}`,
-        notShared ? `${notShared} media file${notShared === 1 ? " is" : "s are"} only on this device — others on this board won't see ${notShared === 1 ? "it" : "them"}` : "",
+        notShared.length ? `Only on this device, others on this board won't see: ${notShared.join(", ")}` : "",
       ].filter(Boolean).join(" · "));
       console.info(`[import-board] ${label}: ${count} items in ${Math.round(performance.now() - started)}ms`);
     } catch (err) {
@@ -27499,8 +27523,12 @@ function Board2Editor({
       for (const clip of clipsRef.current) {
         const avBlob = clip.type === "video" || (clip.type === "cutto" && clip.cutToMedia === "video") ? clip.sourceBlob : clip.type === "narration" ? clip.audioBlob : undefined;
         if ((clip.type === "image" || (clip.type === "cutto" && clip.cutToMedia === "image")) && clip.sourceBlob?.size) {
-          const sourceUrl = await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code);
-          sharedClips.push({ ...clip, sourceUrl });
+          try {
+            sharedClips.push({ ...clip, sourceUrl: await uploadJoinableImage(clip.sourceBlob, clip.name || "image", result.code) });
+          } catch (error) {
+            notShared.push(`${clip.name || "an image"} (${error instanceof SharedImageUploadError ? error.reason : "upload failed"})`);
+            sharedClips.push(clip);
+          }
         } else if (avBlob?.size && clip.sourceUrl.startsWith("blob:")) {
           try {
             sharedClips.push({ ...clip, sourceUrl: await uploadJoinableAv(avBlob, result.code) });
@@ -27524,7 +27552,7 @@ function Board2Editor({
             const blob = await fetch(image.url).then((response) => response.blob());
             sharedAnnotations.push({ ...annotation, noteImage: { ...image, url: await uploadJoinableImage(blob, "note picture", result.code) } });
           } catch (error) {
-            notShared.push(`a note's picture (${error instanceof Error ? error.message : "upload failed"})`);
+            notShared.push(`a note's picture (${error instanceof SharedImageUploadError ? error.reason : "upload failed"})`);
             sharedAnnotations.push(annotation);
           }
         }
