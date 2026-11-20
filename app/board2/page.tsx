@@ -7408,6 +7408,9 @@ function Board2Editor({
   const ytRangeRef = useRef({ start: 0, end: 30 });
   const annotationsRef = useRef<Annotation[]>([]);
   const annotationToolRef = useRef<AnnotationTool>("pointer");
+  // While the Annotations panel is open it owns the board: an armed (or kept-on) Custom Zoom
+  // steps aside until the panel is closed, then picks up where it left off.
+  const annotationToolbarOpenRef = useRef(false);
   const annotationColorRef = useRef<string>(DEFAULT_ANNOTATION_COLOR);
   const annotationStrokeWidthRef = useRef<number>(DEFAULT_ANNOTATION_STROKE_WIDTH);
   const annotationFontRef = useRef("Caveat");
@@ -9088,6 +9091,7 @@ function Board2Editor({
     };
   }, [viewOnly]);
   useEffect(() => { annotationToolRef.current = annotationTool; }, [annotationTool]);
+  useEffect(() => { annotationToolbarOpenRef.current = annotationToolbarOpen; }, [annotationToolbarOpen]);
   useEffect(() => { annotationColorRef.current = annotationColor; }, [annotationColor]);
   useEffect(() => { annotationStrokeWidthRef.current = annotationStrokeWidth; }, [annotationStrokeWidth]);
   useEffect(() => { annotationFontRef.current = annotationFont; }, [annotationFont]);
@@ -13243,6 +13247,9 @@ function Board2Editor({
     customZoomDrawModeRef.current = true;
     setCustomZoomDrawMode(true);
     disarmAnnotationTool();
+    // Arming Custom Zoom on purpose is a request to draw zooms now, so close Annotations.
+    annotationToolbarOpenRef.current = false;
+    setAnnotationToolbarOpen(false);
   }
 
   function toggleCustomZoomContinuous() {
@@ -22890,14 +22897,14 @@ function Board2Editor({
         cancelPendingMediaPlacement();
         return;
       }
-      if (!inInput && e.code === "Escape" && customZoomDrawModeRef.current) {
-        e.preventDefault();
-        disarmCustomZoomDrawMode();
-        return;
-      }
       if (!inInput && e.code === "Escape" && annotationToolRef.current !== "pointer") {
         e.preventDefault();
         disarmAnnotationTool();
+        return;
+      }
+      if (!inInput && e.code === "Escape" && customZoomDrawModeRef.current && !annotationToolbarOpenRef.current) {
+        e.preventDefault();
+        disarmCustomZoomDrawMode();
         return;
       }
       if (e.code === "Space") {
@@ -22948,7 +22955,7 @@ function Board2Editor({
       if (e.code === "Space") {
         isSpaceDownRef.current = false;
         setIsSpaceDown(false);
-        if (boardContainerRef.current) boardContainerRef.current.style.cursor = customZoomDrawModeRef.current ? "crosshair" : "default";
+        if (boardContainerRef.current) boardContainerRef.current.style.cursor = customZoomDrawModeRef.current && !annotationToolbarOpenRef.current ? "crosshair" : "default";
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -28891,8 +28898,9 @@ function Board2Editor({
                   />
                 )}
 
-                {/* Glass pane — drag a rectangle to create a Custom Zoom clip */}
-                {customZoomDrawMode && (
+                {/* Glass pane — drag a rectangle to create a Custom Zoom clip. Hidden while the
+                    Annotations panel is open so annotation tools (and selecting/moving) work. */}
+                {customZoomDrawMode && !annotationToolbarOpen && (
                   <div
                     aria-label="Custom Zoom drawing surface"
                     data-custom-zoom-board-width={boardDimensions.width}
